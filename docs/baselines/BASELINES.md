@@ -58,6 +58,11 @@ outputs remain intentionally ignored. Treat this as an operational screening res
 reproducibility-grade benchmark. New publication results must retain the compact manifest,
 checkpoint hashes, and per-model timing summary in a tracked result artifact.
 
+The publication-grade full `adaptation_v2` run is now recorded in
+[`IMWUT_BASELINE_ADAPTATION_V2_20260904.md`](../results/IMWUT_BASELINE_ADAPTATION_V2_20260904.md),
+including the corrected fixed cohort, checkpoint provenance, runtime, aggregate scores, and
+per-dataset 1-NN results.
+
 Use two execution tiers:
 
 - **Rapid development:** HALO, raw/physical controls, HARNet, and UniMTS.

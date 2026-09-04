@@ -63,7 +63,7 @@ motion well enough that attention over a compatible support set can make the cal
 
 Two capabilities fall out of the design rather than being bolted on. Labels are read through
 language and no parameter is tied to a candidate, so **an unseen activity name is scored by the same
-operation as a seen one** — **49 of the 64 candidate labels** in the `adaptation_v2` roster are
+operation as a seen one** — **48 of the 63 candidate labels** in the `adaptation_v2` roster are
 never seen in training. And a user
 enrolling a few examples on their own device is the *native* mode of the model, not a fine-tuning
 afterthought, which is the deployment story a ubicomp venue actually cares about.
@@ -233,11 +233,11 @@ a result.
 **Training — 18 datasets, 56 streams, 31 acquisition configs, 166 labels.**
 `deployment_policy.EXPANDED_PHASE_A_TRAIN_DATASETS`.
 
-**Evaluation — 10 datasets, manifest `adaptation_v2`** (70 cells, 48 usable, fingerprint
-`0f98ae25…`). `adaptation_v1` (7 datasets) is kept intact for comparability but is **not** the
+**Evaluation — 10 datasets, manifest `adaptation_v2`** (69 cells, 48 usable, fingerprint
+`5058cf41…`). `adaptation_v1` (7 datasets) is kept intact for comparability but is **not** the
 current protocol; the two carry different protocol names so the assembler cannot mix their rows.
 
-- **49 of the 64 candidate labels** in the `adaptation_v2` roster are **never seen in training** —
+- **48 of the 63 candidate labels** in the `adaptation_v2` roster are **never seen in training** —
   that is the open-vocabulary story. (An earlier note said 44 of 55; that counted the 7-dataset
   roster's observed grid labels rather than v2's pre-registered candidate vocabulary.)
 - 4 of the 8 original evaluation acquisition configs are **unseen in training** — that is the
@@ -302,7 +302,9 @@ Every one of these is a measurement from the earlier lines, recorded in
 - **No training run has been launched.** Nothing here has evidence of beating its untrained floor.
 - The GPU budget across nine queued ablation arms does not fit the schedule; the cut has not been
   made.
-- The clean baseline rerun on `adaptation_v2` has not happened.
+- The clean released-checkpoint baseline rerun is complete and recorded in
+  [`results/IMWUT_BASELINE_ADAPTATION_V2_20260904.md`](results/IMWUT_BASELINE_ADAPTATION_V2_20260904.md).
+  HALO comparison-model training and matched evaluation remain open.
 - Baseline weight audit for the 2025–26 comparators (Wonderwall, IMUZero, LanHAR, GOAT, MOMENT).
 - Whether to spend GPU settling fixed-vs-continuous, or report it open.
 
@@ -344,5 +346,6 @@ $PY -m pytest tests -q
 | [`design/COMPATIBILITY_AUDIT.txt`](design/COMPATIBILITY_AUDIT.txt) | generated stream → acquisition-key table | regenerate, do not hand-edit |
 | [`design/IMWUT_BUILD_PLAN.md`](design/IMWUT_BUILD_PLAN.md) | the 2026-09-03 sweep and schedule | **historical** — superseded in parts |
 | [`design/IMWUT_HANDOFF.md`](design/IMWUT_HANDOFF.md) | implementation spec written for another agent | **historical** — the work is done |
+| [`results/IMWUT_BASELINE_ADAPTATION_V2_20260904.md`](results/IMWUT_BASELINE_ADAPTATION_V2_20260904.md) | current released-checkpoint zero-shot and enrollment results | live result of record |
 | `results/classification/` | pre-pivot measurements | **frozen — never edit** |
 | `tasks/`, `docs/data/APPLICATION_DATASETS.md` | the application line | not this paper |

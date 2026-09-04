@@ -1,7 +1,8 @@
 # Recognize by comparison — agreed design and paper shape for the IMWUT submission
 
 **Status: design of record for the `imwut/compare` line. Agreed 2026-09-03 and implemented on that
-branch. No full comparison-model training or final `adaptation_v2` evaluation has been completed.**
+branch. The released-checkpoint baseline evaluation is complete; comparison-model training and its
+matched evaluation have not yet been completed.**
 
 This supersedes the clinical / motion-monitoring pivot as the paper target. The
 classification-era code (Phase-A tokenizer, evidence/compact engine, baseline adapters, the
@@ -152,7 +153,7 @@ schedule has never been tested head to head; that is an experiment, not a settle
 ## 5. Evaluation
 
 - **Protocol**: the frozen `adaptation_v2` manifest — **10** held-out datasets, subject-disjoint,
-  70 cells (48 usable), fingerprint `0f98ae25…`. `adaptation_v1` (7 datasets) stays intact so the
+  69 cells (48 usable), fingerprint `5058cf41…`. `adaptation_v1` (7 datasets) stays intact so the
   pre-pivot numbers remain comparable; the two carry different protocol names so the assembler
   cannot mix their rows.
 
