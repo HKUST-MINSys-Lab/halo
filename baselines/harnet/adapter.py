@@ -281,6 +281,9 @@ class HarnetAdapter(ConSEAdapter):
     def feature_artifacts(self, state):
         return {"released_checkpoint": _hub_dir() / "model_check_point/mtl_5_best.mdl"}
 
+    def evaluation_source_paths(self):
+        return (_hub_dir(),)
+
     def feature_config(self, state):
         return {
             "released_model": HARNET_NAME,

@@ -30,6 +30,7 @@ from eval.scoring import align_ground_truth_labels, classification_metrics
 
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_OUT = REPO / "eval" / "adaptation_results"
+DEFAULT_FEATURE_CACHE = REPO / "eval" / "adaptation_feature_cache"
 METHODS = ("nearest", "prototype", "ridge", "linear_head")
 DEFAULT_METHODS = ("nearest", "prototype", "ridge")
 NATIVE_METHOD = "support_comparator"
@@ -57,22 +58,29 @@ def _source_fingerprint(adapter) -> str:
     ]
     module_parts = type(adapter).__module__.split(".")
     baseline_dir = REPO.joinpath(*module_parts[:-1])
-    baseline_sources = sorted(
-        path.relative_to(REPO).as_posix()
-        for path in baseline_dir.rglob("*.py")
-    ) if baseline_dir.exists() else [f"baselines/{adapter.name}/adapter.py"]
-    additional_sources = []
-    for source in adapter.evaluation_source_paths():
+    sources: list[tuple[str, Path | None]] = [
+        (relative, REPO / relative) for relative in fixed
+    ]
+    if baseline_dir.exists():
+        sources.extend(
+            (path.relative_to(REPO).as_posix(), path)
+            for path in sorted(baseline_dir.rglob("*.py"))
+        )
+    else:
+        relative = f"baselines/{adapter.name}/adapter.py"
+        sources.append((relative, REPO / relative))
+    for source_index, source in enumerate(adapter.evaluation_source_paths()):
         source = Path(source)
         candidates = sorted(source.rglob("*.py")) if source.is_dir() else [source]
-        additional_sources.extend(
-            path.resolve().relative_to(REPO.resolve()).as_posix()
-            for path in candidates if path.exists()
-        )
-    for relative in sorted(set(fixed + baseline_sources + additional_sources)):
-        digest.update(relative.encode())
-        path = REPO / relative
-        if path.exists():
+        for path in candidates:
+            if not path.exists():
+                continue
+            relative = path.relative_to(source) if source.is_dir() else Path(path.name)
+            identity = f"external/{source_index}/{source.name}/{relative.as_posix()}"
+            sources.append((identity, path))
+    for identity, path in sorted(set(sources), key=lambda item: item[0]):
+        digest.update(identity.encode())
+        if path is not None and path.exists():
             digest.update(path.read_bytes())
         else:
             # Synthetic test adapters need no repository file; production adapters always have one.
@@ -93,6 +101,44 @@ def _file_fingerprint(path: Path) -> dict:
         "sha256": digest.hexdigest(),
         "bytes": path.stat().st_size,
     }
+
+
+def _feature_cache_key(
+    *, baseline_name: str, dataset: str, stream_id: str, stream_fingerprint: str,
+    source_fingerprint: str, artifacts: dict, config: dict,
+) -> str:
+    payload = {
+        "schema": 1,
+        "baseline": baseline_name,
+        "dataset": dataset,
+        "stream": stream_id,
+        "stream_fingerprint": stream_fingerprint,
+        "source_fingerprint": source_fingerprint,
+        "artifacts": artifacts,
+        "config": config,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _load_cached_features(path: Path, expected_rows: int) -> np.ndarray | None:
+    if not path.is_file():
+        return None
+    try:
+        value = np.load(path, allow_pickle=False)
+    except (OSError, ValueError):
+        return None
+    if value.ndim != 2 or value.shape[0] != expected_rows or not np.isfinite(value).all():
+        return None
+    return np.asarray(value, dtype=np.float32)
+
+
+def _save_cached_features(path: Path, value: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("wb") as handle:
+        np.save(handle, np.asarray(value, dtype=np.float32), allow_pickle=False)
+    os.replace(temporary, path)
 
 
 def _git_provenance() -> dict:
@@ -277,6 +323,7 @@ def score_positive_cell(
     device: torch.device,
     seed: int,
     methods: Sequence[str],
+    execution_feature_cache: dict[tuple[int, ...], torch.Tensor] | None = None,
 ) -> dict:
     unknown = sorted(set(methods) - set(METHODS))
     if unknown:
@@ -306,8 +353,17 @@ def score_positive_cell(
         support_window_counts = []
         for position, executions in enumerate(plan["support_execution_rows"]):
             for execution_rows in executions[:support_count]:
-                row_index = torch.as_tensor(execution_rows, dtype=torch.long, device=device)
-                execution_features.append(F.normalize(support_z[row_index].mean(0), dim=0))
+                cache_key = tuple(int(row) for row in execution_rows)
+                pooled = (
+                    execution_feature_cache.get(cache_key)
+                    if execution_feature_cache is not None else None
+                )
+                if pooled is None:
+                    row_index = torch.as_tensor(execution_rows, dtype=torch.long, device=device)
+                    pooled = F.normalize(support_z[row_index].mean(0), dim=0)
+                    if execution_feature_cache is not None:
+                        execution_feature_cache[cache_key] = pooled
+                execution_features.append(pooled)
                 execution_positions.append(position)
                 support_window_counts.append(len(execution_rows))
         x = torch.stack(execution_features)
@@ -461,6 +517,7 @@ def run(
     methods: Sequence[str] = DEFAULT_METHODS,
     label_modes: Sequence[str] = ("coherent", "random_alias"),
     loaded_manifest: dict | None = None,
+    feature_cache_dir: Path | None = None,
 ) -> dict:
     manifest = (
         loaded_manifest if loaded_manifest is not None
@@ -481,9 +538,38 @@ def run(
         if needs_native_model else adapter.setup_features(resolved_device)
     )
     setup_seconds = time.time() - started
+    source_fingerprint = _source_fingerprint(adapter)
+    artifact_fingerprint_cache: dict[Path, dict] = {}
+
+    def artifact_fingerprint(path: Path) -> dict:
+        resolved = Path(path).resolve()
+        if resolved not in artifact_fingerprint_cache:
+            artifact_fingerprint_cache[resolved] = _file_fingerprint(resolved)
+        return artifact_fingerprint_cache[resolved]
+
+    feature_artifacts = {
+        name: artifact_fingerprint(path)
+        for name, path in adapter.feature_artifacts(state).items()
+    }
+    evaluation_artifacts = {
+        name: artifact_fingerprint(path)
+        for name, path in (
+            adapter.evaluation_artifacts(state).items()
+            if needs_native_model else adapter.feature_artifacts(state).items()
+        )
+    }
+    feature_config = adapter.feature_config(state)
+    adapter_config = (
+        adapter.evaluation_config(state) if needs_native_model else feature_config
+    )
     streams = {}
     feature_cache: dict[tuple[str, str], np.ndarray] = {}
     unit_feature_cache: dict[tuple[str, str], torch.Tensor] = {}
+    pooled_execution_cache: dict[
+        tuple[str, str], dict[tuple[int, ...], torch.Tensor]
+    ] = {}
+    feature_cache_hits = 0
+    feature_cache_misses = 0
 
     def load_stream(dataset: str, stream_id: str):
         key = (dataset, stream_id)
@@ -494,15 +580,47 @@ def run(
         return streams[key]
 
     def features(dataset: str, stream_id: str) -> np.ndarray:
+        nonlocal feature_cache_hits, feature_cache_misses
         key = (dataset, stream_id)
         if key not in feature_cache:
             stream = load_stream(dataset, stream_id)
-            value = np.asarray(adapter.window_features(stream, state, resolved_device))
-            if value.shape[0] != stream.n_windows:
-                raise ValueError(
-                    f"{baseline_name}/{dataset}/{stream_id}: feature rows {len(value)} != "
-                    f"grid windows {stream.n_windows}"
+            cache_path = None
+            value = None
+            if feature_cache_dir is not None:
+                stream_key = f"{dataset}/{stream_id}"
+                if stream_key not in manifest["stream_fingerprints"]:
+                    raise ValueError(f"manifest has no fingerprint for {stream_key}")
+                cache_key = _feature_cache_key(
+                    baseline_name=baseline_name,
+                    dataset=dataset,
+                    stream_id=stream_id,
+                    stream_fingerprint=manifest["stream_fingerprints"][stream_key],
+                    source_fingerprint=source_fingerprint,
+                    artifacts=feature_artifacts,
+                    config=feature_config,
                 )
+                safe_stream = stream_id.replace("/", "_")
+                cache_path = Path(feature_cache_dir) / baseline_name / (
+                    f"{dataset}__{safe_stream}__{cache_key[:16]}.npy"
+                )
+                value = _load_cached_features(cache_path, stream.n_windows)
+            loaded_from_cache = value is not None
+            if value is None:
+                feature_cache_misses += 1
+                value = np.asarray(adapter.window_features(stream, state, resolved_device))
+            else:
+                feature_cache_hits += 1
+            if value.ndim != 2 or value.shape[0] != stream.n_windows:
+                raise ValueError(
+                    f"{baseline_name}/{dataset}/{stream_id}: feature shape {value.shape} is not "
+                    f"({stream.n_windows}, D)"
+                )
+            if not np.isfinite(value).all():
+                raise ValueError(
+                    f"{baseline_name}/{dataset}/{stream_id}: non-finite feature values"
+                )
+            if cache_path is not None and not loaded_from_cache:
+                _save_cached_features(cache_path, value)
             feature_cache[key] = value.astype(np.float32, copy=False)
         return feature_cache[key]
 
@@ -587,6 +705,9 @@ def run(
                     device=resolved_device,
                     seed=seed,
                     methods=methods,
+                    execution_feature_cache=pooled_execution_cache.setdefault(
+                        (dataset, cell["support_stream"]), {}
+                    ),
                 )
                 scored["fit_and_predict_seconds"] = time.time() - adaptation_started
                 scored["feature_dim"] = int(query_z.shape[1])
@@ -644,22 +765,22 @@ def run(
         "adapter": f"{type(adapter).__module__}.{type(adapter).__name__}",
         "manifest": str(manifest_path.resolve()),
         "manifest_fingerprint": manifest["manifest_fingerprint"],
-        "source_fingerprint": _source_fingerprint(adapter),
+        "source_fingerprint": source_fingerprint,
         "methods": list(methods) + ([NATIVE_METHOD] if adapter.supports_native_enrollment() else []),
         "primary_positive_k_method": (
             NATIVE_METHOD if adapter.supports_native_enrollment() else "nearest"
         ),
-        "evaluation_artifacts": {
-            name: _file_fingerprint(path)
-            for name, path in (
-                adapter.evaluation_artifacts(state).items()
-                if needs_native_model else adapter.feature_artifacts(state).items()
-            )
+        "evaluation_artifacts": evaluation_artifacts,
+        "adapter_config": adapter_config,
+        "feature_cache": {
+            "enabled": feature_cache_dir is not None,
+            "directory": str(Path(feature_cache_dir).resolve()) if feature_cache_dir else None,
+            "stream_hits": feature_cache_hits,
+            "stream_misses": feature_cache_misses,
+            "pooled_execution_vectors": int(sum(
+                len(values) for values in pooled_execution_cache.values()
+            )),
         },
-        "adapter_config": (
-            adapter.evaluation_config(state)
-            if needs_native_model else adapter.feature_config(state)
-        ),
         "support_protocol": {
             "support_unit": manifest.get(
                 "support_unit", "independent_execution_per_candidate"
@@ -705,6 +826,9 @@ def main() -> None:
     parser.add_argument("--baselines", nargs="+", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT)
+    parser.add_argument("--feature-cache-dir", type=Path, default=DEFAULT_FEATURE_CACHE)
+    parser.add_argument("--no-feature-cache", action="store_const", const=None,
+                        dest="feature_cache_dir")
     parser.add_argument("--methods", nargs="*", choices=METHODS, default=list(DEFAULT_METHODS))
     parser.add_argument("--label-modes", nargs="*", choices=("coherent", "random_alias"),
                         default=["coherent", "random_alias"])
@@ -726,6 +850,7 @@ def main() -> None:
                 methods=args.methods,
                 label_modes=args.label_modes,
                 loaded_manifest=shared_manifest,
+                feature_cache_dir=args.feature_cache_dir,
             )
             print(f"-> {out}", flush=True)
         except Exception as error:

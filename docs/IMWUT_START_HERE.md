@@ -185,6 +185,10 @@ cites. Never edit those files; add new results elsewhere.
 At evaluation, k ≥ 1 uses one equally weighted pooled vector per enrolled execution, with **no
 corpus bank**. k = 0 is an **ensemble of 8 training-shaped draws** (4 seen labels × 8 independent
 executions = K 32) with every candidate label excluded from support, combined before the argmax.
+The primary external comparison is the fixed-cell, cross-subject/same-configuration k=1..8 curve.
+Same-subject and cross-configuration cells are reported separately; the k=16 point uses a separate
+high-support cohort and is never joined to the main curve. TNDA-HAR has no participant identifiers
+in its released bundle, so its enrollment row is subject-unattributed rather than same-subject.
 
 The full design of record, including every ablation, is
 [`docs/design/IMWUT_COMPARE_DESIGN.md`](design/IMWUT_COMPARE_DESIGN.md). **When this file and that

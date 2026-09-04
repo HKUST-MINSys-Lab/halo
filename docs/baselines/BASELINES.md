@@ -18,21 +18,22 @@ simple, interpretable application methods or provide materially better robustnes
 
 ## Primary released-checkpoint roster
 
-The primary comparison deliberately uses three external encoders. This is the smallest set that
-covers the main representation families relevant to the application without repeating nearly the
-same scientific control.
+The IMWUT comparison branch uses four released-checkpoint external encoders. This is the smallest
+set that covers the main representation families used by the classification/adaptation benchmark;
+the application-task study on `main` may omit ImageBind when its generic multimodal control is not
+informative for a task.
 
 | encoder | publication | family represented | why it is retained | main limitation |
 |---|---|---|---|---|
 | **HARNet / ssl-wearables** | npj Digital Medicine, 2024 | large-scale convolutional self-supervision on real wrist accelerometry | strongest low-cost control for whether scale and a conventional temporal CNN are already sufficient | accelerometer only; fixed 5 s, 30 Hz contract |
 | **UniMTS** | NeurIPS, 2024 | synthetic motion, skeleton-graph encoding, rotation augmentation, and sensor-text alignment | recent control for explicit placement/orientation generalization and language-aligned motion representations | accelerometer only; body placement must map to its 22-joint skeleton |
 | **NormWear** | ACM TCH, 2025 | channel-independent time-frequency wearable foundation model | recent and most direct external comparison to HALO's frequency-domain and variable-channel design | approximately an order of magnitude slower than the other primary baselines |
+| **ImageBind** | CVPR, 2023 | generic multimodal text-aligned IMU representation | tests whether broad multimodal alignment transfers without wearable-specific adaptation | IMU tower was trained on head-mounted Ego4D data; large checkpoint |
 | **HALO** | project model | physical-time representation | fixed and continuous physical-time arms under matched within-HALO ablations | project model, not an external baseline |
 
-**ImageBind remains implemented but is not a primary baseline.** It is a useful optional appendix
-control for generic multimodal alignment, but its IMU tower was trained on head-mounted Ego4D IMU,
-requires a roughly 4.5 GB full-model checkpoint, and overlaps with the language-alignment question
-already covered more directly by UniMTS. It is therefore a poor trade for routine application runs.
+ImageBind remains optional for routine application-task runs because it requires a roughly 4.5 GB
+checkpoint and overlaps with UniMTS's language-alignment question. It is retained in the final
+classification/adaptation comparison so that the released-checkpoint roster matches the design.
 
 CrossHAR and LiMU-BERT remain excluded because the repository's usable backbones were pretrained by
 us rather than released by their authors. That would reintroduce choices about corpus, schedule,

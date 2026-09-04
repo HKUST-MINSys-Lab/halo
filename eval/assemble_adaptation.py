@@ -16,6 +16,22 @@ from eval.run_adaptation_baselines import _source_fingerprint
 
 NATIVE_ZERO_SHOT_MODELS = {"halo_compare", "unimts", "normwear", "imagebind"}
 TARGET_KEY = ("halo_compare", "support_comparator")
+MAIN_CURVE_MAX_K = 8
+
+
+def _cell_id(result_key: str, kind: str) -> str:
+    suffix_parts = 3 if kind == "enrollment" else 2
+    return result_key.rsplit("/", suffix_parts)[0]
+
+
+def _analysis_set(result: dict, cell: dict) -> str:
+    if result["kind"] == "zero_shot":
+        return "zero_shot"
+    if result.get("cohort", "main") == "secondary_high_support":
+        return "secondary_high_support"
+    if int(cell["support_ceiling"]) >= MAIN_CURVE_MAX_K:
+        return "main_common_k1_8"
+    return "supplemental_partial_coverage"
 
 
 def _external_rows(payload: dict, manifest: dict) -> tuple[list[dict], list[dict]]:
@@ -24,7 +40,11 @@ def _external_rows(payload: dict, manifest: dict) -> tuple[list[dict], list[dict
     for key, result in payload["results"].items():
         if result.get("status"):
             continue
-        dataset = key.split("/", 1)[0]
+        cell_id = _cell_id(key, result["kind"])
+        if cell_id not in manifest["cells"]:
+            raise ValueError(f"result references unknown manifest cell: {cell_id}")
+        cell = manifest["cells"][cell_id]
+        dataset = cell["dataset"]
         common = {
             "model": model,
             "dataset": dataset,
@@ -32,7 +52,11 @@ def _external_rows(payload: dict, manifest: dict) -> tuple[list[dict], list[dict
             "label_mode": result.get("label_mode", "coherent"),
             "k": int(result["support_count"]),
             "seed": int(result.get("seed", 0)),
-            "cell": key.rsplit("/", 3)[0] if result.get("kind") == "enrollment" else key,
+            "cell": cell_id,
+            "subject_relation": cell["subject_relation"],
+            "configuration_relation": cell["configuration_relation"],
+            "cohort": result.get("cohort", "zero_shot"),
+            "analysis_set": _analysis_set(result, cell),
         }
         methods = ["zero_shot"] if result["kind"] == "zero_shot" else payload["methods"]
         for method in methods:
@@ -42,6 +66,8 @@ def _external_rows(payload: dict, manifest: dict) -> tuple[list[dict], list[dict
             rows.append({**common, "method": method, "f1_macro": float(metric["f1_macro"])})
             field = f"{method}_f1_macro"
             for subject, record in result.get("subject_results", {}).items():
+                if common["subject_relation"] in {"none", "unattributed"}:
+                    continue
                 if field in record:
                     subjects.append({
                         **common, "method": method, "subject": f"{dataset}:{subject}",
@@ -97,25 +123,34 @@ def dataset_macro(rows: list[dict]) -> list[dict]:
     for row in rows:
         key = (
             row["model"], row["method"], row["regime"], row["label_mode"],
-            row["k"], row["dataset"],
+            row["subject_relation"], row["configuration_relation"], row["cohort"],
+            row["analysis_set"], row["k"], row["dataset"],
         )
         per_dataset[key].append(row["f1_macro"])
     dataset_values = [
         {
             "model": key[0], "method": key[1], "regime": key[2], "label_mode": key[3],
-            "k": key[4], "dataset": key[5], "f1_macro": float(np.mean(values)),
+            "subject_relation": key[4], "configuration_relation": key[5],
+            "cohort": key[6], "analysis_set": key[7], "k": key[8], "dataset": key[9],
+            "f1_macro": float(np.mean(values)),
             "protocol_cells": len(values),
         }
         for key, values in per_dataset.items()
     ]
     groups = defaultdict(list)
     for row in dataset_values:
-        key = (row["model"], row["method"], row["regime"], row["label_mode"], row["k"])
+        key = (
+            row["model"], row["method"], row["regime"], row["label_mode"],
+            row["subject_relation"], row["configuration_relation"], row["cohort"],
+            row["analysis_set"], row["k"],
+        )
         groups[key].append(row)
     return [
         {
             "model": key[0], "method": key[1], "regime": key[2], "label_mode": key[3],
-            "k": key[4], "f1_macro": float(np.mean([row["f1_macro"] for row in values])),
+            "subject_relation": key[4], "configuration_relation": key[5],
+            "cohort": key[6], "analysis_set": key[7], "k": key[8],
+            "f1_macro": float(np.mean([row["f1_macro"] for row in values])),
             "datasets": len(values),
         }
         for key, values in groups.items()
@@ -123,12 +158,18 @@ def dataset_macro(rows: list[dict]) -> list[dict]:
 
 
 def paired_deltas(subject_rows: list[dict], samples: int = 5_000) -> list[dict]:
-    """Paired subject bootstrap within each evaluation condition."""
+    """Dataset-balanced paired subject bootstrap within each evaluation condition.
+
+    The reported point is the mean of per-dataset mean subject deltas. Resampling subjects within
+    each fixed dataset therefore estimates the same dataset-balanced quantity instead of allowing a
+    large-subject dataset to dominate the interval.
+    """
     indexed = defaultdict(dict)
     for row in subject_rows:
         key = (
-            row["regime"], row["label_mode"], row["k"], row["cell"],
-            row["seed"], row["subject"],
+            row["regime"], row["label_mode"], row["subject_relation"],
+            row["configuration_relation"], row["cohort"], row["analysis_set"],
+            row["k"], row["cell"], row["seed"], row["dataset"], row["subject"],
         )
         indexed[(row["model"], row["method"])][key] = row["f1_macro"]
     target_key = TARGET_KEY
@@ -143,31 +184,48 @@ def paired_deltas(subject_rows: list[dict], samples: int = 5_000) -> list[dict]:
         common = sorted(set(target) & set(values))
         if not common:
             continue
-        # Keep unlike protocols separate, then average repeated stream/seed cells
-        # within each independent dataset-subject unit.
-        by_condition = defaultdict(lambda: defaultdict(list))
+        by_condition = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
         for key in common:
-            condition = key[:3]
-            by_condition[condition][key[-1]].append(target[key] - values[key])
-        for (regime, label_mode, k), by_subject in by_condition.items():
-            deltas = np.asarray(
-                [np.mean(value) for value in by_subject.values()], dtype=np.float64
+            condition = key[:7]
+            dataset, subject = key[-2:]
+            by_condition[condition][dataset][subject].append(target[key] - values[key])
+        for condition, by_dataset_subject in by_condition.items():
+            dataset_subject_values = {
+                dataset: np.asarray(
+                    [np.mean(values) for values in by_subject.values()], dtype=np.float64
+                )
+                for dataset, by_subject in by_dataset_subject.items()
+            }
+            dataset_means = np.asarray(
+                [values.mean() for values in dataset_subject_values.values()], dtype=np.float64
             )
-            draws = rng.choice(deltas, size=(samples, len(deltas)), replace=True).mean(1)
+            draws = np.stack([
+                rng.choice(values, size=(samples, len(values)), replace=True).mean(1)
+                for values in dataset_subject_values.values()
+            ]).mean(0)
+            (regime, label_mode, subject_relation, configuration_relation,
+             cohort, analysis_set, k) = condition
             output.append({
                 "target": f"{target_key[0]}/{target_key[1]}",
                 "comparator": f"{comparator[0]}/{comparator[1]}",
                 "regime": regime,
                 "label_mode": label_mode,
+                "subject_relation": subject_relation,
+                "configuration_relation": configuration_relation,
+                "cohort": cohort,
+                "analysis_set": analysis_set,
                 "k": k,
-                "paired_subjects": len(deltas),
-                "delta_f1_macro": float(deltas.mean()),
+                "paired_datasets": len(dataset_subject_values),
+                "paired_subjects": int(sum(len(v) for v in dataset_subject_values.values())),
+                "delta_f1_macro": float(dataset_means.mean()),
                 "ci95": [float(value) for value in np.quantile(draws, [0.025, 0.975])],
+                "estimand": "dataset-balanced mean paired subject macro-F1 delta",
             })
     return sorted(
         output,
         key=lambda row: (
-            row["regime"], row["label_mode"], row["k"], row["comparator"]
+            row["regime"], row["label_mode"], row["subject_relation"],
+            row["configuration_relation"], row["analysis_set"], row["k"], row["comparator"]
         ),
     )
 
@@ -200,10 +258,16 @@ def _markdown(aggregates: list[dict]) -> str:
     for title, include in panels:
         selected = sorted(
             (row for row in aggregates if include(row)),
-            key=lambda row: (row["regime"], row["model"], row["method"], row["k"]),
+            key=lambda row: (
+                row["analysis_set"], row["subject_relation"], row["configuration_relation"],
+                row["regime"], row["model"], row["method"], row["k"],
+            ),
         )
-        lines.extend([f"## {title}", "", "| regime | model | method | k | macro F1 | datasets |",
-                      "|---|---|---:|---:|---:|---:|"])
+        lines.extend([
+            f"## {title}", "",
+            "| analysis set | subject relation | configuration relation | regime | model | method | k | macro F1 | datasets |",
+            "|---|---|---|---|---|---|---:|---:|---:|",
+        ])
         for row in selected:
             method = (
                 "support comparator"
@@ -211,11 +275,13 @@ def _markdown(aggregates: list[dict]) -> str:
                 else "1-NN" if row["method"] == "nearest" else row["method"]
             )
             lines.append(
-                f"| {row['regime']} | {row['model']} | {method} | {row['k']} | "
+                f"| {row['analysis_set']} | {row['subject_relation']} | "
+                f"{row['configuration_relation']} | {row['regime']} | {row['model']} | "
+                f"{method} | {row['k']} | "
                 f"{row['f1_macro']:.2f} | {row['datasets']} |"
             )
         if not selected:
-            lines.append("| - | - | - | - | - | - |")
+            lines.append("| - | - | - | - | - | - | - | - | - |")
         lines.append("")
     return "\n".join(lines)
 

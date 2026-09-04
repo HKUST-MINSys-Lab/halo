@@ -95,6 +95,7 @@ training/evidence/outputs/*.log
 # docs/results; these raw outputs remain recoverable from the pre-application archive branch.
 eval/adaptation_results/
 eval/adaptation_tables/
+eval/adaptation_feature_cache/
 baselines/*/pretrain_run/
 baselines/*/*.meta.json
 

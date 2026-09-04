@@ -46,6 +46,33 @@ DATASET_NAMES = {
     "spar": "SPAR",
     "upper_limb_use": "Upper Limb Use",
 }
+MAIN_KS = (1, 2, 4, 8)
+PRIMARY_SUBJECT_RELATION = "cross_subject"
+PRIMARY_CONFIGURATION_RELATION = "same_configuration"
+
+
+def _is_main_curve_row(row: dict) -> bool:
+    """Select the fixed cell cohort used for comparable k=1..8 curves."""
+
+    return (
+        row.get("analysis_set", "main_common_k1_8") == "main_common_k1_8"
+        and row.get("cohort", "main") == "main"
+    )
+
+
+def _has_relation_fields(cells: list[dict]) -> bool:
+    return any("subject_relation" in row for row in cells)
+
+
+def _relation_rows(cells: list[dict], subject: str, configuration: str) -> list[dict]:
+    if not _has_relation_fields(cells):
+        return [row for row in cells if _is_main_curve_row(row)]
+    return [
+        row for row in cells
+        if _is_main_curve_row(row)
+        and row.get("subject_relation") == subject
+        and row.get("configuration_relation") == configuration
+    ]
 
 
 def _emit(header: list[str], rows: list[tuple[str, list[float]]], higher_better=True) -> list[str]:
@@ -148,31 +175,63 @@ def _enrollment_model_methods() -> list[tuple[str, str, str]]:
 
 
 def table_label_efficiency(cells: list[dict]) -> str:
-    ks = sorted({int(c["k"]) for c in cells if int(c["k"]) > 0})
+    ks = list(MAIN_KS)
     out = ["## 2. Label efficiency", "",
            "`k` is the number of independent enrolled executions per candidate. HALO is shown "
            "with its learned support comparator in addition to the same three non-gradient "
            "readouts used for every representation: one-nearest-neighbor, support prototypes, "
            "and closed-form ridge regression. All readouts see only the enrolled support "
-           "executions. Macro F1, mean over datasets.", ""]
-    scored = []
-    for display_name, model, method in _enrollment_model_methods():
-        row = [
-            _dataset_macro([
-                c for c in cells
-                if c["model"] == model and c["method"] == method
-                and c["label_mode"] == "coherent" and int(c["k"]) == k
+           "executions. Every k=1..8 column uses the same protocol cells. Macro F1 is averaged "
+           "over datasets. Subject and configuration relations are never pooled.", ""]
+    relations = (
+        ("Same configuration, cross subject", "cross_subject", "same_configuration"),
+        ("Same configuration, same subject", "same_subject", "same_configuration"),
+        ("Cross configuration, cross subject", "cross_subject", "cross_configuration"),
+        ("Cross configuration, same subject", "same_subject", "cross_configuration"),
+        ("Subject identity unavailable", "unattributed", "same_configuration"),
+    )
+    for title, subject_relation, configuration_relation in relations:
+        relation_cells = _relation_rows(cells, subject_relation, configuration_relation)
+        if not relation_cells:
+            continue
+        scored = []
+        for display_name, model, method in _enrollment_model_methods():
+            row = [
+                _dataset_macro([
+                    c for c in relation_cells
+                    if c["model"] == model and c["method"] == method
+                    and c["label_mode"] == "coherent" and int(c["k"]) == k
+                ])[0]
+                for k in ks
+            ]
+            scored.append((display_name, row))
+        datasets = sorted({c["dataset"] for c in relation_cells})
+        out += [f"### {title}", "", f"Fixed-cohort datasets: {len(datasets)}.", ""]
+        out += _emit(["model"] + [f"k={k}" for k in ks], scored)
+        out.append("")
+
+    high_support = [
+        c for c in cells
+        if c.get("analysis_set") == "secondary_high_support"
+        and c.get("label_mode") == "coherent" and int(c["k"]) == 16
+    ]
+    if high_support:
+        out += ["### Secondary k=16 cohort", "",
+                "This is a separately eligible subject/cell cohort and is not an extension of the "
+                "fixed k=1..8 curve.", ""]
+        scored = []
+        for display_name, model, method in _enrollment_model_methods():
+            value = _dataset_macro([
+                c for c in high_support if c["model"] == model and c["method"] == method
             ])[0]
-            for k in ks
-        ]
-        scored.append((display_name, row))
-    out += _emit(["model"] + [f"k={k}" for k in ks], scored)
-    out.append("")
+            scored.append((display_name, [value]))
+        out += _emit(["model", "k=16"], scored)
+        out.append("")
     return "\n".join(out)
 
 
 def table_per_dataset(cells: list[dict]) -> str:
-    ks = sorted({int(c["k"]) for c in cells if int(c["k"]) > 0})
+    ks = list(MAIN_KS)
     out = [
         "## 3. Per-dataset performance", "",
         "These tables use the same protocol as the aggregate results. Values are macro F1 averaged "
@@ -194,13 +253,21 @@ def table_per_dataset(cells: list[dict]) -> str:
     out += _emit(["model"] + [DATASET_NAMES.get(d, d) for d in datasets], zero_rows)
     out.append("")
 
-    out += ["### Enrollment by dataset", ""]
-    for dataset in datasets:
+    out += ["### Enrollment by dataset", "",
+            "Fixed k=1..8 cohort; same-configuration, cross-subject relation only. Other relations "
+            "are reported separately in the aggregate table.", ""]
+    enrollment_cells = _relation_rows(
+        cells, PRIMARY_SUBJECT_RELATION, PRIMARY_CONFIGURATION_RELATION
+    )
+    enrollment_datasets = sorted(
+        {c["dataset"] for c in enrollment_cells}, key=lambda d: DATASET_NAMES.get(d, d)
+    )
+    for dataset in enrollment_datasets:
         scored = []
         for display_name, model, method in _enrollment_model_methods():
             values = [
                 _dataset_macro([
-                    c for c in cells
+                    c for c in enrollment_cells
                     if c["model"] == model and c["method"] == method
                     and c["dataset"] == dataset and c["label_mode"] == "coherent"
                     and int(c["k"]) == k

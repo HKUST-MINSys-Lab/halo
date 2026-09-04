@@ -146,6 +146,9 @@ class UniMTSAdapter(CosineAdapter):
     def evaluation_artifacts(self, state):
         return {"released_checkpoint": UNIMTS_CKPT}
 
+    def evaluation_source_paths(self):
+        return (UNIMTS_REPO,)
+
     def evaluation_config(self, state):
         return {
             "input_rate_hz": TARGET_HZ,

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import baselines
 from baselines.base import BaselineAdapter
-from eval.enrollment_protocol import ACTION_REGIMES, iter_cells, load_manifest
+from eval.enrollment_protocol import ACTION_REGIMES, PROTOCOL_NAME, iter_cells, load_manifest
 
 
 PAPER_MODELS = ("halo_compare", "harnet", "unimts", "imagebind", "normwear")
@@ -19,6 +19,10 @@ NATIVE_ZERO_SHOT_MODELS = {"halo_compare", "unimts", "imagebind", "normwear"}
 def audit(manifest_path: Path, baseline_names=PAPER_MODELS) -> dict:
     manifest = load_manifest(manifest_path, validate_grids=True)
     blockers, warnings = [], []
+    if manifest.get("protocol_name") != PROTOCOL_NAME:
+        blockers.append(
+            f"protocol is {manifest.get('protocol_name')!r}, expected {PROTOCOL_NAME!r}"
+        )
     if len(manifest["seeds"]) < 5:
         blockers.append("fewer than five serialized support seeds")
     if manifest["support_counts"][:5] != [0, 1, 2, 4, 8]:
@@ -69,6 +73,26 @@ def audit(manifest_path: Path, baseline_names=PAPER_MODELS) -> dict:
             "cached_feature_prediction": cached_prediction,
             "native_enrollment": native_enrollment,
         }
+        try:
+            artifact_paths = (
+                adapter.evaluation_artifacts(None)
+                if native_zero_shot or native_enrollment
+                else adapter.feature_artifacts(None)
+            )
+        except (AttributeError, KeyError, TypeError):
+            artifact_paths = {}
+        baseline_status[name]["artifacts"] = {
+            artifact_name: {
+                "path": str(path), "exists": Path(path).is_file(),
+            }
+            for artifact_name, path in artifact_paths.items()
+        }
+        missing_artifacts = [
+            artifact_name for artifact_name, record in baseline_status[name]["artifacts"].items()
+            if not record["exists"]
+        ]
+        if missing_artifacts:
+            blockers.append(f"{name}: missing evaluation artifacts: {missing_artifacts}")
         if not features_overridden:
             blockers.append(f"{name}: no frozen window feature interface")
         if native_zero_shot != reported_zero_shot:
@@ -99,6 +123,32 @@ def audit(manifest_path: Path, baseline_names=PAPER_MODELS) -> dict:
     for cell in enrollment:
         ceilings[str(cell["support_ceiling"])] = ceilings.get(str(cell["support_ceiling"]), 0) + 1
         secondary_ready += int(cell.get("secondary_high_support", {}).get("status") == "ok")
+    common_main = [
+        cell for cell in enrollment
+        if cell["status"] == "ok" and int(cell["support_ceiling"]) >= 8
+    ]
+    common_relations = {}
+    for cell in common_main:
+        key = f"{cell['subject_relation']}/{cell['configuration_relation']}"
+        record = common_relations.setdefault(key, {"cells": 0, "datasets": set()})
+        record["cells"] += 1
+        record["datasets"].add(cell["dataset"])
+    common_relations = {
+        key: {"cells": value["cells"], "datasets": sorted(value["datasets"])}
+        for key, value in common_relations.items()
+    }
+    primary = common_relations.get("cross_subject/same_configuration")
+    if not primary:
+        blockers.append("no fixed-cohort cross-subject/same-configuration k=1..8 curve")
+    same_subject = common_relations.get("same_subject/same_configuration")
+    if same_subject is None or len(same_subject["datasets"]) < 3:
+        warnings.append(
+            "same-subject/same-configuration k=1..8 is underpowered; do not use it as a "
+            "multi-dataset headline"
+        )
+    unattributed = sorted({
+        cell["dataset"] for cell in enrollment if cell["subject_relation"] == "unattributed"
+    })
     return {
         "ready": not blockers,
         "manifest_fingerprint": manifest["manifest_fingerprint"],
@@ -108,6 +158,8 @@ def audit(manifest_path: Path, baseline_names=PAPER_MODELS) -> dict:
         "positive_k_datasets": sorted(positive_datasets),
         "positive_relation_support_ceilings": ceilings,
         "secondary_k16_relations": secondary_ready,
+        "fixed_main_curve_relations": common_relations,
+        "subject_unattributed_datasets": unattributed,
         "baseline_status": baseline_status,
         "blockers": blockers,
         "warnings": warnings,
@@ -118,8 +170,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--json", type=Path, default=None)
+    parser.add_argument("--baselines", nargs="*", default=list(PAPER_MODELS))
     args = parser.parse_args()
-    report = audit(args.manifest)
+    report = audit(args.manifest, baseline_names=tuple(args.baselines))
     text = json.dumps(report, indent=2, sort_keys=True)
     print(text)
     if args.json:

@@ -25,7 +25,7 @@ MODEL_NAMES = {
     "normwear": "NormWear",
     "imagebind": "ImageBind",
 }
-KS = (1, 2, 4, 8, 16)
+KS = (1, 2, 4, 8)
 COLORS = {
     "HALO / support comparator": "#c43c39",
     "HALO / 1-NN": "#111111",
@@ -43,11 +43,16 @@ def _load(path: Path) -> list[dict]:
 
 def _dataset_macro(
     rows: list[dict], *, model: str, method: str, k: int,
+    subject_relation: str, configuration_relation: str,
 ) -> float:
     by_dataset: dict[str, list[float]] = defaultdict(list)
     for row in rows:
         if (row["model"] == model and row["method"] == method
                 and row["label_mode"] == "coherent"
+                and row.get("analysis_set") == "main_common_k1_8"
+                and row.get("cohort") == "main"
+                and row.get("subject_relation") == subject_relation
+                and row.get("configuration_relation") == configuration_relation
                 and int(row["k"]) == k):
             by_dataset[row["dataset"]].append(float(row["f1_macro"]))
     if not by_dataset:
@@ -55,8 +60,18 @@ def _dataset_macro(
     return float(np.mean([np.mean(values) for values in by_dataset.values()]))
 
 
-def _curve(rows: list[dict], model: str, method: str) -> list[float]:
-    return [_dataset_macro(rows, model=model, method=method, k=k) for k in KS]
+def _curve(
+    rows: list[dict], model: str, method: str,
+    subject_relation: str, configuration_relation: str,
+) -> list[float]:
+    return [
+        _dataset_macro(
+            rows, model=model, method=method, k=k,
+            subject_relation=subject_relation,
+            configuration_relation=configuration_relation,
+        )
+        for k in KS
+    ]
 
 
 def _style_axes(ax, title: str) -> None:
@@ -76,16 +91,18 @@ def _save(fig, out_dir: Path, stem: str) -> None:
     plt.close(fig)
 
 
-def plot_knn(rows: list[dict], out_dir: Path) -> None:
+def plot_knn(
+    rows: list[dict], out_dir: Path, subject_relation: str, configuration_relation: str,
+) -> None:
     fig, ax = plt.subplots(figsize=(7.3, 4.8))
     for model, name in MODEL_NAMES.items():
-        values = _curve(rows, model, "nearest")
+        values = _curve(rows, model, "nearest", subject_relation, configuration_relation)
         ax.plot(
             range(len(KS)), values, marker="o", markersize=4,
             linewidth=2.8 if model == "halo_compare" else 1.5,
             color=COLORS[name], label=name, zorder=5 if model == "halo_compare" else 2,
         )
-    _style_axes(ax, "All held-out datasets")
+    _style_axes(ax, f"{subject_relation.replace('_', ' ')}, {configuration_relation.replace('_', ' ')}")
     ax.set_ylabel("Macro F1")
     handles, labels = ax.get_legend_handles_labels()
     fig.legend(handles, labels, loc="lower center", ncol=5, frameon=False,
@@ -96,7 +113,9 @@ def plot_knn(rows: list[dict], out_dir: Path) -> None:
     _save(fig, out_dir, "knn_representation_curves")
 
 
-def plot_primary(rows: list[dict], out_dir: Path) -> None:
+def plot_primary(
+    rows: list[dict], out_dir: Path, subject_relation: str, configuration_relation: str,
+) -> None:
     series = [
         ("HALO / support comparator", "halo_compare", "support_comparator"),
         ("HALO / 1-NN", "halo_compare", "nearest"),
@@ -107,12 +126,14 @@ def plot_primary(rows: list[dict], out_dir: Path) -> None:
     for name, model, method in series:
         halo = model == "halo_compare"
         ax.plot(
-            range(len(KS)), _curve(rows, model, method),
+            range(len(KS)), _curve(
+                rows, model, method, subject_relation, configuration_relation
+            ),
             marker="o", markersize=4, linewidth=2.8 if halo else 1.4,
             linestyle="--" if method == "support_comparator" else "-",
             color=COLORS[name], label=name, zorder=5 if halo else 2,
         )
-    _style_axes(ax, "All held-out datasets")
+    _style_axes(ax, f"{subject_relation.replace('_', ' ')}, {configuration_relation.replace('_', ' ')}")
     ax.set_ylabel("Macro F1")
     handles, labels = ax.get_legend_handles_labels()
     fig.legend(handles, labels, loc="lower center", ncol=4, frameon=False,
@@ -127,10 +148,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cells", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--subject-relation", default="cross_subject")
+    parser.add_argument("--configuration-relation", default="same_configuration")
     args = parser.parse_args()
     rows = _load(args.cells)
-    plot_knn(rows, args.out_dir)
-    plot_primary(rows, args.out_dir)
+    plot_knn(rows, args.out_dir, args.subject_relation, args.configuration_relation)
+    plot_primary(rows, args.out_dir, args.subject_relation, args.configuration_relation)
     print(f"wrote k-curve figures to {args.out_dir}")
 
 

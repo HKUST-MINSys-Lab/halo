@@ -172,13 +172,21 @@ schedule has never been tested head to head; that is an experiment, not a settle
 
   `hapt` is permanently excluded and now raises if requested: it is the same 30 subjects as
   `uci_har`, which is in the training corpus.
-- **Headline**: enrollment k-curve, k in {1, 2, 4, 8, 16}, macro-F1 with subject-bootstrap CIs,
-  mean over >= 3 seeds. Zero-shot (k = 0) is reported as a **disclosed secondary** row using the
-  same mechanism with no ground-truth support; we state its cap rather than chase it.
+- **Primary matched benchmark**: the cross-subject, same-configuration enrollment curve at
+  k in {1, 2, 4, 8}. Every point uses the same relation cells, subjects, candidate rosters, and
+  nested support prefixes; cells unable to reach k=8 remain available only in a clearly labelled
+  partial-coverage supplement. Scores are dataset-macro F1 over five serialized support seeds.
+  Paired uncertainty is a dataset-balanced subject bootstrap and is labelled with that estimand.
+  Zero-shot (k=0) is a disclosed secondary row using the released model's native rule.
+- **k=16 is a separate cohort**, not the final point of the primary curve. Only six datasets have
+  enough independent executions, and their eligible query subjects differ from the k=1..8 cohort.
 - **Support at test time** comes from the held-out dataset's own enrollment pool, which is
-  config-compatible by construction. Two enrollment modes are
-  first-class: **cross-subject** (support from other people) and **same-subject** (support from the
-  user's own recordings) — the latter is the deployment story and the ubicomp headline figure.
+  config-compatible by construction. Two enrollment modes are first-class:
+  **cross-subject** (support from other people) and **same-subject** (support from the user's own
+  recordings). The available data support a multi-dataset fixed k=1..8 curve only for the former;
+  same-subject results are therefore reported per supported k and never pooled into that curve.
+  TNDA-HAR's released bundle omits participant identity, so its enrollment result is explicitly
+  **subject-unattributed** and contributes to neither same-subject claims nor subject bootstraps.
 - **Mandatory control rows**: the *untrained floor* (same mechanism at initialisation) and the
   *step-0 control* (paired against each trained run), following the methodology rule that every
   learned component is guilty until a control clears it.

@@ -96,6 +96,25 @@ def test_positive_manifest_lowers_ceiling_without_shrinking_candidates():
     assert cell["candidate_names"] == ["walk", "sit"]
 
 
+def test_unattributed_subject_relation_preserves_execution_disjointness():
+    stream = _stream()
+    stream.subjects[:] = "unknown"
+    cell = _positive_cell(
+        stream,
+        stream,
+        regime="ordinary",
+        subject_relation="unattributed",
+        configuration_relation="same_configuration",
+        support_counts=[0, 1, 2],
+        seeds=[3],
+    )
+
+    assert cell["status"] == "ok"
+    for plan in cell["seeds"]["3"]["plans"]:
+        support = {value for values in plan["support_execution_ids"] for value in values}
+        assert support.isdisjoint(plan["query_execution_ids"])
+
+
 def test_manifest_content_hash_rejects_tampering(tmp_path):
     stream = _stream()
     manifest = {

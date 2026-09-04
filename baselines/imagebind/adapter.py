@@ -123,6 +123,9 @@ class ImageBindAdapter(CosineAdapter):
     def evaluation_artifacts(self, state):
         return {"released_checkpoint": IMAGEBIND_CKPT, "text_vocabulary": BPE_PATH}
 
+    def evaluation_source_paths(self):
+        return (IMAGEBIND_REPO,)
+
     def feature_artifacts(self, state):
         # Application tasks consume only the IMU tower; text tokenization is not
         # part of the cached signal representation.

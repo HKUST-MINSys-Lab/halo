@@ -51,6 +51,14 @@ NORMWEAR_REPO_PARENT = Path(os.environ.get("NORMWEAR_REPO_PARENT", str(_DEFAULT_
 NORMWEAR_REPO = NORMWEAR_REPO_PARENT / "NormWear"
 BACKBONE_CKPT = NORMWEAR_REPO / "checkpoints" / "normwear_pretrain_ckpt.pth"
 MSITF_CKPT = NORMWEAR_REPO / "checkpoints" / "normwear_msitf_zeroshot_last_checkpoint-5.pth"
+CLINICAL_LM_ID = "muzammil-eds/tinyllama-2.5T-Clinical-v2"
+CLINICAL_LM_REVISION = "60edacbb121c27e4e10b33db00ee8f54b307b175"
+CLINICAL_LM_CACHE = (
+    Path.home() / ".cache" / "huggingface" / "hub"
+    / "models--muzammil-eds--tinyllama-2.5T-Clinical-v2"
+    / "snapshots" / CLINICAL_LM_REVISION
+)
+CLINICAL_LM_REF = CLINICAL_LM_CACHE.parents[1] / "refs" / "main"
 
 EMB_DIM = 2048
 TARGET_HZ = 65                # NormWear native rate; ricker-CWT scales are tuned for it.
@@ -66,6 +74,11 @@ def _load_normwear_model(device):
     """NormWearZeroShot(backbone + MSiTF aggregator + frozen Clinical-TinyLlama text head),
     everything frozen, with the pure-torch ricker CWT enabled. TinyLlama loads from HF on
     first run (cached thereafter)."""
+    if not CLINICAL_LM_REF.is_file() or CLINICAL_LM_REF.read_text().strip() != CLINICAL_LM_REVISION:
+        raise RuntimeError(
+            "NormWear Clinical TinyLlama cache is not pinned to the audited revision "
+            f"{CLINICAL_LM_REVISION}"
+        )
     if str(NORMWEAR_REPO_PARENT) not in sys.path:
         sys.path.insert(0, str(NORMWEAR_REPO_PARENT))
     from NormWear.zero_shot.msitf_fusion import NormWearZeroShot  # noqa: E402
@@ -76,6 +89,9 @@ def _load_normwear_model(device):
         use_query=True,
         rel_only=False,
     ).to(device).eval()
+    if (not CLINICAL_LM_CACHE.is_dir()
+            or CLINICAL_LM_REF.read_text().strip() != CLINICAL_LM_REVISION):
+        raise RuntimeError("NormWear text-model revision changed during setup")
     model.sensor_model.optimized_cwt = True   # avoid the removed scipy.signal.cwt path
     for p in model.parameters():
         p.requires_grad_(False)
@@ -175,7 +191,15 @@ class NormWearAdapter(BaselineAdapter):
         return True
 
     def evaluation_artifacts(self, state):
-        return {"backbone": BACKBONE_CKPT, "zero_shot_fusion": MSITF_CKPT}
+        return {
+            "backbone": BACKBONE_CKPT,
+            "zero_shot_fusion": MSITF_CKPT,
+            "text_model": CLINICAL_LM_CACHE / "model.safetensors",
+            "text_tokenizer": CLINICAL_LM_CACHE / "tokenizer.json",
+        }
+
+    def evaluation_source_paths(self):
+        return (NORMWEAR_REPO,)
 
     def evaluation_config(self, state):
         return {
@@ -183,6 +207,8 @@ class NormWearAdapter(BaselineAdapter):
             "input_samples": WINDOW_65,
             "real_channels_only": True,
             "native_metric": "manhattan_l1",
+            "text_model": CLINICAL_LM_ID,
+            "text_model_revision": CLINICAL_LM_REVISION,
             "inference_precision": os.environ.get("NORMWEAR_PRECISION", "fp16").lower(),
         }
 

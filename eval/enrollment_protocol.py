@@ -26,7 +26,7 @@ from training.evidence.policy import PHASE_B_TEST_DATASETS
 
 
 SCHEMA_VERSION = 2
-PROTOCOL_NAME = "halo_matched_adaptation_v1"
+PROTOCOL_NAME = "halo_matched_adaptation_v2"
 DEFAULT_SUPPORT = (0, 1, 2, 4, 8, 16)
 DEFAULT_SEEDS = (20260808, 20260809, 20260810, 20260811, 20260812)
 ACTION_REGIMES = {
@@ -150,6 +150,10 @@ def _build_subject_plan(
             support_mask &= support_subjects == subject
         elif subject_relation == "cross_subject":
             support_mask &= support_subjects != subject
+        elif subject_relation == "unattributed":
+            # Some released evaluation bundles preserve independent executions but not participant
+            # identity. They can support enrollment, but no same/cross-subject claim.
+            pass
         else:
             raise ValueError(f"unknown subject relation {subject_relation!r}")
         rows = np.flatnonzero(support_mask)
@@ -160,7 +164,7 @@ def _build_subject_plan(
         )
         support_rows.append(selected)
         support_execution_names.append(selected_executions)
-        if subject_relation == "same_subject":
+        if subject_relation in {"same_subject", "unattributed"}:
             excluded_query_executions.update(selected_executions)
 
     query_mask = (query_subjects == subject) & np.isin(query_labels, candidate_names)
@@ -370,6 +374,21 @@ def build_manifest(
             fingerprints[f"{dataset}/{stream_id}"] = stream_fingerprint(stream_cache[key])
         return stream_cache[key]
 
+    def relation_options(query: EvalStream, support: EvalStream) -> tuple[str, ...]:
+        """Return honest subject relations for a stream pair.
+
+        A single sentinel identity such as TNDA-HAR's ``unknown`` cannot establish either
+        same-subject or cross-subject enrollment. Preserve the usable execution protocol under an
+        explicit unattributed relation instead of manufacturing a subject claim.
+        """
+
+        sentinels = {"", "unknown", "none", "nan"}
+        query_subjects = {str(value).strip().lower() for value in np.asarray(query.subjects)}
+        support_subjects = {str(value).strip().lower() for value in np.asarray(support.subjects)}
+        if not (query_subjects - sentinels) or not (support_subjects - sentinels):
+            return ("unattributed",)
+        return tuple(subject_relations)
+
     regime_for = {
         dataset: regime for regime, values in ACTION_REGIMES.items() for dataset in values
     }
@@ -416,7 +435,7 @@ def build_manifest(
                 )
             for configuration_relation, support_spec in support_specs:
                 support = load(dataset, support_spec.stream_id)
-                for subject_relation in subject_relations:
+                for subject_relation in relation_options(query, support):
                     cell_id = (
                         f"{dataset}/{query.stream}/from_{support.stream}/"
                         f"{configuration_relation}/{subject_relation}"
@@ -442,7 +461,7 @@ def build_manifest(
         "seeds": [int(value) for value in seeds],
         "candidate_policy": "fixed_dataset_stream_roster_across_curve",
         "skipped_streams": sorted(set(skipped)),
-        "query_policy": "fixed_subject_cohort_across_positive_k_curve",
+        "query_policy": "fixed_subject_cohort_within_each_serialized_support_cohort",
         "support_policy": "nested_execution_disjoint_prefix",
         "stream_fingerprints": fingerprints,
         "cells": cells,
