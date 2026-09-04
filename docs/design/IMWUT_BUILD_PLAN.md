@@ -16,8 +16,8 @@
 > and standing conventions read [`../IMWUT_START_HERE.md`](../IMWUT_START_HERE.md).
 
 
-**Status: plan of record, 2026-09-03. Target deadline Nov 1 2026 (user decision). Nothing here is
-implemented yet.** Design: `docs/design/IMWUT_COMPARE_DESIGN.md`. Venue read:
+**Status: historical implementation plan, 2026-09-03.** It is retained as an audit trail only;
+current behavior is defined by `docs/design/IMWUT_COMPARE_DESIGN.md`. Venue read:
 `docs/research/IMWUT_VENUE_READ.md`.
 
 This document records (1) a read-only debug sweep of the training and evaluation code on `main`

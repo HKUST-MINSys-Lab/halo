@@ -24,7 +24,7 @@ def test_paired_deltas_do_not_pool_label_modes_or_support_counts():
     ):
         rows.extend([
             _row(
-                model="halo_compact", method="evidence_engine",
+                model="halo_compare", method="support_comparator",
                 label_mode=label_mode, k=k, score=target,
             ),
             _row(
@@ -49,7 +49,7 @@ def test_paired_deltas_average_repeated_cells_within_subject():
     rows = []
     for cell, target, comparator in (("cell-a", 50.0, 40.0), ("cell-b", 30.0, 40.0)):
         target_row = _row(
-            model="halo_compact", method="evidence_engine",
+            model="halo_compare", method="support_comparator",
             label_mode="coherent", k=1, score=target,
         )
         comparator_row = _row(
@@ -77,11 +77,11 @@ def test_zero_shot_markdown_omits_non_native_harnet_bridge():
             "f1_macro": 25.0,
             "datasets": 1,
         }
-        for model in ("halo_compact", "harnet", "unimts")
+        for model in ("halo_compare", "harnet", "unimts")
     ]
 
     table = _markdown(aggregates)
 
-    assert "| ordinary | halo_compact | zero_shot |" in table
+    assert "| ordinary | halo_compare | zero_shot |" in table
     assert "| ordinary | unimts | zero_shot |" in table
     assert "| ordinary | harnet | zero_shot |" not in table

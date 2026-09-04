@@ -35,6 +35,10 @@ from eval import scoring
 REGISTRY: Dict[str, "BaselineAdapter"] = {}
 
 
+class UnsupportedEvaluationCell(RuntimeError):
+    """A model cannot score one protocol cell without changing its declared mechanism."""
+
+
 def register(cls):
     """Class decorator: instantiate and add to REGISTRY under ``cls.name``."""
     if not getattr(cls, "name", ""):
@@ -140,6 +144,15 @@ class BaselineAdapter:
         the generic runner model-specific behavior.
         """
         return False
+
+    def supports_native_zero_shot(self) -> bool:
+        """Whether candidate scoring is part of the released/deployed model itself.
+
+        Text-aligned cosine models satisfy this through their native shared space. A locally fitted
+        ConSE bridge does not: it remains available for historical analyses but is not a native
+        zero-shot result in the current comparison.
+        """
+        return self.tier == "cosine"
 
     def predict_enrollment(
         self,

@@ -6,7 +6,7 @@
 
 1. Zero-shot: HALO against released-checkpoint baselines with a native zero-shot rule.
 2. Label efficiency: the same non-gradient 1-NN, prototype, and ridge readouts for every
-   released-checkpoint representation, with HALO's retrieve-mix-vote mechanism shown separately.
+   released-checkpoint representation, with HALO's learned support comparator shown separately.
 
 The input must come from :mod:`eval.assemble_adaptation`, which validates the manifest, source and
 checkpoint fingerprints before writing it. Aggregation first averages seeds within each dataset and
@@ -24,17 +24,20 @@ from pathlib import Path
 import numpy as np
 
 MODEL_NAMES = {
-    "halo_compact": "HALO (ours)",
+    "halo_compare": "HALO (ours)",
     "harnet": "HARNet", "unimts": "UniMTS", "normwear": "NormWear",
     "imagebind": "ImageBind",
 }
 REPORT_MODEL_ORDER = (
-    "halo_compact", "unimts", "harnet", "imagebind", "normwear",
+    "halo_compare", "unimts", "harnet", "imagebind", "normwear",
 )
 # HARNet has a released representation checkpoint but no native open-vocabulary decision rule.
 # Its locally fitted ConSE bridge is intentionally omitted from the paper's zero-shot comparison.
-ZERO_SHOT_MODEL_ORDER = ("halo_compact", "unimts", "imagebind", "normwear")
+ZERO_SHOT_MODEL_ORDER = ("halo_compare", "unimts", "imagebind", "normwear")
 DATASET_NAMES = {
+    "motionsense": "MotionSense",
+    "realworld": "RealWorld HAR",
+    "shoaib": "Shoaib",
     "inclusivehar": "Inclusive-HAR",
     "usc_had": "USC-HAD",
     "tnda_har": "TNDA-HAR",
@@ -86,7 +89,7 @@ def _validate_current_cells(cells: list[dict]) -> None:
             + ", ".join(sorted(missing))
         )
     if not any(
-        row["model"] == "halo_compact" and row["method"] == "evidence_engine"
+        row["model"] == "halo_compare" and row["method"] == "support_comparator"
         and int(row["k"]) > 0
         for row in cells
     ):
@@ -134,9 +137,9 @@ def _enrollment_model_methods() -> list[tuple[str, str, str]]:
     rows = []
     readout_names = {"nearest": "1-NN", "prototype": "prototype", "ridge": "ridge"}
     for model in REPORT_MODEL_ORDER:
-        display_model = "HALO" if model == "halo_compact" else MODEL_NAMES[model]
-        if model == "halo_compact":
-            rows.append(("HALO / retrieve-mix-vote", model, "evidence_engine"))
+        display_model = "HALO" if model == "halo_compare" else MODEL_NAMES[model]
+        if model == "halo_compare":
+            rows.append(("HALO / support comparator", model, "support_comparator"))
         rows.extend(
             (f"{display_model} / {display_method}", model, method)
             for method, display_method in readout_names.items()
@@ -148,7 +151,7 @@ def table_label_efficiency(cells: list[dict]) -> str:
     ks = sorted({int(c["k"]) for c in cells if int(c["k"]) > 0})
     out = ["## 2. Label efficiency", "",
            "`k` is the number of independent enrolled executions per candidate. HALO is shown "
-           "with its retrieve-mix-vote mechanism in addition to the same three non-gradient "
+           "with its learned support comparator in addition to the same three non-gradient "
            "readouts used for every representation: one-nearest-neighbor, support prototypes, "
            "and closed-form ridge regression. All readouts see only the enrolled support "
            "executions. Macro F1, mean over datasets.", ""]

@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 
 import baselines
+from baselines.base import UnsupportedEvaluationCell
 from eval.data import load_eval_stream
 from eval.enrollment_protocol import iter_cells, load_manifest
 from eval.scoring import align_ground_truth_labels, classification_metrics
@@ -31,7 +32,7 @@ REPO = Path(__file__).resolve().parents[1]
 DEFAULT_OUT = REPO / "eval" / "adaptation_results"
 METHODS = ("nearest", "prototype", "ridge", "linear_head")
 DEFAULT_METHODS = ("nearest", "prototype", "ridge")
-NATIVE_METHOD = "evidence_engine"
+NATIVE_METHOD = "support_comparator"
 LINEAR_HEAD_STEPS = 200
 LINEAR_HEAD_LR = 5e-2
 LINEAR_HEAD_WEIGHT_DECAY = 1e-3
@@ -313,7 +314,7 @@ def score_positive_cell(
         q = query_z[torch.as_tensor(query_rows, dtype=torch.long, device=device)]
         y = torch.as_tensor(execution_positions, dtype=torch.long, device=device)
         if any(not bool(y.eq(index).any()) for index in range(len(candidates))):
-            raise ValueError("every candidate must have at least one support window")
+            raise ValueError("every candidate must have at least one support execution")
         centroids = torch.stack([
             F.normalize(x[y.eq(index)].mean(0), dim=0) for index in range(len(candidates))
         ])
@@ -472,7 +473,13 @@ def run(
     if resolved_device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(resolved_device)
     started = time.time()
-    state = adapter.setup(resolved_device)
+    needs_native_model = (
+        adapter.supports_native_zero_shot() or adapter.supports_native_enrollment()
+    )
+    state = (
+        adapter.setup(resolved_device)
+        if needs_native_model else adapter.setup_features(resolved_device)
+    )
     setup_seconds = time.time() - started
     streams = {}
     feature_cache: dict[tuple[str, str], np.ndarray] = {}
@@ -518,16 +525,36 @@ def run(
                 "regime": cell["regime"],
             }
             continue
-        query_stream = load_stream(dataset, cell["query_stream"])
         if cell["kind"] == "zero_shot":
-            result = score_zero_cell(
-                adapter, query_stream, features(dataset, cell["query_stream"]),
-                state, resolved_device, cell,
-            )
+            if not adapter.supports_native_zero_shot():
+                results[f"{cell_id}/coherent/k0"] = {
+                    "status": "n/a",
+                    "reason": "model has no native open-vocabulary prediction rule",
+                    "kind": "zero_shot",
+                    "regime": cell["regime"],
+                    "support_count": 0,
+                    "label_mode": "coherent",
+                }
+                continue
+            query_stream = load_stream(dataset, cell["query_stream"])
+            try:
+                result = score_zero_cell(
+                    adapter, query_stream, features(dataset, cell["query_stream"]),
+                    state, resolved_device, cell,
+                )
+            except UnsupportedEvaluationCell as exc:
+                results[f"{cell_id}/coherent/k0"] = {
+                    "status": "n/a", "reason": str(exc), "kind": "zero_shot",
+                    "regime": cell["regime"], "support_count": 0,
+                    "label_mode": "coherent",
+                }
+                print(f"[{baseline_name}] {cell_id}: unsupported ({exc})", flush=True)
+                continue
             result.update({"kind": "zero_shot", "regime": cell["regime"], "support_count": 0})
             results[f"{cell_id}/coherent/k0"] = result
             continue
 
+        query_stream = load_stream(dataset, cell["query_stream"])
         query_labels = np.asarray(
             align_ground_truth_labels(query_stream.gt, query_stream.eval_labels), dtype=object
         )
@@ -563,9 +590,10 @@ def run(
                 )
                 scored["fit_and_predict_seconds"] = time.time() - adaptation_started
                 scored["feature_dim"] = int(query_z.shape[1])
-                scored["linear_head_trainable_parameters"] = int(
-                    len(cell["candidate_names"]) * (query_z.shape[1] + 1)
-                )
+                if "linear_head" in methods:
+                    scored["linear_head_trainable_parameters"] = int(
+                        len(cell["candidate_names"]) * (query_z.shape[1] + 1)
+                    )
                 for label_mode in label_modes:
                     mode_scored = scored
                     if adapter.supports_native_enrollment():
@@ -623,9 +651,15 @@ def run(
         ),
         "evaluation_artifacts": {
             name: _file_fingerprint(path)
-            for name, path in adapter.evaluation_artifacts(state).items()
+            for name, path in (
+                adapter.evaluation_artifacts(state).items()
+                if needs_native_model else adapter.feature_artifacts(state).items()
+            )
         },
-        "adapter_config": adapter.evaluation_config(state),
+        "adapter_config": (
+            adapter.evaluation_config(state)
+            if needs_native_model else adapter.feature_config(state)
+        ),
         "support_protocol": {
             "support_unit": manifest.get(
                 "support_unit", "independent_execution_per_candidate"
@@ -634,7 +668,9 @@ def run(
             "generic_readout_representation": (
                 "one_normalized_mean_pooled_vector_per_enrolled_execution"
             ),
-            "halo_native_representation": "all_patch_sensor_rows_from_enrolled_executions",
+            "halo_native_representation": (
+                "one_normalized_mean_pooled_vector_per_enrolled_execution"
+            ),
         },
         "linear_head_recipe": {
             "scope": "linear_head_finetuning_on_frozen_representation",

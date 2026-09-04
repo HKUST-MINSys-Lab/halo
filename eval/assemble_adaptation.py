@@ -14,7 +14,8 @@ import baselines
 from eval.enrollment_protocol import load_manifest
 from eval.run_adaptation_baselines import _source_fingerprint
 
-NATIVE_ZERO_SHOT_MODELS = {"halo_compact", "unimts", "normwear", "imagebind"}
+NATIVE_ZERO_SHOT_MODELS = {"halo_compare", "unimts", "normwear", "imagebind"}
+TARGET_KEY = ("halo_compare", "support_comparator")
 
 
 def _external_rows(payload: dict, manifest: dict) -> tuple[list[dict], list[dict]]:
@@ -79,6 +80,8 @@ def load_rows(paths: list[Path], manifest: dict) -> tuple[list[dict], list[dict]
                     digest.update(chunk)
             if digest.hexdigest() != artifact.get("sha256"):
                 raise ValueError(f"{path}: {name} artifact content changed; rerun {model}")
+        if payload.get("git_dirty"):
+            raise ValueError(f"{path}: result was produced from a dirty worktree")
         actual = payload.get("manifest_fingerprint")
         if actual != manifest["manifest_fingerprint"]:
             raise ValueError(
@@ -128,7 +131,7 @@ def paired_deltas(subject_rows: list[dict], samples: int = 5_000) -> list[dict]:
             row["seed"], row["subject"],
         )
         indexed[(row["model"], row["method"])][key] = row["f1_macro"]
-    target_key = ("halo_compact", "evidence_engine")
+    target_key = TARGET_KEY
     if target_key not in indexed:
         return []
     target = indexed[target_key]
@@ -174,26 +177,24 @@ def _markdown(aggregates: list[dict]) -> str:
         "# Matched adaptation results", "",
         "`k` is the number of independent enrolled executions per candidate. External-model",
         "1-NN, prototype, and ridge controls use one equally weighted pooled vector per enrolled",
-        "execution and require no gradient fitting. HALO's retrieve-mix-vote mechanism instead",
-        "consumes the enrolled executions' patch/sensor rows.", "",
+        "execution and require no gradient fitting. HALO's support comparator consumes one pooled",
+        "row per enrolled execution and adds a learned residual to its closed-form support vote.", "",
     ]
     panels = [
         ("Semantic zero-shot", lambda row: (
             row["label_mode"] == "coherent" and row["k"] == 0
             and row["model"] in NATIVE_ZERO_SHOT_MODELS
-            and (row["method"] == "zero_shot" or (
-                row["model"] == "halo_learned_gate" and row["method"] in {"learned", "identity"}
-            ))
+            and row["method"] == "zero_shot"
         )),
         ("Coherent adaptation comparison", lambda row: (
             row["label_mode"] == "coherent" and row["k"] > 0
             and (row["method"] in {"nearest", "prototype", "ridge"}
-                 or (row["model"] == "halo_compact" and row["method"] == "evidence_engine"))
+                 or (row["model"] == "halo_compare" and row["method"] == "support_comparator"))
         )),
         ("Random-label binding", lambda row: (
             row["label_mode"] == "random_alias" and row["k"] > 0
             and (row["method"] in {"nearest", "prototype", "ridge"}
-                 or (row["model"] == "halo_compact" and row["method"] == "evidence_engine"))
+                 or (row["model"] == "halo_compare" and row["method"] == "support_comparator"))
         )),
     ]
     for title, include in panels:
@@ -205,8 +206,8 @@ def _markdown(aggregates: list[dict]) -> str:
                       "|---|---|---:|---:|---:|---:|"])
         for row in selected:
             method = (
-                "retrieve-mix-vote"
-                if row["model"] == "halo_compact" and row["method"] == "evidence_engine"
+                "support comparator"
+                if row["model"] == "halo_compare" and row["method"] == "support_comparator"
                 else "1-NN" if row["method"] == "nearest" else row["method"]
             )
             lines.append(

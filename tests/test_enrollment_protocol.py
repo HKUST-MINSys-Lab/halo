@@ -201,8 +201,8 @@ def test_native_enrollment_is_scored_on_the_manifest_queries():
         np.asarray(["walk", "sit"], dtype=object), [plan], 1,
         ["walk", "sit"], None, torch.device("cpu"), seed=3,
     )
-    assert result["evidence_engine"]["f1_macro"] == 100.0
-    assert result["native_subject_results"]["s1"]["evidence_engine_f1_macro"] == 100.0
+    assert result["support_comparator"]["f1_macro"] == 100.0
+    assert result["native_subject_results"]["s1"]["support_comparator_f1_macro"] == 100.0
 
 
 def test_halo_native_bank_appends_all_rows_and_binds_candidates():

@@ -16,16 +16,15 @@ comparator attends over all of it. K is small enough that there is nothing to se
 
 THE READOUT
 -----------
-For candidate ``c`` the score is a weighted vote over support recordings::
+At step 0, candidate ``c`` receives a closed-form weighted vote over support rows::
 
     score(c) = sum_e  w(query, e, c) * vote(e, c)
 
-``w`` is the comparator's attention weight for that (query, support, candidate) triple. ``vote`` is
-1 when support recording ``e`` is *enrolled* against candidate ``c`` (its label is that candidate),
-and otherwise the rectified cosine between the support recording's own label text and the
-candidate's text. That second branch is what makes an unseen candidate scorable at all, and it is
-why labels can stay verbatim: two candidates with near-identical text simply receive near-identical
-votes, which is correct rather than a problem to deduplicate away.
+Here ``w`` is the fixed softmax of query/support cosine similarity, shared across candidates.
+``vote`` is 1 when support row ``e`` is enrolled against candidate ``c`` and otherwise the rectified
+cosine between the support row's label text and the candidate text.  The learned set-attention stack
+does not replace ``w`` directly: it reads all candidate, query and support tokens and adds one
+residual scalar to each candidate's closed-form logit.
 
 There are no per-candidate parameters anywhere. An unseen candidate is scored by the same operation
 as a seen one, and permuting candidates permutes the logits.
@@ -116,12 +115,22 @@ class SupportComparator(nn.Module):
         support_mask: torch.Tensor,          # (B, K)     True = a real support row
         candidate_slot: torch.Tensor,        # (B, C)     episode-randomised coreference tags
         support_slot: torch.Tensor,          # (B, K)     tag of the candidate a row is bound to
+        candidate_mask: torch.Tensor | None = None,  # (B, C) True = a real candidate
     ) -> torch.Tensor:
         """Return ``(B, C)`` residual logits, zero at initialisation."""
 
         B, C, _ = candidate_text.shape
         Q = query_feature.shape[1]
         device = query_feature.device
+        if candidate_mask is None:
+            candidate_mask = torch.ones((B, C), dtype=torch.bool, device=device)
+        if candidate_mask.shape != (B, C):
+            raise ValueError("candidate_mask must have shape (batch, candidates)")
+        valid_slots = candidate_slot[candidate_mask]
+        if bool(valid_slots.le(UNBOUND_SLOT).any()):
+            raise ValueError("slot 0 is reserved for unbound tokens")
+        if bool(valid_slots.ge(self.cfg.n_slots).any()):
+            raise ValueError("candidate slot exceeds ComparatorConfig.n_slots")
 
         query_slot = torch.full((B, Q), UNBOUND_SLOT, dtype=torch.long, device=device)
 
@@ -140,14 +149,15 @@ class SupportComparator(nn.Module):
             [candidate, query, query_desc, support, support_desc, support_label], dim=1,
         )
         valid = torch.cat([
-            torch.ones((B, C), dtype=torch.bool, device=device),
+            candidate_mask,
             query_mask, query_mask,
             support_mask, support_mask, support_mask,
         ], dim=1)
 
         hidden = self.stack(tokens, key_padding_mask=valid)
         with torch.autocast(device_type=device.type, enabled=False):
-            return self.residual_head(hidden[:, :C].float()).squeeze(-1)
+            residual = self.residual_head(hidden[:, :C].float()).squeeze(-1)
+        return residual.masked_fill(~candidate_mask, 0.0)
 
     def telemetry(self) -> dict[str, float]:
         gains = self.compose.log_gain.detach().exp()
@@ -236,6 +246,7 @@ def comparator_logits(
     support_bound: torch.Tensor,
     support_mask: torch.Tensor,
     candidate_slot: torch.Tensor | None = None,
+    candidate_mask: torch.Tensor | None = None,
     temperature: float = 0.07,
     vote_scale: float = 10.0,
     center: bool = True,
@@ -254,6 +265,8 @@ def comparator_logits(
 
     B, C, _ = candidate_text.shape
     K = support_feature.shape[1]
+    if candidate_mask is None:
+        candidate_mask = torch.ones((B, C), dtype=torch.bool, device=candidate_text.device)
 
     if center:
         query_feature, support_feature = center_episode(
@@ -306,6 +319,7 @@ def comparator_logits(
             support_mask=support_mask,
             candidate_slot=candidate_slot,
             support_slot=support_slot,
+            candidate_mask=candidate_mask,
         )
 
     return {"logits": base + residual, "base_logits": base, "residual": residual,

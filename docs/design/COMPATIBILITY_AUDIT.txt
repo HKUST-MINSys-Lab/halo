@@ -1,4 +1,4 @@
-curated streams: 90   distinct keys: 50
+curated streams: 90   distinct keys: 52
 
 ====================================================================================================
 STREAM -> ACQUISITION KEY
@@ -41,10 +41,10 @@ train mmfit           right_pocket            phone/right_pocket/acc+gyro/g+    
 train mmfit           right_wrist             watch/right_wrist/acc+gyro/g+                   2,124
 -     mobiact         phone_trouser_pocket    phone/pocket_unspecified/acc+gyro/g+                0
 EVAL  monipar         watch_wrist             watch/wrist_unspecified/acc/g+                 12,079
--     motionsense     phone_front_pocket      phone/front_pocket/acc+gyro/g+                  4,534
+EVAL  motionsense     phone_front_pocket      phone/front_pocket/acc+gyro/g+                  4,534
 train nfi_fared       back                    body_imu/lower_back/acc+gyro/g+                14,592
 train nfi_fared       wrist                   body_imu/forearm_unspecified/acc+gyro/g+       14,592
--     nhanes          watch_wrist             watch/wrist_unspecified/acc/g+                115,179
+-     nhanes          watch_wrist             watch/non_dominant_wrist/acc/g+               115,179
 train opportunity     back                    body_imu/back/acc+gyro/g+                       5,757
 train opportunity     left_lower_arm          body_imu/left_forearm/acc+gyro/g+               5,757
 train opportunity     left_upper_arm          body_imu/left_upper_arm/acc+gyro/g+             5,757
@@ -68,11 +68,11 @@ train realdisp        rc                      body_imu/right_calf/acc+gyro/g+   
 train realdisp        rla                     body_imu/right_forearm/acc+gyro/g+              7,048
 train realdisp        rt                      body_imu/right_thigh/acc+gyro/g+                7,048
 train realdisp        rua                     body_imu/right_upper_arm/acc+gyro/g+            7,048
--     realworld       phone_waist             phone/waist/acc+gyro/g+                        11,237
--     shoaib          phone_belt              phone/belt/acc+gyro/g+                              -
--     shoaib          phone_left_pocket       phone/left_pocket/acc+gyro/g+                       -
--     shoaib          phone_right_pocket      phone/right_pocket/acc+gyro/g+                  2,100
--     shoaib          watch_wrist_proxy       watch_proxy/right_wrist/acc+gyro/g+                 -
+EVAL  realworld       phone_waist             phone/waist/acc+gyro/g+                        11,237
+EVAL  shoaib          phone_belt              phone/belt/acc+gyro/g+                              -
+EVAL  shoaib          phone_left_pocket       phone/left_pocket/acc+gyro/g+                       -
+EVAL  shoaib          phone_right_pocket      phone/right_pocket/acc+gyro/g+                  2,100
+EVAL  shoaib          watch_wrist_proxy       watch_proxy/right_wrist/acc+gyro/g+                 -
 train sp_sw_har       phone_pocket            phone/left_pocket/acc+gyro/g+                   1,179
 train sp_sw_har       watch_wrist             watch/left_wrist/acc+gyro/g+                    2,578
 EVAL  spar            watch_left_wrist        watch/left_wrist/acc+gyro/g+                      953
@@ -82,8 +82,8 @@ train uci_har         phone_waist             phone/waist/acc+gyro/g+           
 train unimib_shar     phone_pocket            phone/pocket_unspecified/acc/g+                11,771
 EVAL  upper_limb_use  control_left_wrist      body_imu/left_wrist/acc+gyro/g+                   361
 EVAL  upper_limb_use  control_right_wrist     body_imu/right_wrist/acc+gyro/g+                  363
-EVAL  upper_limb_use  patient_affected_wrist  body_imu/wrist_unspecified/acc+gyro/g+            192
-EVAL  upper_limb_use  patient_unaffected_wristbody_imu/wrist_unspecified/acc+gyro/g+            208
+EVAL  upper_limb_use  patient_affected_wrist  body_imu/affected_wrist/acc+gyro/g+               192
+EVAL  upper_limb_use  patient_unaffected_wristbody_imu/unaffected_wrist/acc+gyro/g+             208
 EVAL  usc_had         phone_hip               phone/hip/acc+gyro/g+                           4,350
 EVAL  ut_complex      watch_wrist             watch/right_wrist/acc+gyro/g+                   3,900
 train wisdm           phone_pocket            phone/pocket_unspecified/acc+gyro/g+           40,213
@@ -139,17 +139,26 @@ EVALUATION STREAM COVERAGE (zero-shot support is drawn from TRAINING)
 ====================================================================================================
 inclusivehar    phone_waist             phone/waist/acc+gyro/g+                     exact=2   near=1   ok
 monipar         watch_wrist             watch/wrist_unspecified/acc/g+              exact=1   near=13  ok
+motionsense     phone_front_pocket      phone/front_pocket/acc+gyro/g+              exact=0   near=6   NEAR-MISS ONLY
+realworld       phone_waist             phone/waist/acc+gyro/g+                     exact=2   near=1   ok
+shoaib          phone_belt              phone/belt/acc+gyro/g+                      exact=0   near=3   NEAR-MISS ONLY
+shoaib          phone_left_pocket       phone/left_pocket/acc+gyro/g+               exact=2   near=4   ok
+shoaib          phone_right_pocket      phone/right_pocket/acc+gyro/g+              exact=2   near=4   ok
+shoaib          watch_wrist_proxy       watch_proxy/right_wrist/acc+gyro/g+         exact=0   near=0   NONE
 spar            watch_left_wrist        watch/left_wrist/acc+gyro/g+                exact=5   near=9   ok
 spar            watch_right_wrist       watch/right_wrist/acc+gyro/g+               exact=6   near=8   ok
 tnda_har        watch_wrist             watch/right_wrist/acc+gyro/g+               exact=6   near=8   ok
 upper_limb_use  control_left_wrist      body_imu/left_wrist/acc+gyro/g+             exact=0   near=0   NONE
 upper_limb_use  control_right_wrist     body_imu/right_wrist/acc+gyro/g+            exact=0   near=0   NONE
-upper_limb_use  patient_affected_wrist  body_imu/wrist_unspecified/acc+gyro/g+      exact=0   near=0   NONE
-upper_limb_use  patient_unaffected_wristbody_imu/wrist_unspecified/acc+gyro/g+      exact=0   near=0   NONE
+upper_limb_use  patient_affected_wrist  body_imu/affected_wrist/acc+gyro/g+         exact=0   near=0   NONE
+upper_limb_use  patient_unaffected_wristbody_imu/unaffected_wrist/acc+gyro/g+       exact=0   near=0   NONE
 usc_had         phone_hip               phone/hip/acc+gyro/g+                       exact=0   near=3   NEAR-MISS ONLY
 ut_complex      watch_wrist             watch/right_wrist/acc+gyro/g+               exact=6   near=8   ok
 
 FINDING — these evaluation streams have no exactly compatible training stream:
+  motionsense/phone_front_pocket: NEAR-MISS ONLY
+  shoaib/phone_belt: NEAR-MISS ONLY
+  shoaib/watch_wrist_proxy: NONE
   upper_limb_use/control_left_wrist: NONE
   upper_limb_use/control_right_wrist: NONE
   upper_limb_use/patient_affected_wrist: NONE

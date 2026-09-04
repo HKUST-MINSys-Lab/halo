@@ -63,7 +63,8 @@ def assert_identity_at_init(
         "support_label_text": torch.nn.functional.normalize(normal(batch, support, z), dim=-1),
         "support_bound": torch.randint(-1, candidates, (batch, support), generator=generator),
         "support_mask": torch.ones(batch, support, dtype=torch.bool),
-        "candidate_slot": torch.arange(candidates).unsqueeze(0).expand(batch, candidates),
+        "candidate_slot": (1 + torch.arange(candidates)).unsqueeze(0).expand(batch, candidates),
+        "candidate_mask": torch.ones(batch, candidates, dtype=torch.bool),
     }
     with torch.no_grad():
         learned = comparator_logits(comparator, center=center, **episode)["logits"]

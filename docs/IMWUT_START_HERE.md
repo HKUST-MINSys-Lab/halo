@@ -120,7 +120,7 @@ not a fix.
 | Looks like a bug | Why it is there |
 |---|---|
 | **No retrieval stage.** The comparator attends over the whole support set with no top-k. | Retrieval was measured to rank by *acquisition configuration* rather than activity (×7.0 lift), and a learned retrieval stage was worth exactly +0.0000 paired. K is small enough to attend over completely. |
-| **Labels are used verbatim** — no canonicalisation, no synonym merging, no dedup. Two candidates can carry near-identical text. | The readout gives them near-identical votes, which is the correct answer. Deduplicating would impose a closed vocabulary on an open-vocabulary model. |
+| **Episode labels use the corpus's canonical strings verbatim** — the sampler performs no further synonym merging or deduplication. Two candidates can carry near-identical text. | The readout gives them near-identical votes. Canonicalization already happens in `CorpusIndex`; claiming that it never happens would be false. |
 | **Some k = 0 cells report "unsupported"** rather than a number. | Those streams have no config-compatible training partner, so the deployed mechanism genuinely does not apply. Substituting ConSE or padding with incompatible rows would report a different mechanism under this model's name. Principle 4. |
 | **Support sets shrink below K instead of being padded.** | Padding with foreign rows would silently violate the compatibility rule; skipping the episode would bias the corpus toward well-populated configurations. Shrinking is logged in telemetry. |
 | **Training starts from random init**, not from the Phase-A checkpoint that exists. | Every compact checkpoint that ever led the table was trained this way. An earlier draft of the docs claimed warm start was mandatory; that claim was wrong and is corrected. |
@@ -164,27 +164,27 @@ cites. Never edit those files; add new results elsewhere.
 ## 4. The model, end to end
 
 1. **Draw an episode** (`training/compare/sampling.py`). Pick a query recording; look up its
-   acquisition key; build the admissible pool — same key, different subject, different execution.
-   With probability `p` the query's own label is among the candidates (few-shot); otherwise it is
-   excluded (zero-shot). Pick 2–8 candidate labels verbatim, then fill K = 32 support recordings
-   round-robin so labels are balanced to within one.
+   acquisition key; then choose same-subject or cross-subject support from distinct physical
+   executions. The answer is always one of 2–14 candidate labels. With probability `p` the
+   candidates have enrolled support; otherwise every candidate is withheld from support and
+   compatible examples of other labels form unbound background. Draw at most one window from each
+   support execution and balance support across labels.
 2. **Encode** the query and all support recordings together in one forward pass. Support is encoded
    **per query, with gradients** — nothing is cached, so the comparison itself trains the encoder.
 3. **Centre** each episode on its own mean feature (default), so only how rows *differ* can drive
    anything downstream.
 4. **Compare** (`model/evidence/comparator.py`). One set-attention sequence per query over
    `[candidates | query row | support rows + descriptors + labels]`. No retrieval, no top-k.
-5. **Vote.** `score(c) = Σ_e weight(query, e, c) × vote(e, c)`, where an enrolled row votes 1 for
-   its own candidate and any other row votes the rectified cosine between its label text and the
-   candidate's. **No per-candidate parameters anywhere**, so an unseen candidate is scored by the
-   same operation as a seen one.
-6. **Loss.** Few-shot episodes get cross-entropy; zero-shot episodes get KL against the label-text
-   similarity distribution at `tau_text = 0.1`, because with the answer absent a one-hot target is
-   undefined.
+5. **Vote and correct.** A fixed query/support cosine softmax weights each support row. An enrolled
+   row votes for its bound candidate; unbound background votes through label-text cosine. The
+   attention stack reads the complete set and adds one learned residual scalar per candidate.
+   There are no label-specific learned parameters.
+6. **Loss.** Both regimes use cross-entropy on the true candidate. The batch mean is the sole
+   objective, so `p` directly controls the relative training mass of zero- and few-shot episodes.
 
-At evaluation, k ≥ 1 uses the manifest's own enrolled support rows with **no corpus bank**. k = 0
-is an **ensemble of 8 training-shaped draws** (4 seen labels × 8 recordings = K 32) with every
-candidate label excluded, combined before the argmax.
+At evaluation, k ≥ 1 uses one equally weighted pooled vector per enrolled execution, with **no
+corpus bank**. k = 0 is an **ensemble of 8 training-shaped draws** (4 seen labels × 8 independent
+executions = K 32) with every candidate label excluded from support, combined before the argmax.
 
 The full design of record, including every ablation, is
 [`docs/design/IMWUT_COMPARE_DESIGN.md`](design/IMWUT_COMPARE_DESIGN.md). **When this file and that
@@ -199,9 +199,10 @@ a result.
 
 1. **Never launch a training, control, or evaluation run without the user's explicit go.**
    "Implement" means build + tests + a short smoke on real data. Nothing longer.
-2. **Two data roles only: training and evaluation. There is no development split.** Every constant,
-   threshold and checkpoint choice is fixed *a priori*, by judgement, before the run. Never select a
-   checkpoint or tune a hyper-parameter on evaluation data.
+2. **Two data roles only: training and evaluation.** The training corpus has a deterministic
+   subject-held-out split used for health telemetry and writes `best_internal.pt`, but the declared
+   result checkpoint remains the final fixed-budget step. Never select a checkpoint or tune a
+   hyper-parameter on evaluation data.
 3. **Paired-gain rule.** Report a run as `score(trained) − score(its own step 0)`. The validation
    draw once contributed five times the run-to-run scatter of the thing being measured, so a raw
    number carries the draw, not the method. **Paired gain is only valid when both arms share the
@@ -246,8 +247,12 @@ current protocol; the two carry different protocol names so the assembler cannot
   otherwise inflate results.
 - **`hapt` may never be evaluated.** It is the same 30 subjects as `uci_har`, which is in training.
   `build_manifest` raises if it is requested.
-- `upper_limb_use` (4 streams) and `motionsense` have no config-compatible training stream, so their
-  **k = 0 row is unsupported**. Their k ≥ 1 rows are unaffected. This is reported, not patched.
+- `upper_limb_use` (4 streams), `motionsense`, and `usc_had` have no exactly config-compatible
+  training stream, so their **k = 0 row is unsupported**. Their k >= 1 rows are unaffected. The
+  evaluator must record these cells as unsupported rather than aborting or substituting a method.
+- The full compatibility audit also reports unsupported `shoaib/phone_belt` and
+  `shoaib/watch_wrist_proxy`; `adaptation_v2` skips those streams, so they are not additional result
+  cells.
 
 ---
 
@@ -263,7 +268,7 @@ Every one of these is a measurement from the earlier lines, recorded in
 | Retrieval ranked by **acquisition configuration**, ×7.0 lift, not by activity | Delete the retrieval stage; and centre the episode, since configuration is a common mode |
 | Learned retrieval was worth **+0.0000** paired | The stage is not worth its complexity |
 | The attention mixer gained +0.12, and a scrambled-vocabulary control inverted it | The gain is *semantic*; keep language in the loop |
-| Closed-vocabulary episodic CE pushed zero-shot **below chance** (16.18 → 9.44) | Zero-shot episodes need a soft text target, not one-hot |
+| Asking CE to predict an answer omitted from the candidate roster pushed zero-shot **below chance** (16.18 → 9.44) | Hold out the answer's support, not the answer itself; the current one-hot target is then well-defined |
 | Every compact checkpoint that ever led the table was trained **from random init** | End-to-end from scratch is the default; warm start is a secondary arm |
 | Signal-similarity vs label-name-similarity: r ≈ 0.11 | Zero-shot is structurally capped; headline on k ≥ 1 and disclose k = 0 |
 
@@ -280,7 +285,8 @@ Every one of these is a measurement from the earlier lines, recorded in
 - Laterality is preserved but wording is not: `"the left wrist"` and `"left wrist"` are one site,
   while left and right wrist are a near miss. Non-dominant, affected and unaffected wrists are their
   own sites.
-- Constants, fixed a priori: `K = 32`, `p = 0.5`, label subset 2–8, 35k steps, final-step
+- Constants, fixed a priori: 32 total support executions per training episode, `p = 0.5`, label
+  subset 2–14, 35k steps, final-step
   checkpoint, ≥ 3 seeds; zero-shot ensemble R = 8 draws × 4 labels × 8 rows, combiner
   `probability`.
 - Centering is **ON by default**; `--no-center-features` is the ablation.
@@ -306,12 +312,11 @@ PY=/home/alex/code/HALO/legacy_code/.venv/bin/python   # from the repo root
 # audit the acquisition-key table (read-only)
 $PY -m data.scripts.curate.audit_compatibility
 
-# train, end to end from scratch, Arm A. --smoke does ~50 steps on real data
+# train, end to end from scratch, Arm A. --smoke does three steps on capped real data
 $PY -m training.compare.train --out training/compare/outputs/arm_a \
     --device cuda --neutral-acquisition-text --smoke
 
-# the paired step-0 control, in the same checkpoint format
-$PY -m training.compare.step0 --phase-a <phase_a.pt> --out <dir>
+# `initial.pt` is written automatically after frontend calibration and step-0 validation
 
 # build an evaluation manifest
 $PY -m eval.enrollment_protocol --out eval/manifests/adaptation_v2.json.gz

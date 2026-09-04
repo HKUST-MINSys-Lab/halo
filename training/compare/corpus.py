@@ -19,7 +19,12 @@ from typing import Sequence
 import numpy as np
 
 from data.scripts.curate.compatibility import AcquisitionKey, is_near_miss, stream_key
-from training.compare.sampling import Recording, SupportCorpus, _execution_ids
+from training.compare.sampling import (
+    MIN_RECORDING_SECONDS,
+    Recording,
+    SupportCorpus,
+    _execution_ids,
+)
 from training.tokenizer.pretrain_data import CorpusIndex
 
 REPO = Path(__file__).resolve().parents[2]
@@ -30,6 +35,7 @@ def support_corpus_from_index(
     *,
     split: str = "train",
     exclude_labels: Sequence[str] = ("unlabeled",),
+    min_duration_seconds: float = MIN_RECORDING_SECONDS,
 ) -> SupportCorpus:
     """A :class:`SupportCorpus` addressing positions in ``index.<split>``.
 
@@ -42,6 +48,7 @@ def support_corpus_from_index(
     id_to_label = {value: label for label, value in index.label_ids.items()}
 
     executions_by_stream: dict[int, np.ndarray] = {}
+    lengths_by_stream: dict[int, np.ndarray] = {}
     acquisition: dict[int, AcquisitionKey | None] = {}
 
     recordings: list[Recording] = []
@@ -61,8 +68,12 @@ def support_corpus_from_index(
                     "windows cannot enter a support set and are skipped"
                 )
             executions_by_stream[key.stream_i] = _execution_ids(ref.dataset, ref.event_ids)
+            lengths_by_stream[key.stream_i] = ref.load_lengths()
         acquisition_key = acquisition[key.stream_i]
         if acquisition_key is None:
+            continue
+        if float(lengths_by_stream[key.stream_i][key.window_i]) / ref.rate_hz \
+                < min_duration_seconds:
             continue
         label = id_to_label.get(key.label_id, "")
         if str(label).lower() in banned:
@@ -95,4 +106,5 @@ def support_corpus_from_index(
         corpus.near_miss_keys[acquisition_key] = [
             other for other in distinct if is_near_miss(acquisition_key, other)
         ]
+    corpus.ensure_indexes()
     return corpus

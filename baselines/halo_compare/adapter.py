@@ -20,7 +20,7 @@ training recordings the query resembles and let their label text bridge to the c
 
 **It is an ensemble of small, training-shaped comparisons, not one large one** (revised 2026-09-04).
 A single 64-row draw spanning many labels is off-distribution: the sampler trains on episodes of
-2-8 candidate labels with K = 32, so a wide flat support set asks the comparator a question it has
+2-14 candidate labels with K = 32, so a wide flat support set asks the comparator a question it has
 never been asked. Instead the row is scored R times, each draw being a handful of seen labels with
 their example recordings, shaped exactly like a training episode; the per-draw candidate scores are
 then combined. Two things improve at once — the comparison matches the training distribution, and
@@ -32,11 +32,12 @@ Ensembling is also the intervention with the best track record on this project: 
 label paraphrases was the single largest Phase-B gain (45.3 -> 47.5 macro-F1), and it has no learned
 parameters, which is the category of change that has historically survived its controls here.
 
-Two evaluation streams have no compatible training partner at all (``upper_limb_use``, whose
-wrist sensor is a research IMU rather than a watch, and ``usc_had/phone_hip``, which has near
-misses only). For those the k = 0 row is reported as **unsupported**, with the reason recorded in
-the artifact. It is not silently replaced by a different mechanism, and it is not padded with
-incompatible rows.
+Six streams in the active ``adaptation_v2`` manifest have no compatible training partner:
+MotionSense's front-pocket stream, USC-HAD's hip stream, and all four Upper Limb Use research-IMU
+wrist streams. For those the k = 0 row is unsupported. The broader curation audit also lists two
+unsupported Shoaib streams, but the manifest skips them. The evaluation runner must record an
+unsupported cell rather than silently substitute a different mechanism or pad with incompatible
+rows.
 """
 
 from __future__ import annotations
@@ -49,7 +50,7 @@ from typing import List, Sequence, Tuple
 import numpy as np
 import torch.nn.functional as F
 
-from baselines.base import BaselineAdapter, InputContract, register
+from baselines.base import BaselineAdapter, InputContract, UnsupportedEvaluationCell, register
 
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parents[1]
@@ -60,8 +61,8 @@ _CKPT = Path(os.environ.get(
 #: Arm A is the headline configuration: the encoder is never told the acquisition configuration.
 _NEUTRAL_ACQUISITION_TEXT = os.environ.get("HALO_NEUTRAL_ACQUISITION_TEXT", "1") not in {"0", ""}
 # The k = 0 row is an ENSEMBLE of training-shaped comparisons (see the module docstring). These
-# defaults reproduce the training episode shape exactly — 4 labels x 8 recordings = K 32, inside the
-# sampler's 2-8 label range — so the deployed mechanism is asked the kind of question it was trained
+# defaults reproduce the training episode shape exactly — 4 labels x 8 executions = K 32, inside
+# the sampler's 2-14 label range — so the deployed mechanism is asked the kind of question it trained
 # on. R = 8 follows the text-ensemble precedent, where averaging 8 paraphrases was worth +2.2 macro-F1
 # and was the single largest Phase-B gain.
 ZERO_SHOT_DRAWS = int(os.environ.get("HALO_COMPARE_ZERO_SHOT_DRAWS", "8"))
@@ -244,6 +245,9 @@ class HALOCompareAdapter(BaselineAdapter):
     def supports_native_enrollment(self) -> bool:
         return True
 
+    def supports_native_zero_shot(self) -> bool:
+        return True
+
     # ---------------------------------------------------------- the mechanism
     def _score(self, state, query_feature, query_descriptor,
                support_feature, support_descriptor, support_label_text, support_bound,
@@ -268,7 +272,10 @@ class HALOCompareAdapter(BaselineAdapter):
             support_label_text=support_label_text.unsqueeze(0).expand(n_query, -1, -1),
             support_bound=support_bound.unsqueeze(0).expand(n_query, -1),
             support_mask=T.ones((n_query, n_support), dtype=T.bool, device=device),
-            candidate_slot=T.arange(n_candidates, device=device).unsqueeze(0).expand(n_query, -1),
+            candidate_slot=(1 + T.arange(n_candidates, device=device)).unsqueeze(0).expand(
+                n_query, -1,
+            ),
+            candidate_mask=T.ones((n_query, n_candidates), dtype=T.bool, device=device),
             center=state["center"],
         )
         return out["logits"]
@@ -291,19 +298,24 @@ class HALOCompareAdapter(BaselineAdapter):
 
         # The manifest already chose which executions are enrolled for each candidate; the support
         # set is exactly those rows. No corpus bank, no retrieval, no selection.
-        rows: list[int] = []
+        support_features = []
+        support_descriptors = []
         bound: list[int] = []
         for slot, executions in enumerate(plan["support_execution_rows"]):
             for execution in executions[:support_count]:
-                for row in execution:
-                    rows.append(int(row))
-                    bound.append(slot)
-        if not rows:
+                index = T.as_tensor(execution, dtype=T.long, device=state["device"])
+                support_features.append(F.normalize(
+                    support_feature_all.index_select(0, index).mean(dim=0), dim=0,
+                ))
+                support_descriptors.append(F.normalize(
+                    support_descriptor_all.index_select(0, index).mean(dim=0), dim=0,
+                ))
+                bound.append(slot)
+        if not support_features:
             raise ValueError("native enrollment received no support rows")
-        index = T.as_tensor(rows, dtype=T.long, device=state["device"])
         support_bound = T.as_tensor(bound, dtype=T.long, device=state["device"])
-        support_feature = support_feature_all.index_select(0, index)
-        support_descriptor = support_descriptor_all.index_select(0, index)
+        support_feature = T.stack(support_features)
+        support_descriptor = T.stack(support_descriptors)
         # An enrolled row's label IS its candidate's text, which is what binds it.
         support_label_text = candidate_text.index_select(0, support_bound)
 
@@ -323,9 +335,10 @@ class HALOCompareAdapter(BaselineAdapter):
                 predictions.extend(canonical[int(i)] for i in logits.argmax(1).cpu().tolist())
         return predictions, {
             "mechanism": "support_comparator",
-            "support_rows": int(len(rows)),
+            "support_rows": int(len(support_features)),
             "corpus_rows": 0,
             "enrolled_executions": int(len(canonical) * support_count),
+            "support_representation": "one_normalized_mean_vector_per_execution",
         }
 
     # ------------------------------------------------------------ zero shot
@@ -388,9 +401,17 @@ class HALOCompareAdapter(BaselineAdapter):
             rows = []
             for label in chosen:
                 pool = by_label[str(label)]
-                take = min(ZERO_SHOT_ROWS_PER_LABEL, len(pool))
-                picked = rng.choice(len(pool), size=take, replace=False)
-                rows.extend(pool[int(i)] for i in picked)
+                by_execution: dict[tuple[str, str, str], list] = {}
+                for recording in pool:
+                    by_execution.setdefault(
+                        (recording.dataset, recording.subject, recording.execution), []
+                    ).append(recording)
+                units = list(by_execution)
+                take = min(ZERO_SHOT_ROWS_PER_LABEL, len(units))
+                picked = rng.choice(len(units), size=take, replace=False)
+                for position in picked:
+                    members = by_execution[units[int(position)]]
+                    rows.append(members[int(rng.integers(len(members)))])
             if rows:
                 draws.append(rows)
         if not draws:
@@ -482,7 +503,9 @@ class HALOCompareAdapter(BaselineAdapter):
         if draws is None:
             # An honest unsupported row. Substituting ConSE, or padding with incompatible
             # recordings, would report a different mechanism under this model's name.
-            raise ValueError(f"zero-shot unsupported for {owner[0]}/{owner[1]}: {reason}")
+            raise UnsupportedEvaluationCell(
+                f"zero-shot unsupported for {owner[0]}/{owner[1]}: {reason}"
+            )
 
         query_feature, query_descriptor, _ = self._stream_rows(stream, state)
         candidate_text = F.normalize(T.from_numpy(

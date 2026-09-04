@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 from pathlib import Path
 
@@ -11,11 +12,11 @@ from baselines.base import BaselineAdapter
 from eval.enrollment_protocol import ACTION_REGIMES, iter_cells, load_manifest
 
 
-PAPER_BASELINES = ("harnet", "unimts", "imagebind", "normwear")
-NATIVE_ZERO_SHOT_BASELINES = {"unimts", "imagebind", "normwear"}
+PAPER_MODELS = ("halo_compare", "harnet", "unimts", "imagebind", "normwear")
+NATIVE_ZERO_SHOT_MODELS = {"halo_compare", "unimts", "imagebind", "normwear"}
 
 
-def audit(manifest_path: Path, baseline_names=PAPER_BASELINES) -> dict:
+def audit(manifest_path: Path, baseline_names=PAPER_MODELS) -> dict:
     manifest = load_manifest(manifest_path, validate_grids=True)
     blockers, warnings = [], []
     if len(manifest["seeds"]) < 5:
@@ -47,7 +48,7 @@ def audit(manifest_path: Path, baseline_names=PAPER_BASELINES) -> dict:
             blockers.append(f"baseline adapter is not registered: {name}")
             continue
         features_overridden = type(adapter).window_features is not BaselineAdapter.window_features
-        candidates_overridden = (
+        direct_candidate_override = (
             type(adapter).predict_candidates is not BaselineAdapter.predict_candidates
             or adapter.tier in {"conse", "cosine"}
         )
@@ -55,19 +56,42 @@ def audit(manifest_path: Path, baseline_names=PAPER_BASELINES) -> dict:
             type(adapter).predict_candidates_from_features
             is not BaselineAdapter.predict_candidates_from_features
         )
+        candidates_overridden = direct_candidate_override or cached_prediction
+        native_enrollment = adapter.supports_native_enrollment()
+        native_zero_shot = adapter.supports_native_zero_shot()
+        reported_zero_shot = name in NATIVE_ZERO_SHOT_MODELS
         baseline_status[name] = {
             "adapter": f"{type(adapter).__module__}.{type(adapter).__name__}",
             "frozen_features": features_overridden,
-            "reported_at_zero_shot": name in NATIVE_ZERO_SHOT_BASELINES,
+            "reported_at_zero_shot": reported_zero_shot,
+            "native_zero_shot": native_zero_shot,
             "candidate_override": candidates_overridden,
             "cached_feature_prediction": cached_prediction,
+            "native_enrollment": native_enrollment,
         }
         if not features_overridden:
             blockers.append(f"{name}: no frozen window feature interface")
-        if name in NATIVE_ZERO_SHOT_BASELINES and not candidates_overridden:
+        if native_zero_shot != reported_zero_shot:
+            blockers.append(
+                f"{name}: native zero-shot capability disagrees with the report roster"
+            )
+        if reported_zero_shot and not candidates_overridden:
             blockers.append(f"{name}: cannot score the manifest candidate roster")
-        if name in NATIVE_ZERO_SHOT_BASELINES and not cached_prediction:
+        if reported_zero_shot and not cached_prediction:
             blockers.append(f"{name}: k=0 would require a second sensor encoding pass")
+        if name == "halo_compare":
+            checkpoint = getattr(importlib.import_module(type(adapter).__module__), "_CKPT", None)
+            baseline_status[name]["checkpoint"] = str(checkpoint) if checkpoint else None
+            baseline_status[name]["checkpoint_exists"] = bool(
+                checkpoint is not None and Path(checkpoint).is_file()
+            )
+            if not native_enrollment:
+                blockers.append("halo_compare: current model has no native enrollment path")
+            if not baseline_status[name]["checkpoint_exists"]:
+                blockers.append(
+                    "halo_compare: checkpoint is missing; set HALO_COMPARE_CKPT to the trained "
+                    "comparison checkpoint"
+                )
 
     enrollment = [cell for _, cell in iter_cells(manifest, kinds=["enrollment"])]
     ceilings = {}

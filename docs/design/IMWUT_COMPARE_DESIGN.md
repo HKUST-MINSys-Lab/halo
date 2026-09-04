@@ -1,7 +1,7 @@
 # Recognize by comparison — agreed design and paper shape for the IMWUT submission
 
-**Status: design of record for the `imwut/compare` line. Agreed 2026-09-03, revised the same day (two arms). THINKING STAGE —
-nothing in this document is implemented, trained, or evaluated yet.**
+**Status: design of record for the `imwut/compare` line. Agreed 2026-09-03 and implemented on that
+branch. No full comparison-model training or final `adaptation_v2` evaluation has been completed.**
 
 This supersedes the clinical / motion-monitoring pivot as the paper target. The
 classification-era code (Phase-A tokenizer, evidence/compact engine, baseline adapters, the
@@ -24,18 +24,21 @@ increment:
 - The encoder was never the bottleneck: frozen HALO features linearly separate activities at
   84 macro-F1 while zero-shot through a text bridge sits near 40.
 - Comparison against labelled exemplars is the right primitive: the *untrained* retrieve-and-vote
-  mechanism already edged harnet (47.5 vs 47.3), and prototype/ridge over frozen features beat
-  every trained head we built.
+  mechanism reached 44.1 macro-F1 like-for-like, versus 47.3 for harnet and 42.7 for ConSE.
+  Prototype/ridge over frozen features beat every trained head we built. The earlier 47.5 figure was
+  confounded and is not evidence that the untrained mechanism beat harnet.
 - Plain cosine retrieval over a heterogeneous bank fails for a specific reason: it ranks by
   acquisition configuration (x7 lift) rather than by activity. Learned retrieval was worth
   exactly nothing. The stage should go.
 - The one learned component that helped (the attention mixer, +0.12) helped only because the
   language channel was in the loop: a scrambled-vocabulary control inverted the gain.
-- Training with the ground-truth label absent from the support set pushed zero-shot below chance
-  under closed-vocabulary cross-entropy, while helping k >= 1. Zero-shot is additionally capped by
-  the weak relation between signal similarity and label-name similarity (r ~ 0.11).
-- End-to-end training from random initialisation collapsed the encoder's effective rank within
-  300 steps. Warm-starting from self-supervised pretraining is not optional.
+- Training with the answer absent from the *candidate roster* pushed zero-shot below chance under
+  closed-vocabulary cross-entropy. The corrected task withholds its support but keeps the answer
+  selectable. Zero-shot is still capped by the weak relation between signal similarity and
+  label-name similarity (r ~ 0.11).
+- A short end-to-end run showed an early effective-rank drop, but longer historical runs from random
+  initialisation performed best. Warm-starting from self-supervised pretraining remains an untested
+  comparison arm, not a requirement.
 
 The literature has moved the same way: sensor heterogeneity (user, device, placement) is named as
 the dominant barrier in every 2025-26 survey, ZARA (ACL 2026) gets training-free transfer by
@@ -68,7 +71,7 @@ vocabulary. Nothing in the architecture is claimed as novel.
 | Conditioning | **Rate and patch-duration pathways kept. Acquisition-configuration text is OFF in the core design.** Compatibility is handled at support construction instead (Section 3). | The encoder is trained on every configuration anyway; once support is compatible by construction there is nothing left for the text to tell it. The text pathway is kept in the code for the Section 6 experiment. |
 | Comparator | **Attention over the query and every support example** (no retrieval stage, no top-k) | Removes the config-ranking defect and the non-differentiable selection; K is small enough to attend over fully. |
 | Feature centering | **ON by default**: each episode's mean feature is subtracted from the query and support rows before similarity and attention | Acquisition configuration is close to a common mode within an episode, since the support all shares the query's key; the previous design's retrieval ranked by configuration at a 7.0x lift. Removing the mean leaves only how rows differ. `--no-center-features` is the ablation. |
-| Readout | score(candidate c) = sum over support examples e of  attn(query, e) x cos(text(label_e), text(c)) | The vote we already run. Duplicate or synonymous labels need no homogenisation — they simply contribute through their text similarity. |
+| Readout | Fixed query/support cosine vote plus one learned residual scalar per candidate | Step 0 is exactly the closed-form support vote. Set attention can correct it, while unseen candidates still use the same shared operation and no candidate-specific parameter. |
 | Label / text tower | Frozen sentence encoder (MiniLM), text ensembling kept | Every learned text adapter we tried was net-negative. |
 | Size | Compact engine budget, ~1M trainable parameters | Efficiency is part of the story. |
 
@@ -78,8 +81,11 @@ Support examples are **encoded per query, with gradients**, at train time. Nothi
 
 ## 3. Support-set contract (the method)
 
-A support set is the list of labelled recordings the comparator sees alongside the query. The
-same sampler runs at train and test; only the pool differs.
+A support set is the list of labelled executions the comparator sees alongside the query. Training
+samples one window from each distinct execution on each draw, which is a stochastic view of that
+execution and gives every execution equal influence. Evaluation deterministically pools all windows
+of each enrolled execution into one normalized vector. Neither path lets a long execution cast more
+votes than a short one.
 
 1. **Compatibility is a filter, not a learned quantity.** Support examples must share the query's
    acquisition configuration family: device family, placement, channel set, gravity state.
@@ -87,39 +93,46 @@ same sampler runs at train and test; only the pool differs.
    do not offer a smartwatch example to a pocket-phone query. This is a plain deployment
    consideration; we claim no novelty for it. The compatibility key already exists in the
    application code (`SensorCompatibilityKey`) and is reused as-is.
-2. **Never the query, never the query's subject.** Support is subject-disjoint from the query.
-3. **Random label subset.** Draw a subset of labels present in the pool, then K recordings across
-   that subset. Labels are used verbatim; no canonicalisation, no deduplication.
-4. **Ground truth present with fixed probability.** With probability p the query's label is
-   among the support labels (few-shot episode); otherwise it is excluded (zero-shot episode). The
-   two regimes are trained jointly, not in separate arms.
-5. **Zero-shot episodes use a soft target**, the text-similarity distribution over candidates,
-   not a hard one-hot. This is the guard against the k = 0 collapse we measured.
+2. **Never the query or its physical execution.** Few-shot episodes mix same-subject and
+   cross-subject enrollment with equal probability when both are feasible. Zero-shot support comes
+   from other subjects, matching the external training-corpus support used at evaluation.
+3. **Random label subset.** Draw 2–14 candidate labels and K support executions. Grid labels are
+   canonicalized at the corpus boundary; the episode sampler applies no additional synonym merging
+   or deduplication.
+4. **Ground-truth support present with fixed probability.** The answer always remains in the
+   candidate roster. With probability p all candidates have enrolled support (few-shot); otherwise
+   no candidate has enrolled support and compatible examples of other labels form unbound
+   background (zero-shot). The two regimes are interleaved.
+5. **Both regimes use one-hot cross-entropy** because the correct answer is present in both candidate
+   rosters. Loss is averaged over episodes, so p is the objective-mixture weight.
 6. **Support may span datasets** as long as every example passes the compatibility filter. The
    encoder is trained on all configurations; the filter only constrains what is compared.
 
-Constants (there is no development split; set by judgement before the first run, and free to be
-varied *in training* as an experiment — varying them costs nothing and is informative):
+Constants are set by judgement before the first run. The training corpus's deterministic
+subject-held-out split is health telemetry, not an external development set and not permission to
+tune against evaluation data:
 
 | constant | value | note |
 |---|---|---|
-| K (support size, train) | 32 | drawn per episode; at evaluation K is the swept k of the k-curve |
+| total support executions (train) | 32 | shared across the episode's candidate or background labels; it may shrink when the compatible pool is smaller |
 | p (GT present, train) | 0.5 | joint ZS/FS; a sweep over p in {0.25, 0.5, 0.75} is a cheap experiment |
-| label-subset size | uniform in [2, min(8, labels available)] | |
+| label-subset size | uniform in [2, min(14, labels available)] | |
 | fine-tune schedule | 35k-50k steps | the plateau we saw at 6k was a schedule artifact |
 | checkpoint | final step of the fixed budget | no selection on held-out data |
 | seeds | >= 3 | validation-draw variance dominates single runs |
 
-At inference the support size is not a constant at all: the evaluation sweeps k, which is the
-k-curve.
+At inference, `k` means **enrolled executions per candidate**, not the total support size used by
+training. The evaluation therefore presents up to `candidate count * k` support executions. The
+comparator is set-based and accepts that variable size; this train/test difference is explicit and
+must be inspected in the k-curve rather than described as if the two quantities were identical.
 
 ---
 
 ## 4. Training
 
 **One stage: end to end from random initialisation** (revised 2026-09-04). Encoder and comparator
-are trained together on episodes drawn by the Section 3 sampler. Loss = cross-entropy over
-candidates for few-shot episodes, soft-target KL for zero-shot episodes.
+are trained together on episodes drawn by the Section 3 sampler. The sole loss is mean
+cross-entropy over candidates in both regimes.
 
 This corrects an earlier draft that made a Phase-A warm start mandatory on the grounds that
 from-scratch training collapsed the encoder's effective rank. The checkpoints contradict it: every
@@ -161,9 +174,9 @@ schedule has never been tested head to head; that is an experiment, not a settle
   `uci_har`, which is in the training corpus.
 - **Headline**: enrollment k-curve, k in {1, 2, 4, 8, 16}, macro-F1 with subject-bootstrap CIs,
   mean over >= 3 seeds. Zero-shot (k = 0) is reported as a **disclosed secondary** row using the
-  same mechanism with an empty ground-truth slot; we state its cap rather than chase it.
+  same mechanism with no ground-truth support; we state its cap rather than chase it.
 - **Support at test time** comes from the held-out dataset's own enrollment pool, which is
-  config-compatible by construction and subject-disjoint by the manifest. Two enrollment modes are
+  config-compatible by construction. Two enrollment modes are
   first-class: **cross-subject** (support from other people) and **same-subject** (support from the
   user's own recordings) — the latter is the deployment story and the ubicomp headline figure.
 - **Mandatory control rows**: the *untrained floor* (same mechanism at initialisation) and the
@@ -172,12 +185,13 @@ schedule has never been tested head to head; that is an experiment, not a settle
 - **Baselines = released checkpoints only.** Training regimen and data are part of each method;
   we do not match them. Keep harnet, UniMTS, ImageBind, NormWear. Drop CrossHAR and LiMU-BERT
   (we pretrained those ourselves). Audit for released weights before writing: Wonderwall
-  (IMWUT'26), IMUZero (IMWUT'25), LanHAR (IMWUT'24), GOAT (IMWUT'24), MOMENT. Every baseline gets
-  its own native few-shot rule (1-NN / prototype / linear head, whichever is best for it).
-- **Closed-set models do open-set through ConSE** (Norouzi et al. 2014), exactly as before: a
-  temperature-calibrated convex combination of label-text embeddings fit on training data only.
-  It is the defensible, practical bridge and it is what lets every released checkpoint enter the
-  same k-curve sweep.
+  (IMWUT'26), IMUZero (IMWUT'25), LanHAR (IMWUT'24), GOAT (IMWUT'24), MOMENT. For k >= 1 every
+  representation receives the same 1-NN, prototype, and closed-form ridge
+  readouts; HALO's support comparator is an additional row. Native rules are used only for k = 0.
+- **Closed-set models have no k = 0 row.** Historical ConSE results remain reproducible, but a
+  locally fitted semantic bridge is not the released model's native rule and is excluded from the
+  current zero-shot table. Those encoders still enter every k >= 1 comparison through the matched
+  representation readouts above.
 
 ---
 
@@ -244,13 +258,14 @@ continuous is the challenger, not the default.
 IMU Setups.
 
 **Claims.**
-1. A ~1M-parameter comparator over a fixed physical filterbank, told nothing about the sensor
-   configuration but given K compatible labelled recordings at test time, matches or beats
-   68M-1.2B released foundation models on enrollment k >= 1 across seven held-out datasets, and
-   leads where device and placement shift.
-2. The gain comes from the training curriculum — episodic support sampling with joint zero- and
-   few-shot regimes and soft zero-shot targets — not from architecture.
-3. No label homogenisation is needed; verbatim labels vote through language similarity.
+1. Test whether a compact comparator over a fixed physical filterbank, told nothing about the
+   sensor configuration but given K compatible labelled recordings at test time, improves over its
+   exact closed-form vote and released foundation-model representations across ten held-out
+   datasets. This remains a hypothesis until the declared runs are complete.
+2. Any measured gain is tested against the exact step-0 vote and matched frozen-feature readouts;
+   the curriculum interleaves support-present and support-withheld episodes.
+3. No episode-specific label homogenisation is needed after the corpus's canonical mapping;
+   canonical label strings vote through language similarity.
 4. The whole system runs on device (parameter, latency and memory table).
 
 **Sections.** Introduction (heterogeneity is a comparison problem) -> Related work (HAR foundation
@@ -271,13 +286,13 @@ baselines under identical inputs.
 | Reused as-is | New |
 |---|---|
 | Phase-A tokenizer + pretraining recipe | Episode sampler with no retrieval and the compatibility filter |
-| Evidence mixer (becomes the comparator) | Joint ZS/FS loss with soft zero-shot targets |
+| Evidence mixer (becomes the comparator) | Joint support-present/support-withheld cross-entropy |
 | `adaptation_v1` manifest, eval harness, adapters | Baseline weight audit for the 2025-26 comparators |
 | Results/methodology tooling (paired gain, step-0 predictor) | Cost table |
 
 ---
 
-## 9. Open items before any build
+## 9. Historical pre-build decisions
 
 All three are now **DECIDED** (2026-09-03) and recorded in `docs/design/IMWUT_HANDOFF.md` §1:
 
@@ -293,9 +308,8 @@ Remaining: constants in Section 3 are set by judgement and may be varied in trai
 weight audit (Section 5). Target deadline is **Nov 1 2026** (user decision), with the Oct 1 k-curve
 gate in `docs/design/IMWUT_BUILD_PLAN.md`. Venue read: `docs/research/IMWUT_VENUE_READ.md`.
 
-**A blocking prerequisite surfaced during the sweep**: `StreamSpec.placement` values are free-text
-prose ("the left wrist" vs "left wrist" vs "dominant wrist"), and the existing compatibility key
-normalizes only whitespace and case — so the compatible pool fragments. Placement classes must be
-built before anything else. See the handoff, §2 and W1.
+The former free-text placement blocker is resolved by the checked-in `PLACEMENT_SITE` mapping in
+`data/scripts/curate/compatibility.py`. New placement prose now fails loudly until mapped.
 
-No implementation, branch beyond this document, or training run is authorised by this document.
+The implementation now exists on `imwut/compare`; launch readiness is tracked in
+`docs/IMWUT_START_HERE.md` and must be re-audited before a full run.

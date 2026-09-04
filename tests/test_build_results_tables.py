@@ -18,16 +18,16 @@ def test_label_efficiency_excludes_random_alias_rows() -> None:
             "label_mode": "coherent",
             "dataset": "example",
             "k": "1",
-            "f1_macro": "80.0" if method == "evidence_engine" else "40.0",
+            "f1_macro": "80.0" if method == "support_comparator" else "40.0",
         }
         for model in MODEL_NAMES
         for regime in ("ordinary", "specialized_novel")
-        for method in (("evidence_engine", "nearest", "prototype", "ridge")
-                       if model == "halo_compact" else ("nearest", "prototype", "ridge"))
+        for method in (("support_comparator", "nearest", "prototype", "ridge")
+                       if model == "halo_compare" else ("nearest", "prototype", "ridge"))
     ] + [
         {
-            "model": "halo_compact",
-            "method": "evidence_engine",
+            "model": "halo_compare",
+            "method": "support_comparator",
             "regime": "ordinary",
             "label_mode": "random_alias",
             "dataset": "example",
@@ -38,7 +38,7 @@ def test_label_efficiency_excludes_random_alias_rows() -> None:
 
     table = table_label_efficiency(cells)
 
-    assert "| HALO / retrieve-mix-vote | **80.00** |" in table
+    assert "| HALO / support comparator | **80.00** |" in table
     assert "HARNet / 1-NN" in table
     assert "HARNet / prototype" in table
     assert "HARNet / ridge" in table
@@ -80,8 +80,8 @@ def test_current_report_rejects_missing_matched_readout() -> None:
             "k": "1",
         }
         for model in (*MODEL_NAMES, "crosshar", "limubert")
-        for method in (("evidence_engine", "nearest", "prototype", "ridge")
-                       if model == "halo_compact" else ("nearest", "prototype", "ridge"))
+        for method in (("support_comparator", "nearest", "prototype", "ridge")
+                       if model == "halo_compare" else ("nearest", "prototype", "ridge"))
         if not (model == "harnet" and method == "ridge")
     ]
 
@@ -102,8 +102,8 @@ def test_per_dataset_table_keeps_datasets_separate() -> None:
         }
         for dataset in ("inclusivehar", "usc_had")
         for model in MODEL_NAMES
-        for method in (("evidence_engine", "nearest", "prototype", "ridge")
-                       if model == "halo_compact" else ("nearest", "prototype", "ridge"))
+        for method in (("support_comparator", "nearest", "prototype", "ridge")
+                       if model == "halo_compare" else ("nearest", "prototype", "ridge"))
     ] + [
         {
             "model": model,
@@ -124,7 +124,7 @@ def test_per_dataset_table_keeps_datasets_separate() -> None:
     assert "#### USC-HAD" in table
     assert "ordinary" not in table
     assert "specialized" not in table
-    assert "| HALO / retrieve-mix-vote | **90.00** |" in table
-    assert "| HALO / retrieve-mix-vote | **10.00** |" in table
+    assert "| HALO / support comparator | **90.00** |" in table
+    assert "| HALO / support comparator | **10.00** |" in table
     assert "CrossHAR" not in table
     assert "LIMU-BERT" not in table

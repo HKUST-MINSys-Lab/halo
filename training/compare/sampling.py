@@ -2,7 +2,7 @@
 
 WHAT AN EPISODE IS
 ------------------
-One query recording, a candidate label roster, and K labelled *support* recordings the comparator
+One query recording, a candidate label roster, and K labelled *support executions* the comparator
 may compare the query against. Everything the model learns about "how to compare" comes from how
 these are drawn, so this module is the method rather than plumbing around it.
 
@@ -11,23 +11,24 @@ THE FOUR RULES
 1. **Compatibility.** In ``"compatible"`` mode every support recording shares the query's exact
    acquisition key. This is a deployment filter, not a learned quantity, and no novelty is claimed
    for it — you would not offer smartwatch examples to a pocket-phone query in a real product.
-2. **Never the query, never its subject, never its execution.** Support is subject-disjoint, and
-   the execution (one continuous physical capture) is the leakage unit — the same unit
-   ``eval/data.py`` uses, derived the same way, because two label blocks seconds apart are not
-   independent examples.
+2. **Never the query or its execution.** Few-shot episodes deliberately mix same-subject and
+   cross-subject enrollment, but a support execution is always physically distinct from the query.
+   Each support execution contributes one row, so long recordings do not receive more voting mass.
 3. **Verbatim labels.** No canonicalisation beyond what the corpus already applied, no synonym
    merging, no deduplication. Two candidates may carry near-identical text; the readout handles
    that by giving them near-identical votes, which is the right answer.
-4. **Ground truth present with probability p.** Above it the episode is few-shot; below it the
-   answer is absent from the support set and the episode trains the zero-shot path. The two are
-   interleaved in one stream, never trained as separate arms.
+4. **Ground-truth support present with probability p.** The answer is always in the candidate
+   roster. In a few-shot episode every candidate has enrolled support. In a zero-shot episode none
+   of the candidate labels has support; compatible rows with other labels are unbound background,
+   exactly like deployed k=0 evaluation.
 
 WHAT HAPPENS WHEN THE POOL IS TOO SMALL
 ---------------------------------------
 K shrinks for that episode and the shrink is recorded in telemetry. Support is never padded with
-incompatible rows (that would silently violate rule 1) and the episode is never skipped (that would
-quietly bias the corpus toward whichever configurations happen to be well populated). If shrinking
-is common, that is a finding about the corpus to report, not a bug to hide.
+incompatible rows (that would silently violate rule 1). A query that cannot form a two-candidate
+decision is redrawn and counted as unusable; a requested batch that still cannot be filled after
+the bounded retry budget fails loudly instead of changing the effective batch size. If shrinking or
+redrawing is common, that is a finding about the corpus to report, not a bug to hide.
 """
 
 from __future__ import annotations
@@ -52,12 +53,16 @@ REPO = Path(__file__).resolve().parents[2]
 DATASETS_DIR = REPO / "data" / "datasets"
 
 SamplingMode = Literal["compatible", "near_miss", "unfiltered"]
+SubjectRelation = Literal["same_subject", "cross_subject"]
+SupportUnit = tuple[str, str, str]  # dataset, subject, physical execution
 
 #: A-priori constants (design doc §3). They may be varied deliberately as an experiment; they are
 #: never tuned against evaluation data, because there is no development split.
 DEFAULT_SUPPORT = 32
 DEFAULT_P_GT_PRESENT = 0.5
-DEFAULT_LABEL_SUBSET = (2, 8)
+DEFAULT_LABEL_SUBSET = (2, 14)
+DEFAULT_SAME_SUBJECT_PROBABILITY = 0.5
+MIN_RECORDING_SECONDS = 1.0
 
 
 def _recording_map(dataset: str) -> dict:
@@ -112,7 +117,7 @@ class Recording:
 
 @dataclass
 class SupportCorpus:
-    """Windows grouped by acquisition key, then by label, for O(1) episode draws."""
+    """Windows indexed for balanced queries and execution-level support sampling."""
 
     recordings: list[Recording]
     keys: list[AcquisitionKey]                      # per stream index
@@ -120,12 +125,50 @@ class SupportCorpus:
     by_key: dict[AcquisitionKey, list[int]] = field(default_factory=dict)
     by_key_label: dict[tuple[AcquisitionKey, str], list[int]] = field(default_factory=dict)
     near_miss_keys: dict[AcquisitionKey, list[AcquisitionKey]] = field(default_factory=dict)
+    by_key_label_unit: dict[
+        tuple[AcquisitionKey, str], dict[SupportUnit, list[int]]
+    ] = field(default_factory=dict)
+    query_by_dataset_label: dict[tuple[str, str], list[int]] = field(default_factory=dict)
+    query_labels_by_dataset: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    all_labels: tuple[str, ...] = ()
 
     def __len__(self) -> int:
         return len(self.recordings)
 
     def key_of(self, recording: Recording) -> AcquisitionKey:
         return self.keys[recording.stream_index]
+
+    def ensure_indexes(self) -> None:
+        """Build derived lookup tables once; synthetic tests may populate the basic tables later."""
+        if self.query_by_dataset_label:
+            return
+        if not self.by_key:
+            for index, recording in enumerate(self.recordings):
+                key = self.key_of(recording)
+                self.by_key.setdefault(key, []).append(index)
+                self.by_key_label.setdefault((key, recording.label), []).append(index)
+        if not self.near_miss_keys:
+            distinct = list(self.by_key)
+            for key in distinct:
+                self.near_miss_keys[key] = [other for other in distinct if is_near_miss(key, other)]
+        labels_by_dataset: dict[str, set[str]] = defaultdict(set)
+        labels: set[str] = set()
+        for index, recording in enumerate(self.recordings):
+            key = self.key_of(recording)
+            unit = (recording.dataset, recording.subject, recording.execution)
+            self.by_key_label_unit.setdefault((key, recording.label), {}).setdefault(
+                unit, []
+            ).append(index)
+            self.query_by_dataset_label.setdefault(
+                (recording.dataset, recording.label), []
+            ).append(index)
+            labels_by_dataset[recording.dataset].add(recording.label)
+            labels.add(recording.label)
+        self.query_labels_by_dataset = {
+            dataset: tuple(sorted(dataset_labels))
+            for dataset, dataset_labels in labels_by_dataset.items()
+        }
+        self.all_labels = tuple(sorted(labels))
 
     def summary(self) -> dict[str, object]:
         pools = {key: len(rows) for key, rows in self.by_key.items()}
@@ -136,6 +179,8 @@ class SupportCorpus:
             "largest_pool": max(pools.values()) if pools else 0,
             "median_pool": int(np.median(list(pools.values()))) if pools else 0,
             "keys_with_near_miss": sum(1 for v in self.near_miss_keys.values() if v),
+            "datasets": len(self.query_labels_by_dataset),
+            "labels": len(self.all_labels),
         }
 
 
@@ -146,6 +191,7 @@ def build_support_corpus(
     max_per_stream: int | None = None,
     seed: int = 0,
     exclude_labels: Iterable[str] = ("unlabeled",),
+    min_duration_seconds: float = MIN_RECORDING_SECONDS,
 ) -> SupportCorpus:
     """Index the training grids into the structure the sampler draws from.
 
@@ -176,10 +222,13 @@ def build_support_corpus(
         keys.append(key)
 
         executions = _execution_ids(ref.dataset, ref.event_ids)
+        lengths = ref.load_lengths()
         chosen = np.arange(ref.n_windows)
         if max_per_stream is not None and ref.n_windows > max_per_stream:
             chosen = np.sort(rng.choice(ref.n_windows, size=max_per_stream, replace=False))
         for window in chosen:
+            if float(lengths[int(window)]) / ref.rate_hz < min_duration_seconds:
+                continue
             label = canonicalize(ref.labels[int(window)])
             if str(label).lower() in banned:
                 continue
@@ -203,6 +252,7 @@ def build_support_corpus(
         corpus.near_miss_keys[key] = [
             other for other in distinct if is_near_miss(key, other)
         ]
+    corpus.ensure_indexes()
     return corpus
 
 
@@ -211,30 +261,142 @@ class Episode:
     """One training episode. Indices address ``SupportCorpus.recordings``."""
 
     query: int
-    support: tuple[int, ...]
-    support_candidate: tuple[int, ...]   # candidate slot each support row is bound to
+    support: tuple[int, ...]             # one sampled window from each distinct execution
+    support_candidate: tuple[int, ...]   # candidate slot, or -1 for zero-shot background
     candidates: tuple[str, ...]          # verbatim label strings
-    gt_slot: int | None                  # index into candidates, or None for a zero-shot episode
+    gt_slot: int                         # the answer is always in the candidate roster
     mode: SamplingMode
     requested_support: int
     shrunk: bool
+    zero_shot: bool = False
+    subject_relation: SubjectRelation = "cross_subject"
 
     @property
     def is_zero_shot(self) -> bool:
-        return self.gt_slot is None
+        return self.zero_shot
 
 
-def _pool_for(corpus: SupportCorpus, key: AcquisitionKey, mode: SamplingMode) -> list[int]:
+def _keys_for(corpus: SupportCorpus, key: AcquisitionKey, mode: SamplingMode) -> list[AcquisitionKey]:
     if mode == "compatible":
-        return corpus.by_key.get(key, [])
+        return [key] if key in corpus.by_key else []
     if mode == "near_miss":
-        rows: list[int] = []
-        for other in corpus.near_miss_keys.get(key, []):
-            rows.extend(corpus.by_key.get(other, []))
-        return rows
+        return list(corpus.near_miss_keys.get(key, []))
     if mode == "unfiltered":
-        return list(range(len(corpus.recordings)))
+        return list(corpus.by_key)
     raise ValueError(f"unknown sampling mode {mode!r}")
+
+
+def _choose_query(corpus: SupportCorpus, rng: np.random.Generator) -> int:
+    """Dataset-first, label-second sampling prevents large sources/classes dominating queries."""
+    corpus.ensure_indexes()
+    datasets = tuple(sorted(corpus.query_labels_by_dataset))
+    dataset = str(rng.choice(datasets))
+    label = str(rng.choice(corpus.query_labels_by_dataset[dataset]))
+    rows = corpus.query_by_dataset_label[(dataset, label)]
+    return int(rows[int(rng.integers(len(rows)))])
+
+
+def balanced_query_indices(
+    corpus: SupportCorpus, rng: np.random.Generator, count: int,
+) -> list[int]:
+    """Draw query indices with the same dataset/label hierarchy used by training episodes."""
+    if count < 0:
+        raise ValueError("count must be nonnegative")
+    return [_choose_query(corpus, rng) for _ in range(count)]
+
+
+def _available_units(
+    corpus: SupportCorpus,
+    keys: Sequence[AcquisitionKey],
+    query: Recording,
+    relation: SubjectRelation,
+) -> dict[str, dict[SupportUnit, list[int]]]:
+    """Execution groups available under one subject relation, without scanning corpus windows."""
+    query_subject = (query.dataset, query.subject)
+    query_execution: SupportUnit = (query.dataset, query.subject, query.execution)
+    output: dict[str, dict[SupportUnit, list[int]]] = defaultdict(dict)
+    for key in keys:
+        for label in corpus.all_labels:
+            for unit, rows in corpus.by_key_label_unit.get((key, label), {}).items():
+                subject = unit[:2]
+                if unit == query_execution:
+                    continue
+                if relation == "same_subject" and subject != query_subject:
+                    continue
+                if relation == "cross_subject" and subject == query_subject:
+                    continue
+                output[label].setdefault(unit, []).extend(rows)
+    return output
+
+
+def _draw_support(
+    units_by_label: dict[str, dict[SupportUnit, list[int]]],
+    labels: Sequence[str],
+    rng: np.random.Generator,
+    support_size: int,
+    candidate_slots: dict[str, int] | None,
+) -> tuple[list[int], list[int]]:
+    """Draw at most one row per physical execution, balanced across the selected labels."""
+    remaining = {label: list(units_by_label[label]) for label in labels}
+    for units in remaining.values():
+        rng.shuffle(units)
+    used: set[SupportUnit] = set()
+    support: list[int] = []
+    bound: list[int] = []
+
+    if candidate_slots is not None:
+        # A few-shot episode promises at least one enrolled execution for every candidate. Labels
+        # can share one physical recording in continuously annotated datasets, so a greedy draw can
+        # starve a later label even when a valid distinct-execution assignment exists. Find that
+        # assignment first with a small bipartite matching (C <= 14), then fill the remaining budget.
+        owner: dict[SupportUnit, str] = {}
+        assigned: dict[str, SupportUnit] = {}
+
+        def assign(label: str, seen: set[SupportUnit]) -> bool:
+            for unit in remaining[label]:
+                if unit in seen:
+                    continue
+                seen.add(unit)
+                previous = owner.get(unit)
+                if previous is None or assign(previous, seen):
+                    owner[unit] = label
+                    assigned[label] = unit
+                    return True
+            return False
+
+        # Scarce labels first reduces needless rematching; random tie-breaking preserves stochastic
+        # episode views without changing feasibility.
+        label_order = list(labels)
+        rng.shuffle(label_order)
+        label_order.sort(key=lambda label: len(remaining[label]))
+        if support_size < len(labels) or any(not assign(label, set()) for label in label_order):
+            return [], []
+        for label in labels:
+            unit = assigned[label]
+            rows = units_by_label[label][unit]
+            support.append(int(rows[int(rng.integers(len(rows)))]))
+            bound.append(candidate_slots[label])
+            used.add(unit)
+        for label in labels:
+            remaining[label] = [unit for unit in remaining[label] if unit not in used]
+
+    while len(support) < support_size:
+        progressed = False
+        for label in labels:
+            units = remaining[label]
+            while units and units[-1] in used:
+                units.pop()
+            if not units or len(support) >= support_size:
+                continue
+            unit = units.pop()
+            rows = units_by_label[label][unit]
+            support.append(int(rows[int(rng.integers(len(rows)))]))
+            bound.append(-1 if candidate_slots is None else candidate_slots[label])
+            used.add(unit)
+            progressed = True
+        if not progressed:
+            break
+    return support, bound
 
 
 def draw_episode(
@@ -246,6 +408,7 @@ def draw_episode(
     label_subset: tuple[int, int] = DEFAULT_LABEL_SUBSET,
     mode: SamplingMode = "compatible",
     query_index: int | None = None,
+    same_subject_probability: float = DEFAULT_SAME_SUBJECT_PROBABILITY,
 ) -> Episode | None:
     """Draw one episode, or ``None`` when the query admits no usable support at all.
 
@@ -255,70 +418,94 @@ def draw_episode(
 
     if not 0.0 <= p_gt_present <= 1.0:
         raise ValueError("p_gt_present must be in [0, 1]")
+    if not 0.0 <= same_subject_probability <= 1.0:
+        raise ValueError("same_subject_probability must be in [0, 1]")
     low, high = label_subset
     if low < 2 or high < low:
         raise ValueError("label_subset must be (low >= 2, high >= low)")
 
-    query_index = int(rng.integers(len(corpus))) if query_index is None else int(query_index)
+    corpus.ensure_indexes()
+    query_index = _choose_query(corpus, rng) if query_index is None else int(query_index)
     query = corpus.recordings[query_index]
     key = corpus.key_of(query)
-
-    admissible = [
-        index for index in _pool_for(corpus, key, mode)
-        if corpus.recordings[index].subject != query.subject
-        and corpus.recordings[index].execution != query.execution
-        and index != query_index
-    ]
-    if not admissible:
+    keys = _keys_for(corpus, key, mode)
+    if not keys:
         return None
 
-    by_label: dict[str, list[int]] = defaultdict(list)
-    for index in admissible:
-        by_label[corpus.recordings[index].label].append(index)
-
-    available = sorted(by_label)
-    gt_available = query.label in by_label
-    want_gt = bool(rng.random() < p_gt_present) and gt_available
-
-    others = [label for label in available if label != query.label]
-    n_labels = int(rng.integers(low, high + 1))
-    n_others = max(0, n_labels - (1 if want_gt else 0))
-    if n_others > len(others):
-        n_others = len(others)
-    picked = list(rng.choice(others, size=n_others, replace=False)) if n_others else []
+    want_gt = bool(rng.random() < p_gt_present)
+    cross = _available_units(corpus, keys, query, "cross_subject")
+    same = _available_units(corpus, keys, query, "same_subject")
     if want_gt:
-        picked.append(query.label)
-    if len(picked) < 2:
-        # A single candidate is not a decision. Widen only within the same admissible pool.
-        extra = [label for label in available if label not in picked]
-        if not extra:
+        feasible: list[tuple[SubjectRelation, dict[str, dict[SupportUnit, list[int]]]]] = []
+        if query.label in cross and len(cross) >= 2:
+            feasible.append(("cross_subject", cross))
+        if query.label in same and len(same) >= 2:
+            feasible.append(("same_subject", same))
+        if not feasible:
             return None
-        picked.append(str(rng.choice(extra)))
+        if len(feasible) == 2:
+            selected = 1 if rng.random() < same_subject_probability else 0
+            relation, available_units = feasible[selected]
+        else:
+            relation, available_units = feasible[0]
+    else:
+        # Deployed k=0 draws from the training corpus and therefore has no same-user enrollment.
+        relation, available_units = "cross_subject", cross
+        if not available_units:
+            return None
+
+    available = sorted(available_units)
+    n_labels = int(rng.integers(low, high + 1))
+    n_labels = min(n_labels, len(corpus.all_labels))
+    if want_gt:
+        n_labels = min(n_labels, support_size)
+    if n_labels < 2:
+        return None
+
+    if want_gt:
+        others = [label for label in available if label != query.label]
+        take = min(n_labels - 1, len(others))
+        if take < 1:
+            return None
+        picked = list(rng.choice(others, size=take, replace=False))
+        picked.append(query.label)
+    else:
+        # Prefer distractors absent from the compatible support pool. This leaves genuine
+        # background labels available and teaches candidate labels that have no enrolled example.
+        outside = [label for label in corpus.all_labels
+                   if label != query.label and label not in available_units]
+        inside = [label for label in corpus.all_labels
+                  if label != query.label and label in available_units]
+        rng.shuffle(outside); rng.shuffle(inside)
+        # Preserve at least one compatible non-candidate label as background. If every available
+        # label became a candidate, this would silently turn into an empty-support task unlike k=0
+        # deployment.
+        inside_take = max(0, min(
+            len(inside) - 1,
+            n_labels - 1 - min(len(outside), n_labels - 1),
+        ))
+        distractors = outside[: n_labels - 1]
+        distractors.extend(inside[:inside_take])
+        picked = [query.label, *distractors[: n_labels - 1]]
+        if len(picked) < 2:
+            return None
     rng.shuffle(picked)
     candidates = tuple(str(label) for label in picked)
-    gt_slot = candidates.index(query.label) if want_gt else None
+    gt_slot = candidates.index(query.label)
 
-    # Round-robin across candidates so support is label-balanced to within one row. An episode that
-    # over-represents one candidate teaches a prior over candidates, which is exactly the closed-
-    # vocabulary habit this design is trying to avoid.
-    remaining = {label: list(by_label[label]) for label in candidates}
-    for rows in remaining.values():
-        rng.shuffle(rows)
-    support: list[int] = []
-    support_candidate: list[int] = []
-    while len(support) < support_size:
-        progressed = False
-        for slot, label in enumerate(candidates):
-            if len(support) >= support_size:
-                break
-            rows = remaining[label]
-            if not rows:
-                continue
-            support.append(rows.pop())
-            support_candidate.append(slot)
-            progressed = True
-        if not progressed:
-            break
+    if want_gt:
+        support_labels = [label for label in candidates if label in available_units]
+        candidate_slots = {label: candidates.index(label) for label in support_labels}
+    else:
+        support_labels = [label for label in available if label not in candidates]
+        if len(support_labels) > high:
+            support_labels = list(rng.choice(support_labels, size=high, replace=False))
+        candidate_slots = None
+    if not support_labels:
+        return None
+    support, support_candidate = _draw_support(
+        available_units, support_labels, rng, support_size, candidate_slots,
+    )
 
     if not support:
         return None
@@ -331,6 +518,8 @@ def draw_episode(
         mode=mode,
         requested_support=int(support_size),
         shrunk=len(support) < support_size,
+        zero_shot=not want_gt,
+        subject_relation=relation,
     )
 
 
@@ -354,18 +543,38 @@ def draw_batch(
             unusable += 1
             continue
         episodes.append(episode)
-    if not episodes:
+    if len(episodes) != batch_size:
         raise RuntimeError(
-            "no usable episode in "
-            f"{attempts} attempts — the corpus has no admissible support under mode "
-            f"{kwargs.get('mode', 'compatible')!r}"
+            f"only drew {len(episodes)} of {batch_size} requested episodes in {attempts} "
+            f"attempts under mode {kwargs.get('mode', 'compatible')!r}; refusing to train "
+            "with a silently smaller batch"
         )
     zero_shot = sum(1 for episode in episodes if episode.is_zero_shot)
+    query_datasets = [corpus.recordings[episode.query].dataset for episode in episodes]
+    query_labels = [corpus.recordings[episode.query].label for episode in episodes]
+    dataset_counts = {value: query_datasets.count(value) for value in set(query_datasets)}
+    duplicate_executions = []
+    for episode in episodes:
+        units = {
+            (corpus.recordings[index].dataset, corpus.recordings[index].subject,
+             corpus.recordings[index].execution)
+            for index in episode.support
+        }
+        duplicate_executions.append(len(episode.support) - len(units))
     telemetry = {
         "sampler/realised_gt_rate": 1.0 - zero_shot / len(episodes),
+        "sampler/zero_shot_rate": zero_shot / len(episodes),
+        "sampler/same_subject_rate": sum(
+            episode.subject_relation == "same_subject" for episode in episodes
+            if not episode.is_zero_shot
+        ) / max(1, len(episodes) - zero_shot),
         "sampler/shrunk_episode_fraction": sum(e.shrunk for e in episodes) / len(episodes),
         "sampler/mean_support_size": float(np.mean([len(e.support) for e in episodes])),
         "sampler/mean_candidate_count": float(np.mean([len(e.candidates) for e in episodes])),
         "sampler/unusable_query_fraction": unusable / max(attempts, 1),
+        "sampler/query_dataset_count": float(len(set(query_datasets))),
+        "sampler/query_label_count": float(len(set(query_labels))),
+        "sampler/max_query_dataset_share": max(dataset_counts.values()) / len(episodes),
+        "sampler/duplicate_support_execution_mean": float(np.mean(duplicate_executions)),
     }
     return episodes, telemetry

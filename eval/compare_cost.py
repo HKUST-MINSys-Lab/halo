@@ -1,16 +1,9 @@
 """Measure what the comparison model costs to run, on a named device.
 
-The venue's author guide is blunt about this: "CPU time measurements are meaningless unless the
-reader is told the machine and configuration on which they were obtained." So this script reports
-the device by name, states whether each number was measured or derived, and separates the two costs
-that behave differently in deployment:
-
-* **enrolment** — encoding the K support recordings. Paid once when a user enrols, then reusable.
-* **query** — encoding one window and running the comparator against the already-encoded support.
-  Paid on every prediction, and the number that decides whether this runs on a watch.
-
-Reported per k so the reader can see how the deployed cost grows with the support set, which is the
-question a systems reviewer will actually ask.
+This script measures only the comparator forward over already-encoded synthetic rows. It reports
+the device by name and repeats the measurement for several support-row counts. It does **not** time
+query encoding, enrolment encoding, data loading, or a full evaluation cell, so its output must not
+be presented as end-to-end deployment latency.
 
 Run::
 
@@ -81,7 +74,8 @@ def time_comparator(
         "support_label_text": F.normalize(torch.randn(1, support, z, device=device), dim=-1),
         "support_bound": torch.randint(-1, candidates, (1, support), device=device),
         "support_mask": torch.ones(1, support, dtype=torch.bool, device=device),
-        "candidate_slot": torch.arange(candidates, device=device).unsqueeze(0),
+        "candidate_slot": (1 + torch.arange(candidates, device=device)).unsqueeze(0),
+        "candidate_mask": torch.ones(1, candidates, dtype=torch.bool, device=device),
     }
     for _ in range(warmup):
         comparator_logits(comparator, **episode)
@@ -133,7 +127,7 @@ def main() -> None:
         "torch": torch.__version__,
         "checkpoint": str(args.checkpoint),
         "checkpoint_step": int(blob.get("step", 0)),
-        "measurement": "measured, not derived; median of repeated forwards after warmup",
+        "measurement": "measured, not derived; arithmetic mean of repeated forwards after warmup",
         "parameters": parameter_report(encoder, comparator),
         "query_latency_by_support": rows,
         "peak_memory_gib": (
@@ -141,8 +135,8 @@ def main() -> None:
             if device.type == "cuda" else None
         ),
         "note": (
-            "query_ms is the comparator only: support recordings are encoded once at enrolment "
-            "and reused, so this is the per-prediction cost in deployment."
+            "query_ms is comparator latency only. It excludes query encoding; support recordings "
+            "are encoded once at enrolment and reused."
         ),
     }
     text = json.dumps(report, indent=2)

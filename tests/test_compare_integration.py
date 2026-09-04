@@ -79,9 +79,20 @@ def test_episodes_drawn_over_the_real_corpus_obey_the_rules(small_index):
         query_key = corpus.key_of(query)
         for index in episode.support:
             other = corpus.recordings[index]
-            assert other.subject != query.subject
-            assert other.execution != query.execution
+            assert (other.dataset, other.subject, other.execution) != (
+                query.dataset, query.subject, query.execution,
+            )
+            if episode.subject_relation == "same_subject":
+                assert (other.dataset, other.subject) == (query.dataset, query.subject)
+            else:
+                assert (other.dataset, other.subject) != (query.dataset, query.subject)
             assert are_compatible(query_key, corpus.key_of(other))
+        units = {
+            (corpus.recordings[index].dataset, corpus.recordings[index].subject,
+             corpus.recordings[index].execution)
+            for index in episode.support
+        }
+        assert len(units) == len(episode.support)
     assert 0.0 <= telemetry["sampler/realised_gt_rate"] <= 1.0
 
 
@@ -123,6 +134,11 @@ def test_zero_shot_support_excludes_every_candidate_label():
     assert draws is not None, reason
     banned = {c.replace("_", " ").lower() for c in candidates}
     for rows in draws:
+        executions = {
+            (recording.dataset, recording.subject, recording.execution)
+            for recording in rows
+        }
+        assert len(executions) == len(rows)
         for recording in rows:
             assert recording.label.replace("_", " ").lower() not in banned
 
@@ -165,10 +181,7 @@ def test_zero_shot_support_never_draws_from_an_evaluation_dataset():
 
 def test_evaluation_datasets_are_absent_from_the_training_corpus():
     """The whole comparison rests on this; assert it rather than trusting the roster."""
-    evaluation = {
-        "inclusivehar", "usc_had", "tnda_har", "ut_complex",
-        "monipar", "spar", "upper_limb_use",
-    }
+    evaluation = set(deployment_policy.PRIMARY_EVAL_DATASETS)
     assert evaluation.isdisjoint(deployment_policy.EXPANDED_PHASE_A_TRAIN_DATASETS)
 
 

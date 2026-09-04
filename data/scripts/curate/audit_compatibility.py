@@ -61,10 +61,9 @@ def main() -> None:
     args = parser.parse_args()
 
     train = list(deployment_policy.EXPANDED_PHASE_A_TRAIN_DATASETS)
-    evaluation = [
-        "inclusivehar", "usc_had", "tnda_har", "ut_complex",
-        "monipar", "spar", "upper_limb_use",
-    ]
+    # Keep the audit tied to the live protocol roster.  A previous hard-coded seven-dataset list
+    # silently omitted MotionSense, RealWorld and Shoaib after adaptation_v2 restored them.
+    evaluation = list(deployment_policy.PRIMARY_EVAL_DATASETS)
 
     keys = corpus_keys()
     print(f"curated streams: {len(keys)}   distinct keys: {len(set(keys.values()))}\n")

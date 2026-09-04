@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .base import (  # noqa: F401
     REGISTRY, register, BaselineAdapter, ConSEAdapter, CosineAdapter, InputContract,
-    load_gt, score, global_labels,
+    UnsupportedEvaluationCell, load_gt, score, global_labels,
 )
 
 # Auto-import every baselines/<name>/adapter.py for its @register side effects.
@@ -22,4 +22,4 @@ for _sub in sorted(p for p in _pkg_dir.iterdir() if p.is_dir() and (p / "adapter
     importlib.import_module(f"{__name__}.{_sub.name}.adapter")
 
 __all__ = ["REGISTRY", "register", "BaselineAdapter", "ConSEAdapter", "CosineAdapter",
-           "InputContract", "load_gt", "score", "global_labels"]
+           "InputContract", "UnsupportedEvaluationCell", "load_gt", "score", "global_labels"]

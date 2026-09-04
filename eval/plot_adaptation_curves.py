@@ -3,7 +3,7 @@
 The two outputs answer different questions and must remain separate:
 
 1. ``knn_representation_curves`` applies the same 1-NN readout to every representation.
-2. ``primary_adaptation_curves`` shows HALO retrieve-mix-vote beside the same no-fitting 1-NN rule
+2. ``primary_adaptation_curves`` shows HALO's support comparator beside the same no-fitting 1-NN rule
    on every frozen representation.
 """
 
@@ -19,7 +19,7 @@ import numpy as np
 
 
 MODEL_NAMES = {
-    "halo_compact": "HALO",
+    "halo_compare": "HALO",
     "harnet": "HARNet",
     "unimts": "UniMTS",
     "normwear": "NormWear",
@@ -27,7 +27,7 @@ MODEL_NAMES = {
 }
 KS = (1, 2, 4, 8, 16)
 COLORS = {
-    "HALO / retrieve-mix-vote": "#c43c39",
+    "HALO / support comparator": "#c43c39",
     "HALO / 1-NN": "#111111",
     "HALO": "#111111",
     "HARNet": "#2878b5",
@@ -63,8 +63,8 @@ def _style_axes(ax, title: str) -> None:
     ax.set_title(title, fontsize=11, fontweight="semibold", pad=8)
     ax.set_xticks(range(len(KS)), [str(k) for k in KS])
     ax.set_xlabel("Enrolled executions per candidate (k)")
-    ax.set_ylim(15, 70)
-    ax.set_yticks(np.arange(20, 71, 10))
+    ax.set_ylim(0, 100)
+    ax.set_yticks(np.arange(0, 101, 20))
     ax.grid(axis="y", color="#d8d8d8", linewidth=0.7)
     ax.spines[["top", "right"]].set_visible(False)
 
@@ -82,8 +82,8 @@ def plot_knn(rows: list[dict], out_dir: Path) -> None:
         values = _curve(rows, model, "nearest")
         ax.plot(
             range(len(KS)), values, marker="o", markersize=4,
-            linewidth=2.8 if model == "halo_compact" else 1.5,
-            color=COLORS[name], label=name, zorder=5 if model == "halo_compact" else 2,
+            linewidth=2.8 if model == "halo_compare" else 1.5,
+            color=COLORS[name], label=name, zorder=5 if model == "halo_compare" else 2,
         )
     _style_axes(ax, "All held-out datasets")
     ax.set_ylabel("Macro F1")
@@ -98,18 +98,18 @@ def plot_knn(rows: list[dict], out_dir: Path) -> None:
 
 def plot_primary(rows: list[dict], out_dir: Path) -> None:
     series = [
-        ("HALO / retrieve-mix-vote", "halo_compact", "evidence_engine"),
-        ("HALO / 1-NN", "halo_compact", "nearest"),
+        ("HALO / support comparator", "halo_compare", "support_comparator"),
+        ("HALO / 1-NN", "halo_compare", "nearest"),
         *((MODEL_NAMES[model], model, "nearest")
-          for model in MODEL_NAMES if model != "halo_compact"),
+          for model in MODEL_NAMES if model != "halo_compare"),
     ]
     fig, ax = plt.subplots(figsize=(7.3, 4.8))
     for name, model, method in series:
-        halo = model == "halo_compact"
+        halo = model == "halo_compare"
         ax.plot(
             range(len(KS)), _curve(rows, model, method),
             marker="o", markersize=4, linewidth=2.8 if halo else 1.4,
-            linestyle="--" if method == "evidence_engine" else "-",
+            linestyle="--" if method == "support_comparator" else "-",
             color=COLORS[name], label=name, zorder=5 if halo else 2,
         )
     _style_axes(ax, "All held-out datasets")
@@ -117,7 +117,7 @@ def plot_primary(rows: list[dict], out_dir: Path) -> None:
     handles, labels = ax.get_legend_handles_labels()
     fig.legend(handles, labels, loc="lower center", ncol=4, frameon=False,
                bbox_to_anchor=(0.5, -0.08), fontsize=8.5)
-    fig.suptitle("Label-efficient adaptation: HALO retrieve-mix-vote and matched 1-NN", fontsize=13,
+    fig.suptitle("Label-efficient adaptation: HALO support comparator and matched 1-NN", fontsize=13,
                  fontweight="semibold", y=1.02)
     fig.subplots_adjust(bottom=0.27)
     _save(fig, out_dir, "primary_adaptation_curves")

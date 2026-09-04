@@ -171,6 +171,9 @@ class NormWearAdapter(BaselineAdapter):
     tier = "bespoke"
     contract = InputContract(channels=None, rate_hz=float(TARGET_HZ), window_sec=6.0)
 
+    def supports_native_zero_shot(self) -> bool:
+        return True
+
     def evaluation_artifacts(self, state):
         return {"backbone": BACKBONE_CKPT, "zero_shot_fusion": MSITF_CKPT}
 

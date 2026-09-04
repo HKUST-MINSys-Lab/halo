@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+import pytest
 
 from model.blocks import AttentionSpec
 from model.evidence.comparator import (
@@ -43,7 +44,8 @@ def _episode(B=2, C=4, Q=3, K=6, seed=0):
         "support_label_text": support_label_text,
         "support_bound": bound,
         "support_mask": torch.ones(B, K, dtype=torch.bool),
-        "candidate_slot": torch.arange(C).unsqueeze(0).expand(B, C).contiguous(),
+        "candidate_slot": (1 + torch.arange(C)).unsqueeze(0).expand(B, C).contiguous(),
+        "candidate_mask": torch.ones(B, C, dtype=torch.bool),
     }
 
 
@@ -155,6 +157,32 @@ def test_masked_support_rows_do_not_vote():
         part = comparator_logits(None, **masked)["logits"]
     assert not torch.allclose(full, part)
     assert torch.isfinite(part).all()
+
+
+def test_padded_candidates_cannot_change_real_logits():
+    """Candidate padding is a batch shape detail, not information available to attention."""
+    episode = _episode(B=1, C=4, seed=17)
+    comparator = _comparator()
+    with torch.no_grad():
+        comparator.residual_head.weight.normal_(std=0.05)
+        base = comparator_logits(comparator, **episode)["logits"]
+        padded = dict(episode)
+        padded["candidate_text"] = torch.cat([
+            episode["candidate_text"], torch.randn(1, 2, TEXT),
+        ], dim=1)
+        padded["candidate_slot"] = torch.cat([
+            episode["candidate_slot"], torch.zeros(1, 2, dtype=torch.long),
+        ], dim=1)
+        padded["candidate_mask"] = torch.tensor([[True, True, True, True, False, False]])
+        after = comparator_logits(comparator, **padded)["logits"]
+    assert torch.allclose(base, after[:, :4], atol=1e-5)
+
+
+def test_bound_candidates_cannot_use_the_unbound_slot():
+    episode = _episode(B=1)
+    episode["candidate_slot"][0, 0] = 0
+    with torch.no_grad(), pytest.raises(ValueError, match="reserved"):
+        comparator_logits(_comparator(), **episode)
 
 
 def test_verbatim_duplicate_labels_are_not_a_problem():
