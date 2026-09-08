@@ -4,7 +4,17 @@ You are on the branch for the **IMWUT comparison-model line**. If you read only 
 touching anything, read this one. It exists because this repository has carried three successive
 research lines and most of the confusion available here comes from mistaking one for another.
 
-Last updated 2026-09-07.
+Last updated 2026-09-08.
+
+## Latest matched results (2026-09-08)
+
+Completed HALO trained/initial controls and all four released baselines on the same current manifest
+and clean evaluation source `83058a3`. The current tables and interpretation are in
+[Matched adaptation results](results/IMWUT_MATCHED_ADAPTATION_20260908.md).
+HALO 1-NN improves with training but its native engine still trails 1-NN at higher k; UniMTS leads
+the primary aggregate. Zero-shot remains weak. The readiness notes below describe the preceding
+audit; its clean-source and matched-manifest reruns have now been completed. Upstream overlap and
+prior test-set exposure remain disclosure limitations.
 
 ## Evaluation readiness (2026-09-07)
 
