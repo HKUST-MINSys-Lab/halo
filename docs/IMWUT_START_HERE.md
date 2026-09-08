@@ -10,9 +10,12 @@ Last updated 2026-09-08.
 
 The next experiment separates encoder training with differentiable neighbors from two independently
 weighted attention heads (zero-shot and enrollment). See the current section of
-[the model design](design/IMWUT_COMPARE_DESIGN.md). Both paths and the deployment-matched sampler
-passed short CPU/GPU training smokes; full training remains. The completed tables below still describe
-the older sensor-only model, not the newly implemented heads.
+[the model design](design/IMWUT_COMPARE_DESIGN.md). The 35,000-step neighbor-only encoder run and
+its matched ten-dataset evaluation are complete. Its hard 1-NN curve is
+`62.73 / 66.73 / 70.22 / 72.62` macro F1 at k=`1 / 2 / 4 / 8`, ahead of UniMTS by
+`6.92 / 6.16 / 5.96 / 5.44` points on the same primary cohort. See
+[the differentiable-neighbor report](results/IMWUT_DIFFERENTIABLE_NEIGHBORS_20260908.md).
+The two attention heads have not yet received substantive training.
 
 ## Latest matched results (2026-09-08)
 

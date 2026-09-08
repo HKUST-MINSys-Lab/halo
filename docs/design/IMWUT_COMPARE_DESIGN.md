@@ -5,7 +5,9 @@
 The current implementation is `dual_attention` plus the separate `neighbors` encoder-training
 experiment. The September 7 `sensor_only` model remains the source of the completed
 [matched results](../results/IMWUT_MATCHED_ADAPTATION_20260908.md); those scores do not describe
-the new heads. No full training or evaluation of the new design has been performed.
+the new heads. The neighbor-only encoder experiment completed on September 8 and is reported in
+[its result of record](../results/IMWUT_DIFFERENTIABLE_NEIGHBORS_20260908.md). The attention heads
+remain untrained beyond smoke tests.
 
 ### Model
 
@@ -44,7 +46,7 @@ neighbors. Both query and support encoder paths receive gradients. k=0 is explic
 for this control, rather than inventing a text bridge. Its native enrollment rule is soft neighbors;
 the evaluation's generic 1-NN remains the hard-neighbor control.
 
-Examples (mechanically runnable; full experiments have not yet been launched):
+Examples:
 
 ```bash
 python -m training.compare.train --comparator-readout neighbors --out training/compare/outputs/neighbor_encoder
@@ -55,7 +57,7 @@ Use the project venv interpreter. `--phase-a` is the existing encoder-checkpoint
 accepts a neighbor-trained checkpoint; it does not imply JEPA pretraining. The default attention
 run requires an encoder checkpoint and freezes it. Three-step CPU smokes of both stages passed.
 Smoke scores are wiring checks, not evidence of model quality. Checkpoint readout and source
-  fingerprints distinguish the experiments. Published result tables remain unchanged.
+  fingerprints distinguish the experiments.
 
 ### Deployment-matched training episodes
 
@@ -84,10 +86,10 @@ Smoke scores are wiring checks, not evidence of model quality. Checkpoint readou
   structurally form the requested execution-disjoint regime in the held-out split are excluded and
   counted in telemetry; the remaining sources are each represented before any is repeated.
 
-### Remaining agreed work before substantive training
+### Remaining agreed work
 
-1. Run the neighbor-only encoder experiment first, then train the two attention heads separately
-   from the shared encoder. Measure k=0,1,2,4,8; report the different k=0 dataset cohort explicitly.
+1. The neighbor-only encoder experiment is complete. Next, train the two attention heads separately
+   from its shared encoder. Measure k=0,1,2,4,8; report the different k=0 dataset cohort explicitly.
 2. Track head-specific gradients, query/support signal, support ablations, rank and losses.
    For new heads `base_logits` is a neighbor floor (uniform without enrollment), not the old vote;
    `neighbor_floor/*` telemetry describes this floor, NOT internal attention weights.
