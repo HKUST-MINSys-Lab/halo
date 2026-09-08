@@ -58,7 +58,7 @@ not asked to learn a universal representation of all IMU data; it is asked to em
 features good enough that attention over a compatible support set can make the call.
 
 The contribution we market is the **training curriculum**: how support sets are sampled during
-pretraining-plus-fine-tuning so that the comparator learns to compare rather than to memorise a
+end-to-end episodic training so that the comparator learns to compare rather than to memorise a
 vocabulary. Nothing in the architecture is claimed as novel.
 
 ---
@@ -72,11 +72,20 @@ vocabulary. Nothing in the architecture is claimed as novel.
 | Conditioning | **Rate and patch-duration pathways kept. Acquisition-configuration text is OFF in the core design.** Compatibility is handled at support construction instead (Section 3). | The encoder is trained on every configuration anyway; once support is compatible by construction there is nothing left for the text to tell it. The text pathway is kept in the code for the Section 6 experiment. |
 | Comparator | **Attention over the query and every support example** (no retrieval stage, no top-k) | Removes the config-ranking defect and the non-differentiable selection; K is small enough to attend over fully. |
 | Feature centering | **ON by default**: each episode's mean feature is subtracted from the query and support rows before similarity and attention | Acquisition configuration is close to a common mode within an episode, since the support all shares the query's key; the previous design's retrieval ranked by configuration at a 7.0x lift. Removing the mean leaves only how rows differ. `--no-center-features` is the ablation. |
-| Readout | Fixed query/support cosine vote plus one learned residual scalar per candidate | Step 0 is exactly the closed-form support vote. Set attention can correct it, while unseen candidates still use the same shared operation and no candidate-specific parameter. |
-| Label / text tower | Frozen sentence encoder (MiniLM), text ensembling kept | Every learned text adapter we tried was net-negative. |
+| Readout | Fixed query/support cosine vote, plus a **sensor-only** learned reweighting: attention over the query's and support rows' signal vectors emits one zero-initialised scalar per support row that shifts its logit before the softmax (`--comparator-readout sensor_only`, design of record 2026-09-07). Label and candidate text never enter the learned path. | Sensors are compared with sensors and labels with labels, paired by index in the vote. The learned part decides only which examples to trust; it cannot become a label-text-to-motion bridge, which is the pathway every earlier learned text component hurt through. Step 0 is exactly the closed-form vote; unseen candidates use the same shared operation and no candidate-specific parameter. The `fused` readout (label text fused into support tokens, residual per candidate) is kept as an ablation arm. |
+| Label / text tower | Frozen sentence encoder (MiniLM), one vector per label string | Zero-shot evaluation ensembles support draws, not label paraphrases. |
 | Size | Compact engine budget, ~1M trainable parameters | Efficiency is part of the story. |
 
 Support examples are **encoded per query, with gradients**, at train time. Nothing is cached.
+
+**Correctness revision, 2026-09-07.** Each support recording's projected signal, acquisition
+description and label are fused into one support token before set attention. Their role embeddings
+are retained inside that fusion; candidate bindings remain separate from recording identity.
+This keeps the feature-label association available for unbound zero-shot background as well as
+enrolled support. Candidate tokens and query feature/description tokens remain explicit. Padding
+is excluded from the cosine-softmax denominator, and the residual head still starts at exactly zero.
+Older comparison checkpoints without the support-fusion parameters require the earlier branch
+revision; they must not be silently loaded as this design or used as its paired step-0 control.
 
 ---
 
@@ -85,8 +94,11 @@ Support examples are **encoded per query, with gradients**, at train time. Nothi
 A support set is the list of labelled executions the comparator sees alongside the query. Training
 samples one window from each distinct execution on each draw, which is a stochastic view of that
 execution and gives every execution equal influence. Evaluation deterministically pools all windows
-of each enrolled execution into one normalized vector. Neither path lets a long execution cast more
-votes than a short one.
+of each enrolled execution into one mean vector **at the encoder's native scale** — the same scale as
+a training support row, never L2-normalised, because episode centering averages query and support
+rows together and the residual head was fitted to raw-scale rows
+(`tests/test_compare_eval_parity.py`). Neither path lets a long execution cast more votes than a
+short one.
 
 1. **Compatibility is a filter, not a learned quantity.** Support examples must share the query's
    acquisition configuration family: device family, placement, channel set, gravity state.
@@ -104,6 +116,10 @@ votes than a short one.
    candidate roster. With probability p all candidates have enrolled support (few-shot); otherwise
    no candidate has enrolled support and compatible examples of other labels form unbound
    background (zero-shot). The two regimes are interleaved.
+   Zero-shot distractors are drawn from the same available compatible label pool as the answer,
+   not preferentially from other configurations. The roster shrinks to leave at least one
+   non-candidate background label. Pools with fewer than three available labels cannot supply this
+   regime and the draw is retried; the realized mixture and rejection rate are logged.
 5. **Both regimes use one-hot cross-entropy** because the correct answer is present in both candidate
    rosters. Loss is averaged over episodes, so p is the objective-mixture weight.
 6. **Support may span datasets** as long as every example passes the compatibility filter. The
@@ -179,6 +195,9 @@ schedule has never been tested head to head; that is an experiment, not a settle
   partial-coverage supplement. Scores are dataset-macro F1 over five serialized support seeds.
   Paired uncertainty is a dataset-balanced subject bootstrap and is labelled with that estimand.
   Zero-shot (k=0) is a disclosed secondary row using the released model's native rule.
+  The zero-shot headline uses only the intersection of scored cells across models with results,
+  with per-model dataset/cell coverage shown separately. Variant cell-level deltas and subject-level
+  deltas are separate statistics; a subject-bootstrap interval belongs only to the latter.
 - **k=16 is a separate cohort**, not the final point of the primary curve. Only six datasets have
   enough independent executions, and their eligible query subjects differ from the k=1..8 cohort.
 - **Support at test time** comes from the held-out dataset's own enrollment pool, which is
@@ -231,6 +250,7 @@ Arm B is reported as a result about the model, not as a claim the paper rests on
 | **Fixed filterbank vs continuous kernel** (`--frontend`) | The encoder's two real front-end modes; see 6.1 — the existing head-to-head is inside the noise and must be re-run matched. |
 | Fixed single-res filterbank vs multiresolution vs learnable | Is the simple front end leaving accuracy on the table? |
 | Attention comparator vs cosine 1-NN vs prototype over the same encoder | Is the learned comparison worth having? (the untrained floor lives here) |
+| **Sensor-only reweighting vs fused label-in-attention** (`--comparator-readout`) | Does letting the learned part see label text help or hurt? Both share the same step-0 function, so compare by paired gain. The run launched 2026-09-07 14:27 (`imwut_compare_arm_a_fixed_35k_20260907`) is the fused arm. |
 | Compatible support vs unfiltered support, text OFF | How much does the explicit filter buy on its own? |
 | Text vote vs one-hot vote | Is the language channel load-bearing? (plus the scrambled-vocabulary control) |
 | p in {0, 0.25, 0.5, 0.75, 1} | Does joint ZS/FS training cost few-shot accuracy? |
@@ -286,7 +306,10 @@ Cost -> Limitations (zero-shot cap stated plainly; compatibility filter assumes 
 
 **Heterogeneity-axis experiment** (kept from the earlier thesis, now with a mechanism that can use
 it): placement shift, rate shift, orientation perturbation, gravity present vs removed — ours vs
-baselines under identical inputs.
+baselines under identical inputs. Built 2026-09-05 as `--perturb` on the adaptation runner
+(`eval/perturbation.py`; placement shift is the existing cross-configuration cells), applied to the
+frozen `adaptation_v2` cells on the query side (the figure) or the support side (the
+incompatible-exemplar cell for Arm A vs Arm B). Not yet run.
 
 ---
 

@@ -99,6 +99,8 @@ def stream_fingerprint(stream: EvalStream) -> str:
         "channels": list(stream.channels),
         "mask": np.asarray(stream.mask, dtype=bool).tolist(),
         "rate_hz": float(stream.rate_hz),
+        "lengths": (None if stream.lengths is None else np.asarray(stream.lengths).tolist()),
+        "execution_identity_known": stream.execution_identity_known,
         "quality_screen": stream.quality_screen,
         "quality_excluded": int(stream.n_quality_excluded),
     })
@@ -261,6 +263,12 @@ def _positive_cell(
     requested = sorted({int(value) for value in support_counts if int(value) > 0})
     main_requested = [value for value in requested if value <= 8]
     secondary_requested = [value for value in requested if value > 8]
+    # A genuinely independent short recording is valid. Missing recording identity
+    # is not, regardless of how many windows a converter happened to emit.
+    identity_known = (query.execution_identity_known and support.execution_identity_known
+                      and query.dataset != "tnda_har" and support.dataset != "tnda_har")
+    if not identity_known:
+        main_requested, secondary_requested = [], []
     relation_id = (
         f"{query.dataset}/{query.stream}/from_{support.stream}/"
         f"{configuration_relation}/{subject_relation}"
@@ -312,15 +320,20 @@ def _positive_cell(
         }
         for seed in seeds
     }
-    status = "ok" if candidates and ceiling > 0 else (
-        "insufficient_independent_executions" if len(candidates) >= 2 else "insufficient_candidates"
-    )
+    if not identity_known:
+        status = "unverified_execution_identity"
+    else:
+        status = "ok" if candidates and ceiling > 0 else (
+            "insufficient_independent_executions" if len(candidates) >= 2
+            else "insufficient_candidates"
+        )
     return {
         "kind": "enrollment",
         "regime": regime,
         "dataset": query.dataset,
         "query_stream": query.stream,
         "support_stream": support.stream,
+        "execution_identity_known": identity_known,
         "configuration_relation": configuration_relation,
         "subject_relation": subject_relation,
         "candidate_names": candidates,
@@ -328,7 +341,10 @@ def _positive_cell(
         "status": status,
         "seeds": seed_payload,
         "secondary_high_support": {
-            "status": "ok" if secondary_ceiling else "insufficient_independent_executions",
+            "status": "ok" if secondary_ceiling else (
+                "unverified_execution_identity" if not identity_known
+                else "insufficient_independent_executions"
+            ),
             "support_ceiling": secondary_ceiling,
             "support_counts": secondary_requested,
             "cohort_policy": "separate_secondary_cohort_not_pooled_with_main_k_curve",

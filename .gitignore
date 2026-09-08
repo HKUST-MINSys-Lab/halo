@@ -90,6 +90,7 @@ training/evidence/outputs/*/
 training/evidence/outputs/**/*.log
 training/evidence/outputs/*.json
 training/evidence/outputs/*.log
+training/compare/outputs/
 
 # Historical per-run evaluation and locally trained baseline artifacts. Promoted summaries live in
 # docs/results; these raw outputs remain recoverable from the pre-application archive branch.

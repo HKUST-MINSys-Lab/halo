@@ -132,7 +132,9 @@ def test_zero_shot_support_excludes_every_candidate_label():
         _Stream("inclusivehar", "phone_waist"), state, candidates,
     )
     assert draws is not None, reason
-    banned = {c.replace("_", " ").lower() for c in candidates}
+    from data.scripts.labels.canonical_labels import canonicalize
+
+    banned = {canonicalize(c) for c in candidates}
     for rows in draws:
         executions = {
             (recording.dataset, recording.subject, recording.execution)
@@ -140,7 +142,34 @@ def test_zero_shot_support_excludes_every_candidate_label():
         }
         assert len(executions) == len(rows)
         for recording in rows:
-            assert recording.label.replace("_", " ").lower() not in banned
+            assert canonicalize(recording.label) not in banned
+
+
+def test_zero_shot_support_excludes_synonyms_of_candidates():
+    """A candidate written in the dataset's own words must ban its canonical training synonym.
+
+    realworld's ``climbingup`` and tnda_har's ``ascending_stairs`` canonicalise to the training
+    label ``walking_upstairs``. Under a string-only ban those rows survived and voted for the
+    candidate through label text, which is enrolled support under another name (found 2026-09-05).
+    """
+    from baselines.halo_compare.adapter import HALOCompareAdapter
+    from data.scripts.labels.canonical_labels import canonicalize
+    from training.compare.sampling import build_support_corpus
+
+    corpus = build_support_corpus(
+        deployment_policy.EXPANDED_PHASE_A_TRAIN_DATASETS, max_per_stream=200, seed=0,
+    )
+    state = {"zero_shot_support": {}, "_corpus": corpus}
+    candidates = ["climbingup", "climbingdown", "walking"]
+    concepts = {canonicalize(c) for c in candidates}
+    assert "walking_upstairs" in concepts, "the fixture no longer exercises a synonym"
+    draws, reason = HALOCompareAdapter()._zero_shot_draws(
+        _Stream("realworld", "phone_waist"), state, candidates,
+    )
+    assert draws is not None, reason
+    drawn = {recording.label for rows in draws for recording in rows}
+    assert "walking_upstairs" not in drawn and "walking_downstairs" not in drawn
+    assert not ({canonicalize(label) for label in drawn} & concepts)
 
 
 def test_zero_shot_support_is_configuration_compatible():
@@ -357,3 +386,39 @@ def test_manifest_records_streams_it_could_not_materialize():
     assert "skipped_streams" in manifest
     # shoaib declares four placements; only phone_right_pocket has a native grid.
     assert any(name.startswith("shoaib/") for name in manifest["skipped_streams"])
+
+
+def test_prefetch_loader_reproduces_the_synchronous_draw(small_index):
+    """Worker processes must hand back exactly the episodes step-seeded drawing would produce,
+    in any order of completion, with the collated batch covering those episodes' windows."""
+    from training.compare.corpus import support_corpus_from_index
+    from training.compare.sampling import draw_batch
+    from training.compare.train import PrefetchLoader, episode_positions, episode_rng
+    from training.tokenizer.episodic import EpisodicCollate
+    from training.tokenizer.pretrain_data import PATCH_SECONDS, MultiScaleCollate, PretrainDataset
+
+    corpus = support_corpus_from_index(small_index)
+    dataset = PretrainDataset(
+        small_index, small_index.train, augment=False, two_view=False,
+        neutral_acquisition_text=True,
+    )
+    collate = EpisodicCollate(MultiScaleCollate(fixed_patch_seconds=PATCH_SECONDS))
+    kwargs = dict(support_size=6, p_gt_present=0.5, label_subset=(2, 4), mode="compatible",
+                  same_subject_probability=0.5)
+    loader = PrefetchLoader(
+        corpus, dataset, collate, data_seed=11, batch_size=3, draw_kwargs=kwargs,
+        workers=2, depth=2, start_step=1,
+    )
+    try:
+        for step in (1, 2, 3, 4):
+            episodes, telemetry, batch = loader.get(step)
+            expected, _ = draw_batch(corpus, episode_rng(11, step), batch_size=3, **kwargs)
+            assert episodes == expected
+            assert batch["patches"].shape[0] == len(episode_positions(episodes, corpus))
+            assert "sampler/zero_shot_rate" in telemetry
+    finally:
+        loader.close()
+    # Two different seeds do not share a sequence; the same seed does.
+    a, _ = draw_batch(corpus, episode_rng(11, 2), batch_size=3, **kwargs)
+    b, _ = draw_batch(corpus, episode_rng(12, 2), batch_size=3, **kwargs)
+    assert a != b

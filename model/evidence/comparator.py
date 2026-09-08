@@ -56,6 +56,11 @@ N_ROLES = 6
 UNBOUND_SLOT = 0
 
 
+#: The two learned readouts. ``sensor_only`` is the design of record (2026-09-07); ``fused`` is
+#: the ablation arm and the shape of every checkpoint written before that date.
+READOUTS = ("sensor_only", "fused")
+
+
 @dataclass(frozen=True)
 class ComparatorConfig:
     """Shape and initialisation of the comparator.
@@ -63,6 +68,26 @@ class ComparatorConfig:
     ``n_slots`` bounds how many candidates one episode may carry. The slot embedding is an
     episode-randomised coreference tag, not a label identity: it lets attention notice that a
     support row and a candidate refer to the same thing without ever learning what that thing is.
+
+    ``readout`` selects what the learned part is allowed to see:
+
+    * ``"sensor_only"`` (default) — attention runs over the query's and the support rows' SIGNAL
+      vectors only, and emits one zero-initialised scalar per support row that shifts that row's
+      logit before the closed-form softmax. Label text and candidate text never enter the learned
+      path: sensors are compared with sensors, labels with labels, paired by index in the vote.
+      This keeps the learned part from becoming a label-text-to-motion bridge — the pathway every
+      earlier learned text component turned out to hurt through — and makes the residual a pure
+      "which examples do I trust" decision. In a zero-shot episode it still reweights the
+      background rows; what it cannot touch is the label-to-candidate relation, which stays the
+      frozen text cosine.
+    * ``"fused"`` — each support row's signal, sensor description and label text are fused into
+      one token, attention runs over [candidates | query | support], and one zero-initialised
+      scalar per CANDIDATE is added to its logit. Strictly more capacity, including a learned
+      label-to-candidate relation; kept as the ablation arm.
+
+    ``use_descriptor`` adds the frozen sensor-description embedding to each ``sensor_only`` row.
+    It is constant within an Arm A episode (neutral text + exact-key support), so it is OFF there
+    and ON for Arm B, where support may mix configurations. ``fused`` always consumes it.
     """
 
     text_dim: int = 384
@@ -71,29 +96,62 @@ class ComparatorConfig:
     #: Content leads at initialisation. Role and coreference stay visible without jointly
     #: outweighing the signal they are supposed to annotate.
     identity_gain_init: float = 0.25
+    readout: str = "sensor_only"
+    use_descriptor: bool = False
+
+    def __post_init__(self) -> None:
+        if self.readout not in READOUTS:
+            raise ValueError(f"readout must be one of {READOUTS}, got {self.readout!r}")
+
+
+def comparator_config_from_checkpoint(saved: dict) -> ComparatorConfig:
+    """Rebuild the config a checkpoint was trained with.
+
+    Checkpoints written before 2026-09-07 predate ``readout`` and were all the fused design; they
+    must load as such rather than silently as the current default, or ``load_state_dict`` would
+    fail on the head names — and, worse, a step-0 control would be paired against the wrong
+    function.
+    """
+    config = dict(saved)
+    if "readout" not in config:
+        config["readout"] = "fused"
+        config.setdefault("use_descriptor", True)
+    return ComparatorConfig(**config)
 
 
 class SupportComparator(nn.Module):
-    """Attention over [candidates | query rows | support rows], then a corrected vote."""
+    """The learned part of the comparison. See :class:`ComparatorConfig` for the two readouts."""
 
     def __init__(self, spec: AttentionSpec, cfg: ComparatorConfig | None = None):
         super().__init__()
         self.spec = spec
         self.cfg = cfg or ComparatorConfig()
         d = spec.d_model
-        self.proj_text = nn.Linear(self.cfg.text_dim, d)
         self.proj_signal = nn.Linear(d, d)
         self.role_emb = nn.Embedding(N_ROLES, d)
         self.slot_emb = nn.Embedding(self.cfg.n_slots, d)
         self.compose = ScaledSum(3, init=[1.0, self.cfg.identity_gain_init,
                                           self.cfg.identity_gain_init])
         self.stack = SetAttentionStack(spec, self.cfg.n_layers)
-        # One shared scalar head over candidate tokens: permutation-equivariant, and it works on a
-        # candidate the model has never seen. Zero init makes the whole module exactly the
-        # closed-form vote at step 0. No bias: a shared constant added to every candidate logit
-        # cancels in the softmax and would be permanently unidentifiable.
-        self.residual_head = nn.Linear(d, 1, bias=False)
-        nn.init.zeros_(self.residual_head.weight)
+        # Whichever readout, the head is one shared scalar with NO bias, zero-initialised, so the
+        # whole module is exactly the closed-form vote at step 0. A shared constant would cancel in
+        # the softmax and be permanently unidentifiable.
+        if self.cfg.readout == "fused":
+            self.proj_text = nn.Linear(self.cfg.text_dim, d)
+            # A support's feature, descriptor and label must stay associated even when it is not
+            # bound to a candidate. Separate set tokens lose that association.
+            self.support_fusion = nn.Linear(3 * d, d)
+            self.residual_head = nn.Linear(d, 1, bias=False)
+            nn.init.zeros_(self.residual_head.weight)
+        else:
+            if self.cfg.use_descriptor:
+                self.proj_text = nn.Linear(self.cfg.text_dim, d)
+            self.shift_head = nn.Linear(d, 1, bias=False)
+            nn.init.zeros_(self.shift_head.weight)
+
+    @property
+    def head(self) -> nn.Linear:
+        return self.residual_head if self.cfg.readout == "fused" else self.shift_head
 
     # ------------------------------------------------------------------ tokens
     def _token(self, content: torch.Tensor, role: int, slot: torch.Tensor) -> torch.Tensor:
@@ -117,7 +175,8 @@ class SupportComparator(nn.Module):
         support_slot: torch.Tensor,          # (B, K)     tag of the candidate a row is bound to
         candidate_mask: torch.Tensor | None = None,  # (B, C) True = a real candidate
     ) -> torch.Tensor:
-        """Return ``(B, C)`` residual logits, zero at initialisation."""
+        """``fused``: ``(B, C)`` candidate residual logits. ``sensor_only``: ``(B, K)`` support
+        logit shifts. Both are exactly zero at initialisation."""
 
         B, C, _ = candidate_text.shape
         Q = query_feature.shape[1]
@@ -134,6 +193,22 @@ class SupportComparator(nn.Module):
 
         query_slot = torch.full((B, Q), UNBOUND_SLOT, dtype=torch.long, device=device)
 
+        if self.cfg.readout == "sensor_only":
+            # Sensors against sensors. No candidate token, no label text: the association between a
+            # row's signal and its label lives in the vote's index, not in attention.
+            query = self._token(self.proj_signal(query_feature), ROLE_QUERY, query_slot)
+            content = self.proj_signal(support_feature)
+            if self.cfg.use_descriptor:
+                content = content + self.proj_text(support_descriptor)
+            support = self._token(content, ROLE_SUPPORT, support_slot)
+            hidden = self.stack(
+                torch.cat([query, support], dim=1),
+                key_padding_mask=torch.cat([query_mask, support_mask], dim=1),
+            )
+            with torch.autocast(device_type=device.type, enabled=False):
+                shift = self.shift_head(hidden[:, Q:].float()).squeeze(-1)
+            return shift.masked_fill(~support_mask, 0.0)
+
         candidate = self._token(self.proj_text(candidate_text), ROLE_CANDIDATE, candidate_slot)
         query = self._token(self.proj_signal(query_feature), ROLE_QUERY, query_slot)
         query_desc = self._token(self.proj_text(query_descriptor), ROLE_QUERY_DESC, query_slot)
@@ -144,14 +219,17 @@ class SupportComparator(nn.Module):
         support_label = self._token(
             self.proj_text(support_label_text), ROLE_SUPPORT_LABEL, support_slot,
         )
+        support_row = self.support_fusion(torch.cat(
+            [support, support_desc, support_label], dim=-1,
+        ))
 
         tokens = torch.cat(
-            [candidate, query, query_desc, support, support_desc, support_label], dim=1,
+            [candidate, query, query_desc, support_row], dim=1,
         )
         valid = torch.cat([
             candidate_mask,
             query_mask, query_mask,
-            support_mask, support_mask, support_mask,
+            support_mask,
         ], dim=1)
 
         hidden = self.stack(tokens, key_padding_mask=valid)
@@ -162,7 +240,10 @@ class SupportComparator(nn.Module):
     def telemetry(self) -> dict[str, float]:
         gains = self.compose.log_gain.detach().exp()
         return {
-            "comparator/residual_head_norm": float(self.residual_head.weight.detach().norm()),
+            # Whichever readout: the norm of the one zero-initialised head, so a flat line here
+            # means the learned part never woke up.
+            "comparator/residual_head_norm": float(self.head.weight.detach().norm()),
+            "comparator/readout_is_fused": float(self.cfg.readout == "fused"),
             "comparator/content_gain": float(gains[0]),
             "comparator/identity_gain_mean": float(gains[1:].mean()),
         }
@@ -255,8 +336,14 @@ def comparator_logits(
 
     ``comparator=None`` is the untrained floor: cosine similarity between the query and each
     support recording supplies the weights, and nothing is learned anywhere. With a comparator
-    whose ``residual_head`` is still zero the two paths agree exactly, which is what makes the
-    step-0 control a control rather than an approximation.
+    whose head is still zero the two paths agree exactly, which is what makes the step-0 control a
+    control rather than an approximation.
+
+    A ``sensor_only`` comparator shifts each support row's logit BEFORE the softmax (``shift`` is
+    already in units of the temperature-scaled logit); a ``fused`` one adds a residual to each
+    candidate's logit AFTER the vote. ``base_logits`` is always the unshifted closed-form vote, so
+    ``residual = logits - base_logits`` is the learned contribution under either readout, and
+    ``support_weight`` is the weight the model actually used.
 
     ``center`` removes the episode's mean feature first (see :func:`center_episode`) and is ON by
     default. It is applied to BOTH the closed-form similarity and the comparator's signal input, so
@@ -285,21 +372,30 @@ def comparator_logits(
     # Softmax over support rows, shared across candidates. With every row masked out (K = 0 or an
     # all-empty support set) the vote is zero and the logits fall back to the text path alone.
     empty = ~support_mask.any(dim=1, keepdim=True)
-    safe = torch.where(support_mask, similarity, torch.zeros_like(similarity))
-    weights = torch.softmax(safe / temperature, dim=1)
-    weights = torch.where(support_mask, weights, torch.zeros_like(weights))
-    weights = torch.where(empty, torch.zeros_like(weights), weights)
-    weights = weights.unsqueeze(-1).expand(B, K, C)
+    # Only all-empty episodes need finite dummy logits; real episodes must keep
+    # masked rows at -inf so padding never takes probability mass.
+    safe = torch.where(empty, torch.zeros_like(similarity), similarity)
+    scaled = safe / temperature
 
-    base = vote_scale * support_vote(
-        candidate_text=candidate_text,
-        support_label_text=support_label_text,
-        support_bound=support_bound,
-        support_mask=support_mask,
-        weights=weights,
-    )
+    def support_weights(logit: torch.Tensor) -> torch.Tensor:
+        weights = torch.softmax(logit, dim=1)
+        weights = torch.where(support_mask, weights, torch.zeros_like(weights))
+        weights = torch.where(empty, torch.zeros_like(weights), weights)
+        return weights.unsqueeze(-1).expand(B, K, C)
 
-    residual = base.new_zeros(base.shape)
+    def vote(weights: torch.Tensor) -> torch.Tensor:
+        return vote_scale * support_vote(
+            candidate_text=candidate_text,
+            support_label_text=support_label_text,
+            support_bound=support_bound,
+            support_mask=support_mask,
+            weights=weights,
+        )
+
+    base_weights = support_weights(scaled)
+    base = vote(base_weights)
+    used_weights = base_weights
+    logits = base
     if comparator is not None:
         if candidate_slot is None:
             raise ValueError("a comparator needs episode-randomised candidate slots")
@@ -308,7 +404,7 @@ def comparator_logits(
             torch.gather(candidate_slot, 1, support_bound.clamp_min(0)),
             torch.full_like(support_bound, UNBOUND_SLOT),
         )
-        residual = comparator(
+        learned = comparator(
             candidate_text=candidate_text,
             query_feature=query_feature,
             query_descriptor=query_descriptor,
@@ -321,6 +417,11 @@ def comparator_logits(
             support_slot=support_slot,
             candidate_mask=candidate_mask,
         )
+        if comparator.cfg.readout == "sensor_only":
+            used_weights = support_weights(scaled + learned.to(scaled.dtype))
+            logits = vote(used_weights)
+        else:
+            logits = base + learned
 
-    return {"logits": base + residual, "base_logits": base, "residual": residual,
-            "support_weight": weights[..., 0]}
+    return {"logits": logits, "base_logits": base, "residual": logits - base,
+            "support_weight": used_weights[..., 0]}

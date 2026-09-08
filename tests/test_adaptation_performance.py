@@ -83,3 +83,23 @@ def test_execution_pool_cache_is_reused_without_changing_scores() -> None:
     assert first["nearest"] == second["nearest"]
     assert first["prototype"] == second["prototype"]
     assert first["ridge"] == second["ridge"]
+
+
+def test_halo_fingerprint_covers_encoder_preprocessing_and_perturbations(monkeypatch):
+    from baselines.halo_compare.adapter import HALOCompareAdapter
+
+    original = Path.read_bytes
+    changed = set()
+
+    def read(path):
+        data = original(path)
+        return data + b"\n# changed" if any(path.as_posix().endswith(p) for p in changed) else data
+
+    monkeypatch.setattr(Path, "read_bytes", read)
+    adapter = HALOCompareAdapter()
+    before = _source_fingerprint(adapter)
+    for dependency in ("eval/perturbation.py", "eval/data.py", "model/tokenizer/encoder.py",
+                       "model/tokenizer/filterbank.py", "data/scripts/labels/canonical_labels.py"):
+        changed.clear()
+        changed.add(dependency)
+        assert _source_fingerprint(adapter) != before, dependency

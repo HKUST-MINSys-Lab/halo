@@ -129,6 +129,9 @@ class BaselineAdapter:
         """
         raise NotImplementedError(f"{self.name} does not expose frozen window features")
 
+    def restore_window_features(self, stream, features, state, device) -> None:
+        """Restore adapter context after a persistent feature-cache hit, if needed."""
+
     def predict_candidates_from_features(
         self, features: np.ndarray, candidates: Sequence[str], state, device
     ) -> Tuple[List[str], dict]:

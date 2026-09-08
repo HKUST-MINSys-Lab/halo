@@ -49,8 +49,64 @@ def _episode(B=2, C=4, Q=3, K=6, seed=0):
     }
 
 
-def _comparator():
-    return SupportComparator(SPEC, ComparatorConfig(text_dim=TEXT, n_layers=2, n_slots=16)).eval()
+def _comparator(readout="fused"):
+    """These tests were written against the fused readout and exercise its label-in-attention
+    path directly; the sensor-only design of record has its own file."""
+    return SupportComparator(SPEC, ComparatorConfig(
+        text_dim=TEXT, n_layers=2, n_slots=16, readout=readout,
+        use_descriptor=(readout == "fused"),
+    )).eval()
+
+
+@pytest.mark.parametrize("center", [False, True])
+def test_support_padding_preserves_logits_and_gradients(center):
+    episode = _episode(B=1, K=2)
+    module = _comparator()
+    torch.nn.init.normal_(module.residual_head.weight, std=.05)
+    episode["support_feature"].requires_grad_()
+    original = comparator_logits(module, **episode, center=center)
+    original["logits"].square().sum().backward()
+    gradient = episode["support_feature"].grad.clone()
+    padded = dict(episode)
+    for key in ("support_feature", "support_descriptor", "support_label_text",
+                "support_bound", "support_mask"):
+        value = episode[key].detach()
+        fill = -1 if key == "support_bound" else 0
+        tail = value.new_full((1, 30, *value.shape[2:]), fill)
+        padded[key] = torch.cat([value, tail], dim=1)
+    padded["support_feature"].requires_grad_()
+    actual = comparator_logits(module, **padded, center=center)
+    actual["logits"].square().sum().backward()
+    torch.testing.assert_close(actual["logits"], original["logits"], atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(actual["support_weight"].sum(1), torch.ones(1))
+    torch.testing.assert_close(padded["support_feature"].grad[:, :2], gradient, atol=1e-4, rtol=1e-4)
+    assert not padded["support_feature"].grad[:, 2:].count_nonzero()
+
+
+def test_unbound_feature_label_association_changes_learned_residual():
+    episode = _episode(B=1)
+    episode["support_bound"].fill_(-1)
+    module = _comparator()
+    torch.nn.init.normal_(module.residual_head.weight, std=.2)
+    before = comparator_logits(module, **episode)["residual"]
+    changed = {**episode, "support_label_text": episode["support_label_text"].flip(1)}
+    after = comparator_logits(module, **changed)["residual"]
+    assert not torch.allclose(before, after, atol=1e-6)
+
+
+def test_zero_head_allows_upstream_learning_after_first_update():
+    module = _comparator()
+    optimizer = torch.optim.AdamW(module.parameters(), lr=.001)
+    episode = _episode()
+    for step in range(2):
+        optimizer.zero_grad()
+        result = comparator_logits(module, **episode)
+        F.cross_entropy(result["logits"], torch.tensor([0, 1])).backward()
+        assert module.residual_head.weight.grad.norm() > 0
+        if step == 1:
+            assert module.support_fusion.weight.grad.norm() > 0
+            assert module.proj_signal.weight.grad.norm() > 0
+        optimizer.step()
 
 
 def test_identity_at_init_matches_the_closed_form_vote():
@@ -202,7 +258,9 @@ def test_verbatim_duplicate_labels_are_not_a_problem():
 
 def test_every_parameter_receives_gradient_after_two_steps():
     """A dead parameter means a component that cannot be credited or blamed."""
-    comparator = SupportComparator(SPEC, ComparatorConfig(text_dim=TEXT, n_layers=2, n_slots=16))
+    comparator = SupportComparator(SPEC, ComparatorConfig(
+        text_dim=TEXT, n_layers=2, n_slots=16, readout="fused", use_descriptor=True,
+    ))
     optimizer = torch.optim.SGD(comparator.parameters(), lr=0.1)
     episode = _episode()
     for _ in range(2):

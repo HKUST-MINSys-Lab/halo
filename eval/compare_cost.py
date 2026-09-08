@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F
 
 from model.blocks import AttentionSpec
-from model.evidence.comparator import ComparatorConfig, SupportComparator, comparator_logits
+from model.evidence.comparator import SupportComparator, comparator_config_from_checkpoint, comparator_logits
 
 
 def device_name(device: torch.device) -> str:
@@ -107,7 +107,7 @@ def main() -> None:
 
     encoder = build_encoder(blob, device, training=False).eval()
     spec = AttentionSpec(**blob["attention_spec"])
-    comparator = SupportComparator(spec, ComparatorConfig(**blob["comparator_config"]))
+    comparator = SupportComparator(spec, comparator_config_from_checkpoint(blob["comparator_config"]))
     comparator.load_state_dict(blob["comparator"])
     comparator = comparator.to(device).eval()
 

@@ -32,7 +32,12 @@ from pathlib import Path
 import torch
 
 from model.blocks import AttentionSpec
-from model.evidence.comparator import ComparatorConfig, SupportComparator, comparator_logits
+from model.evidence.comparator import (
+    READOUTS,
+    ComparatorConfig,
+    SupportComparator,
+    comparator_logits,
+)
 
 IDENTITY_TOLERANCE = 1e-6
 
@@ -88,6 +93,8 @@ def main() -> None:
     parser.add_argument("--n-heads", type=int, default=4)
     parser.add_argument("--center-features", action=argparse.BooleanOptionalAction, default=True,
                         help="must match the arm this control is paired against")
+    parser.add_argument("--comparator-readout", choices=READOUTS, default="sensor_only",
+                        help="must match the arm this control is paired against")
     parser.add_argument("--seed", type=int, default=20260901)
     args = parser.parse_args()
 
@@ -95,12 +102,14 @@ def main() -> None:
     # Written by our own Phase-A trainer; `config` holds plain Python values beside the tensors.
     checkpoint = torch.load(args.phase_a, map_location="cpu", weights_only=False)
     d_model = int(checkpoint["config"].get("d_model", 128))
+    neutral = bool(checkpoint["config"].get("neutral_acquisition_text", False))
     spec = AttentionSpec(d_model=d_model, n_heads=args.n_heads, ffn_mult=2, dropout=0.1)
-    comparator = SupportComparator(spec, ComparatorConfig(n_layers=args.n_layers))
+    comparator = SupportComparator(spec, ComparatorConfig(
+        n_layers=args.n_layers, readout=args.comparator_readout, use_descriptor=not neutral,
+    ))
 
     gap = assert_identity_at_init(comparator, center=args.center_features)
     args.out.mkdir(parents=True, exist_ok=True)
-    neutral = bool(checkpoint["config"].get("neutral_acquisition_text", False))
     torch.save({
         # Written in the trained checkpoint's exact format, so the SAME evaluation adapter scores
         # the control and the trained arm. A control scored through a different code path is not a

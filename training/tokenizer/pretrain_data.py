@@ -653,9 +653,10 @@ class PretrainDataset(Dataset):
 
     def _raw_sample(self, ref, key: WindowKey, base_texts: list[str]) -> IMUSample:
         valid_length = int(self._lengths(key.stream_i)[key.window_i])
-        window = torch.tensor(
-            np.asarray(self._grid(key.stream_i)[key.window_i, :valid_length], dtype=np.float32)
-        )
+        # Own the array so downstream augmentation cannot mutate the memory-mapped grid.
+        window = torch.from_numpy(np.array(
+            self._grid(key.stream_i)[key.window_i, :valid_length], dtype=np.float32, copy=True,
+        ))
         role_texts, sensor_texts, sensor_id = stream_sensor_texts(
             ref.dataset, ref.stream,
             has_accel=bool(any(ref.mask[:3])), has_gyro=bool(any(ref.mask[3:])),
@@ -1061,18 +1062,23 @@ class MultiScaleCollate:
         return out
 
     def _collate_impl(self, batch: list[dict], ps: float) -> dict:
-        P = max(1, max(
-            len(_physical_patch_bounds(item["data"].shape[0], float(item["rate"]), ps))
-            for item in batch
-        ))
+        bounds_by_shape = {}
+        bounds = []
+        for item in batch:
+            key = (item["data"].shape[0], float(item["rate"]))
+            if key not in bounds_by_shape:
+                bounds_by_shape[key] = _physical_patch_bounds(*key, ps)
+            bounds.append(bounds_by_shape[key])
+        P = max(1, max(map(len, bounds)))
         B = len(batch)
         patches = torch.zeros(B, P, self.dft_size, len(CHANNELS))
-        patch_len = torch.zeros(B, P, dtype=torch.long)
-        patch_durations = torch.zeros(B, P)
-        patch_pad = torch.zeros(B, P, dtype=torch.bool)     # True = real patch
-        rates = torch.zeros(B)
-        source_rates = torch.zeros(B)
-        positions = torch.zeros(B, P)
+        # Fill small metadata arrays on the CPU without a tensor dispatch per scalar.
+        patch_len = np.zeros((B, P), dtype=np.int64)
+        patch_durations = np.zeros((B, P), dtype=np.float32)
+        patch_pad = np.zeros((B, P), dtype=bool)     # True = real patch
+        rates = np.zeros(B, dtype=np.float32)
+        source_rates = np.zeros(B, dtype=np.float32)
+        positions = np.zeros((B, P), dtype=np.float32)
 
         for b, item in enumerate(batch):
             data, rate = item["data"], item["rate"]
@@ -1081,11 +1087,7 @@ class MultiScaleCollate:
                     f"patch length {int(np.ceil(rate * ps))} exceeds dft_size {self.dft_size}"
                 )
             usable = 0
-            for p, (start, end) in enumerate(
-                _physical_patch_bounds(data.shape[0], float(rate), ps)
-            ):
-                if p >= P:
-                    break
+            for p, (start, end) in enumerate(bounds[b]):
                 length = end - start
                 patches[b, p, :length] = data[start:end]
                 patch_len[b, p] = length
@@ -1097,11 +1099,11 @@ class MultiScaleCollate:
             source_rates[b] = float(item.get("source_rate", rate))
         out = {
             "patches": patches,
-            "patch_len": patch_len,
-            "rates": rates,
-            "source_rates": source_rates,
-            "positions": positions,
-            "patch_durations": patch_durations,
+            "patch_len": torch.from_numpy(patch_len),
+            "rates": torch.from_numpy(rates),
+            "source_rates": torch.from_numpy(source_rates),
+            "positions": torch.from_numpy(positions),
+            "patch_durations": torch.from_numpy(patch_durations),
             "patch_seconds": ps,
             "texts": [item["texts"] for item in batch],
             # Factored text conditioning (docs/design/TEXT_CONDITIONING.md §4b), read ONLY by the
@@ -1123,7 +1125,7 @@ class MultiScaleCollate:
             "subjects": [item.get("subject", "?") for item in batch],
             "augmentations": [item.get("augmentations", ()) for item in batch],
             "channel_mask": torch.stack([item["channel_mask"] for item in batch]),
-            "patch_padding_mask": patch_pad,
+            "patch_padding_mask": torch.from_numpy(patch_pad),
         }
         # Legacy checkpoint evaluation can inject the frozen artifact explicitly. New Phase-A
         # datasets omit it, so no source-specific statistics enter or burden the training path.

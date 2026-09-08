@@ -146,7 +146,7 @@ class HALOCompareAdapter(BaselineAdapter):
         import torch as T
         from eval.scoring import get_sbert_encoder
         from model.blocks import AttentionSpec
-        from model.evidence.comparator import ComparatorConfig, SupportComparator
+        from model.evidence.comparator import SupportComparator, comparator_config_from_checkpoint
         from training.tokenizer.eval_transfer import build_encoder
 
         if not _CKPT.exists():
@@ -159,7 +159,7 @@ class HALOCompareAdapter(BaselineAdapter):
         encoder = build_encoder(blob, device, training=False).eval()
 
         spec = AttentionSpec(**blob["attention_spec"])
-        comparator = SupportComparator(spec, ComparatorConfig(**blob["comparator_config"]))
+        comparator = SupportComparator(spec, comparator_config_from_checkpoint(blob["comparator_config"]))
         comparator.load_state_dict(blob["comparator"])
         comparator = comparator.to(device).eval()
 
@@ -194,7 +194,9 @@ class HALOCompareAdapter(BaselineAdapter):
             stream_sensor_texts,
         )
 
-        key = (stream.dataset, stream.stream)
+        # A perturbed view of a grid (eval.perturbation) is a different input from the grid as
+        # converted; the two must never share cached rows.
+        key = (stream.dataset, stream.stream, getattr(stream, "perturbation", None))
         if key in state["streams"]:
             return state["streams"][key]
         device, encoder = state["device"], state["encoder"]
@@ -217,6 +219,7 @@ class HALOCompareAdapter(BaselineAdapter):
             gravity_state=gravity_state, channel_mask=mask,
             dataset=stream.dataset, stream=stream.stream,
             neutral_text=_NEUTRAL_ACQUISITION_TEXT, export_sensor_rows=False,
+            lengths=getattr(stream, "lengths", None),
         )
         feature = detailed["pooled"].to(device)
 
@@ -239,8 +242,13 @@ class HALOCompareAdapter(BaselineAdapter):
     # ------------------------------------------------ standard adaptation face
     def window_features(self, stream, state, device) -> np.ndarray:
         _, _, pooled = self._stream_rows(stream, state)
-        state["feature_owner"][id(pooled)] = (stream.dataset, stream.stream)
+        # Keep the stream object itself, not its name: the k=0 path must score the exact view it
+        # was handed (possibly perturbed), never a fresh load of the grid.
+        state["feature_owner"][id(pooled)] = stream
         return pooled
+
+    def restore_window_features(self, stream, features, state, device):
+        state["feature_owner"][id(features)] = stream
 
     def supports_native_enrollment(self) -> bool:
         return True
@@ -286,6 +294,23 @@ class HALOCompareAdapter(BaselineAdapter):
     ) -> Tuple[List[str], dict]:
         import torch as T
 
+        from eval.perturbation import compatibility_relation
+
+        # THE DEPLOYED RULE. Arm A (no acquisition text) is only ever offered exemplars that
+        # share the query's acquisition key; anything else is filtered out at support
+        # construction, and a support set with nothing left is an unsupported cell, not a
+        # different mechanism. Arm B (text ON) attends over whatever it is given and the
+        # relation is recorded so its near-miss and incompatible rows can be read separately.
+        relation = compatibility_relation(query_stream, support_stream)
+        if _NEUTRAL_ACQUISITION_TEXT and relation != "identical":
+            view = getattr(support_stream, "perturbation", None)
+            raise UnsupportedEvaluationCell(
+                f"Arm A admits only acquisition-compatible exemplars; support "
+                f"{support_stream.dataset}/{support_stream.stream}"
+                f"{' (' + view + ')' if view else ''} is {relation} to the query and is filtered "
+                "out by the deployed rule"
+            )
+
         query_feature, query_descriptor, _ = self._stream_rows(query_stream, state)
         support_feature_all, support_descriptor_all, _ = self._stream_rows(support_stream, state)
 
@@ -298,15 +323,23 @@ class HALOCompareAdapter(BaselineAdapter):
 
         # The manifest already chose which executions are enrolled for each candidate; the support
         # set is exactly those rows. No corpus bank, no retrieval, no selection.
+        #
+        # PARITY WITH TRAINING. A training support row is one window's raw pooled encoder output
+        # (``training.compare.train.recording_rows``), never L2-normalised. The evaluation row is
+        # the mean of that execution's raw pooled windows and is ALSO left at the encoder's scale.
+        # The closed-form cosine does not care, but two things downstream do: episode centering
+        # averages query and support rows together, so a unit-norm support row next to a raw-scale
+        # query row would let the query dominate the mean; and the learned residual was trained on
+        # raw-scale rows. ``tests/test_compare_eval_parity.py`` pins this.
         support_features = []
         support_descriptors = []
         bound: list[int] = []
         for slot, executions in enumerate(plan["support_execution_rows"]):
             for execution in executions[:support_count]:
                 index = T.as_tensor(execution, dtype=T.long, device=state["device"])
-                support_features.append(F.normalize(
-                    support_feature_all.index_select(0, index).mean(dim=0), dim=0,
-                ))
+                support_features.append(
+                    support_feature_all.index_select(0, index).mean(dim=0)
+                )
                 support_descriptors.append(F.normalize(
                     support_descriptor_all.index_select(0, index).mean(dim=0), dim=0,
                 ))
@@ -335,22 +368,26 @@ class HALOCompareAdapter(BaselineAdapter):
                 predictions.extend(canonical[int(i)] for i in logits.argmax(1).cpu().tolist())
         return predictions, {
             "mechanism": "support_comparator",
+            "support_compatibility": relation,
             "support_rows": int(len(support_features)),
             "corpus_rows": 0,
             "enrolled_executions": int(len(canonical) * support_count),
-            "support_representation": "one_normalized_mean_vector_per_execution",
+            "support_representation": "one_mean_pooled_vector_per_execution_at_encoder_scale",
         }
 
     # ------------------------------------------------------------ zero shot
     def _compatible_pool(self, stream, state):
         """Training recordings sharing this stream's acquisition key, grouped by label."""
         from data.scripts.curate import deployment_policy
-        from data.scripts.curate.compatibility import are_compatible, stream_key
+        from data.scripts.curate.compatibility import are_compatible
+        from eval.perturbation import acquisition_key_for
         from training.compare.sampling import build_support_corpus
 
-        key = (stream.dataset, stream.stream)
+        key = (stream.dataset, stream.stream, getattr(stream, "perturbation", None))
         if key not in state["zero_shot_support"]:
-            query_key = stream_key(stream.dataset, stream.stream)
+            # The key of the view as presented: a gravity-removed or gyro-less perturbation
+            # changes which training recordings are admissible, exactly as it would in deployment.
+            query_key = acquisition_key_for(stream)
             corpus = state.get("_corpus")
             if corpus is None:
                 corpus = build_support_corpus(
@@ -376,17 +413,22 @@ class HALOCompareAdapter(BaselineAdapter):
         trains on — rather than one wide flat set. Drawing is deterministic under ``ZERO_SHOT_SEED``
         so the row is reproducible.
         """
+        from data.scripts.labels.canonical_labels import canonicalize
+
         by_label = self._compatible_pool(stream, state)
         if not by_label:
             return None, (
                 "no training stream shares this acquisition configuration, so the deployed "
                 "mechanism has nothing admissible to compare against at k=0"
             )
-        banned = {str(text).replace("_", " ").lower() for text in candidates}
-        eligible = sorted(
-            label for label in by_label
-            if str(label).replace("_", " ").lower() not in banned
-        )
+        # Exclude by CONCEPT, not by string. Candidate names are the evaluation dataset's native
+        # wording while the training pool is canonicalised, so a string ban lets a synonym through:
+        # measured 2026-09-05, ``walking_upstairs`` rows survived the ban on realworld's
+        # ``climbingup`` and tnda_har's ``ascending_stairs`` and voted for them through label text,
+        # which is enrolled support under another name. The sampler compares canonical strings on
+        # both sides at training time; this is the same rule.
+        banned = {canonicalize(str(text)) for text in candidates}
+        eligible = sorted(label for label in by_label if canonicalize(str(label)) not in banned)
         if len(eligible) < 2:
             return None, (
                 "fewer than two compatible training labels remain once the candidates are "
@@ -458,6 +500,7 @@ class HALOCompareAdapter(BaselineAdapter):
                 gravity_state=gravity_state, channel_mask=mask,
                 dataset=dataset, stream=stream_id,
                 neutral_text=_NEUTRAL_ACQUISITION_TEXT, export_sensor_rows=False,
+                lengths=ref.load_lengths()[rows],
             )
             _, sensor_texts, _ = stream_sensor_texts(
                 dataset, stream_id,
@@ -489,22 +532,19 @@ class HALOCompareAdapter(BaselineAdapter):
         """
         import torch as T
 
-        owner = state["feature_owner"].get(id(features))
-        if owner is None:
+        stream = state["feature_owner"].get(id(features))
+        if stream is None:
             raise ValueError(
                 "halo_compare scores k=0 with its own mechanism over recording rows; the features "
                 "passed here were not produced by this adapter's window_features"
             )
-        from eval import data as eval_data
-
-        stream = eval_data.load_eval_stream(*owner)
         candidates = list(candidates)
         draws, reason = self._zero_shot_draws(stream, state, candidates)
         if draws is None:
             # An honest unsupported row. Substituting ConSE, or padding with incompatible
             # recordings, would report a different mechanism under this model's name.
             raise UnsupportedEvaluationCell(
-                f"zero-shot unsupported for {owner[0]}/{owner[1]}: {reason}"
+                f"zero-shot unsupported for {stream.dataset}/{stream.stream}: {reason}"
             )
 
         query_feature, query_descriptor, _ = self._stream_rows(stream, state)
@@ -559,7 +599,7 @@ class HALOCompareAdapter(BaselineAdapter):
             # against 86 for tnda_har/watch_wrist. Reported per row rather than assumed.
             "distinct_label_sets": len({tuple(labels) for labels in draw_labels}),
             "support_labels": sorted({label for labels in draw_labels for label in labels}),
-            "support_policy": "config_compatible_training_rows_excluding_candidates",
+            "support_policy": "config_compatible_training_rows_excluding_candidate_concepts",
         }
 
     def evaluation_config(self, state) -> dict:
@@ -576,7 +616,7 @@ class HALOCompareAdapter(BaselineAdapter):
             "zero_shot_rows_per_label": ZERO_SHOT_ROWS_PER_LABEL,
             "zero_shot_ensemble": ZERO_SHOT_ENSEMBLE,
             "zero_shot_seed": ZERO_SHOT_SEED,
-            "zero_shot_support_policy": "config_compatible_training_rows_excluding_candidates",
+            "zero_shot_support_policy": "config_compatible_training_rows_excluding_candidate_concepts",
         }
 
     def evaluation_artifacts(self, state):
@@ -584,7 +624,9 @@ class HALOCompareAdapter(BaselineAdapter):
 
     def evaluation_source_paths(self):
         return (
-            _REPO / "model" / "evidence" / "comparator.py",
+            _REPO / "model",
             _REPO / "training" / "compare",
-            _REPO / "data" / "scripts" / "curate" / "compatibility.py",
+            _REPO / "training" / "tokenizer",
+            _REPO / "data" / "scripts" / "curate",
+            _REPO / "data" / "scripts" / "eda" / "grid_io.py",
         )

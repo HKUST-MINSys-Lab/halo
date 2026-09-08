@@ -25,6 +25,7 @@ import baselines
 from baselines.base import UnsupportedEvaluationCell
 from eval.data import load_eval_stream
 from eval.enrollment_protocol import iter_cells, load_manifest
+from eval.perturbation import AXES, ROTATION_UNITS, SIDES, Perturbation, perturb_stream
 from eval.scoring import align_ground_truth_labels, classification_metrics
 
 
@@ -52,16 +53,20 @@ def _source_fingerprint(adapter) -> str:
     fixed = [
         "eval/run_adaptation_baselines.py",
         "eval/enrollment_protocol.py",
+        "eval/data.py",
+        "eval/perturbation.py",
         "baselines/base.py",
         "eval/scoring.py",
         "data/labels/global_labels.json",
+        "data/scripts/labels/canonical_labels.py",
+        "data/scripts/curate/deployment_policy.py",
     ]
     module_parts = type(adapter).__module__.split(".")
     baseline_dir = REPO.joinpath(*module_parts[:-1])
     sources: list[tuple[str, Path | None]] = [
         (relative, REPO / relative) for relative in fixed
     ]
-    if baseline_dir.exists():
+    if module_parts[0] == "baselines" and baseline_dir.exists():
         sources.extend(
             (path.relative_to(REPO).as_posix(), path)
             for path in sorted(baseline_dir.rglob("*.py"))
@@ -152,6 +157,17 @@ def _git_provenance() -> dict:
     except (OSError, subprocess.CalledProcessError):
         commit, dirty = None, None
     return {"git_commit": commit, "git_dirty": dirty}
+
+
+def require_publication_source() -> dict:
+    provenance = _git_provenance()
+    if not provenance["git_commit"] or provenance["git_dirty"] is not False:
+        raise RuntimeError(
+            "Publication evaluation requires a committed, clean source tree. "
+            "Preserve and commit the intended source changes before running evaluation; "
+            "do not clear this guard by editing result provenance."
+        )
+    return provenance
 
 
 def _unit_features(features: np.ndarray) -> torch.Tensor:
@@ -518,7 +534,22 @@ def run(
     label_modes: Sequence[str] = ("coherent", "random_alias"),
     loaded_manifest: dict | None = None,
     feature_cache_dir: Path | None = None,
+    variant: str | None = None,
+    perturbation: Perturbation | None = None,
 ) -> dict:
+    """``variant`` distinguishes runs of ONE adapter that must never be pooled: the trained
+    checkpoint and its own step-0 control both register as ``halo_compare``, and without a
+    variant the assembler would average their rows into one number. ``model`` in the payload is
+    ``baseline@variant``; ``baseline`` stays the registry name for source fingerprints.
+
+    ``perturbation`` applies one controlled acquisition change (:mod:`eval.perturbation`) to every
+    query-side or every support-side stream after the manifest's grid validation and before any
+    feature extraction. A perturbed run is always a variant, named after the perturbation unless
+    one is given, so it assembles beside the matched run instead of replacing it."""
+    if perturbation is not None and variant is None:
+        variant = perturbation.label
+    if variant is not None and (not variant or "@" in variant or "/" in variant):
+        raise ValueError("variant must be a non-empty label without '@' or '/'")
     manifest = (
         loaded_manifest if loaded_manifest is not None
         else load_manifest(manifest_path, validate_grids=True)
@@ -563,27 +594,33 @@ def run(
         adapter.evaluation_config(state) if needs_native_model else feature_config
     )
     streams = {}
-    feature_cache: dict[tuple[str, str], np.ndarray] = {}
-    unit_feature_cache: dict[tuple[str, str], torch.Tensor] = {}
+    feature_cache: dict[tuple[str, str, bool], np.ndarray] = {}
+    unit_feature_cache: dict[tuple[str, str, bool], torch.Tensor] = {}
     pooled_execution_cache: dict[
-        tuple[str, str], dict[tuple[int, ...], torch.Tensor]
+        tuple[str, str, bool], dict[tuple[int, ...], torch.Tensor]
     ] = {}
     feature_cache_hits = 0
     feature_cache_misses = 0
 
-    def load_stream(dataset: str, stream_id: str):
-        key = (dataset, stream_id)
+    def is_perturbed(role: str) -> bool:
+        return perturbation is not None and perturbation.side == role
+
+    def load_stream(dataset: str, stream_id: str, role: str = "query"):
+        # One grid can serve as both query and support of a cell (every same-configuration
+        # cell), so the two roles are cached separately whenever one of them is perturbed.
+        key = (dataset, stream_id, is_perturbed(role))
         if key not in streams:
-            streams[key] = load_eval_stream(
-                dataset, stream_id, alignment=manifest["alignment"]
-            )
+            stream = load_eval_stream(dataset, stream_id, alignment=manifest["alignment"])
+            if is_perturbed(role):
+                stream = perturb_stream(stream, perturbation)
+            streams[key] = stream
         return streams[key]
 
-    def features(dataset: str, stream_id: str) -> np.ndarray:
+    def features(dataset: str, stream_id: str, role: str = "query") -> np.ndarray:
         nonlocal feature_cache_hits, feature_cache_misses
-        key = (dataset, stream_id)
+        key = (dataset, stream_id, is_perturbed(role))
         if key not in feature_cache:
-            stream = load_stream(dataset, stream_id)
+            stream = load_stream(dataset, stream_id, role)
             cache_path = None
             value = None
             if feature_cache_dir is not None:
@@ -597,7 +634,10 @@ def run(
                     stream_fingerprint=manifest["stream_fingerprints"][stream_key],
                     source_fingerprint=source_fingerprint,
                     artifacts=feature_artifacts,
-                    config=feature_config,
+                    config=(
+                        {**feature_config, "perturbation": perturbation.as_dict()}
+                        if is_perturbed(role) else feature_config
+                    ),
                 )
                 safe_stream = stream_id.replace("/", "_")
                 cache_path = Path(feature_cache_dir) / baseline_name / (
@@ -622,13 +662,16 @@ def run(
             if cache_path is not None and not loaded_from_cache:
                 _save_cached_features(cache_path, value)
             feature_cache[key] = value.astype(np.float32, copy=False)
+            adapter.restore_window_features(
+                stream, feature_cache[key], state, resolved_device,
+            )
         return feature_cache[key]
 
-    def unit_features(dataset: str, stream_id: str) -> torch.Tensor:
-        key = (dataset, stream_id)
+    def unit_features(dataset: str, stream_id: str, role: str = "query") -> torch.Tensor:
+        key = (dataset, stream_id, is_perturbed(role))
         if key not in unit_feature_cache:
             unit_feature_cache[key] = _unit_features(
-                features(dataset, stream_id)
+                features(dataset, stream_id, role)
             ).to(resolved_device)
         return unit_feature_cache[key]
 
@@ -654,10 +697,14 @@ def run(
                     "label_mode": "coherent",
                 }
                 continue
-            query_stream = load_stream(dataset, cell["query_stream"])
             try:
+                if perturbation is not None and perturbation.side == "support":
+                    raise UnsupportedEvaluationCell(
+                        "support-side perturbations apply to enrollment, not the k=0 corpus bank"
+                    )
+                query_stream = load_stream(dataset, cell["query_stream"], "query")
                 result = score_zero_cell(
-                    adapter, query_stream, features(dataset, cell["query_stream"]),
+                    adapter, query_stream, features(dataset, cell["query_stream"], "query"),
                     state, resolved_device, cell,
                 )
             except UnsupportedEvaluationCell as exc:
@@ -672,12 +719,20 @@ def run(
             results[f"{cell_id}/coherent/k0"] = result
             continue
 
-        query_stream = load_stream(dataset, cell["query_stream"])
+        try:
+            query_stream = load_stream(dataset, cell["query_stream"], "query")
+            load_stream(dataset, cell["support_stream"], "support")
+        except UnsupportedEvaluationCell as exc:
+            results[cell_id] = {
+                "status": "n/a", "reason": str(exc), "kind": "enrollment",
+                "regime": cell["regime"],
+            }
+            continue
         query_labels = np.asarray(
             align_ground_truth_labels(query_stream.gt, query_stream.eval_labels), dtype=object
         )
-        query_z = unit_features(dataset, cell["query_stream"])
-        support_z = unit_features(dataset, cell["support_stream"])
+        query_z = unit_features(dataset, cell["query_stream"], "query")
+        support_z = unit_features(dataset, cell["support_stream"], "support")
         for seed_text, seed_payload in cell["seeds"].items():
             seed = int(seed_text)
             for support_count in manifest["support_counts"]:
@@ -706,7 +761,7 @@ def run(
                     seed=seed,
                     methods=methods,
                     execution_feature_cache=pooled_execution_cache.setdefault(
-                        (dataset, cell["support_stream"]), {}
+                        (dataset, cell["support_stream"], is_perturbed("support")), {}
                     ),
                 )
                 scored["fit_and_predict_seconds"] = time.time() - adaptation_started
@@ -725,25 +780,34 @@ def run(
                             else [aliases[name] for name in cell["candidate_names"]]
                         )
                         native_started = time.time()
-                        native = score_native_enrollment_cell(
-                            adapter, query_stream,
-                            load_stream(dataset, cell["support_stream"]), query_labels,
-                            plans, support_count, candidate_texts, state, resolved_device,
-                            seed=seed,
-                        )
-                        mode_scored = {
-                            **scored,
-                            NATIVE_METHOD: native[NATIVE_METHOD],
-                            "native_fit_and_predict_seconds": time.time() - native_started,
-                            "native_adapter_info": native["native_adapter_info"],
-                            "subject_results": {
-                                subject: {
-                                    **record,
-                                    **native["native_subject_results"].get(subject, {}),
-                                }
-                                for subject, record in scored["subject_results"].items()
-                            },
-                        }
+                        try:
+                            native = score_native_enrollment_cell(
+                                adapter, query_stream,
+                                load_stream(dataset, cell["support_stream"], "support"),
+                                query_labels, plans, support_count, candidate_texts, state,
+                                resolved_device, seed=seed,
+                            )
+                        except UnsupportedEvaluationCell as exc:
+                            # The deployed rule declines this support set (Arm A on
+                            # acquisition-incompatible exemplars). The matched frozen-feature
+                            # readouts are still reported; the native row is an honest n/a.
+                            mode_scored = {**scored, "native_unsupported": str(exc)}
+                            print(f"[{baseline_name}] {cell_id} k={support_count}: native "
+                                  f"unsupported ({exc})", flush=True)
+                        else:
+                            mode_scored = {
+                                **scored,
+                                NATIVE_METHOD: native[NATIVE_METHOD],
+                                "native_fit_and_predict_seconds": time.time() - native_started,
+                                "native_adapter_info": native["native_adapter_info"],
+                                "subject_results": {
+                                    subject: {
+                                        **record,
+                                        **native["native_subject_results"].get(subject, {}),
+                                    }
+                                    for subject, record in scored["subject_results"].items()
+                                },
+                            }
                     # Generic readouts use aliases only as class IDs and are intentionally identical
                     # across label modes. A native semantic mechanism is re-run with the actual text.
                     key = f"{cell_id}/{label_mode}/seed{seed}/k{support_count}"
@@ -762,6 +826,9 @@ def run(
     payload = {
         "schema_version": 2,
         "baseline": baseline_name,
+        "variant": variant,
+        "model": f"{baseline_name}@{variant}" if variant else baseline_name,
+        "perturbation": perturbation.as_dict() if perturbation is not None else None,
         "adapter": f"{type(adapter).__module__}.{type(adapter).__name__}",
         "manifest": str(manifest_path.resolve()),
         "manifest_fingerprint": manifest["manifest_fingerprint"],
@@ -790,7 +857,7 @@ def run(
                 "one_normalized_mean_pooled_vector_per_enrolled_execution"
             ),
             "halo_native_representation": (
-                "one_normalized_mean_pooled_vector_per_enrolled_execution"
+                "one_mean_pooled_vector_per_enrolled_execution_at_encoder_scale"
             ),
         },
         "linear_head_recipe": {
@@ -832,7 +899,33 @@ def main() -> None:
     parser.add_argument("--methods", nargs="*", choices=METHODS, default=list(DEFAULT_METHODS))
     parser.add_argument("--label-modes", nargs="*", choices=("coherent", "random_alias"),
                         default=["coherent", "random_alias"])
+    parser.add_argument("--variant", default=None,
+                        help="label for a run that must not be pooled with other runs of the same "
+                             "adapter, e.g. 'step0' for the paired untrained control; the output "
+                             "file and the assembled model column both carry it")
+    parser.add_argument("--perturb", choices=AXES, default=None,
+                        help="heterogeneity axis applied at test time to one side of every cell "
+                             "(eval.perturbation); the run becomes a variant named after it")
+    parser.add_argument("--perturb-side", choices=SIDES, default="query",
+                        help="query = the user's device differs from the exemplars; support = "
+                             "the exemplars came from a different setup")
+    parser.add_argument("--perturb-seed", type=int, default=Perturbation.seed)
+    parser.add_argument("--perturb-rate-hz", type=float, default=Perturbation.rate_hz,
+                        help="target rate for --perturb rate; must be below every native rate")
+    parser.add_argument("--rotation-unit", choices=ROTATION_UNITS, default="stream",
+                        help="--perturb orientation draws one rotation per stream (remounted "
+                             "device), per execution, or per window")
     args = parser.parse_args()
+    initial_source = require_publication_source()
+    perturbation = None
+    if args.perturb is not None:
+        perturbation = Perturbation(
+            axis=args.perturb, side=args.perturb_side, seed=args.perturb_seed,
+            rate_hz=args.perturb_rate_hz, rotation_unit=args.rotation_unit,
+        )
+    variant = args.variant if args.variant is not None else (
+        perturbation.label if perturbation is not None else None
+    )
     failures = []
     shared_manifest = load_manifest(args.manifest, validate_grids=True)
     manifest_tag = args.manifest.name
@@ -840,7 +933,10 @@ def main() -> None:
         if manifest_tag.endswith(suffix):
             manifest_tag = manifest_tag[:-len(suffix)]
     for baseline_name in args.baselines:
-        out = args.out_dir / f"{baseline_name}__{manifest_tag}.json"
+        if require_publication_source() != initial_source:
+            raise RuntimeError("Source commit changed during the evaluation suite; rerun on pinned source")
+        identity = f"{baseline_name}@{variant}" if variant else baseline_name
+        out = args.out_dir / f"{identity}__{manifest_tag}.json"
         try:
             run(
                 baseline_name=baseline_name,
@@ -851,7 +947,11 @@ def main() -> None:
                 label_modes=args.label_modes,
                 loaded_manifest=shared_manifest,
                 feature_cache_dir=args.feature_cache_dir,
+                variant=variant,
+                perturbation=perturbation,
             )
+            if require_publication_source() != initial_source:
+                raise RuntimeError("Source changed during evaluation; output is not publication-ready")
             print(f"-> {out}", flush=True)
         except Exception as error:
             failures.append((baseline_name, repr(error)))

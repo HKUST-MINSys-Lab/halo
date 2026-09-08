@@ -21,16 +21,21 @@ from eval.run_adaptation_baselines import (
 )
 
 
-def _stream(name="wrist"):
+def _stream(name="wrist", windows_per_execution=2):
+    """Three subjects, two labels, four executions each; every execution spans several windows.
+
+    A one-window execution is still independent when its recording identity is provided.
+    """
     labels, subjects, executions = [], [], []
     windows = []
     for subject in ("s1", "s2", "s3"):
         for label in ("walk", "sit"):
             for execution in range(4):
-                labels.append(label)
-                subjects.append(subject)
-                executions.append(f"{subject}:{label}:{execution}")
-                windows.append(np.full((12, 3), execution, dtype=np.float32))
+                for _ in range(windows_per_execution):
+                    labels.append(label)
+                    subjects.append(subject)
+                    executions.append(f"{subject}:{label}:{execution}")
+                    windows.append(np.full((12, 3), execution, dtype=np.float32))
     return EvalStream(
         dataset="synthetic",
         stream=name,
@@ -94,6 +99,35 @@ def test_positive_manifest_lowers_ceiling_without_shrinking_candidates():
     # Four executions cannot provide k=4 support and a disjoint query, but k=2 can.
     assert cell["support_ceiling"] == 2
     assert cell["candidate_names"] == ["walk", "sit"]
+
+
+def test_missing_execution_identity_cannot_enroll():
+    stream = _stream(windows_per_execution=1)
+    stream.execution_identity_known = False
+    cell = _positive_cell(
+        stream,
+        stream,
+        regime="ordinary",
+        subject_relation="cross_subject",
+        configuration_relation="same_configuration",
+        support_counts=[0, 1, 2, 16],
+        seeds=[3],
+    )
+    assert cell["status"] == "unverified_execution_identity"
+    assert cell["support_ceiling"] == 0
+    assert all(payload["plans"] == [] for payload in cell["seeds"].values())
+    assert cell["secondary_high_support"]["status"] == "unverified_execution_identity"
+    assert cell["candidate_names"] == ["walk", "sit"], "the roster is still reported"
+    # Zero-shot enrolls nothing, so the same stream keeps its k=0 cell.
+    assert _zero_shot_cell(stream, regime="ordinary")["status"] == "ok"
+
+
+def test_verified_short_executions_can_enroll():
+    stream = _stream(windows_per_execution=1)
+    cell = _positive_cell(stream, stream, regime="ordinary", subject_relation="cross_subject",
+                          configuration_relation="same_configuration", support_counts=[1, 2], seeds=[3])
+    assert cell["status"] == "ok"
+    assert cell["support_ceiling"] == 2
 
 
 def test_unattributed_subject_relation_preserves_execution_disjointness():

@@ -90,6 +90,12 @@ class EvalStream:
     # the authoritative values from deployment_policy exactly as before.
     gravity_state: Optional[str] = None
     channel_descriptions: Optional[list] = None
+    # Label of the controlled acquisition perturbation applied to this view of the grid, or None
+    # for the grid as converted. Set only by :mod:`eval.perturbation`; adapters that cache per
+    # stream must key on it so a perturbed and an unperturbed view of one grid never collide.
+    perturbation: Optional[str] = None
+    lengths: Optional[np.ndarray] = None
+    execution_identity_known: bool = True
 
     @property
     def n_windows(self) -> int:
@@ -262,6 +268,14 @@ def load_eval_stream(
     windows = np.load(gdir / "data.npy")
     mask = np.load(gdir / "mask.npy")
     meta = json.loads((gdir / "meta.json").read_text())
+    lengths_path = gdir / meta.get("lengths_file", "lengths.npy")
+    if "lengths_file" in meta and not lengths_path.exists():
+        raise FileNotFoundError(f"{dataset}/{stream}: declared lengths file is missing: {lengths_path}")
+    lengths = (np.load(lengths_path) if lengths_path.exists()
+               else np.full(len(windows), windows.shape[1], dtype=np.int64))
+    if (lengths.shape != (len(windows),) or not np.issubdtype(lengths.dtype, np.integer)
+            or np.any(lengths <= 0) or np.any(lengths > windows.shape[1])):
+        raise ValueError(f"{dataset}/{stream}: invalid per-window valid lengths")
 
     gt = list(meta["labels"])
     subjects = np.asarray(meta["subjects"])
@@ -312,6 +326,7 @@ def load_eval_stream(
             keep[excluded[excluded < n]] = False
             n_excluded = int((~keep).sum())
             windows = windows[keep]
+            lengths = lengths[keep]
             gt = [label for label, take in zip(gt, keep) if take]
             subjects = subjects[keep]
             event_ids = event_ids[keep]
@@ -335,4 +350,9 @@ def load_eval_stream(
         execution_granularity="recording" if recordings else "block",
         quality_screen=screen,
         n_quality_excluded=n_excluded,
+        lengths=lengths,
+        execution_identity_known=(
+            dataset != "tnda_har" and "event_ids" in meta
+            and bool(meta.get("execution_identity_known", True))
+        ),
     )

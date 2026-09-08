@@ -317,15 +317,23 @@ def _available_units(
     output: dict[str, dict[SupportUnit, list[int]]] = defaultdict(dict)
     for key in keys:
         for label in corpus.all_labels:
-            for unit, rows in corpus.by_key_label_unit.get((key, label), {}).items():
-                subject = unit[:2]
-                if unit == query_execution:
-                    continue
-                if relation == "same_subject" and subject != query_subject:
-                    continue
-                if relation == "cross_subject" and subject == query_subject:
-                    continue
-                output[label].setdefault(unit, []).extend(rows)
+            available = {
+                unit: rows
+                for unit, rows in corpus.by_key_label_unit.get((key, label), {}).items()
+                if unit != query_execution
+                and (relation != "same_subject" or unit[:2] == query_subject)
+                and (relation != "cross_subject" or unit[:2] != query_subject)
+            }
+            if not available:
+                continue
+            if label not in output:
+                output[label] = available
+            else:
+                # Rows are read-only during drawing. Copy only executions spanning keys;
+                # never extend a list owned by the corpus index.
+                merged = output[label]
+                for unit, rows in available.items():
+                    merged[unit] = merged[unit] + rows if unit in merged else rows
     return output
 
 
@@ -470,25 +478,14 @@ def draw_episode(
         picked = list(rng.choice(others, size=take, replace=False))
         picked.append(query.label)
     else:
-        # Prefer distractors absent from the compatible support pool. This leaves genuine
-        # background labels available and teaches candidate labels that have no enrolled example.
-        outside = [label for label in corpus.all_labels
-                   if label != query.label and label not in available_units]
-        inside = [label for label in corpus.all_labels
-                  if label != query.label and label in available_units]
-        rng.shuffle(outside); rng.shuffle(inside)
-        # Preserve at least one compatible non-candidate label as background. If every available
-        # label became a candidate, this would silently turn into an empty-support task unlike k=0
-        # deployment.
-        inside_take = max(0, min(
-            len(inside) - 1,
-            n_labels - 1 - min(len(outside), n_labels - 1),
-        ))
-        distractors = outside[: n_labels - 1]
-        distractors.extend(inside[:inside_take])
-        picked = [query.label, *distractors[: n_labels - 1]]
-        if len(picked) < 2:
+        # All candidates must be plausible under the same support availability
+        # rule. Otherwise the answer alone reveals the configuration's vocabulary.
+        # Keep at least one other label for non-candidate background support.
+        if query.label not in available_units or len(available) < 3:
             return None
+        n_labels = min(n_labels, len(available) - 1)
+        others = [label for label in available if label != query.label]
+        picked = [query.label, *rng.choice(others, size=n_labels - 1, replace=False)]
     rng.shuffle(picked)
     candidates = tuple(str(label) for label in picked)
     gt_slot = candidates.index(query.label)

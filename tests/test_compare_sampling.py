@@ -72,6 +72,57 @@ def _rng(seed=0):
     return np.random.default_rng(seed)
 
 
+@pytest.mark.parametrize("relation", ["same_subject", "cross_subject"])
+def test_available_units_preserves_order_and_never_mutates_corpus(relation):
+    import copy
+    from training.compare.sampling import _available_units, _draw_support
+
+    corpus = _corpus(sites=("left_wrist", "right_wrist"))
+    corpus.ensure_indexes()
+    # Include an execution observed under two acquisition keys.
+    label = corpus.all_labels[0]
+    first = corpus.by_key_label_unit[(corpus.keys[0], label)]
+    unit = next(iter(first))
+    corpus.by_key_label_unit[(corpus.keys[1], label)][unit] = [999]
+    before = copy.deepcopy(corpus.by_key_label_unit)
+    query = corpus.recordings[-1]
+    expected = {}
+    for key in corpus.keys:
+        for name in corpus.all_labels:
+            for group, rows in corpus.by_key_label_unit.get((key, name), {}).items():
+                if group == (query.dataset, query.subject, query.execution):
+                    continue
+                same = group[:2] == (query.dataset, query.subject)
+                if (relation == "same_subject") != same:
+                    continue
+                expected.setdefault(name, {}).setdefault(group, []).extend(rows)
+    actual = _available_units(corpus, corpus.keys, query, relation)
+    assert list(actual) == list(expected)
+    for name in actual:
+        assert list(actual[name].items()) == list(expected[name].items())
+    assert _draw_support(actual, list(actual), _rng(4), 8, None) == _draw_support(
+        expected, list(expected), _rng(4), 8, None,
+    )
+    assert corpus.by_key_label_unit == before
+
+
+def test_zero_shot_candidates_are_all_compatible_and_keep_background():
+    corpus = _corpus(sites=("left_wrist", "phone_pocket"))
+    for seed in range(30):
+        episode = draw_episode(corpus, _rng(seed), p_gt_present=0., support_size=8)
+        assert episode is not None
+        key = corpus.key_of(corpus.recordings[episode.query])
+        assert all((key, label) in corpus.by_key_label for label in episode.candidates)
+        assert len(episode.candidates) >= 2
+        assert episode.support
+        assert all(corpus.recordings[i].label not in episode.candidates for i in episode.support)
+
+
+def test_zero_shot_does_not_invent_out_of_configuration_distractors():
+    corpus = _corpus(labels=("walking", "sitting"))
+    assert draw_episode(corpus, _rng(), p_gt_present=0.) is None
+
+
 def test_query_is_never_in_its_own_support():
     corpus = _corpus()
     rng = _rng()

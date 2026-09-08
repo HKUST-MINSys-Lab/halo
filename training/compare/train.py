@@ -49,7 +49,13 @@ import torch.nn.functional as F
 
 from data.scripts.curate import deployment_policy
 from model.blocks import AttentionSpec
-from model.evidence.comparator import ComparatorConfig, SupportComparator, comparator_logits
+from model.evidence.comparator import (
+    READOUTS,
+    ComparatorConfig,
+    SupportComparator,
+    comparator_config_from_checkpoint,
+    comparator_logits,
+)
 from training.compare.corpus import support_corpus_from_index
 from training.compare.sampling import (
     DEFAULT_LABEL_SUBSET,
@@ -80,6 +86,11 @@ from training.tokenizer.pretrain_episodic import _autocast, _random_encoder, enc
 
 TAU_SUPPORT = 0.07      # closed-form weighting temperature
 VOTE_SCALE = 10.0
+def make_optimizer(param_groups, *, weight_decay: float, device: torch.device):
+    """AdamW; the fused CUDA kernel updates every parameter in one launch."""
+    return torch.optim.AdamW(
+        param_groups, weight_decay=weight_decay, fused=(device.type == "cuda"),
+    )
 PROVENANCE_ROOTS = (
     "training/compare", "training/tokenizer", "model/evidence/comparator.py",
     "model/tokenizer", "model/blocks.py", "data/scripts", "data/datasets",
@@ -115,6 +126,120 @@ def _load_items(dataset, positions: list[int], executor: ThreadPoolExecutor | No
     return list(executor.map(dataset.__getitem__, positions))
 
 
+# ------------------------------------------------------------------ prefetching
+def episode_rng(data_seed: int, step: int) -> np.random.Generator:
+    """The generator that draws training step ``step``.
+
+    Seeding per step (rather than advancing one generator) makes the episode sequence a pure
+    function of ``data_seed``: any worker can draw any step, resume needs no generator state, and
+    the calibration draws before training cannot shift it.
+    """
+    return np.random.default_rng([int(data_seed), int(step)])
+
+
+def _prefetch_worker(corpus, dataset, collate, data_seed, batch_size, draw_kwargs,
+                     requests, results) -> None:
+    torch.set_num_threads(1)          # forked workers must not oversubscribe the cores
+    while True:
+        step = requests.get()
+        if step is None:
+            # close() discards unused prefetched batches; do not wait for their queue feeder.
+            results.cancel_join_thread()
+            return
+        try:
+            episodes, telemetry = draw_batch(
+                corpus, episode_rng(data_seed, step), batch_size=batch_size, **draw_kwargs,
+            )
+            batch = collate([dataset[position] for position in episode_positions(episodes, corpus)])
+            results.put((step, episodes, telemetry, batch, None))
+        except Exception as error:      # noqa: BLE001 - surfaced in the parent, which re-raises
+            results.put((step, None, None, None, repr(error)))
+
+
+class PrefetchLoader:
+    """Draw, load and collate the NEXT training steps in worker processes while the GPU trains.
+
+    Measured 2026-09-05 (8 episodes/step, capped corpus): draw + load + collate is about 29 ms
+    of single-threaded Python per step against about 13 ms of GPU work, and thread pools cannot
+    overlap it because the per-window work holds the GIL. Forked processes can. Workers are
+    forked from the parent so they share the corpus index and memory-mapped grids for free; they
+    never touch CUDA, exactly like ``torch.utils.data.DataLoader`` workers.
+
+    Step ``s`` is always drawn with :func:`episode_rng`, so the sequence is identical with any
+    number of workers, including zero, and identical across a resume.
+    """
+
+    def __init__(self, corpus, dataset, collate, *, data_seed: int, batch_size: int,
+                 draw_kwargs: dict, workers: int = 4, depth: int = 2, start_step: int = 1):
+        if workers < 1:
+            raise ValueError("PrefetchLoader needs at least one worker; use draw_batch directly")
+        import torch.multiprocessing as mp
+
+        context = mp.get_context("fork")
+        self._requests = context.Queue()
+        self._results = context.Queue()
+        self._pending: dict[int, tuple] = {}
+        self._consumed: set[int] = set()
+        self._first_step = int(start_step)
+        self._next_request = int(start_step)
+        self._ahead = int(depth) * int(workers)
+        self._processes = [
+            context.Process(
+                target=_prefetch_worker,
+                args=(corpus, dataset, collate, data_seed, batch_size, draw_kwargs,
+                      self._requests, self._results),
+                daemon=True,
+            )
+            for _ in range(int(workers))
+        ]
+        for process in self._processes:
+            process.start()
+        self._fill(self._next_request + self._ahead)
+
+    def _fill(self, upto: int) -> None:
+        while self._next_request < upto:
+            self._requests.put(self._next_request)
+            self._next_request += 1
+
+    def get(self, step: int):
+        """Episodes, sampler telemetry and the collated batch for training step ``step``."""
+        if step in self._consumed:
+            raise ValueError(f"step {step} has already been consumed")
+        if step < self._first_step and step not in self._pending:
+            raise ValueError(
+                f"step {step} precedes this loader's start_step {self._first_step}; it was never "
+                "requested and no worker will produce it"
+            )
+        self._fill(step + 1 + self._ahead)
+        while step not in self._pending:
+            from queue import Empty
+
+            try:
+                done, episodes, telemetry, batch, error = self._results.get(timeout=1.0)
+            except Empty:
+                dead = [p for p in self._processes if not p.is_alive()]
+                if dead:
+                    raise RuntimeError(
+                        f"prefetch worker exited while waiting for step {step}: "
+                        f"{[(p.pid, p.exitcode) for p in dead]}"
+                    )
+                continue
+            if error is not None:
+                raise RuntimeError(f"prefetch worker failed at step {done}: {error}")
+            self._pending[done] = (episodes, telemetry, batch)
+        self._consumed.add(step)
+        return self._pending.pop(step)
+
+    def close(self) -> None:
+        for _ in self._processes:
+            self._requests.put(None)
+        for process in self._processes:
+            process.join(timeout=5)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+
 # ------------------------------------------------------------------ text tower
 def label_text_matrix(labels: list[str], device) -> torch.Tensor:
     """Frozen MiniLM embeddings for verbatim label strings.
@@ -126,6 +251,41 @@ def label_text_matrix(labels: list[str], device) -> torch.Tensor:
 
     embeddings = torch.from_numpy(get_sbert_encoder()(list(labels))).to(device)
     return F.normalize(embeddings.float(), dim=-1)
+
+
+class LabelTextTable:
+    """Every corpus label's frozen text vector in ONE matrix, addressed by integer id.
+
+    Built once per run. ``episode_text`` then gathers whole (B, C, z) and (B, K, z) tensors with
+    a single index op instead of writing one row per candidate and per support row — the per-row
+    writes cost thousands of tiny kernels and autograd nodes per step (measured 2026-09-05:
+    7.4 ms forward and about 6 ms of backward per 8-episode step, against 0.4 ms vectorised).
+    """
+
+    def __init__(self, labels, device):
+        self.labels = tuple(sorted(set(str(label) for label in labels)))
+        self.index = {label: position for position, label in enumerate(self.labels)}
+        self.matrix = label_text_matrix(list(self.labels), device)
+        self.device = self.matrix.device
+        self.dim = int(self.matrix.shape[-1])
+
+    def __call__(self, label: str) -> torch.Tensor:
+        """One label's vector; kept so a caller can still ask for a single row."""
+        if label not in self.index:
+            self.labels = self.labels + (label,)
+            self.index[label] = len(self.labels) - 1
+            self.matrix = torch.cat([self.matrix, label_text_matrix([label], self.device)])
+        return self.matrix[self.index[label]]
+
+    def ids(self, labels) -> list[int]:
+        missing = [label for label in labels if label not in self.index]
+        for label in missing:
+            self(label)
+        return [self.index[label] for label in labels]
+
+
+def make_label_text(labels, device) -> LabelTextTable:
+    return LabelTextTable(labels, device)
 
 
 # ------------------------------------------------------------------ batching
@@ -163,39 +323,39 @@ def split_encoded(
     descriptor: torch.Tensor,
     episodes: list[Episode],
 ) -> dict[str, torch.Tensor]:
-    """Regroup one flat encoder output into padded per-episode query and support tensors."""
+    """Regroup one flat encoder output into padded per-episode query and support tensors.
+
+    One gather per tensor. The index arrays are built on the CPU in numpy; padded support slots
+    point at row 0 and are zeroed by the mask, so every padded row is exactly zero as before.
+    """
     device = pooled.device
     B = len(episodes)
     K = max((len(episode.support) for episode in episodes), default=0)
-    d = pooled.shape[-1]
-    z = descriptor.shape[-1]
 
-    query_feature = pooled.new_zeros((B, 1, d))
-    query_descriptor = descriptor.new_zeros((B, 1, z))
-    support_feature = pooled.new_zeros((B, K, d))
-    support_descriptor = descriptor.new_zeros((B, K, z))
-    support_mask = torch.zeros((B, K), dtype=torch.bool, device=device)
-
+    query_position = np.zeros(B, dtype=np.int64)
+    support_position = np.zeros((B, K), dtype=np.int64)
+    support_valid = np.zeros((B, K), dtype=bool)
     cursor = 0
     for row, episode in enumerate(episodes):
-        query_feature[row, 0] = pooled[cursor]
-        query_descriptor[row, 0] = descriptor[cursor]
-        cursor += 1
-        for slot in range(len(episode.support)):
-            support_feature[row, slot] = pooled[cursor]
-            support_descriptor[row, slot] = descriptor[cursor]
-            support_mask[row, slot] = True
-            cursor += 1
+        count = len(episode.support)
+        query_position[row] = cursor
+        support_position[row, :count] = cursor + 1 + np.arange(count)
+        support_valid[row, :count] = True
+        cursor += 1 + count
     if cursor != pooled.shape[0]:
         raise RuntimeError(
             f"episodes cover {cursor} rows but the encoder returned {pooled.shape[0]}"
         )
+    query_index = torch.from_numpy(query_position).to(device)
+    support_index = torch.from_numpy(support_position).to(device)
+    support_mask = torch.from_numpy(support_valid).to(device)
+    keep = support_mask.unsqueeze(-1)
     return {
-        "query_feature": query_feature,
-        "query_descriptor": query_descriptor,
+        "query_feature": pooled[query_index].unsqueeze(1),
+        "query_descriptor": descriptor[query_index].unsqueeze(1),
         "query_mask": torch.ones((B, 1), dtype=torch.bool, device=device),
-        "support_feature": support_feature,
-        "support_descriptor": support_descriptor,
+        "support_feature": pooled[support_index] * keep.to(pooled.dtype),
+        "support_descriptor": descriptor[support_index] * keep.to(descriptor.dtype),
         "support_mask": support_mask,
     }
 
@@ -206,38 +366,52 @@ def episode_text(
     text_of,
     device,
 ) -> dict[str, torch.Tensor]:
-    """Candidate text, support-label text, bindings and slots for one batch of episodes."""
+    """Candidate text, support-label text, bindings and slots for one batch of episodes.
+
+    ``text_of`` is a :class:`LabelTextTable`. All ids are assembled in numpy and each text tensor
+    is one gather from the table; padded slots gather row 0 and are zeroed by their mask.
+    """
+    if not isinstance(text_of, LabelTextTable):
+        raise TypeError("episode_text needs a LabelTextTable (see make_label_text)")
     B = len(episodes)
     C = max(len(episode.candidates) for episode in episodes)
     K = max((len(episode.support) for episode in episodes), default=0)
-    z = text_of("walking").shape[-1]
 
-    candidate_text = torch.zeros((B, C, z), device=device)
-    support_label_text = torch.zeros((B, K, z), device=device)
-    support_bound = torch.full((B, K), -1, dtype=torch.long, device=device)
-    candidate_slot = torch.zeros((B, C), dtype=torch.long, device=device)
-    candidate_mask = torch.zeros((B, C), dtype=torch.bool, device=device)
-
+    candidate_id = np.zeros((B, C), dtype=np.int64)
+    candidate_valid = np.zeros((B, C), dtype=bool)
+    support_label_id = np.zeros((B, K), dtype=np.int64)
+    support_valid = np.zeros((B, K), dtype=bool)
+    bound = np.full((B, K), -1, dtype=np.int64)
     for row, episode in enumerate(episodes):
-        for slot, label in enumerate(episode.candidates):
-            candidate_text[row, slot] = text_of(label)
-            candidate_mask[row, slot] = True
         # Slot 0 means unbound. Sequential positive slots are pure within-episode coreference tags;
         # candidate order is already randomized by the sampler, so another RNG is unnecessary and
         # would make the supposedly fixed validation draw change between checkpoints.
         if len(episode.candidates) >= 64:
             raise ValueError("candidate roster exceeds the 63 bound slots available to the model")
-        candidate_slot[row, : len(episode.candidates)] = 1 + torch.arange(
-            len(episode.candidates), device=device,
+        n_candidates, n_support = len(episode.candidates), len(episode.support)
+        candidate_id[row, :n_candidates] = text_of.ids(episode.candidates)
+        candidate_valid[row, :n_candidates] = True
+        support_label_id[row, :n_support] = text_of.ids(
+            [corpus.recordings[index].label for index in episode.support]
         )
-        for slot, index in enumerate(episode.support):
-            support_label_text[row, slot] = text_of(corpus.recordings[index].label)
-            support_bound[row, slot] = episode.support_candidate[slot]
+        support_valid[row, :n_support] = True
+        bound[row, :n_support] = episode.support_candidate
+    candidate_mask = torch.from_numpy(candidate_valid).to(device)
+    support_mask = torch.from_numpy(support_valid).to(device)
+    matrix = text_of.matrix
     return {
-        "candidate_text": candidate_text,
-        "support_label_text": support_label_text,
-        "support_bound": support_bound,
-        "candidate_slot": candidate_slot,
+        "candidate_text": (
+            matrix[torch.from_numpy(candidate_id).to(device)]
+            * candidate_mask.unsqueeze(-1).to(matrix.dtype)
+        ),
+        "support_label_text": (
+            matrix[torch.from_numpy(support_label_id).to(device)]
+            * support_mask.unsqueeze(-1).to(matrix.dtype)
+        ),
+        "support_bound": torch.from_numpy(bound).to(device),
+        "candidate_slot": (
+            (1 + torch.arange(C, device=device)).unsqueeze(0).expand(B, -1) * candidate_mask
+        ),
         "candidate_mask": candidate_mask,
     }
 
@@ -317,9 +491,13 @@ def run_step(
     device: torch.device,
     center: bool = False,
     executor: ThreadPoolExecutor | None = None,
+    batch: dict | None = None,
 ) -> dict:
-    positions = episode_positions(episodes, corpus)
-    batch = collate(_load_items(dataset, positions, executor))
+    """``batch`` lets a prefetching loader hand over an already-collated batch for these episodes;
+    otherwise the windows are loaded and collated here, on the calling thread."""
+    if batch is None:
+        positions = episode_positions(episodes, corpus)
+        batch = collate(_load_items(dataset, positions, executor))
     encoded = encode_batch(encoder, batch, device)
     pooled, descriptor = recording_rows(encoded)
 
@@ -365,6 +543,8 @@ def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, flo
             learned.eq(target).float().mean() - base.eq(target).float().mean()
         ),
         "vote/top1_support_mass": float(weights.max(dim=1).values.mean()),
+        "vote/total_support_mass_min": float(weights.sum(dim=1).min()),
+        "vote/total_support_mass_mean": float(weights.sum(dim=1).mean()),
         "vote/effective_support_rows": float(entropy.exp().mean()),
         "vote/support_entropy": float(entropy.mean()),
         "comparator/residual_abs_mean": float(result["residual"].detach().abs().mean()),
@@ -500,8 +680,10 @@ def validate(
     ablations: list[dict] = []
     losses: list[float] = []
     ranks: list[float] = []
+    group_sizes: list[int] = []
     for start in range(0, len(episodes), episodes_per_step):
         group = episodes[start:start + episodes_per_step]
+        group_sizes.append(len(group))
         with _autocast(device):
             result = run_step(
                 episodes=group, corpus=corpus, dataset=dataset, collate=collate,
@@ -521,10 +703,12 @@ def validate(
     keys = sorted({key for row in rows for key in row})
     ablation_keys = sorted({key for row in ablations for key in row})
     return {
-        "validation/loss": float(np.mean(losses)),
+        "validation/loss": float(np.average(losses, weights=group_sizes)),
         "validation/encoder_effective_rank": float(np.mean(ranks)),
-        **{f"validation/{key}": float(np.mean([row[key] for row in rows])) for key in keys},
-        **{key: float(np.mean([row[key] for row in ablations])) for key in ablation_keys},
+        **{f"validation/{key}": float(np.average([row[key] for row in rows], weights=group_sizes))
+           for key in keys},
+        **{key: float(np.average([row[key] for row in ablations], weights=group_sizes))
+           for key in ablation_keys},
         **{f"validation/{key}": value for key, value in sampler.items()},
     }
 
@@ -559,6 +743,12 @@ def main() -> None:
     parser.add_argument("--label-subset", type=int, nargs=2, default=list(DEFAULT_LABEL_SUBSET))
     parser.add_argument("--mode", choices=("compatible", "near_miss", "unfiltered"),
                         default="compatible")
+    parser.add_argument("--comparator-readout", choices=READOUTS, default="sensor_only",
+                        help="what the learned part may see. sensor_only (design of record): "
+                             "attention over signal vectors only, one zero-init shift per support "
+                             "row before the softmax; labels stay in the frozen cosine vote. "
+                             "fused (ablation): label text fused into support tokens, one "
+                             "zero-init residual per candidate")
     parser.add_argument("--neutral-acquisition-text", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="Arm A (default): hide acquisition prose; use --no-neutral-... for B")
@@ -576,8 +766,12 @@ def main() -> None:
     parser.add_argument("--checkpoint-every", type=int, default=500)
     parser.add_argument("--calib-batches", type=int, default=20)
     parser.add_argument("--calib-batch-size", type=int, default=256)
-    parser.add_argument("--loader-workers", type=int, default=8,
-                        help="threads used to fetch independent mmap-backed windows")
+    parser.add_argument("--loader-workers", type=int, default=4,
+                        help="forked worker PROCESSES that draw, load and collate upcoming steps "
+                             "while the GPU trains (PrefetchLoader). 0 = synchronous on the main "
+                             "thread. The episode sequence is identical for any value. Thread "
+                             "pools were removed: the per-window work holds the GIL and 8 "
+                             "threads measured 2.5-3.5x slower than none (2026-09-05)")
     parser.add_argument("--max-per-stream", type=int, default=None)
     parser.add_argument("--smoke", action="store_true",
                         help="three steps on capped real data with telemetry; launches nothing long")
@@ -592,12 +786,11 @@ def main() -> None:
         args.checkpoint_every = args.steps
         args.calib_batches = min(args.calib_batches, 1)
         args.calib_batch_size = min(args.calib_batch_size, 32)
-        args.loader_workers = 0
         args.max_per_stream = args.max_per_stream or 200
 
     if args.steps < 1 or not 0 <= args.warmup_steps < args.steps:
         parser.error("steps must be positive and warmup-steps must be in [0, steps)")
-    if min(args.episodes_per_step, args.support_size, args.val_every, args.val_episodes,
+    if min(args.episodes_per_step, args.support_size, args.log_every, args.val_every, args.val_episodes,
            args.checkpoint_every, args.calib_batches, args.calib_batch_size) < 1:
         parser.error("episode, support, validation, checkpoint and calibration counts must be positive")
     if args.loader_workers < 0:
@@ -642,14 +835,31 @@ def main() -> None:
         neutral_acquisition_text=args.neutral_acquisition_text,
     )
     collate = EpisodicCollate(MultiScaleCollate(fixed_patch_seconds=PATCH_SECONDS))
-    executor = (
-        ThreadPoolExecutor(max_workers=args.loader_workers, thread_name_prefix="compare-data")
-        if args.loader_workers else None
-    )
+    # Calibration and validation load on this thread; training steps come from the prefetcher.
+    executor = None
 
     resume_blob = (
         torch.load(args.resume, map_location="cpu", weights_only=False)
         if args.resume is not None else None
+    )
+    draw_kwargs = {
+        "support_size": args.support_size,
+        "p_gt_present": args.p_gt_present,
+        "same_subject_probability": args.same_subject_probability,
+        "label_subset": tuple(args.label_subset),
+        "mode": args.mode,
+    }
+    # Fork the prefetch workers NOW, before the encoder, the text tower or any library thread
+    # exists: forking a process that has live threads can deadlock the child on a lock a thread
+    # held at fork time. The workers only need the corpus, the dataset and the collate.
+    loader = (
+        PrefetchLoader(
+            corpus, dataset, collate, data_seed=args.data_seed,
+            batch_size=args.episodes_per_step, draw_kwargs=draw_kwargs,
+            workers=args.loader_workers,
+            start_step=(int(resume_blob["step"]) if resume_blob is not None else 0) + 1,
+        )
+        if args.loader_workers else None
     )
 
     if resume_blob is not None:
@@ -657,7 +867,7 @@ def main() -> None:
         encoder = build_encoder(resume_blob, device, training=True)
         spec = AttentionSpec(**resume_blob["attention_spec"])
         comparator = SupportComparator(
-            spec, ComparatorConfig(**resume_blob["comparator_config"]),
+            spec, comparator_config_from_checkpoint(resume_blob["comparator_config"]),
         ).to(device)
         comparator.load_state_dict(resume_blob["comparator"])
         print(f"[compare] resuming {args.resume} at step {resume_blob['step']}", flush=True)
@@ -692,7 +902,14 @@ def main() -> None:
         print(f"[compare] warm-started from {args.phase_a}", flush=True)
     if resume_blob is None:
         spec = AttentionSpec(d_model=encoder.d_model, n_heads=4, ffn_mult=2, dropout=0.1)
-        comparator = SupportComparator(spec, ComparatorConfig()).to(device)
+        # The frozen sensor description is constant within an Arm A episode (neutral text and
+        # exact-key support), so it enters the learned path only when acquisition text is ON.
+        comparator = SupportComparator(spec, ComparatorConfig(
+            readout=args.comparator_readout,
+            use_descriptor=not args.neutral_acquisition_text,
+        )).to(device)
+    print(f"[compare] comparator readout={comparator.cfg.readout} "
+          f"use_descriptor={comparator.cfg.use_descriptor}", flush=True)
     if hasattr(encoder, "mask_token"):
         encoder.mask_token.requires_grad_(False)
 
@@ -707,24 +924,22 @@ def main() -> None:
             and not bool(frontend._norm_fitted.item()):
         raise SystemExit("checkpoint frontend has no fitted normalization statistics")
 
-    text_cache: dict[str, torch.Tensor] = {}
-
-    def text_of(label: str) -> torch.Tensor:
-        if label not in text_cache:
-            text_cache[label] = label_text_matrix([label], device)[0]
-        return text_cache[label]
+    text_of = make_label_text(
+        list(corpus.all_labels) + list(val_corpus.all_labels), device,
+    )
 
     comparator_params = [parameter for parameter in comparator.parameters() if parameter.requires_grad]
     encoder_params = [parameter for parameter in encoder.parameters() if parameter.requires_grad]
-    optimizer = torch.optim.AdamW([
+    optimizer = make_optimizer([
         {"name": "comparator", "params": comparator_params, "lr": args.lr},
         {"name": "encoder", "params": encoder_params,
          "lr": args.lr * args.encoder_lr_scale},
-    ], weight_decay=args.weight_decay)
+    ], weight_decay=args.weight_decay, device=device)
 
     trajectory = {
         key: value for key, value in {
             "steps": args.steps,
+            "episodes_per_step": args.episodes_per_step,
             "frontend": args.frontend,
             "center_features": args.center_features,
             "support_size": args.support_size,
@@ -733,6 +948,7 @@ def main() -> None:
             "label_subset": list(args.label_subset),
             "mode": args.mode,
             "neutral_acquisition_text": args.neutral_acquisition_text,
+            "comparator_readout": args.comparator_readout,
             "lr": args.lr,
             "encoder_lr_scale": args.encoder_lr_scale,
             "weight_decay": args.weight_decay,
@@ -744,7 +960,10 @@ def main() -> None:
     }
     start_step = 0
     if resume_blob is not None:
-        if resume_blob.get("trajectory") != trajectory:
+        saved_trajectory = dict(resume_blob.get("trajectory") or {})
+        # Checkpoints written before the readout flag existed are all the fused design.
+        saved_trajectory.setdefault("comparator_readout", "fused")
+        if saved_trajectory != trajectory:
             raise SystemExit("resume trajectory differs from the checkpoint configuration")
         optimizer.load_state_dict(resume_blob["optimizer"])
         start_step = int(resume_blob["step"])
@@ -817,13 +1036,6 @@ def main() -> None:
 
     log_path = args.out / "log.jsonl"
     started = time.perf_counter()
-    draw_kwargs = {
-        "support_size": args.support_size,
-        "p_gt_present": args.p_gt_present,
-        "same_subject_probability": args.same_subject_probability,
-        "label_subset": tuple(args.label_subset),
-        "mode": args.mode,
-    }
 
     def run_validation(step: int) -> dict[str, float]:
         nonlocal latest_validation, best_accuracy
@@ -853,17 +1065,20 @@ def main() -> None:
                                (args.lr, args.lr * args.encoder_lr_scale)):
             group["lr"] = base * scale
 
-        episodes, telemetry = draw_batch(
-            corpus, rng,
-            batch_size=args.episodes_per_step,
-            **draw_kwargs,
-        )
+        if loader is not None:
+            episodes, telemetry, batch = loader.get(step)
+        else:
+            episodes, telemetry = draw_batch(
+                corpus, episode_rng(args.data_seed, step),
+                batch_size=args.episodes_per_step, **draw_kwargs,
+            )
+            batch = None
         optimizer.zero_grad(set_to_none=True)
         with _autocast(device):
             result = run_step(
                 episodes=episodes, corpus=corpus, dataset=dataset, collate=collate,
                 encoder=encoder, comparator=comparator, text_of=text_of, device=device,
-                center=args.center_features, executor=executor,
+                center=args.center_features, executor=executor, batch=batch,
             )
         if not bool(torch.isfinite(result["loss"])):
             raise FloatingPointError(f"non-finite comparison loss at step {step}")
@@ -919,8 +1134,8 @@ def main() -> None:
         if step % args.checkpoint_every == 0 or step == args.steps:
             _atomic_torch_save(payload(step), args.out / "last.pt")
 
-    if executor is not None:
-        executor.shutdown(wait=True)
+    if loader is not None:
+        loader.close()
     _atomic_torch_save(payload(args.steps), args.out / "last.pt")
     print(f"[compare] wrote {args.out / 'last.pt'}", flush=True)
 

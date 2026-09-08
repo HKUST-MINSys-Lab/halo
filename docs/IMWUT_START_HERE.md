@@ -4,7 +4,32 @@ You are on the branch for the **IMWUT comparison-model line**. If you read only 
 touching anything, read this one. It exists because this repository has carried three successive
 research lines and most of the confusion available here comes from mistaking one for another.
 
-Last updated 2026-09-04.
+Last updated 2026-09-07.
+
+## Evaluation readiness (2026-09-07)
+
+Use `eval/manifests/adaptation_v2_20260907.json.gz` for every model in the next comparison.
+The September 4 baseline tables and the preliminary dirty-source September 7 HALO output are
+historical artifacts, not a final matched table. The evaluation CLI requires committed clean
+source before loading models; the assembler also validates source, checkpoint, and manifest hashes.
+Do not edit old JSON provenance or bypass these checks. Preserve concurrent agents' changes when
+preparing the intended source commit. Run released HARNet, UniMTS, ImageBind, and NormWear on the
+same manifest as HALO, with `nearest prototype ridge`; HALO additionally reports its native engine.
+
+The assembler retains variant-qualified model names, reports every HALO native variant's paired
+subject comparisons, writes `per_dataset.csv`, and adds a common-stream-coverage zero-shot table.
+Its all-available averages are descriptive only when coverage differs. Unsupported predictions are
+N/A, not zero scores. The current HALO mechanism lacks compatible zero-shot evidence on MotionSense,
+RealWorld, Upper Limb Use, and USC-HAD; report that limitation, not only its supported average.
+
+Table F1 pools query windows within each cell, averages cells/seeds per dataset, then datasets.
+Paired subject-macro differences and their bootstrap intervals use a different, explicitly labelled
+estimand. `k=16` remains a separate cohort from the fixed `k=1,2,4,8` curve. Random aliases test
+label renaming, not novel physical actions. Models retain their published input contracts (including
+different modalities and temporal padding/cropping), so this is a deployed-system comparison, not
+a matched-data/architecture superiority claim. Upstream checkpoint-specific training-data overlap
+must be disclosed; released weights alone do not prove that test sources were unseen. Repeated use
+of these test datasets for design feedback must also be disclosed rather than called sealed testing.
 
 ---
 
@@ -63,8 +88,10 @@ motion well enough that attention over a compatible support set can make the cal
 
 Two capabilities fall out of the design rather than being bolted on. Labels are read through
 language and no parameter is tied to a candidate, so **an unseen activity name is scored by the same
-operation as a seen one** — **48 of the 63 candidate labels** in the `adaptation_v2` roster are
-never seen in training. And a user
+operation as a seen one** — **44 of the 63 candidate labels** in the `adaptation_v2` roster name
+an activity the training corpus does not contain (48 by exact string; 4 more are synonyms of a
+training label, e.g. `climbingup` for `walking_upstairs`, and the k = 0 support draw excludes those
+by concept). And a user
 enrolling a few examples on their own device is the *native* mode of the model, not a fine-tuning
 afterthought, which is the deployment story a ubicomp venue actually cares about.
 
@@ -125,7 +152,7 @@ not a fix.
 | **Support sets shrink below K instead of being padded.** | Padding with foreign rows would silently violate the compatibility rule; skipping the episode would bias the corpus toward well-populated configurations. Shrinking is logged in telemetry. |
 | **Training starts from random init**, not from the Phase-A checkpoint that exists. | Every compact checkpoint that ever led the table was trained this way. An earlier draft of the docs claimed warm start was mandatory; that claim was wrong and is corrected. |
 | **Encoder effective rank falls early in training.** | Measured before, on a 6k schedule where the apparent peak was head saturation. At 35k the same recipe produced the project's best result. It is logged as a watchdog, not treated as a failure. |
-| **The residual head is zero-initialised**, so the model does nothing at step 0. | That is what makes step 0 *exactly* the closed-form vote, which is what the untrained floor and every paired comparison are defined against. It is asserted to 1e-6. Do not "helpfully" initialise it. |
+| **The learned head is zero-initialised** (`shift_head`, or `residual_head` in the fused arm), so the model does nothing at step 0. | That is what makes step 0 *exactly* the closed-form vote, which is what the untrained floor and every paired comparison are defined against. It is asserted to 1e-6. Do not "helpfully" initialise it. |
 | **Absent channels are exact zeros with a mask**, never imputed. | Fabricating a channel would hand the model information no deployment has. Principle 4. |
 | **`adaptation_v1` still exists** alongside v2. | Kept for comparability with pre-pivot numbers. Different protocol names stop the assembler mixing rows. |
 | **Retired baseline adapters (`halo`, `halo_compact`, `halo_evidence`) are still registered.** | They reproduce the frozen classification results. They are retired from the *table*, not from the repo. |
@@ -173,12 +200,20 @@ cites. Never edit those files; add new results elsewhere.
    **per query, with gradients** — nothing is cached, so the comparison itself trains the encoder.
 3. **Centre** each episode on its own mean feature (default), so only how rows *differ* can drive
    anything downstream.
-4. **Compare** (`model/evidence/comparator.py`). One set-attention sequence per query over
-   `[candidates | query row | support rows + descriptors + labels]`. No retrieval, no top-k.
+4. **Compare** (`model/evidence/comparator.py`, `--comparator-readout sensor_only`, design of
+   record 2026-09-07). One set-attention sequence per query over `[query row | support rows]` —
+   **signal vectors only**. No retrieval, no top-k, and no label or candidate text in the learned
+   path: sensors are compared with sensors, labels with labels, paired by index in the vote. The
+   sensor description is already fused into every encoder feature, so it re-enters here only for
+   Arm B (`use_descriptor`), where support may mix configurations; in Arm A it is constant within
+   an episode. The `fused` readout (label text fused into support tokens, residual per candidate)
+   is the ablation arm.
 5. **Vote and correct.** A fixed query/support cosine softmax weights each support row. An enrolled
    row votes for its bound candidate; unbound background votes through label-text cosine. The
-   attention stack reads the complete set and adds one learned residual scalar per candidate.
-   There are no label-specific learned parameters.
+   attention stack emits one learned scalar per support row that shifts its logit before that
+   softmax — the model learns which examples to trust, nothing else. There are no label-specific
+   learned parameters. In a zero-shot episode the shift still reweights the background rows; the
+   label-to-candidate relation itself is the frozen text cosine and is never learned.
 6. **Loss.** Both regimes use cross-entropy on the true candidate. The batch mean is the sole
    objective, so `p` directly controls the relative training mass of zero- and few-shot episodes.
 
@@ -225,6 +260,57 @@ a result.
    `checkout`/`reset` over someone else's work.
 9. **Do not commit or push unless asked.**
 10. **The GPU is shared and has 24 GB.** Estimate cost before proposing a run, and emit progress.
+11. **The training step is still partly CPU-bound.** The trainer vectorises
+    the episode indexing (`LabelTextTable`, gather-based `split_encoded`/`episode_text`), uses
+    the fused AdamW, and prefetches upcoming steps in forked worker processes (`PrefetchLoader`,
+    `--loader-workers`, default 4; steps are seeded per step by `episode_rng(data_seed, step)` so
+    the episode sequence is identical for any worker count and across resume). The September 7
+    full-corpus probe measured about 24 ms/step after the CPU preparation improvements; see the
+    bounded measurements below rather than extrapolating older capped-corpus timings. Do not
+    reintroduce thread pools for loading (the per-window work holds the GIL; 8 threads were
+    2.5-3.5x slower than none) and do not fork workers after threads exist (deadlock).
+
+### Training performance check (2026-09-07)
+
+RTX 4090, fixed frontend, 8 episodes/step, up to 32 support windows/episode, neutral acquisition
+text, native-rate full training corpus (1,744,767 eligible windows), BF16 and fused AdamW.
+CPU threads limited with `OMP_NUM_THREADS=2 MKL_NUM_THREADS=2`. No objective, support budget,
+label pool, learning rate, or precision policy changed in this optimization pass.
+
+| Probe | Workers | Timed steps after warmup | Mean step | Mean loader wait |
+|---|---:|---:|---:|---:|
+| Corrected code before optimizations | 2 | 16 | 37.83 ms | 21.96 ms |
+| Corrected code before optimizations | 4 | 16 | 28.33 ms | 13.18 ms |
+| Optimized sampler, copies, and collation | 2 | 64 | 32.08 ms | 16.31 ms |
+| Optimized sampler, copies, and collation (default) | 4 | 64 | 23.83 ms | 9.38 ms |
+| Same optimized code, experimental synchronous pinning | 4 | 64 | 25.00 ms | 10.25 ms |
+
+These short, warm-cache probes include forward/backward, clipping, optimizer update and GPU
+synchronization, but exclude startup, normal telemetry/checkpoint writing, and validation.
+Timings vary with host contention; these are not full-run completion measurements. At 24-32 ms,
+35k optimizer steps alone extrapolate to 14-19 minutes; budget roughly 20-30 minutes including
+overheads, then use the actual run telemetry to refine the estimate. Peak allocated GPU tensor
+memory in these probes was 0.21 GiB (not total CUDA/process memory). Low VRAM does not imply that
+increasing the episode batch is a semantics-preserving speed optimization.
+
+Kept: reuse read-only support-row lists (copy only cross-key merges), owned NumPy-to-tensor
+window copies, reuse patch boundaries by shape/rate within a batch, fill small metadata in NumPy,
+four process workers, and avoid waiting for unused queue buffers at normal shutdown.
+Dropped: synchronous pinned transfers, since no speedup was measured. No additional background
+pipeline or GPU stream scheduler was added.
+
+Episode hashes and final losses matched across worker counts and the transfer probes; scalar
+reference tests check exact collation equivalence, including fractional native rates and short
+tails. The final correctness/optimization suite passed 188 tests in 22.56 seconds, including
+the worker-shutdown regression. A real three-step trainer smoke completed forward/backward,
+validation, checkpoint writing, and shutdown with finite gradients and normalized support votes.
+
+Reproduce a bounded probe (no checkpoints or full training):
+
+```bash
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 /home/alex/code/HALO/legacy_code/.venv/bin/python \
+  -m training.compare.profile --workers 2 4 --steps 80 --warmup 16 --out /tmp/compare-profile.json
+```
 
 ---
 
@@ -237,8 +323,12 @@ a result.
 `5058cf41…`). `adaptation_v1` (7 datasets) is kept intact for comparability but is **not** the
 current protocol; the two carry different protocol names so the assembler cannot mix their rows.
 
-- **48 of the 63 candidate labels** in the `adaptation_v2` roster are **never seen in training** —
-  that is the open-vocabulary story. (An earlier note said 44 of 55; that counted the 7-dataset
+- **44 of the 63 candidate labels** in the `adaptation_v2` roster are **never seen in training**
+  by concept (48 by exact string) — that is the open-vocabulary story. Count by concept, not by
+  string: `climbingup`, `climbingdown`, `ascending_stairs`, `descending_stairs` are the training
+  labels `walking_upstairs` / `walking_downstairs` under another name. Per dataset, in the primary
+  cohort: monipar 9/9 and spar 7/7 unseen; usc_had 6/12, ut_complex 5/13, inclusivehar 2/6;
+  motionsense, realworld and shoaib 0. (An earlier note said 44 of 55; that counted the 7-dataset
   roster's observed grid labels rather than v2's pre-registered candidate vocabulary.)
 - 4 of the 8 original evaluation acquisition configs are **unseen in training** — that is the
   heterogeneity story.
@@ -299,7 +389,59 @@ Every one of these is a measurement from the earlier lines, recorded in
 
 ## 9. Still open
 
+- **Readout decision 2026-09-07:** `sensor_only` is the design of record (labels never enter the
+  learned path; one zero-init shift per support row). The run launched at 14:27 the same day,
+  `imwut_compare_arm_a_fixed_35k_20260907`, started minutes before the change and is therefore the
+  **fused ablation arm**, not the core. Its checkpoints load as `fused` via
+  `comparator_config_from_checkpoint`; a step-0 control for it must be written with
+  `--comparator-readout fused`. The core Arm A run has not been launched.
+
+- **Correctness revision 2026-09-07:** support feature/description/label binding is now explicit
+  through a fused support-row token; padding cannot dilute the base vote. Zero-shot candidates
+  all come from the compatible activity pool, with other labels reserved for background support.
+  Training remains the same single-stage end-to-end cross-entropy objective, not Phase-A SSL.
+  The zero residual head still receives gradients immediately and upstream comparator modules
+  begin learning after its first update. New training and a new paired initial checkpoint are
+  required for this architecture. No performance defaults were changed in this correctness pass.
+- **Evaluation correctness 2026-09-07:** zero-shot support encoding now preserves valid lengths;
+  persistent cache hits restore adapter stream context; cache provenance includes encoder,
+  preprocessing and perturbation code. Inapplicable perturbations are N/A cells, and support-side
+  perturbations do not masquerade as a changed k=0 corpus bank. Single-window recordings remain
+  eligible when execution identity is known; TNDA-HAR is excluded because that identity is missing,
+  not because its windows are short. Zero-shot headline coverage is matched across models, and
+  variant subject deltas/intervals are kept separate from cell-level deltas with label mode visible.
+  Valid lengths and execution provenance enter manifest fingerprints: regenerate the manifest and
+  result artifacts before reporting new numbers. Historical baseline tables remain historical,
+  not results from this revision. Optimizations and a full evaluation rerun are deferred.
 - **No training run has been launched.** Nothing here has evidence of beating its untrained floor.
+- **Evaluation audit 2026-09-05, fixed in code but not yet in the frozen artifacts:** (a) the
+  adapter's enrolled support rows are now the raw execution mean at the encoder's scale, matching a
+  training row (they were L2-normalised while the query was not; `tests/test_compare_eval_parity.py`
+  pins parity); (b) the k = 0 support draw excludes candidates by canonical concept, not string;
+  (c) `eval.run_adaptation_baselines --variant step0` gives the paired control its own model
+  identity, and the assembler refuses two artifacts with one identity (they used to be averaged);
+  (d) TNDA-HAR's enrollment cells lack verified execution identity and are refused at manifest
+  build and reclassified as unsupported at assembly. **The frozen `adaptation_v2` manifest still
+  carries the TNDA-HAR enrollment cells**; rebuilding it changes the fingerprint and requires the
+  released-checkpoint baselines to be rerun (about 8 minutes) — batch that with the first HALO
+  evaluation rather than spending it now.
+- **Evaluation audit 2026-09-05, open protocol questions** (not bugs; decisions): the primary curve
+  is same-configuration by construction so it never varies acquisition between query and support;
+  same-subject enrollment is supported at k ≥ 2 on three datasets only (the user's call 2026-09-05:
+  the paper is cross-subject few-shot HAR, same-subject is a supplement); the headline pools the
+  ordinary and specialized regimes and emits no confidence intervals or chance floor — per-dataset
+  rows are always kept in `cells.csv` / `dataset_macro.csv`.
+- **Heterogeneity-axis experiment: BUILT 2026-09-05, NOT RUN.** `eval.run_adaptation_baselines
+  --perturb {rate,channel,orientation,gravity} --perturb-side {query,support}` applies one controlled
+  change (`eval/perturbation.py`) to one side of every frozen `adaptation_v2` cell and assembles as a
+  `model@<perturbation>` variant; `variant_deltas.json` in the assembled tables is the retention
+  (variant minus base) per readout and condition, with paired subject intervals. Query side = the
+  §7 figure; support side = the incompatible-exemplar cell for the two arms. **Arm A's deployed
+  rule is now in the adapter:** with acquisition text OFF it refuses support whose acquisition
+  key differs from the query's (near-miss included) and the runner records an honest native n/a
+  while the frozen-feature readouts stay; Arm B attends over anything and records
+  `support_compatibility`. Rate and orientation leave the key unchanged (they test what
+  "compatible" absorbs); channel and gravity change it (they test the filter itself).
 - The GPU budget across nine queued ablation arms does not fit the schedule; the cut has not been
   made.
 - The clean released-checkpoint baseline rerun is complete and recorded in
@@ -329,6 +471,16 @@ $PY -m eval.enrollment_protocol --out eval/manifests/adaptation_v2.json.gz
 
 # cost table, on a named device
 $PY -m eval.compare_cost --checkpoint <ckpt> --device cuda
+
+# paired step-0 control: same adapter, its own identity (assembles as halo_compare@step0)
+HALO_COMPARE_CKPT=<step0.pt> $PY -m eval.run_adaptation_baselines \
+    --manifest eval/manifests/adaptation_v2.json.gz --baselines halo_compare --variant step0 \
+    --device cuda --out-dir eval/adaptation_results/<run>
+
+# heterogeneity axis: perturb every query (or --perturb-side support) at test time
+$PY -m eval.run_adaptation_baselines --manifest eval/manifests/adaptation_v2.json.gz \
+    --baselines harnet unimts imagebind normwear halo_compare --device cuda \
+    --perturb orientation --perturb-side query --out-dir eval/adaptation_results/<run>
 
 # tests
 $PY -m pytest tests -q

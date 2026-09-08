@@ -1,7 +1,10 @@
 # Released-checkpoint adaptation baselines — 2026-09-04
 
 This is the tracked result of the first complete released-checkpoint baseline run on the corrected
-`adaptation_v2` protocol. It is the current baseline result of record for branch `imwut/compare`.
+`adaptation_v2` protocol. This is a historical baseline snapshot, not a matched comparison
+against the September 7 sensor-only HALO run. The current manifest is
+`eval/manifests/adaptation_v2_20260907.json.gz`; rerun all models on committed current source
+before producing the new comparison. Do not reuse these numbers in that table.
 HALO is intentionally absent: no comparison-model checkpoint was available for this run. Add HALO
 only after its checkpoint passes the same readiness and provenance checks.
 
@@ -23,8 +26,10 @@ The primary enrollment benchmark is the fixed, common cohort that supports every
 `k in {1, 2, 4, 8}` under **cross-subject, same-configuration** enrollment. It contains eight
 datasets: InclusiveHAR, MoniPar, MotionSense, RealWorld, Shoaib, SPAR, USC-HAD, and UT-Complex.
 Every support item is one equally weighted vector pooled from one independent execution. The
-reported score first averages subjects/seeds within each dataset, then gives every dataset equal
-weight.
+reported score pools query-window predictions across subjects within each cell, computes macro F1,
+averages cells/seeds within each dataset, then gives every dataset equal weight. Subjects with more
+query windows contribute more to the cell score. Paired subject-macro deltas and bootstrap intervals
+are separate statistics, not confidence intervals for these cell-based table scores.
 
 TNDA-HAR is subject-unattributed in the released files and is therefore excluded from the primary
 cross-subject claim. Upper Limb Use cannot support the complete fixed `k=1..8` cohort. Both remain
@@ -124,4 +129,3 @@ $PY -m eval.run_adaptation_baselines \
   --methods nearest prototype ridge \
   --label-modes coherent random_alias
 ```
-

@@ -31,6 +31,13 @@ MODEL_NAMES = {
 REPORT_MODEL_ORDER = (
     "halo_compare", "unimts", "harnet", "imagebind", "normwear",
 )
+# Runs of the HALO adapter that are controls, not the headline: assembled under
+# ``halo_compare@<variant>`` (see ``eval.run_adaptation_baselines --variant``). They are listed
+# beside the trained row whenever present and never substitute for it.
+CONTROL_MODEL_NAMES = {
+    "halo_compare@step0": "HALO step-0 control (untrained)",
+    "halo_compare@untrained_floor": "HALO untrained floor",
+}
 # HARNet has a released representation checkpoint but no native open-vocabulary decision rule.
 # Its locally fitted ConSE bridge is intentionally omitted from the paper's zero-shot comparison.
 ZERO_SHOT_MODEL_ORDER = ("halo_compare", "unimts", "imagebind", "normwear")
@@ -141,32 +148,49 @@ def _validate_current_cells(cells: list[dict]) -> None:
 
 def table_zero_shot(cells: list[dict]) -> str:
     out = ["## 1. Zero-shot", "",
-           "No labelled examples. Macro F1, equally averaged over all held-out datasets.", ""]
+           "No labelled examples. Macro F1 on the intersection of scored cells shared by all "
+           "models with zero-shot results. Datasets receive equal weight. Missing models are "
+           "shown as n/a; coverage outside the matched cohort is not a head-to-head score.", ""]
+    models = list(ZERO_SHOT_MODEL_ORDER) + _control_models(cells)
+    def cell_key(row):
+        return (row["dataset"], row.get("cell", row["dataset"]))
+    by_model = {
+        model: [r for r in cells if r["model"] == model and r["method"] == "zero_shot"
+                and r["label_mode"] == "coherent" and np.isfinite(float(r["f1_macro"]))]
+        for model in models
+    }
+    available = [set(map(cell_key, rows)) for rows in by_model.values() if rows]
+    common = set.intersection(*available) if available else set()
     scored = []
-    for model in ZERO_SHOT_MODEL_ORDER:
-        overall, _ = _dataset_macro([
-            c for c in cells
-            if c["model"] == model and c["method"] == "zero_shot"
-            and c["label_mode"] == "coherent"
-        ])
-        scored.append((MODEL_NAMES[model], [overall]))
-    scored.sort(key=lambda r: -np.nanmean(r[1]))
-    out += _emit(["model", "all datasets"], scored)
-    dataset_count = _dataset_macro([
-        c for c in cells
-        if c["method"] == "zero_shot" and c["label_mode"] == "coherent"
-    ])[1]
-    out += ["", f"Held-out datasets: {dataset_count}.", ""]
+    for model in models:
+        overall, _ = _dataset_macro([r for r in by_model[model] if cell_key(r) in common])
+        scored.append((MODEL_NAMES.get(model, CONTROL_MODEL_NAMES.get(model, model)), [overall]))
+    scored.sort(key=lambda r: -r[1][0] if np.isfinite(r[1][0]) else float("inf"))
+    out += _emit(["model", "matched cells"], scored)
+    out += ["", f"Matched held-out datasets: {len({k[0] for k in common})}; cells: {len(common)}.",
+            "", "| model | scored datasets | scored cells |", "|---|---:|---:|"]
+    for model in models:
+        keys = set(map(cell_key, by_model[model]))
+        name = MODEL_NAMES.get(model, CONTROL_MODEL_NAMES.get(model, model))
+        out.append(f"| {name} | {len({k[0] for k in keys})} | {len(keys)} |")
+    out.append("")
     return "\n".join(out)
 
 
-def _enrollment_model_methods() -> list[tuple[str, str, str]]:
+def _control_models(cells: list[dict]) -> list[str]:
+    present = {row["model"] for row in cells}
+    return [model for model in CONTROL_MODEL_NAMES if model in present]
+
+
+def _enrollment_model_methods(cells: list[dict] | None = None) -> list[tuple[str, str, str]]:
     rows = []
     readout_names = {"nearest": "1-NN", "prototype": "prototype", "ridge": "ridge"}
     for model in REPORT_MODEL_ORDER:
         display_model = "HALO" if model == "halo_compare" else MODEL_NAMES[model]
         if model == "halo_compare":
             rows.append(("HALO / support comparator", model, "support_comparator"))
+            for control in _control_models(cells or []):
+                rows.append((CONTROL_MODEL_NAMES[control], control, "support_comparator"))
         rows.extend(
             (f"{display_model} / {display_method}", model, method)
             for method, display_method in readout_names.items()
@@ -195,7 +219,7 @@ def table_label_efficiency(cells: list[dict]) -> str:
         if not relation_cells:
             continue
         scored = []
-        for display_name, model, method in _enrollment_model_methods():
+        for display_name, model, method in _enrollment_model_methods(cells):
             row = [
                 _dataset_macro([
                     c for c in relation_cells
@@ -220,7 +244,7 @@ def table_label_efficiency(cells: list[dict]) -> str:
                 "This is a separately eligible subject/cell cohort and is not an extension of the "
                 "fixed k=1..8 curve.", ""]
         scored = []
-        for display_name, model, method in _enrollment_model_methods():
+        for display_name, model, method in _enrollment_model_methods(cells):
             value = _dataset_macro([
                 c for c in high_support if c["model"] == model and c["method"] == method
             ])[0]
@@ -264,7 +288,7 @@ def table_per_dataset(cells: list[dict]) -> str:
     )
     for dataset in enrollment_datasets:
         scored = []
-        for display_name, model, method in _enrollment_model_methods():
+        for display_name, model, method in _enrollment_model_methods(cells):
             values = [
                 _dataset_macro([
                     c for c in enrollment_cells

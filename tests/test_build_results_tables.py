@@ -9,6 +9,19 @@ from eval.build_results_tables import (
 )
 
 
+def test_zero_shot_compares_only_matched_coverage():
+    cells = [dict(model=m, method="zero_shot", label_mode="coherent", dataset=d,
+                  cell=d, k=0, f1_macro=score)
+             for m, d, score in [("halo_compare", "easy", 90), ("unimts", "easy", 95),
+                                 ("unimts", "hard", 30)]]
+    text = table_zero_shot(cells)
+    assert "| UniMTS | **95.00** |" in text
+    assert "62.50" not in text
+    assert "Matched held-out datasets: 1; cells: 1" in text
+    assert "| HALO (ours) | 1 | 1 |" in text
+    assert "| UniMTS | 2 | 2 |" in text
+
+
 def test_label_efficiency_excludes_random_alias_rows() -> None:
     cells = [
         {
@@ -128,3 +141,22 @@ def test_per_dataset_table_keeps_datasets_separate() -> None:
     assert "| HALO / support comparator | **10.00** |" in table
     assert "CrossHAR" not in table
     assert "LIMU-BERT" not in table
+
+
+def test_step0_control_rows_are_listed_beside_the_trained_row() -> None:
+    """A ``halo_compare@step0`` run appears as its own labelled row and never replaces HALO."""
+    def cell(model, method, score):
+        return {
+            "model": model, "method": method, "regime": "ordinary", "label_mode": "coherent",
+            "dataset": "example", "k": "1", "f1_macro": score,
+        }
+
+    cells = [cell("halo_compare", "support_comparator", "80.0"),
+             cell("halo_compare@step0", "support_comparator", "40.0")]
+    for model in MODEL_NAMES:
+        cells.extend(cell(model, method, "30.0") for method in ("nearest", "prototype", "ridge"))
+    table = table_label_efficiency(cells)
+    assert "| HALO / support comparator | **80.00** |" in table
+    assert "| HALO step-0 control (untrained) | 40.00 |" in table
+    without = table_label_efficiency([c for c in cells if c["model"] != "halo_compare@step0"])
+    assert "step-0" not in without
