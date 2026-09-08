@@ -940,6 +940,9 @@ def main() -> None:
                              "eligible held-out dataset); legacy episode count otherwise "
                              "(default 64)")
     parser.add_argument("--checkpoint-every", type=int, default=500)
+    parser.add_argument("--milestone-every", type=int, default=5_000,
+                        help="retain a numbered checkpoint at this interval; last.pt is still "
+                             "updated at --checkpoint-every")
     parser.add_argument("--calib-batches", type=int, default=20)
     parser.add_argument("--calib-batch-size", type=int, default=256)
     parser.add_argument("--loader-workers", type=int, default=4,
@@ -988,6 +991,7 @@ def main() -> None:
         args.val_every = args.steps
         args.val_episodes = min(args.val_episodes, 4)
         args.checkpoint_every = args.steps
+        args.milestone_every = args.steps
         args.calib_batches = min(args.calib_batches, 1)
         args.calib_batch_size = min(args.calib_batch_size, 32)
         args.max_per_stream = args.max_per_stream or 200
@@ -996,7 +1000,8 @@ def main() -> None:
         parser.error("steps must be positive and warmup-steps must be in [0, steps)")
     if min(args.episodes_per_step, args.support_size, args.queries_per_support_set,
            args.windows_per_execution, args.log_every, args.val_every, args.val_episodes,
-           args.checkpoint_every, args.calib_batches, args.calib_batch_size) < 1:
+           args.checkpoint_every, args.milestone_every,
+           args.calib_batches, args.calib_batch_size) < 1:
         parser.error("episode, support, validation, checkpoint and calibration counts must be positive")
     if args.loader_workers < 0:
         parser.error("loader-workers must be nonnegative")
@@ -1240,6 +1245,8 @@ def main() -> None:
 
     latest_validation: dict[str, float] | None = resume_blob.get("validation") if resume_blob else None
     best_accuracy = float(resume_blob.get("best_validation_accuracy", -1.0)) if resume_blob else -1.0
+    best_loss = float(resume_blob.get("best_validation_loss", float("inf"))) \
+        if resume_blob else float("inf")
 
     def payload(step: int) -> dict:
         return {
@@ -1255,6 +1262,7 @@ def main() -> None:
             "step": step,
             "validation": latest_validation,
             "best_validation_accuracy": best_accuracy,
+            "best_validation_loss": best_loss,
             "optimizer": optimizer.state_dict(),
             "rng": {
                 "torch": torch.get_rng_state(),
@@ -1273,7 +1281,7 @@ def main() -> None:
     started = time.perf_counter()
 
     def run_validation(step: int) -> dict[str, float]:
-        nonlocal latest_validation, best_accuracy
+        nonlocal latest_validation, best_accuracy, best_loss
         latest_validation = validate(
             encoder=encoder, comparator=comparator, corpus=val_corpus, dataset=val_dataset,
             collate=collate, text_of=text_of, device=device,
@@ -1285,9 +1293,10 @@ def main() -> None:
         latest_validation["step"] = float(step)
         with log_path.open("a") as handle:
             handle.write(json.dumps({"kind": "validation", **latest_validation}) + "\n")
-        score = latest_validation["validation/accuracy/learned"]
-        if score > best_accuracy:
-            best_accuracy = score
+        best_accuracy = max(best_accuracy, latest_validation["validation/accuracy/learned"])
+        score = latest_validation["validation/loss"]
+        if score < best_loss:
+            best_loss = score
             _atomic_torch_save(payload(step), args.out / "best_internal.pt")
         return latest_validation
 
@@ -1378,13 +1387,18 @@ def main() -> None:
             report = run_validation(step)
             message = (
                 f"[compare] validation step {step}: model "
-                f"{report['validation/accuracy/learned']:.3f}"
+                f"{report['validation/accuracy/learned']:.3f}, "
+                f"loss {report['validation/loss']:.3f}"
             )
             if "validation/accuracy/base" in report:
                 message += f", neighbor floor {report['validation/accuracy/base']:.3f}"
             print(message, flush=True)
         if step % args.checkpoint_every == 0 or step == args.steps:
             _atomic_torch_save(payload(step), args.out / "last.pt")
+        if step % args.milestone_every == 0 or step == args.steps:
+            milestone_dir = args.out / "checkpoints"
+            milestone_dir.mkdir(exist_ok=True)
+            _atomic_torch_save(payload(step), milestone_dir / f"step_{step:06d}.pt")
 
     if loader is not None:
         loader.close()
