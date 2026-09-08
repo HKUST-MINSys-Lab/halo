@@ -324,9 +324,11 @@ class HALOCompareAdapter(BaselineAdapter):
         # The manifest already chose which executions are enrolled for each candidate; the support
         # set is exactly those rows. No corpus bank, no retrieval, no selection.
         #
-        # PARITY WITH TRAINING. A training support row is one window's raw pooled encoder output
-        # (``training.compare.train.recording_rows``), never L2-normalised. The evaluation row is
-        # the mean of that execution's raw pooled windows and is ALSO left at the encoder's scale.
+        # SCALE PARITY WITH TRAINING. A training support row is the mean of a small random sample
+        # of raw pooled windows from one execution and is never L2-normalised. Evaluation averages
+        # every available window from that execution, the lower-variance estimate of the same
+        # execution mean, and likewise leaves it at the encoder's scale. Thus this is deliberate
+        # train-time execution subsampling, not bitwise-identical pooling.
         # The closed-form cosine does not care, but two things downstream do: episode centering
         # averages query and support rows together, so a unit-norm support row next to a raw-scale
         # query row would let the query dominate the mean; and the learned residual was trained on
@@ -372,7 +374,8 @@ class HALOCompareAdapter(BaselineAdapter):
             "support_rows": int(len(support_features)),
             "corpus_rows": 0,
             "enrolled_executions": int(len(canonical) * support_count),
-            "support_representation": "one_mean_pooled_vector_per_execution_at_encoder_scale",
+            "support_representation": "full_execution_mean_at_encoder_scale",
+            "training_support_estimator": "random_window_subset_mean_at_encoder_scale",
         }
 
     # ------------------------------------------------------------ zero shot
@@ -539,6 +542,29 @@ class HALOCompareAdapter(BaselineAdapter):
                 "passed here were not produced by this adapter's window_features"
             )
         candidates = list(candidates)
+        readout = state["comparator"].cfg.readout
+        if readout == "neighbors":
+            raise UnsupportedEvaluationCell("neighbor-only encoder has no native zero-shot head")
+        if readout == "dual_attention":
+            query_feature, query_descriptor, _ = self._stream_rows(stream, state)
+            candidate_text = F.normalize(T.from_numpy(
+                state["sbert"]([c.replace("_", " ") for c in candidates])
+            ).float(), dim=-1).to(state["device"])
+            empty_feature = query_feature.new_empty((0, query_feature.shape[-1]))
+            empty_text = candidate_text.new_empty((0, candidate_text.shape[-1]))
+            chunks = []
+            with T.no_grad():
+                for start_row in range(0, len(query_feature), QUERY_CHUNK):
+                    chunks.append(self._score(
+                        state, query_feature[start_row:start_row + QUERY_CHUNK],
+                        query_descriptor[start_row:start_row + QUERY_CHUNK],
+                        empty_feature, empty_text, empty_text,
+                        T.empty(0, dtype=T.long, device=state["device"]), candidate_text,
+                    ))
+            logits = T.cat(chunks)
+            return [candidates[int(i)] for i in logits.argmax(1).cpu().tolist()], {
+                "mechanism": "direct_semantic_attention", "support_rows": 0,
+            }
         draws, reason = self._zero_shot_draws(stream, state, candidates)
         if draws is None:
             # An honest unsupported row. Substituting ConSE, or padding with incompatible
@@ -603,6 +629,14 @@ class HALOCompareAdapter(BaselineAdapter):
         }
 
     def evaluation_config(self, state) -> dict:
+        if state["comparator"].cfg.readout in ("dual_attention", "neighbors"):
+            return {
+                "checkpoint": str(_CKPT), "checkpoint_sha256": _ckpt_sha256(),
+                "checkpoint_step": state.get("checkpoint_step"),
+                "mechanism": state["comparator"].cfg.readout,
+                "center_features": False, "corpus_bank_at_positive_k": False,
+                "zero_shot_support_policy": "no_support",
+            }
         return {
             "checkpoint": str(_CKPT),
             "checkpoint_sha256": _ckpt_sha256(),

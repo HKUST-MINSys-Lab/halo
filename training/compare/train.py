@@ -11,8 +11,10 @@ Two regimes, interleaved in one stream at the sampler's rate ``p``:
 Both use cross-entropy on the true candidate. This matches deployment: zero-shot means that the
 answer has no enrolled example, not that the correct answer is absent from the decision roster.
 
-Cross-entropy is averaged over all episodes. Consequently ``p`` is the actual objective-mixture
-weight instead of merely controlling whether each regime appears in a batch.
+Cross-entropy is averaged within each independently drawn support set and then equally across
+support sets. A sparse source therefore does not receive less weight merely because it supplies
+fewer distinct queries for its roster. Consequently ``p`` controls the mixture of independently
+drawn training conditions rather than being distorted by query-set size.
 
 END TO END, FROM SCRATCH, IS THE DEFAULT
 ----------------------------------------
@@ -58,12 +60,16 @@ from model.evidence.comparator import (
 )
 from training.compare.corpus import support_corpus_from_index
 from training.compare.sampling import (
+    DEFAULT_ENROLLMENT_K,
     DEFAULT_LABEL_SUBSET,
     DEFAULT_P_GT_PRESENT,
+    DEFAULT_QUERIES_PER_SUPPORT_SET,
     DEFAULT_SAME_SUBJECT_PROBABILITY,
     DEFAULT_SUPPORT,
+    DEFAULT_WINDOWS_PER_EXECUTION,
     Episode,
     SupportCorpus,
+    _eligible_deployment_datasets,
     balanced_query_indices,
     draw_batch,
 )
@@ -92,7 +98,7 @@ def make_optimizer(param_groups, *, weight_decay: float, device: torch.device):
         param_groups, weight_decay=weight_decay, fused=(device.type == "cuda"),
     )
 PROVENANCE_ROOTS = (
-    "training/compare", "training/tokenizer", "model/evidence/comparator.py",
+    "training/compare", "training/tokenizer", "model/evidence",
     "model/tokenizer", "model/blocks.py", "data/scripts", "data/datasets",
     "baselines/halo_compare", "baselines/base.py", "eval/run_adaptation_baselines.py",
     "eval/enrollment_protocol.py", "eval/data.py", "eval/scoring.py",
@@ -310,42 +316,83 @@ def recording_rows(encoded: dict) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def episode_positions(episodes: list[Episode], corpus: SupportCorpus) -> list[int]:
-    """Every dataset position one step needs, query rows first within each episode."""
-    positions: list[int] = []
+    """Unique dataset positions required by a batch, including execution-pooling windows."""
+    recording_indices: list[int] = []
+    seen: set[int] = set()
     for episode in episodes:
-        positions.append(corpus.recordings[episode.query].window_index)
-        positions.extend(corpus.recordings[i].window_index for i in episode.support)
-    return positions
+        groups = episode.support_window_groups or tuple((index,) for index in episode.support)
+        for index in (episode.query, *(value for group in groups for value in group)):
+            if index not in seen:
+                seen.add(index)
+                recording_indices.append(index)
+    return [corpus.recordings[index].window_index for index in recording_indices]
 
 
 def split_encoded(
     pooled: torch.Tensor,
     descriptor: torch.Tensor,
     episodes: list[Episode],
+    corpus: SupportCorpus,
 ) -> dict[str, torch.Tensor]:
-    """Regroup one flat encoder output into padded per-episode query and support tensors.
-
-    One gather per tensor. The index arrays are built on the CPU in numpy; padded support slots
-    point at row 0 and are zeroed by the mask, so every padded row is exactly zero as before.
-    """
+    """Pool support executions once, then reuse them across queries sharing a support set."""
     device = pooled.device
     B = len(episodes)
     K = max((len(episode.support) for episode in episodes), default=0)
+    recording_indices: list[int] = []
+    seen: set[int] = set()
+    for episode in episodes:
+        groups = episode.support_window_groups or tuple((index,) for index in episode.support)
+        for index in (episode.query, *(value for group in groups for value in group)):
+            if index not in seen:
+                seen.add(index)
+                recording_indices.append(index)
+    if len(recording_indices) != pooled.shape[0]:
+        raise RuntimeError(
+            f"batch references {len(recording_indices)} unique windows but encoder returned "
+            f"{pooled.shape[0]} rows"
+        )
+    encoded_row = {recording: row for row, recording in enumerate(recording_indices)}
 
-    query_position = np.zeros(B, dtype=np.int64)
+    unique_groups: list[tuple[int, ...]] = []
+    group_id: dict[tuple[int, ...], int] = {}
+    for episode in episodes:
+        groups = episode.support_window_groups or tuple((index,) for index in episode.support)
+        if len(groups) != len(episode.support):
+            raise ValueError("one support window group is required per support execution")
+        for group in groups:
+            if not group:
+                raise ValueError("support execution window groups cannot be empty")
+            if group not in group_id:
+                group_id[group] = len(unique_groups)
+                unique_groups.append(group)
+
+    if unique_groups:
+        width = max(map(len, unique_groups))
+        group_rows = np.zeros((len(unique_groups), width), dtype=np.int64)
+        group_valid = np.zeros((len(unique_groups), width), dtype=bool)
+        for row, group in enumerate(unique_groups):
+            group_rows[row, :len(group)] = [encoded_row[index] for index in group]
+            group_valid[row, :len(group)] = True
+        gather = torch.from_numpy(group_rows).to(device)
+        valid = torch.from_numpy(group_valid).to(device).unsqueeze(-1)
+        denom = valid.sum(1).clamp_min(1).to(pooled.dtype)
+        group_feature = (pooled[gather] * valid.to(pooled.dtype)).sum(1) / denom
+        group_descriptor = F.normalize(
+            (descriptor[gather] * valid.to(descriptor.dtype)).sum(1)
+            / valid.sum(1).clamp_min(1).to(descriptor.dtype), dim=-1,
+        )
+    else:
+        group_feature = pooled.new_zeros((1, pooled.shape[-1]))
+        group_descriptor = descriptor.new_zeros((1, descriptor.shape[-1]))
+
+    query_position = np.asarray([encoded_row[e.query] for e in episodes], dtype=np.int64)
     support_position = np.zeros((B, K), dtype=np.int64)
     support_valid = np.zeros((B, K), dtype=bool)
-    cursor = 0
     for row, episode in enumerate(episodes):
-        count = len(episode.support)
-        query_position[row] = cursor
-        support_position[row, :count] = cursor + 1 + np.arange(count)
+        groups = episode.support_window_groups or tuple((index,) for index in episode.support)
+        count = len(groups)
+        support_position[row, :count] = [group_id[group] for group in groups]
         support_valid[row, :count] = True
-        cursor += 1 + count
-    if cursor != pooled.shape[0]:
-        raise RuntimeError(
-            f"episodes cover {cursor} rows but the encoder returned {pooled.shape[0]}"
-        )
     query_index = torch.from_numpy(query_position).to(device)
     support_index = torch.from_numpy(support_position).to(device)
     support_mask = torch.from_numpy(support_valid).to(device)
@@ -354,8 +401,8 @@ def split_encoded(
         "query_feature": pooled[query_index].unsqueeze(1),
         "query_descriptor": descriptor[query_index].unsqueeze(1),
         "query_mask": torch.ones((B, 1), dtype=torch.bool, device=device),
-        "support_feature": pooled[support_index] * keep.to(pooled.dtype),
-        "support_descriptor": descriptor[support_index] * keep.to(descriptor.dtype),
+        "support_feature": group_feature[support_index] * keep.to(pooled.dtype),
+        "support_descriptor": group_descriptor[support_index] * keep.to(descriptor.dtype),
         "support_mask": support_mask,
     }
 
@@ -439,20 +486,35 @@ def episode_loss(
     target = torch.tensor([episode.gt_slot for episode in episodes], dtype=torch.long, device=device)
     per_episode = F.nll_loss(log_probability, target, reduction="none")
 
-    few_ce = logits.new_zeros(())
-    if len(few_shot):
-        few_ce = per_episode[few_shot].mean()
-
-    zero_ce = logits.new_zeros(())
-    if len(zero_shot):
-        zero_ce = per_episode[zero_shot].mean()
-    # Per-regime means are telemetry. The actual mean lets p control each regime's expected share;
-    # summing the means would give a rare regime the same gradient as a common one.
-    loss = per_episode.mean()
+    # Several queries may share one support roster. Give each independently drawn support set equal
+    # weight even when a sparse source cannot supply the requested number of distinct query
+    # executions. Legacy episodes carry id -1 and retain the ordinary query mean.
+    support_set_ids = torch.tensor(
+        [episode.support_set_id for episode in episodes], dtype=torch.long, device=device,
+    )
+    if bool(support_set_ids.ge(0).all()):
+        unique_ids = list(dict.fromkeys(episode.support_set_id for episode in episodes))
+        set_losses = torch.stack([
+            per_episode[[index for index, episode in enumerate(episodes)
+                         if episode.support_set_id == set_id]].mean()
+            for set_id in unique_ids
+        ])
+        set_is_zero = torch.tensor([
+            next(episode.is_zero_shot for episode in episodes
+                 if episode.support_set_id == set_id)
+            for set_id in unique_ids
+        ], dtype=torch.bool, device=device)
+        loss = set_losses.mean()
+        few_ce = set_losses[~set_is_zero].mean() if bool((~set_is_zero).any()) else logits.new_zeros(())
+        zero_ce = set_losses[set_is_zero].mean() if bool(set_is_zero.any()) else logits.new_zeros(())
+    else:
+        loss = per_episode.mean()
+        few_ce = per_episode[few_shot].mean() if len(few_shot) else logits.new_zeros(())
+        zero_ce = per_episode[zero_shot].mean() if len(zero_shot) else logits.new_zeros(())
     accuracy = masked.argmax(dim=-1).eq(target).float()
     return {
         "loss": loss,
-        "ce": per_episode.mean().detach(),
+        "ce": loss.detach(),
         "few_shot_ce": few_ce.detach(),
         "zero_shot_ce": zero_ce.detach(),
         "accuracy": accuracy.detach(),
@@ -501,8 +563,18 @@ def run_step(
     encoded = encode_batch(encoder, batch, device)
     pooled, descriptor = recording_rows(encoded)
 
-    rows = split_encoded(pooled, descriptor, episodes)
+    rows = split_encoded(pooled, descriptor, episodes, corpus)
+    if (comparator is not None and comparator.cfg.readout == "neighbors"
+            and rows["query_feature"].requires_grad):
+        # Retaining these two small boundary tensors lets telemetry prove that both sides of the
+        # metric-learning comparison receive credit, without a second backward pass.
+        rows["query_feature"].retain_grad()
+        rows["support_feature"].retain_grad()
     text = episode_text(episodes, corpus, text_of, device)
+    if comparator is not None and comparator.cfg.readout == "neighbors":
+        for episode in episodes:
+            if episode.is_zero_shot or episode.gt_slot not in episode.support_candidate:
+                raise ValueError("neighbor training requires genuine true-label enrollment")
     output = comparator_logits(
         comparator,
         candidate_text=text["candidate_text"],
@@ -521,7 +593,8 @@ def run_step(
         center=center,
     )
     loss = episode_loss(output["logits"], episodes, text)
-    return {**loss, **output, "pooled": pooled, "text": text, "rows": rows}
+    return {**loss, **output, "pooled": pooled, "text": text, "rows": rows,
+            "readout": comparator.cfg.readout if comparator is not None else "fixed"}
 
 
 def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, float]:
@@ -533,22 +606,88 @@ def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, flo
     learned = result["logits"].detach().masked_fill(~mask, float("-inf")).argmax(dim=-1)
     base = result["base_logits"].detach().masked_fill(~mask, float("-inf")).argmax(dim=-1)
     weights = result["support_weight"].detach()
-    support_mask = weights > 0
+    # Soft weights may be exactly zero for reasons other than padding. The structural mask is the
+    # honest definition of whether an episode has support, especially for direct k=0 episodes.
+    support_mask = result["rows"]["support_mask"]
+    has_support = support_mask.any(dim=1)
     entropy = -(weights.clamp_min(1e-12).log() * weights).sum(dim=1)
-    entropy = torch.where(support_mask.any(dim=1), entropy, torch.zeros_like(entropy))
-    return {
+    entropy = torch.where(has_support, entropy, torch.zeros_like(entropy))
+    effective_rows = torch.where(has_support, entropy.exp(), torch.zeros_like(entropy))
+    metrics = {
         "accuracy/learned": float(learned.eq(target).float().mean()),
         "accuracy/base": float(base.eq(target).float().mean()),
         "accuracy/learned_minus_base": float(
             learned.eq(target).float().mean() - base.eq(target).float().mean()
         ),
-        "vote/top1_support_mass": float(weights.max(dim=1).values.mean()),
+        "vote/top1_support_mass": float(weights.max(dim=1).values.mean()) if weights.shape[1] else 0.0,
         "vote/total_support_mass_min": float(weights.sum(dim=1).min()),
         "vote/total_support_mass_mean": float(weights.sum(dim=1).mean()),
-        "vote/effective_support_rows": float(entropy.exp().mean()),
+        "vote/effective_support_rows": float(effective_rows.mean()),
         "vote/support_entropy": float(entropy.mean()),
         "comparator/residual_abs_mean": float(result["residual"].detach().abs().mean()),
         "sampler/candidate_padding_fraction": float((~mask).float().mean()),
+    }
+    if result.get("readout") in ("dual_attention", "neighbors"):
+        metrics = {key.replace("vote/", "neighbor_floor/"): value for key, value in metrics.items()}
+        metrics.pop("comparator/residual_abs_mean")
+        metrics["prediction/logit_abs_mean"] = float(result["logits"].detach()[mask].abs().mean())
+        if bool(has_support.any()):
+            active = has_support.nonzero(as_tuple=True)[0]
+            active_weights = weights[active]
+            active_support = support_mask[active]
+            active_bound = result["text"]["support_bound"][active]
+            active_target = target[active]
+            correct = active_support & active_bound.eq(active_target.unsqueeze(1))
+            correct_mass = (active_weights * correct).sum(dim=1)
+            top_row = active_weights.masked_fill(~active_support, -1.0).argmax(dim=1)
+            hard_correct = active_bound.gather(1, top_row.unsqueeze(1)).squeeze(1).eq(active_target)
+            order = active_weights.masked_fill(~active_support, -1.0).argsort(
+                dim=1, descending=True,
+            )
+            ordered_correct = correct.gather(1, order)
+            has_correct = ordered_correct.any(dim=1)
+            first_rank = ordered_correct.to(torch.int64).argmax(dim=1) + 1
+            reciprocal_rank = torch.where(
+                has_correct, first_rank.float().reciprocal(), torch.zeros_like(first_rank.float()),
+            )
+
+            query = F.normalize(result["rows"]["query_feature"][active, 0].detach().float(), dim=-1)
+            support = F.normalize(result["rows"]["support_feature"][active].detach().float(), dim=-1)
+            similarity = torch.einsum("bd,bkd->bk", query, support)
+            negative = active_support & ~correct
+            positive_mean = similarity[correct].mean() if bool(correct.any()) else similarity.new_zeros(())
+            negative_mean = similarity[negative].mean() if bool(negative.any()) else similarity.new_zeros(())
+            metrics.update({
+                "neighbor_floor/correct_label_mass": float(correct_mass.mean()),
+                "neighbor_floor/hard_1nn_accuracy": float(hard_correct.float().mean()),
+                "neighbor_floor/mean_reciprocal_rank": float(reciprocal_rank.mean()),
+                "neighbor_floor/positive_cosine_mean": float(positive_mean),
+                "neighbor_floor/negative_cosine_mean": float(negative_mean),
+                "neighbor_floor/cosine_margin": float(positive_mean - negative_mean),
+            })
+    if result.get("readout") == "neighbors":
+        # There is no second prediction path in this encoder-only objective. Calling the identical
+        # tensor a baseline made every log line look like a learned-vs-control comparison.
+        metrics.pop("accuracy/base")
+        metrics.pop("accuracy/learned_minus_base")
+    return metrics
+
+
+def embedding_gradient_telemetry(result: dict) -> dict[str, float]:
+    """Per-vector gradient norms at the query/support encoder boundary."""
+    rows = result["rows"]
+
+    def mean_vector_norm(value: torch.Tensor, mask: torch.Tensor) -> float:
+        if value.grad is None or not bool(mask.any()):
+            return 0.0
+        return float(value.grad.detach().float()[mask].norm(dim=-1).mean())
+
+    query = mean_vector_norm(rows["query_feature"], rows["query_mask"])
+    support = mean_vector_norm(rows["support_feature"], rows["support_mask"])
+    return {
+        "gradient/query_embedding_mean_norm": query,
+        "gradient/support_embedding_mean_norm": support,
+        "gradient/support_to_query_ratio": support / max(query, 1e-12),
     }
 
 
@@ -584,6 +723,7 @@ def support_ablation_telemetry(
             temperature=TAU_SUPPORT,
             vote_scale=VOTE_SCALE,
             center=center,
+            enrollment_override=(rows["support_mask"] & text["support_bound"].ge(0)).any(dim=1),
         )
         prediction = output["logits"].masked_fill(
             ~candidate_mask, float("-inf"),
@@ -669,6 +809,7 @@ def validate(
     draw_kwargs: dict,
     center: bool,
     executor: ThreadPoolExecutor | None,
+    deployment_matched: bool = False,
 ) -> dict[str, float]:
     """Evaluate a fixed subject-held-out episode draw without consuming test datasets."""
     was_encoder_training = encoder.training
@@ -681,8 +822,28 @@ def validate(
     losses: list[float] = []
     ranks: list[float] = []
     group_sizes: list[int] = []
-    for start in range(0, len(episodes), episodes_per_step):
-        group = episodes[start:start + episodes_per_step]
+    loss_group_sizes: list[int] = []
+    if deployment_matched:
+        by_set: dict[int, list[Episode]] = {}
+        for episode in episodes:
+            by_set.setdefault(episode.support_set_id, []).append(episode)
+        support_sets = list(by_set.values())
+        validation_groups = [
+            [episode for support_set in support_sets[start:start + episodes_per_step]
+             for episode in support_set]
+            for start in range(0, len(support_sets), episodes_per_step)
+        ]
+        loss_group_sizes = [
+            len(support_sets[start:start + episodes_per_step])
+            for start in range(0, len(support_sets), episodes_per_step)
+        ]
+    else:
+        validation_groups = [
+            episodes[start:start + episodes_per_step]
+            for start in range(0, len(episodes), episodes_per_step)
+        ]
+        loss_group_sizes = [len(group) for group in validation_groups]
+    for group in validation_groups:
         group_sizes.append(len(group))
         with _autocast(device):
             result = run_step(
@@ -703,7 +864,7 @@ def validate(
     keys = sorted({key for row in rows for key in row})
     ablation_keys = sorted({key for row in ablations for key in row})
     return {
-        "validation/loss": float(np.average(losses, weights=group_sizes)),
+        "validation/loss": float(np.average(losses, weights=loss_group_sizes)),
         "validation/encoder_effective_rank": float(np.mean(ranks)),
         **{f"validation/{key}": float(np.average([row[key] for row in rows], weights=group_sizes))
            for key in keys},
@@ -722,7 +883,7 @@ def main() -> None:
     parser.add_argument("--frontend", choices=("fixed", "learnable", "continuous"),
                         default="fixed",
                         help="front end for a from-scratch encoder; the design of record is fixed")
-    parser.add_argument("--center-features", action=argparse.BooleanOptionalAction, default=True,
+    parser.add_argument("--center-features", action=argparse.BooleanOptionalAction, default=None,
                         help="subtract each episode's mean feature before similarity and attention, "
                              "so only how rows DIFFER can drive the decision. ON by default; "
                              "--no-center-features is the ablation. Centering changes the step-0 "
@@ -735,25 +896,37 @@ def main() -> None:
                         help="resume model, optimizer, schedule and RNG state from a checkpoint")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--steps", type=int, default=35_000)
-    parser.add_argument("--episodes-per-step", type=int, default=8)
+    parser.add_argument("--episodes-per-step", type=int, default=None,
+                        help="independent support sets per step for staged readouts (default 4); "
+                             "legacy episodes otherwise (default 8)")
     parser.add_argument("--support-size", type=int, default=DEFAULT_SUPPORT)
-    parser.add_argument("--p-gt-present", type=float, default=DEFAULT_P_GT_PRESENT)
-    parser.add_argument("--same-subject-probability", type=float,
-                        default=DEFAULT_SAME_SUBJECT_PROBABILITY)
-    parser.add_argument("--label-subset", type=int, nargs=2, default=list(DEFAULT_LABEL_SUBSET))
+    parser.add_argument("--p-gt-present", type=float, default=None)
+    parser.add_argument("--same-subject-probability", type=float, default=None,
+                        help="requested same-user share when feasible; staged default 0.2")
+    parser.add_argument("--enrollment-k", type=int, nargs="+", default=list(DEFAULT_ENROLLMENT_K),
+                        help="deployment enrollment executions per candidate sampled by training")
+    parser.add_argument("--queries-per-support-set", type=int,
+                        default=DEFAULT_QUERIES_PER_SUPPORT_SET)
+    parser.add_argument("--windows-per-execution", type=int,
+                        default=DEFAULT_WINDOWS_PER_EXECUTION,
+                        help="maximum windows averaged into each training support execution")
+    parser.add_argument("--label-subset", type=int, nargs=2, default=None,
+                        help="candidate-count range; defaults to deployment-matched 6..14 for "
+                             "staged readouts and historical 2..14 for legacy readouts")
     parser.add_argument("--mode", choices=("compatible", "near_miss", "unfiltered"),
                         default="compatible")
-    parser.add_argument("--comparator-readout", choices=READOUTS, default="sensor_only",
-                        help="what the learned part may see. sensor_only (design of record): "
-                             "attention over signal vectors only, one zero-init shift per support "
-                             "row before the softmax; labels stay in the frozen cosine vote. "
-                             "fused (ablation): label text fused into support tokens, one "
-                             "zero-init residual per candidate")
+    parser.add_argument("--comparator-readout", choices=READOUTS, default="dual_attention",
+                        help="dual_attention: separate semantic/enrollment heads; neighbors: "
+                             "parameter-free encoder objective; sensor_only/fused: legacy runs")
     parser.add_argument("--neutral-acquisition-text", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="Arm A (default): hide acquisition prose; use --no-neutral-... for B")
+    parser.add_argument("--freeze-encoder", action=argparse.BooleanOptionalAction, default=None,
+                        help="default: freeze for dual_attention, train for neighbors/legacy")
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--encoder-lr-scale", type=float, default=0.05)
+    parser.add_argument("--encoder-lr-scale", type=float, default=None,
+                        help="encoder LR multiplier on --lr; default 1.0 for the from-scratch "
+                             "neighbor encoder and 0.05 for head/legacy training")
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--warmup-steps", type=int, default=500)
     parser.add_argument("--grad-clip", type=float, default=1.0)
@@ -762,7 +935,10 @@ def main() -> None:
                         help="fixed subject split/corpus seed; keep constant across model replicates")
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--val-every", type=int, default=500)
-    parser.add_argument("--val-episodes", type=int, default=64)
+    parser.add_argument("--val-episodes", type=int, default=None,
+                        help="fixed support-set count for staged readouts (default: one per "
+                             "eligible held-out dataset); legacy episode count otherwise "
+                             "(default 64)")
     parser.add_argument("--checkpoint-every", type=int, default=500)
     parser.add_argument("--calib-batches", type=int, default=20)
     parser.add_argument("--calib-batch-size", type=int, default=256)
@@ -776,6 +952,34 @@ def main() -> None:
     parser.add_argument("--smoke", action="store_true",
                         help="three steps on capped real data with telemetry; launches nothing long")
     args = parser.parse_args()
+    staged = args.comparator_readout in ("dual_attention", "neighbors")
+    automatic_val_episodes = args.val_episodes is None
+    if args.episodes_per_step is None:
+        args.episodes_per_step = 4 if staged else 8
+    if args.val_episodes is None:
+        args.val_episodes = (
+            len(deployment_policy.EXPANDED_PHASE_A_TRAIN_DATASETS) if staged else 64
+        )
+    if args.label_subset is None:
+        args.label_subset = [6, 14] if staged else list(DEFAULT_LABEL_SUBSET)
+    if args.encoder_lr_scale is None:
+        args.encoder_lr_scale = 1.0 if args.comparator_readout == "neighbors" else 0.05
+    if args.same_subject_probability is None:
+        args.same_subject_probability = 0.2 if staged else DEFAULT_SAME_SUBJECT_PROBABILITY
+    if args.center_features is None:
+        args.center_features = not staged
+    if staged and args.center_features:
+        parser.error("staged readouts require --no-center-features")
+    if args.freeze_encoder is None:
+        args.freeze_encoder = args.comparator_readout == "dual_attention"
+    if args.freeze_encoder and args.phase_a is None and args.resume is None:
+        parser.error("frozen head training requires --phase-a ENCODER_CHECKPOINT")
+    if args.comparator_readout == "neighbors" and args.freeze_encoder:
+        parser.error("neighbors has no parameters; its encoder must be trainable")
+    if args.p_gt_present is None:
+        args.p_gt_present = 1.0 if args.comparator_readout == "neighbors" else DEFAULT_P_GT_PRESENT
+    if args.comparator_readout == "neighbors" and args.p_gt_present != 1.0:
+        parser.error("neighbors requires --p-gt-present 1; it has no semantic zero-shot head")
 
     if args.smoke:
         args.steps = min(args.steps, 3)
@@ -790,7 +994,8 @@ def main() -> None:
 
     if args.steps < 1 or not 0 <= args.warmup_steps < args.steps:
         parser.error("steps must be positive and warmup-steps must be in [0, steps)")
-    if min(args.episodes_per_step, args.support_size, args.log_every, args.val_every, args.val_episodes,
+    if min(args.episodes_per_step, args.support_size, args.queries_per_support_set,
+           args.windows_per_execution, args.log_every, args.val_every, args.val_episodes,
            args.checkpoint_every, args.calib_batches, args.calib_batch_size) < 1:
         parser.error("episode, support, validation, checkpoint and calibration counts must be positive")
     if args.loader_workers < 0:
@@ -799,6 +1004,10 @@ def main() -> None:
         parser.error("p-gt-present must be in [0,1]")
     if not 0.0 <= args.same_subject_probability <= 1.0:
         parser.error("same-subject-probability must be in [0,1]")
+    if args.encoder_lr_scale <= 0:
+        parser.error("encoder-lr-scale must be positive")
+    if not args.enrollment_k or any(value < 1 for value in args.enrollment_k):
+        parser.error("enrollment-k values must be positive")
     if args.label_subset[0] < 2 or args.label_subset[1] < args.label_subset[0]:
         parser.error("label-subset must be LOW HIGH with 2 <= LOW <= HIGH")
     if args.label_subset[1] >= ComparatorConfig().n_slots:
@@ -826,6 +1035,15 @@ def main() -> None:
     print(f"[compare] corpus: {index.summary()}", flush=True)
     corpus = support_corpus_from_index(index)
     val_corpus = support_corpus_from_index(index, split="val")
+    if automatic_val_episodes and staged and not args.smoke:
+        args.val_episodes = len(_eligible_deployment_datasets(
+            val_corpus, p_gt_present=args.p_gt_present, mode=args.mode,
+            enrollment_k=tuple(args.enrollment_k),
+            semantic_zero_shot=args.comparator_readout == "dual_attention",
+            label_subset=tuple(args.label_subset),
+        ))
+        if args.val_episodes < 1:
+            raise RuntimeError("no held-out dataset can form a staged validation episode")
     print(f"[compare] support corpus: {corpus.summary()}", flush=True)
     print(f"[compare] validation corpus: {val_corpus.summary()}", flush=True)
 
@@ -843,12 +1061,18 @@ def main() -> None:
         if args.resume is not None else None
     )
     draw_kwargs = {
-        "support_size": args.support_size,
         "p_gt_present": args.p_gt_present,
         "same_subject_probability": args.same_subject_probability,
         "label_subset": tuple(args.label_subset),
         "mode": args.mode,
+        "semantic_zero_shot": args.comparator_readout == "dual_attention",
+        "deployment_matched": staged,
+        "enrollment_k": tuple(args.enrollment_k),
+        "queries_per_support_set": args.queries_per_support_set,
+        "windows_per_execution": args.windows_per_execution,
     }
+    if not staged:
+        draw_kwargs["support_size"] = args.support_size
     # Fork the prefetch workers NOW, before the encoder, the text tower or any library thread
     # exists: forking a process that has live threads can deadlock the child on a lock a thread
     # held at fork time. The workers only need the corpus, the dataset and the collate.
@@ -906,12 +1130,15 @@ def main() -> None:
         # exact-key support), so it enters the learned path only when acquisition text is ON.
         comparator = SupportComparator(spec, ComparatorConfig(
             readout=args.comparator_readout,
-            use_descriptor=not args.neutral_acquisition_text,
+            use_descriptor=not args.neutral_acquisition_text and not staged,
         )).to(device)
     print(f"[compare] comparator readout={comparator.cfg.readout} "
           f"use_descriptor={comparator.cfg.use_descriptor}", flush=True)
     if hasattr(encoder, "mask_token"):
         encoder.mask_token.requires_grad_(False)
+    if args.freeze_encoder:
+        encoder.requires_grad_(False)
+        encoder.eval()
 
     frontend = getattr(encoder, "filterbank", None)
     if resume_blob is None and args.phase_a is None:
@@ -943,12 +1170,16 @@ def main() -> None:
             "frontend": args.frontend,
             "center_features": args.center_features,
             "support_size": args.support_size,
+            "enrollment_k": list(args.enrollment_k),
+            "queries_per_support_set": args.queries_per_support_set,
+            "windows_per_execution": args.windows_per_execution,
             "p_gt_present": args.p_gt_present,
             "same_subject_probability": args.same_subject_probability,
             "label_subset": list(args.label_subset),
             "mode": args.mode,
             "neutral_acquisition_text": args.neutral_acquisition_text,
             "comparator_readout": args.comparator_readout,
+            "freeze_encoder": args.freeze_encoder,
             "lr": args.lr,
             "encoder_lr_scale": args.encoder_lr_scale,
             "weight_decay": args.weight_decay,
@@ -963,6 +1194,10 @@ def main() -> None:
         saved_trajectory = dict(resume_blob.get("trajectory") or {})
         # Checkpoints written before the readout flag existed are all the fused design.
         saved_trajectory.setdefault("comparator_readout", "fused")
+        saved_trajectory.setdefault("freeze_encoder", False)
+        saved_trajectory.setdefault("enrollment_k", list(DEFAULT_ENROLLMENT_K))
+        saved_trajectory.setdefault("queries_per_support_set", DEFAULT_QUERIES_PER_SUPPORT_SET)
+        saved_trajectory.setdefault("windows_per_execution", DEFAULT_WINDOWS_PER_EXECUTION)
         if saved_trajectory != trajectory:
             raise SystemExit("resume trajectory differs from the checkpoint configuration")
         optimizer.load_state_dict(resume_blob["optimizer"])
@@ -1045,6 +1280,7 @@ def main() -> None:
             episodes_count=args.val_episodes, episodes_per_step=args.episodes_per_step,
             seed=args.data_seed + 91_003, draw_kwargs=draw_kwargs,
             center=args.center_features, executor=executor,
+            deployment_matched=staged,
         )
         latest_validation["step"] = float(step)
         with log_path.open("a") as handle:
@@ -1086,6 +1322,17 @@ def main() -> None:
         log_step = step % args.log_every == 0 or step == 1
         encoder_grad = _parameter_grad_norm(encoder_params) if log_step else 0.0
         comparator_grad = _parameter_grad_norm(comparator_params) if log_step else 0.0
+        head_gradients = {}
+        embedding_gradients = (
+            embedding_gradient_telemetry(result)
+            if log_step and args.comparator_readout == "neighbors" else {}
+        )
+        if log_step and args.comparator_readout == "dual_attention":
+            head_gradients = {
+                f"gradient/{name}_head_norm": _parameter_grad_norm(
+                    getattr(comparator.prediction, name).parameters()
+                ) for name in ("zero_shot", "enrollment")
+            }
         preclip = float(torch.nn.utils.clip_grad_norm_(
             comparator_params + encoder_params, args.grad_clip, error_if_nonfinite=True,
         ))
@@ -1111,26 +1358,31 @@ def main() -> None:
                 **telemetry,
                 **behavior,
                 **comparator.telemetry(),
+                **head_gradients,
+                **embedding_gradients,
             }
             with log_path.open("a") as handle:
                 handle.write(json.dumps(row) + "\n")
+            accuracy_text = f"{row['accuracy/learned']:.2f}"
+            if "accuracy/base" in row:
+                accuracy_text += f"/{row['accuracy/base']:.2f}"
             print(
                 f"[compare] step {step:>6} loss {row['loss']:.4f} "
                 f"(few {row['loss/few_shot_ce']:.4f} zero {row['loss/zero_shot_ce']:.4f}) "
-                f"acc {row['accuracy/learned']:.2f}/{row['accuracy/base']:.2f} "
-                f"rank {row['encoder/effective_rank']:.1f} "
+                f"acc {accuracy_text} rank {row['encoder/effective_rank']:.1f} "
                 f"K {row['sampler/mean_support_size']:.1f}",
                 flush=True,
             )
 
         if step % args.val_every == 0 or step == args.steps:
             report = run_validation(step)
-            print(
-                f"[compare] validation step {step}: learned "
-                f"{report['validation/accuracy/learned']:.3f}, base "
-                f"{report['validation/accuracy/base']:.3f}",
-                flush=True,
+            message = (
+                f"[compare] validation step {step}: model "
+                f"{report['validation/accuracy/learned']:.3f}"
             )
+            if "validation/accuracy/base" in report:
+                message += f", neighbor floor {report['validation/accuracy/base']:.3f}"
+            print(message, flush=True)
         if step % args.checkpoint_every == 0 or step == args.steps:
             _atomic_torch_save(payload(step), args.out / "last.pt")
 

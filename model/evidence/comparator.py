@@ -1,4 +1,8 @@
-"""Support-only comparator: recognise a query by comparing it to K labelled recordings.
+"""Prediction readout dispatch, including historical comparison checkpoints.
+
+Current staged readouts (2026-09-08): ``dual_attention`` uses separate semantic/enrollment weights
+and explicit paired tokens; ``neighbors`` is a parameter-free encoder-training control. Their
+implementation lives in ``prediction.py``. The description below applies to legacy readouts only.
 
 WHAT THIS REPLACES
 ------------------
@@ -56,9 +60,9 @@ N_ROLES = 6
 UNBOUND_SLOT = 0
 
 
-#: The two learned readouts. ``sensor_only`` is the design of record (2026-09-07); ``fused`` is
+#: Explicit names preserve the behavior of previously saved checkpoints.
 #: the ablation arm and the shape of every checkpoint written before that date.
-READOUTS = ("sensor_only", "fused")
+READOUTS = ("sensor_only", "fused", "dual_attention", "neighbors")
 
 
 @dataclass(frozen=True)
@@ -98,10 +102,15 @@ class ComparatorConfig:
     identity_gain_init: float = 0.25
     readout: str = "sensor_only"
     use_descriptor: bool = False
+    max_instances: int = 512
 
     def __post_init__(self) -> None:
         if self.readout not in READOUTS:
             raise ValueError(f"readout must be one of {READOUTS}, got {self.readout!r}")
+        if self.max_instances < 1 or self.n_layers < 0:
+            raise ValueError("instance capacity must be positive and depth nonnegative")
+        if self.readout == "dual_attention" and self.n_layers == 0:
+            raise ValueError("dual attention needs at least one attention block")
 
 
 def comparator_config_from_checkpoint(saved: dict) -> ComparatorConfig:
@@ -127,6 +136,17 @@ class SupportComparator(nn.Module):
         self.spec = spec
         self.cfg = cfg or ComparatorConfig()
         d = spec.d_model
+        if self.cfg.readout in ("dual_attention", "neighbors"):
+            if self.cfg.use_descriptor:
+                raise ValueError("staged readouts use encoder vectors and labels, not descriptors")
+            if self.cfg.readout == "dual_attention":
+                from .prediction import DualRecordingAttention
+                self.prediction = DualRecordingAttention(
+                    spec, text_dim=self.cfg.text_dim, n_layers=self.cfg.n_layers,
+                    max_instances=self.cfg.max_instances,
+                    identity_gain=self.cfg.identity_gain_init,
+                )
+            return
         self.proj_signal = nn.Linear(d, d)
         self.role_emb = nn.Embedding(N_ROLES, d)
         self.slot_emb = nn.Embedding(self.cfg.n_slots, d)
@@ -238,6 +258,14 @@ class SupportComparator(nn.Module):
         return residual.masked_fill(~candidate_mask, 0.0)
 
     def telemetry(self) -> dict[str, float]:
+        if self.cfg.readout == "neighbors":
+            return {"prediction/parameter_free": 1.0}
+        if self.cfg.readout == "dual_attention":
+            return {
+                f"prediction/{name}/log_scale": float(head.log_scale.detach())
+                for name, head in (("zero_shot", self.prediction.zero_shot),
+                                   ("enrollment", self.prediction.enrollment))
+            }
         gains = self.compose.log_gain.detach().exp()
         return {
             # Whichever readout: the norm of the one zero-initialised head, so a flat line here
@@ -331,6 +359,8 @@ def comparator_logits(
     temperature: float = 0.07,
     vote_scale: float = 10.0,
     center: bool = True,
+    instance_ids: torch.Tensor | None = None,
+    enrollment_override: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Score every candidate for every episode in the batch.
 
@@ -354,6 +384,34 @@ def comparator_logits(
     K = support_feature.shape[1]
     if candidate_mask is None:
         candidate_mask = torch.ones((B, C), dtype=torch.bool, device=candidate_text.device)
+
+    if comparator is not None and comparator.cfg.readout in ("dual_attention", "neighbors"):
+        from .prediction import neighbor_logits
+        if center:
+            raise ValueError("staged readouts require center=False; preserve encoder geometry")
+        valid_query = query_mask.unsqueeze(-1).to(query_feature.dtype)
+        pooled_query = (query_feature * valid_query).sum(1) / valid_query.sum(1).clamp_min(1)
+        enrolled_mask = support_mask & support_bound.ge(0)
+        base, weights = neighbor_logits(
+            pooled_query, support_feature, support_bound.masked_fill(~enrolled_mask, 0),
+            enrolled_mask, candidate_mask, temperature,
+        )
+        if comparator.cfg.readout == "neighbors":
+            if bool((support_mask & ~enrolled_mask).any()):
+                raise ValueError("neighbors cannot interpret unbound background labels")
+            logits = base
+        else:
+            logits = comparator.prediction(
+                query=pooled_query, candidates=candidate_text, candidate_mask=candidate_mask,
+                support=support_feature, support_labels=support_label_text,
+                support_mask=support_mask, enrolled=(enrolled_mask.any(dim=1)
+                    if enrollment_override is None else enrollment_override),
+                instance_ids=instance_ids,
+            )
+        # Difference is diagnostic only. Mask candidate padding before subtraction/reduction.
+        residual = (logits - base).masked_fill(~candidate_mask | (base < -1e20), 0.0)
+        return {"logits": logits, "base_logits": base, "residual": residual,
+                "support_weight": weights}
 
     if center:
         query_feature, support_feature = center_episode(

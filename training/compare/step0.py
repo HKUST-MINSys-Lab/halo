@@ -103,6 +103,12 @@ def main() -> None:
     checkpoint = torch.load(args.phase_a, map_location="cpu", weights_only=False)
     d_model = int(checkpoint["config"].get("d_model", 128))
     neutral = bool(checkpoint["config"].get("neutral_acquisition_text", False))
+    if args.comparator_readout in ("dual_attention", "neighbors"):
+        raise SystemExit(
+            f"{args.comparator_readout!r} has no identity-at-init floor: 'neighbors' has no "
+            "parameters, and a freshly initialised attention head is noise, not a closed-form rule. "
+            "Its paired control is the trainer's own initial.pt; do not write a step0.pt for it."
+        )
     spec = AttentionSpec(d_model=d_model, n_heads=args.n_heads, ffn_mult=2, dropout=0.1)
     comparator = SupportComparator(spec, ComparatorConfig(
         n_layers=args.n_layers, readout=args.comparator_readout, use_descriptor=not neutral,

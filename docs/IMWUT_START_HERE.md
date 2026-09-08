@@ -6,6 +6,14 @@ research lines and most of the confusion available here comes from mistaking one
 
 Last updated 2026-09-08.
 
+## New staged implementation (2026-09-08)
+
+The next experiment separates encoder training with differentiable neighbors from two independently
+weighted attention heads (zero-shot and enrollment). See the current section of
+[the model design](design/IMWUT_COMPARE_DESIGN.md). Both paths and the deployment-matched sampler
+passed short CPU/GPU training smokes; full training remains. The completed tables below still describe
+the older sensor-only model, not the newly implemented heads.
+
 ## Latest matched results (2026-09-08)
 
 Completed HALO trained/initial controls and all four released baselines on the same current manifest

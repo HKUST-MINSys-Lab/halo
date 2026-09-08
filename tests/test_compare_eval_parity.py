@@ -1,8 +1,8 @@
 """The evaluation adapter must compute the SAME function the trainer trained.
 
-Training support rows are one window's raw pooled encoder output at the encoder's native scale
-(``training.compare.train.recording_rows`` → ``split_encoded``). The adapter builds a support row as
-the mean of an execution's raw pooled windows. Neither side L2-normalises. This matters beyond the
+Training support rows are random subset means of raw pooled encoder outputs at the encoder's native
+scale (``training.compare.train.recording_rows`` → ``split_encoded``). The adapter uses the less
+noisy full-execution mean. Neither side L2-normalises. This matters beyond the
 closed-form cosine, which is scale-free: episode centering averages query and support rows together,
 and the learned residual was fitted to raw-scale rows. A unit-norm support row next to a raw-scale
 query row would let the query dominate the episode mean and hand the residual an input it never saw.
@@ -191,7 +191,8 @@ def test_adapter_support_rows_are_raw_execution_means(monkeypatch, comparator, c
     # Query and support must live at one scale, or centering is dominated by the query.
     query_norm = captured["query_feature"].norm(dim=-1).mean()
     assert 0.2 < float(norms.mean() / query_norm) < 5.0
-    assert info["support_representation"] == "one_mean_pooled_vector_per_execution_at_encoder_scale"
+    assert info["support_representation"] == "full_execution_mean_at_encoder_scale"
+    assert info["training_support_estimator"] == "random_window_subset_mean_at_encoder_scale"
 
 
 @pytest.mark.parametrize("center", [True, False])
@@ -231,3 +232,30 @@ def test_arm_b_attends_over_any_support_and_records_the_relation(monkeypatch, co
     predictions, info, _, _, _ = _run_adapter(monkeypatch, comparator, center=True, relation=relation)
     assert len(predictions) == len(PLAN["query_rows"])
     assert info["support_compatibility"] == relation
+
+
+# ----------------------------------------------------------------------------- staged readouts
+def _staged_comparator(readout: str):
+    torch.manual_seed(0)
+    spec = AttentionSpec(d_model=D_MODEL, n_heads=4, ffn_mult=2, dropout=0.0)
+    return SupportComparator(spec, ComparatorConfig(
+        text_dim=TEXT_DIM, n_layers=1, readout=readout,
+    )).eval()
+
+
+@pytest.mark.parametrize("readout", ["dual_attention", "neighbors"])
+def test_staged_adapter_predictions_match_the_training_layout(monkeypatch, readout):
+    """Staged heads preserve raw scale, instance order and no-centering at evaluation."""
+    comparator = _staged_comparator(readout)
+    predictions, info, captured, query, support = _run_adapter(
+        monkeypatch, comparator, center=False,
+    )
+    logits, expected_support = _training_layout_logits(comparator, query, support, center=False)
+    assert torch.allclose(captured["support_feature"], expected_support, atol=1e-6)
+    assert predictions == [PLAN["candidate_names"][int(i)] for i in logits.argmax(1)]
+    assert info["support_compatibility"] == "identical"
+
+
+def test_staged_readouts_refuse_centering(monkeypatch):
+    with pytest.raises(ValueError, match="center=False"):
+        _run_adapter(monkeypatch, _staged_comparator("dual_attention"), center=True)

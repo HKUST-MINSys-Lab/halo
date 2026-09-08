@@ -1,8 +1,113 @@
 # Recognize by comparison — agreed design and paper shape for the IMWUT submission
 
-**Status: design of record for the `imwut/compare` line. Agreed 2026-09-03 and implemented on that
-branch. The released-checkpoint baseline evaluation is complete; comparison-model training and its
-matched evaluation have not yet been completed.**
+## Current decision: staged encoder and prediction heads (2026-09-08)
+
+The current implementation is `dual_attention` plus the separate `neighbors` encoder-training
+experiment. The September 7 `sensor_only` model remains the source of the completed
+[matched results](../results/IMWUT_MATCHED_ADAPTATION_20260908.md); those scores do not describe
+the new heads. No full training or evaluation of the new design has been performed.
+
+### Model
+
+Both heads use the same `RecordingAttentionHead` architecture with independent weights:
+
+- k=0: one query-recording token and candidate-label tokens, no background support bank.
+- k>0: query, candidate labels, support-recording tokens and separate support-label tokens.
+- Shared sensor projection for query/support; shared text projection for support/candidate labels
+  within each head. Projection + LayerNorm precedes token composition.
+- Four role embeddings identify the token types. Each support recording and its label share a
+  positive instance ID; different recordings have different IDs even when their labels agree.
+  Query and candidate tokens have no instance tag. These IDs do not identify classes or subjects.
+- Training randomly assigns instance tags. At inference explicit IDs must travel with support
+  pairs when reordered; without supplied IDs, the head assigns IDs in input order. Thus permutation
+  equivariance is exact for tokens WITH their tags, not an assertion of invariance to changing the
+  tag vocabulary itself. The default capacity is 512 support instances and fails loudly above it.
+- Content/role/instance directions have controlled learned gains (initially 1/.25/.25).
+  Two pre-LayerNorm attention + GELU FFN blocks, residual connections, depth-scaled residual
+  initialization and final LayerNorm use the existing `SetAttentionStack`.
+- Final scores are scaled cosine similarities of contextualized query and candidate vectors.
+  There is no vote, residual correction, hard retrieval, or candidate-specific classifier weight.
+- Enrollment availability selects the head, never the query's ground-truth label. Zero-shot
+  episodes do not encode background windows. Support-removal diagnostics hold the head fixed.
+
+The encoder is shared, but the first head experiment freezes it to isolate the head's effect.
+`--no-freeze-encoder` explicitly enables later end-to-end training. Old `sensor_only`/`fused`
+readouts and checkpoint shapes remain available for reproduction, not as the new default.
+
+### Separate neighbor experiment
+
+`neighbors` trains the encoder through raw cosine similarities of normalized recording outputs.
+It has no trainable projection, attention head, or episode centering. Every support has an enrolled
+candidate identity; every training query must have actual correct-label support. Cross-entropy on
+per-class log-sum-exp neighbor scores equals negative log probability assigned to correct-label
+neighbors. Both query and support encoder paths receive gradients. k=0 is explicitly unsupported
+for this control, rather than inventing a text bridge. Its native enrollment rule is soft neighbors;
+the evaluation's generic 1-NN remains the hard-neighbor control.
+
+Examples (mechanically runnable; full experiments have not yet been launched):
+
+```bash
+python -m training.compare.train --comparator-readout neighbors --out training/compare/outputs/neighbor_encoder
+python -m training.compare.train --comparator-readout dual_attention --phase-a training/compare/outputs/neighbor_encoder/last.pt --out training/compare/outputs/attention_heads
+```
+
+Use the project venv interpreter. `--phase-a` is the existing encoder-checkpoint argument and also
+accepts a neighbor-trained checkpoint; it does not imply JEPA pretraining. The default attention
+run requires an encoder checkpoint and freezes it. Three-step CPU smokes of both stages passed.
+Smoke scores are wiring checks, not evidence of model quality. Checkpoint readout and source
+  fingerprints distinguish the experiments. Published result tables remain unchanged.
+
+### Deployment-matched training episodes
+
+- A training step draws four independent support sets by default. Their base query datasets are
+  sampled without replacement within a step; failed draws retry within that dataset rather than
+  silently replacing sparse sources. Each set is reused by up to four
+  distinct query executions, yielding up to 16 classified queries without encoding its support
+  repeatedly.
+- Enrollment episodes sample k from the feasible members of {1, 2, 4, 8} for that query/configuration
+  and draw exactly k distinct physical executions for every candidate. Two windows per execution are
+  sampled and averaged when available. Deployment averages all windows in an enrolled execution:
+  this is the lower-variance version of the same execution mean, while random train-time subsampling
+  keeps the batch bounded and exposes the encoder to within-execution variation. Neither path
+  normalizes before averaging. No support is manually inserted, duplicated, or made compatible by
+  relaxing acquisition constraints.
+- Cross-subject support is requested 80% of the time. If one relation is impossible, the feasible
+  relation is used and the fallback rate is reported. Candidate and additional-query shortages are
+  likewise visible in telemetry. Independently drawn support sets receive equal loss weight even if
+  one has fewer usable queries.
+- Direct zero-shot episodes contain candidate text and queries but no fake background memory. The
+  neighbor experiment is enrollment-only by construction.
+- Staged candidate counts default to 6-14, matching the current evaluation manifest's observed
+  range. The neighbor encoder is trained from scratch at the base `3e-4` learning rate; the `0.05`
+  encoder multiplier remains the default only for head/legacy fine-tuning.
+- Validation requests one fixed support set per eligible held-out source by default. Sources that cannot
+  structurally form the requested execution-disjoint regime in the held-out split are excluded and
+  counted in telemetry; the remaining sources are each represented before any is repeated.
+
+### Remaining agreed work before substantive training
+
+1. Run the neighbor-only encoder experiment first, then train the two attention heads separately
+   from the shared encoder. Measure k=0,1,2,4,8; report the different k=0 dataset cohort explicitly.
+2. Track head-specific gradients, query/support signal, support ablations, rank and losses.
+   For new heads `base_logits` is a neighbor floor (uniform without enrollment), not the old vote;
+   `neighbor_floor/*` telemetry describes this floor, NOT internal attention weights.
+3. Encoder learning-rate changes and frontend/temporal-resolution changes are postponed. JEPA
+   future-latent prediction and physical-feature reconstruction remain proposals, not active losses.
+
+### Sources
+
+- [Set Transformer](https://proceedings.mlr.press/v97/lee19d.html): attention over sets.
+- [Pre-LayerNorm analysis](https://proceedings.mlr.press/v119/xiong20b.html): gradient stability.
+- [Neighborhood Components Analysis](https://www.cs.toronto.edu/~hinton/absps/nca.pdf): differentiable
+  neighbor classification; our log probability objective is an adaptation, not an exact reproduction.
+
+---
+
+## Historical design snapshot (September 3-7, superseded above)
+
+The remaining sections record the rationale and settings of the previously evaluated model.
+Their defaults, readiness statements and preliminary protocol fingerprints are historical, not
+instructions for configuring the new staged experiment. See the linked matched report for results.
 
 This supersedes the clinical / motion-monitoring pivot as the paper target. The
 classification-era code (Phase-A tokenizer, evidence/compact engine, baseline adapters, the

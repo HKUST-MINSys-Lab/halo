@@ -72,6 +72,116 @@ def _rng(seed=0):
     return np.random.default_rng(seed)
 
 
+def test_direct_semantic_episode_needs_no_background_or_support_subject():
+    corpus = _corpus(labels=("walking", "running"), subjects_per_label=1)
+    episode = draw_episode(corpus, _rng(), p_gt_present=0, semantic_zero_shot=True)
+    assert episode is not None
+    assert episode.is_zero_shot and episode.support == () and episode.requested_support == 0
+    assert set(episode.candidates) == {"walking", "running"}
+    assert episode.candidates[episode.gt_slot] == corpus.recordings[episode.query].label
+
+
+def test_deployment_batch_draws_exact_k_and_reuses_one_support_set():
+    corpus = _corpus(subjects_per_label=7, windows_per_subject=3)
+    episodes, telemetry = draw_batch(
+        corpus, _rng(91), batch_size=2, deployment_matched=True,
+        enrollment_k=(2,), queries_per_support_set=3, windows_per_execution=2,
+        p_gt_present=1.0, label_subset=(2, 2), mode="compatible",
+        same_subject_probability=0.0, semantic_zero_shot=False,
+    )
+    assert telemetry["sampler/support_set_count"] == 2
+    assert telemetry["sampler/mean_queries_per_support_set"] == 3
+    for support_set_id in range(2):
+        group = [episode for episode in episodes if episode.support_set_id == support_set_id]
+        assert len(group) == 3
+        reference = group[0]
+        assert all(episode.support == reference.support for episode in group)
+        assert all(episode.support_window_groups == reference.support_window_groups for episode in group)
+        assert len(reference.support) == 4
+        assert all(reference.support_candidate.count(slot) == 2 for slot in range(2))
+        assert all(1 <= len(windows) <= 2 for windows in reference.support_window_groups)
+        support_units = {
+            (corpus.recordings[index].dataset, corpus.recordings[index].subject,
+             corpus.recordings[index].execution) for index in reference.support
+        }
+        assert len(support_units) == len(reference.support)
+        query_units = {
+            (corpus.recordings[episode.query].dataset, corpus.recordings[episode.query].subject,
+             corpus.recordings[episode.query].execution) for episode in group
+        }
+        assert len(query_units) == len(group) and not (query_units & support_units)
+
+
+def test_deployment_batch_never_relaxes_an_impossible_k():
+    corpus = _corpus(subjects_per_label=2)
+    with pytest.raises(RuntimeError, match="refusing to relax compatibility or duplicate"):
+        draw_batch(
+            corpus, _rng(), batch_size=1, max_attempts_per_episode=2,
+            deployment_matched=True, enrollment_k=(8,), queries_per_support_set=2,
+            windows_per_execution=1, p_gt_present=1.0, label_subset=(2, 2),
+            mode="compatible", same_subject_probability=0.0, semantic_zero_shot=False,
+        )
+
+
+def test_deployment_zero_shot_has_no_support_and_distinct_queries():
+    corpus = _corpus(subjects_per_label=5)
+    episodes, _ = draw_batch(
+        corpus, _rng(33), batch_size=1, deployment_matched=True,
+        enrollment_k=(1,), queries_per_support_set=4, windows_per_execution=1,
+        p_gt_present=0.0, label_subset=(2, 3), mode="compatible",
+        same_subject_probability=0.0, semantic_zero_shot=True,
+    )
+    assert all(episode.is_zero_shot and not episode.support for episode in episodes)
+    units = {(corpus.recordings[e.query].subject, corpus.recordings[e.query].execution)
+             for e in episodes}
+    assert len(units) == len(episodes)
+
+
+def test_deployment_shortfalls_are_visible_in_telemetry():
+    corpus = _corpus(labels=("walking", "running", "sitting"), subjects_per_label=4)
+    episodes, telemetry = draw_batch(
+        corpus, _rng(8), batch_size=2, deployment_matched=True,
+        enrollment_k=(1,), queries_per_support_set=2, windows_per_execution=1,
+        p_gt_present=1.0, label_subset=(3, 3), mode="compatible",
+        # Synthetic executions have no second execution for the same subject, so this request
+        # must fall back to valid cross-subject support rather than duplicate or leak the query.
+        same_subject_probability=1.0, semantic_zero_shot=False,
+    )
+    assert episodes
+    assert telemetry["sampler/candidate_roster_shrink_fraction"] == 0.0
+    assert telemetry["sampler/subject_relation_fallback_fraction"] == 1.0
+    assert all(len(episode.candidates) == 3 for episode in episodes)
+    assert all(episode.subject_relation == "cross_subject" for episode in episodes)
+
+
+def test_deployment_never_shrinks_below_requested_minimum_candidates():
+    corpus = _corpus(labels=("walking", "running", "sitting"), subjects_per_label=4)
+    with pytest.raises(RuntimeError, match="requested deployment-matched regime"):
+        draw_batch(
+            corpus, _rng(8), batch_size=1, deployment_matched=True,
+            enrollment_k=(1,), queries_per_support_set=2, windows_per_execution=1,
+            p_gt_present=1.0, label_subset=(4, 4), mode="compatible",
+            same_subject_probability=0.0, semantic_zero_shot=False,
+        )
+
+
+def test_deployment_support_sets_remain_source_balanced_after_feasibility_retries():
+    corpus = _corpus(subjects_per_label=5, sites=("left_wrist", "right_wrist"))
+    episodes, telemetry = draw_batch(
+        corpus, _rng(18), batch_size=2, deployment_matched=True,
+        enrollment_k=(1,), queries_per_support_set=3, windows_per_execution=1,
+        p_gt_present=1.0, label_subset=(2, 3), mode="compatible",
+        same_subject_probability=0.0, semantic_zero_shot=False,
+    )
+    by_set = {support_set_id: [] for support_set_id in range(2)}
+    for episode in episodes:
+        by_set[episode.support_set_id].append(corpus.recordings[episode.query].dataset)
+    assert {values[0] for values in by_set.values()} == {"ds0", "ds1"}
+    assert all(len(set(values)) == 1 for values in by_set.values())
+    assert telemetry["sampler/max_support_set_dataset_share"] == 0.5
+    assert telemetry["sampler/min_support_set_dataset_share"] == 0.5
+
+
 @pytest.mark.parametrize("relation", ["same_subject", "cross_subject"])
 def test_available_units_preserves_order_and_never_mutates_corpus(relation):
     import copy
@@ -465,3 +575,33 @@ def test_episode_mix_probability_controls_the_loss_weight():
     expected = torch.nn.functional.cross_entropy(logits, torch.zeros(3, dtype=torch.long))
     assert torch.allclose(out["loss"], expected)
     assert not torch.allclose(out["loss"], out["few_shot_ce"] + out["zero_shot_ce"])
+
+
+def test_deployment_loss_and_regime_telemetry_weight_support_sets_not_queries():
+    import torch
+
+    from training.compare.sampling import Episode
+    from training.compare.train import episode_loss
+
+    episodes = [
+        Episode(query=0, support=(), support_candidate=(), candidates=("a", "b"),
+                gt_slot=0, mode="compatible", requested_support=0, shrunk=False,
+                support_set_id=0),
+        Episode(query=1, support=(), support_candidate=(), candidates=("a", "b"),
+                gt_slot=0, mode="compatible", requested_support=0, shrunk=False,
+                support_set_id=0),
+        Episode(query=2, support=(), support_candidate=(), candidates=("a", "b"),
+                gt_slot=0, mode="compatible", requested_support=0, shrunk=False,
+                zero_shot=True, support_set_id=1),
+    ]
+    logits = torch.tensor([[3.0, 0.0], [1.0, 0.0], [0.0, 2.0]])
+    text = {"candidate_mask": torch.ones(3, 2, dtype=torch.bool)}
+    out = episode_loss(logits, episodes, text)
+    per_query = torch.nn.functional.cross_entropy(
+        logits, torch.zeros(3, dtype=torch.long), reduction="none",
+    )
+    expected_few = per_query[:2].mean()
+    expected_zero = per_query[2]
+    torch.testing.assert_close(out["few_shot_ce"], expected_few)
+    torch.testing.assert_close(out["zero_shot_ce"], expected_zero)
+    torch.testing.assert_close(out["loss"], (expected_few + expected_zero) / 2)
