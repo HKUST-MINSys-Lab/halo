@@ -78,6 +78,7 @@ from training.tokenizer.eval_transfer import build_encoder
 from training.tokenizer.pretrain_data import (
     PATCH_SECONDS,
     CorpusIndex,
+    MultiResolutionCollate,
     MultiScaleCollate,
     PretrainDataset,
 )
@@ -533,6 +534,17 @@ def effective_rank(features: torch.Tensor) -> float:
     return float(entropy.exp())
 
 
+def _macro_f1_names(truth: list[str], prediction: list[str]) -> float:
+    """Unweighted class F1 without adding sklearn to the training hot path."""
+    scores = []
+    for label in sorted(set(truth)):
+        tp = sum(t == label and p == label for t, p in zip(truth, prediction))
+        fp = sum(t != label and p == label for t, p in zip(truth, prediction))
+        fn = sum(t == label and p != label for t, p in zip(truth, prediction))
+        scores.append(2 * tp / max(2 * tp + fp + fn, 1))
+    return float(np.mean(scores)) if scores else 0.0
+
+
 # ------------------------------------------------------------------ training
 def build_dataset(index: CorpusIndex, args) -> PretrainDataset:
     return PretrainDataset(
@@ -816,13 +828,20 @@ def validate(
     was_comparator_training = comparator.training
     encoder.eval(); comparator.eval()
     rng = np.random.default_rng(seed)
-    episodes, sampler = draw_batch(corpus, rng, batch_size=episodes_count, **draw_kwargs)
+    # Sparse held-out datasets can have only a small fraction of drawable query executions. A
+    # larger retry budget preserves their predeclared representation in the fixed panel instead of
+    # silently dropping the source or substituting an easier one. This runs outside the hot path.
+    episodes, sampler = draw_batch(
+        corpus, rng, batch_size=episodes_count, max_attempts_per_episode=256, **draw_kwargs,
+    )
     rows: list[dict] = []
     ablations: list[dict] = []
     losses: list[float] = []
     ranks: list[float] = []
     group_sizes: list[int] = []
     loss_group_sizes: list[int] = []
+    learned_by_dataset: dict[str, tuple[list[str], list[str]]] = {}
+    hard_neighbor_by_dataset: dict[str, tuple[list[str], list[str]]] = {}
     if deployment_matched:
         by_set: dict[int, list[Episode]] = {}
         for episode in episodes:
@@ -857,15 +876,56 @@ def validate(
         ))
         losses.append(float(result["loss"]))
         ranks.append(effective_rank(result["pooled"]))
+        candidate_mask = result["text"]["candidate_mask"]
+        learned_slot = result["logits"].masked_fill(
+            ~candidate_mask, float("-inf"),
+        ).argmax(dim=-1).tolist()
+        hard_slot = None
+        if result.get("readout") == "neighbors":
+            support_mask = result["rows"]["support_mask"]
+            top_row = result["support_weight"].masked_fill(~support_mask, -1.0).argmax(dim=1)
+            hard_slot = result["text"]["support_bound"].gather(
+                1, top_row.unsqueeze(1),
+            ).squeeze(1).tolist()
+        for index, episode in enumerate(group):
+            recording = corpus.recordings[episode.query]
+            learned = learned_by_dataset.setdefault(recording.dataset, ([], []))
+            learned[0].append(recording.label)
+            learned[1].append(episode.candidates[int(learned_slot[index])])
+            if hard_slot is not None:
+                hard = hard_neighbor_by_dataset.setdefault(recording.dataset, ([], []))
+                hard[0].append(recording.label)
+                hard[1].append(episode.candidates[int(hard_slot[index])])
     if was_encoder_training:
         encoder.train()
     if was_comparator_training:
         comparator.train()
     keys = sorted({key for row in rows for key in row})
     ablation_keys = sorted({key for row in ablations for key in row})
+    learned_dataset_f1 = {
+        dataset: _macro_f1_names(truth, prediction)
+        for dataset, (truth, prediction) in learned_by_dataset.items()
+    }
+    hard_dataset_f1 = {
+        dataset: _macro_f1_names(truth, prediction)
+        for dataset, (truth, prediction) in hard_neighbor_by_dataset.items()
+    }
+    selection_dataset_f1 = hard_dataset_f1 or learned_dataset_f1
     return {
         "validation/loss": float(np.average(losses, weights=loss_group_sizes)),
         "validation/encoder_effective_rank": float(np.mean(ranks)),
+        "validation/learned_dataset_macro_f1": float(np.mean(list(learned_dataset_f1.values()))),
+        "validation/selection_dataset_macro_f1": float(
+            np.mean(list(selection_dataset_f1.values()))
+        ),
+        **{
+            f"validation/dataset/{dataset}/learned_macro_f1": value
+            for dataset, value in learned_dataset_f1.items()
+        },
+        **{
+            f"validation/dataset/{dataset}/hard_1nn_macro_f1": value
+            for dataset, value in hard_dataset_f1.items()
+        },
         **{f"validation/{key}": float(np.average([row[key] for row in rows], weights=group_sizes))
            for key in keys},
         **{key: float(np.average([row[key] for row in ablations], weights=group_sizes))
@@ -934,11 +994,14 @@ def main() -> None:
     parser.add_argument("--data-seed", type=int, default=20260901,
                         help="fixed subject split/corpus seed; keep constant across model replicates")
     parser.add_argument("--log-every", type=int, default=50)
-    parser.add_argument("--val-every", type=int, default=500)
+    parser.add_argument("--val-every", type=int, default=2_500)
     parser.add_argument("--val-episodes", type=int, default=None,
-                        help="fixed support-set count for staged readouts (default: one per "
+                        help="fixed support-set count for staged readouts (default: eight per "
                              "eligible held-out dataset); legacy episode count otherwise "
                              "(default 64)")
+    parser.add_argument("--val-repeats-per-dataset", type=int, default=8,
+                        help="development support sets per eligible held-out dataset when "
+                             "--val-episodes is omitted")
     parser.add_argument("--checkpoint-every", type=int, default=500)
     parser.add_argument("--milestone-every", type=int, default=5_000,
                         help="retain a numbered checkpoint at this interval; last.pt is still "
@@ -952,6 +1015,11 @@ def main() -> None:
                              "pools were removed: the per-window work holds the GIL and 8 "
                              "threads measured 2.5-3.5x slower than none (2026-09-05)")
     parser.add_argument("--max-per-stream", type=int, default=None)
+    parser.add_argument("--patch-seconds", type=float, default=PATCH_SECONDS,
+                        help="single filterbank patch duration; ignored with --resolution-pair")
+    parser.add_argument("--resolution-pair", type=float, nargs=2, default=None,
+                        metavar=("SHORT_SECONDS", "LONG_SECONDS"),
+                        help="encode each recording on two physical-time patch grids")
     parser.add_argument("--smoke", action="store_true",
                         help="three steps on capped real data with telemetry; launches nothing long")
     args = parser.parse_args()
@@ -1001,7 +1069,7 @@ def main() -> None:
     if min(args.episodes_per_step, args.support_size, args.queries_per_support_set,
            args.windows_per_execution, args.log_every, args.val_every, args.val_episodes,
            args.checkpoint_every, args.milestone_every,
-           args.calib_batches, args.calib_batch_size) < 1:
+           args.calib_batches, args.calib_batch_size, args.val_repeats_per_dataset) < 1:
         parser.error("episode, support, validation, checkpoint and calibration counts must be positive")
     if args.loader_workers < 0:
         parser.error("loader-workers must be nonnegative")
@@ -1017,6 +1085,21 @@ def main() -> None:
         parser.error("label-subset must be LOW HIGH with 2 <= LOW <= HIGH")
     if args.label_subset[1] >= ComparatorConfig().n_slots:
         parser.error("label-subset HIGH must fit the comparator's 63 bound candidate slots")
+    if args.patch_seconds <= 0:
+        parser.error("patch-seconds must be positive")
+    if args.resolution_pair is not None:
+        short, long = args.resolution_pair
+        if short <= 0 or long <= short:
+            parser.error("resolution-pair requires 0 < SHORT_SECONDS < LONG_SECONDS")
+        if long < 1.75 * short:
+            parser.error("resolution-pair must satisfy LONG_SECONDS >= 1.75 * SHORT_SECONDS")
+    if args.frontend == "continuous" and (
+        args.resolution_pair is not None or not math.isclose(args.patch_seconds, 1.0)
+    ):
+        parser.error(
+            "the continuous frontend currently packages exactly four 8-Hz frames per one-second "
+            "token and cannot be combined with another patch duration"
+        )
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -1041,7 +1124,7 @@ def main() -> None:
     corpus = support_corpus_from_index(index)
     val_corpus = support_corpus_from_index(index, split="val")
     if automatic_val_episodes and staged and not args.smoke:
-        args.val_episodes = len(_eligible_deployment_datasets(
+        args.val_episodes = args.val_repeats_per_dataset * len(_eligible_deployment_datasets(
             val_corpus, p_gt_present=args.p_gt_present, mode=args.mode,
             enrollment_k=tuple(args.enrollment_k),
             semantic_zero_shot=args.comparator_readout == "dual_attention",
@@ -1057,7 +1140,12 @@ def main() -> None:
         index, index.val, augment=False, two_view=False,
         neutral_acquisition_text=args.neutral_acquisition_text,
     )
-    collate = EpisodicCollate(MultiScaleCollate(fixed_patch_seconds=PATCH_SECONDS))
+    base_collate = (
+        MultiResolutionCollate(fixed_patch_seconds=tuple(args.resolution_pair))
+        if args.resolution_pair is not None
+        else MultiScaleCollate(fixed_patch_seconds=args.patch_seconds)
+    )
+    collate = EpisodicCollate(base_collate)
     # Calibration and validation load on this thread; training steps come from the prefetcher.
     executor = None
 
@@ -1106,6 +1194,22 @@ def main() -> None:
         encoder, encoder_config = _random_encoder(
             device, args.frontend, neutral_acquisition_text=args.neutral_acquisition_text,
         )
+        encoder_config.update({
+            "multiresolution": args.resolution_pair is not None,
+            "patch_seconds": float(args.patch_seconds),
+            "short_patch_choices": [
+                float(args.resolution_pair[0]) if args.resolution_pair is not None
+                else 0.4
+            ],
+            "long_patch_choices": [
+                float(args.resolution_pair[1]) if args.resolution_pair is not None
+                else 1.5
+            ],
+            "val_resolution_pair": (
+                [float(value) for value in args.resolution_pair]
+                if args.resolution_pair is not None else [0.5, 1.5]
+            ),
+        })
         encoder = encoder.to(device).train()
         print(f"[compare] end-to-end from scratch (frontend={args.frontend}, "
               f"d_model={encoder_config['d_model']})", flush=True)
@@ -1173,6 +1277,8 @@ def main() -> None:
             "steps": args.steps,
             "episodes_per_step": args.episodes_per_step,
             "frontend": args.frontend,
+            "patch_seconds": args.patch_seconds,
+            "resolution_pair": args.resolution_pair,
             "center_features": args.center_features,
             "support_size": args.support_size,
             "enrollment_k": list(args.enrollment_k),
@@ -1203,6 +1309,8 @@ def main() -> None:
         saved_trajectory.setdefault("enrollment_k", list(DEFAULT_ENROLLMENT_K))
         saved_trajectory.setdefault("queries_per_support_set", DEFAULT_QUERIES_PER_SUPPORT_SET)
         saved_trajectory.setdefault("windows_per_execution", DEFAULT_WINDOWS_PER_EXECUTION)
+        saved_trajectory.setdefault("patch_seconds", PATCH_SECONDS)
+        saved_trajectory.setdefault("resolution_pair", None)
         if saved_trajectory != trajectory:
             raise SystemExit("resume trajectory differs from the checkpoint configuration")
         optimizer.load_state_dict(resume_blob["optimizer"])
@@ -1247,6 +1355,8 @@ def main() -> None:
     best_accuracy = float(resume_blob.get("best_validation_accuracy", -1.0)) if resume_blob else -1.0
     best_loss = float(resume_blob.get("best_validation_loss", float("inf"))) \
         if resume_blob else float("inf")
+    best_dataset_f1 = float(resume_blob.get("best_validation_dataset_macro_f1", -1.0)) \
+        if resume_blob else -1.0
 
     def payload(step: int) -> dict:
         return {
@@ -1263,6 +1373,7 @@ def main() -> None:
             "validation": latest_validation,
             "best_validation_accuracy": best_accuracy,
             "best_validation_loss": best_loss,
+            "best_validation_dataset_macro_f1": best_dataset_f1,
             "optimizer": optimizer.state_dict(),
             "rng": {
                 "torch": torch.get_rng_state(),
@@ -1281,7 +1392,7 @@ def main() -> None:
     started = time.perf_counter()
 
     def run_validation(step: int) -> dict[str, float]:
-        nonlocal latest_validation, best_accuracy, best_loss
+        nonlocal latest_validation, best_accuracy, best_loss, best_dataset_f1
         latest_validation = validate(
             encoder=encoder, comparator=comparator, corpus=val_corpus, dataset=val_dataset,
             collate=collate, text_of=text_of, device=device,
@@ -1294,9 +1405,14 @@ def main() -> None:
         with log_path.open("a") as handle:
             handle.write(json.dumps({"kind": "validation", **latest_validation}) + "\n")
         best_accuracy = max(best_accuracy, latest_validation["validation/accuracy/learned"])
-        score = latest_validation["validation/loss"]
-        if score < best_loss:
-            best_loss = score
+        score = latest_validation["validation/selection_dataset_macro_f1"]
+        loss = latest_validation["validation/loss"]
+        improved = score > best_dataset_f1 or (
+            math.isclose(score, best_dataset_f1) and loss < best_loss
+        )
+        if improved:
+            best_dataset_f1 = score
+            best_loss = loss
             _atomic_torch_save(payload(step), args.out / "best_internal.pt")
         return latest_validation
 
@@ -1388,6 +1504,7 @@ def main() -> None:
             message = (
                 f"[compare] validation step {step}: model "
                 f"{report['validation/accuracy/learned']:.3f}, "
+                f"dataset-macro F1 {report['validation/selection_dataset_macro_f1']:.3f}, "
                 f"loss {report['validation/loss']:.3f}"
             )
             if "validation/accuracy/base" in report:

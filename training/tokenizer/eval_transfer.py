@@ -186,6 +186,7 @@ def build_encoder(ckpt: dict, device, *, training: bool = False) -> torch.nn.Mod
     enc = SetTokenizerEncoder(**kw)
     enc.load_state_dict(ckpt["encoder"])
     enc.eval_resolution_pair = tuple(c.get("val_resolution_pair", VAL_RESOLUTION_PAIR))
+    enc.eval_patch_seconds = float(c.get("patch_seconds", PATCH_SECONDS))
     enc.min_resolution_ratio = float(c.get("min_resolution_ratio", 1.75))
     enc.multiresolution = bool(c.get("multiresolution", False))
     enc.retrieval_granularity = c.get("retrieval_granularity", "patch")
@@ -295,10 +296,13 @@ def encode_dataset_detailed(enc, data, texts, device, rate: float, gravity_state
         getattr(enc, "multiresolution", enc.use_duration_embedding)
         if eval_patching == "checkpoint" else eval_patching == "multiresolution"
     )
+    single_patch_seconds = (
+        enc.eval_patch_seconds if eval_patching == "checkpoint" else PATCH_SECONDS
+    )
     collate = (
         MultiResolutionCollate(fixed_patch_seconds=enc.eval_resolution_pair,
                                min_resolution_ratio=enc.min_resolution_ratio)
-        if use_multiresolution else MultiScaleCollate(fixed_patch_seconds=PATCH_SECONDS)
+        if use_multiresolution else MultiScaleCollate(fixed_patch_seconds=single_patch_seconds)
     )
     if source_rate is None:
         source_rate = STREAM_SOURCE_RATE_HZ.get(f"{dataset}/{stream}", float(rate))
