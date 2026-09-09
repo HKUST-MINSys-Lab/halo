@@ -940,7 +940,7 @@ def main() -> None:
                         help="optional Phase-A checkpoint for the warm-start arm. Omit for the "
                              "default end-to-end-from-scratch recipe, which is what every compact "
                              "checkpoint on disk actually used")
-    parser.add_argument("--frontend", choices=("fixed", "learnable", "continuous"),
+    parser.add_argument("--frontend", choices=("fixed", "learnable", "continuous", "multispan"),
                         default="fixed",
                         help="front end for a from-scratch encoder; the design of record is fixed")
     parser.add_argument("--center-features", action=argparse.BooleanOptionalAction, default=None,
@@ -987,6 +987,13 @@ def main() -> None:
     parser.add_argument("--encoder-lr-scale", type=float, default=None,
                         help="encoder LR multiplier on --lr; default 1.0 for the from-scratch "
                              "neighbor encoder and 0.05 for head/legacy training")
+    parser.add_argument("--frontend-lr-scale", type=float, default=1.0,
+                        help="extra multiplier on the encoder LR for the continuous frontend's "
+                             "analysis bank (kernel coefficients, envelopes, gains); the fixed "
+                             "filterbank has no such parameters")
+    parser.add_argument("--frontend-reg-weight", type=float, default=0.0,
+                        help="weight of the continuous frontend's pull toward its Gabor "
+                             "initialisation; 0 = fully learned bank, as in the 2026-09-08 runs")
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--warmup-steps", type=int, default=500)
     parser.add_argument("--grad-clip", type=float, default=1.0)
@@ -1016,10 +1023,17 @@ def main() -> None:
                              "threads measured 2.5-3.5x slower than none (2026-09-05)")
     parser.add_argument("--max-per-stream", type=int, default=None)
     parser.add_argument("--patch-seconds", type=float, default=PATCH_SECONDS,
-                        help="single filterbank patch duration; ignored with --resolution-pair")
-    parser.add_argument("--resolution-pair", type=float, nargs=2, default=None,
-                        metavar=("SHORT_SECONDS", "LONG_SECONDS"),
-                        help="encode each recording on two physical-time patch grids")
+                        help="single filterbank patch duration; ignored with --resolutions")
+    parser.add_argument("--spans", type=float, nargs="+", default=[0.25, 0.5, 1.0, 2.0],
+                        metavar="SECONDS",
+                        help="multispan frontend: physical kernel spans, one token grid per span")
+    parser.add_argument("--frames-per-span", type=int, default=4,
+                        help="multispan frontend: envelope frames per span (token stride = "
+                             "span / this)")
+    parser.add_argument("--resolutions", type=float, nargs="+", default=None,
+                        metavar="SECONDS",
+                        help="encode each recording on two or more explicitly tagged "
+                             "physical-time patch grids")
     parser.add_argument("--smoke", action="store_true",
                         help="three steps on capped real data with telemetry; launches nothing long")
     args = parser.parse_args()
@@ -1079,6 +1093,8 @@ def main() -> None:
         parser.error("same-subject-probability must be in [0,1]")
     if args.encoder_lr_scale <= 0:
         parser.error("encoder-lr-scale must be positive")
+    if args.frontend_lr_scale <= 0 or args.frontend_reg_weight < 0:
+        parser.error("frontend-lr-scale must be positive and frontend-reg-weight nonnegative")
     if not args.enrollment_k or any(value < 1 for value in args.enrollment_k):
         parser.error("enrollment-k values must be positive")
     if args.label_subset[0] < 2 or args.label_subset[1] < args.label_subset[0]:
@@ -1087,19 +1103,29 @@ def main() -> None:
         parser.error("label-subset HIGH must fit the comparator's 63 bound candidate slots")
     if args.patch_seconds <= 0:
         parser.error("patch-seconds must be positive")
-    if args.resolution_pair is not None:
-        short, long = args.resolution_pair
-        if short <= 0 or long <= short:
-            parser.error("resolution-pair requires 0 < SHORT_SECONDS < LONG_SECONDS")
-        if long < 1.75 * short:
-            parser.error("resolution-pair must satisfy LONG_SECONDS >= 1.75 * SHORT_SECONDS")
-    if args.frontend == "continuous" and (
-        args.resolution_pair is not None or not math.isclose(args.patch_seconds, 1.0)
-    ):
+    if args.resolutions is not None:
+        if len(args.resolutions) < 2 or any(value <= 0 for value in args.resolutions):
+            parser.error("resolutions requires at least two positive durations")
+        if len(set(args.resolutions)) != len(args.resolutions):
+            parser.error("resolutions must not contain duplicate durations")
+        args.resolutions = sorted(args.resolutions)
+        if args.resolutions[-1] < 1.75 * args.resolutions[0]:
+            parser.error("resolutions must span at least a 1.75x duration ratio")
+    if args.frontend == "continuous" and args.resolutions is not None:
         parser.error(
-            "the continuous frontend currently packages exactly four 8-Hz frames per one-second "
-            "token and cannot be combined with another patch duration"
+            "the continuous frontend emits one physical patch grid (set with --patch-seconds); "
+            "multi-resolution token grids are not defined for it yet"
         )
+    if args.frontend == "multispan":
+        if args.resolutions is not None:
+            parser.error("--resolutions is a filterbank token-grid option; the multispan frontend "
+                         "defines its own grid with --spans")
+        if len(args.spans) < 2 or any(s <= 0 for s in args.spans) \
+                or len(set(args.spans)) != len(args.spans):
+            parser.error("spans must be at least two distinct positive durations in seconds")
+        if args.frames_per_span < 1:
+            parser.error("frames-per-span must be positive")
+        args.spans = sorted(float(s) for s in args.spans)
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -1141,8 +1167,8 @@ def main() -> None:
         neutral_acquisition_text=args.neutral_acquisition_text,
     )
     base_collate = (
-        MultiResolutionCollate(fixed_patch_seconds=tuple(args.resolution_pair))
-        if args.resolution_pair is not None
+        MultiResolutionCollate(fixed_patch_seconds=tuple(args.resolutions))
+        if args.resolutions is not None
         else MultiScaleCollate(fixed_patch_seconds=args.patch_seconds)
     )
     collate = EpisodicCollate(base_collate)
@@ -1191,23 +1217,49 @@ def main() -> None:
     elif args.phase_a is None:
         # The design-of-record recipe: one stage, everything but the frozen text tower and the
         # filterbank's normalisation statistics starts random.
+        multispan = args.frontend == "multispan"
+        # The token grid's durations: the frontend's spans for multispan, the collate's patch
+        # grids for --resolutions, otherwise one grid (no duration embedding).
+        grid_durations = (
+            [float(s) for s in args.spans] if multispan
+            else [float(v) for v in args.resolutions] if args.resolutions is not None
+            else None
+        )
+        frontend_kwargs = None
+        if args.frontend == "continuous":
+            frontend_kwargs = {"patch_seconds": float(args.patch_seconds)}
+        elif multispan:
+            frontend_kwargs = {
+                "spans": tuple(grid_durations), "frames_per_span": int(args.frames_per_span),
+                # RoPE's fastest period spans two of the finest group's frame strides.
+                "rope_min_period": 2.0 * grid_durations[0] / args.frames_per_span,
+            }
         encoder, encoder_config = _random_encoder(
             device, args.frontend, neutral_acquisition_text=args.neutral_acquisition_text,
+            duration_range=(
+                (grid_durations[0], grid_durations[-1]) if grid_durations is not None else None
+            ),
+            num_resolutions=(len(grid_durations) if grid_durations is not None else 2),
+            frontend_kwargs=frontend_kwargs,
         )
         encoder_config.update({
-            "multiresolution": args.resolution_pair is not None,
+            "multiresolution": grid_durations is not None,
+            "token_grid_owner": "frontend" if multispan else "collate",
+            "use_duration_embedding": grid_durations is not None,
+            "num_resolutions": len(grid_durations) if grid_durations is not None else 2,
+            **({"spans": grid_durations, "frames_per_span": int(args.frames_per_span),
+                "rope_min_period": frontend_kwargs["rope_min_period"]} if multispan else {}),
             "patch_seconds": float(args.patch_seconds),
             "short_patch_choices": [
-                float(args.resolution_pair[0]) if args.resolution_pair is not None
+                float(grid_durations[0]) if grid_durations is not None
                 else 0.4
             ],
             "long_patch_choices": [
-                float(args.resolution_pair[1]) if args.resolution_pair is not None
+                float(grid_durations[-1]) if grid_durations is not None
                 else 1.5
             ],
-            "val_resolution_pair": (
-                [float(value) for value in args.resolution_pair]
-                if args.resolution_pair is not None else [0.5, 1.5]
+            "eval_resolutions": (
+                list(grid_durations) if grid_durations is not None else [0.5, 1.5]
             ),
         })
         encoder = encoder.to(device).train()
@@ -1230,6 +1282,14 @@ def main() -> None:
                 "--neutral-acquisition-text must match the Phase-A checkpoint. Arm A's claim is "
                 "that the encoder never saw acquisition text at ANY stage; mixing the two stages "
                 "would quietly void it."
+            )
+        checkpoint_patch_seconds = float(encoder_config.get("patch_seconds", PATCH_SECONDS))
+        if checkpoint_frontend == "continuous" and not math.isclose(
+            checkpoint_patch_seconds, float(args.patch_seconds),
+        ):
+            raise SystemExit(
+                f"--patch-seconds={args.patch_seconds} does not match the continuous checkpoint's "
+                f"patch grid of {checkpoint_patch_seconds} s"
             )
         encoder = build_encoder(checkpoint, device, training=True)
         print(f"[compare] warm-started from {args.phase_a}", flush=True)
@@ -1266,11 +1326,25 @@ def main() -> None:
 
     comparator_params = [parameter for parameter in comparator.parameters() if parameter.requires_grad]
     encoder_params = [parameter for parameter in encoder.parameters() if parameter.requires_grad]
-    optimizer = make_optimizer([
-        {"name": "comparator", "params": comparator_params, "lr": args.lr},
-        {"name": "encoder", "params": encoder_params,
-         "lr": args.lr * args.encoder_lr_scale},
-    ], weight_decay=args.weight_decay, device=device)
+    # The continuous frontend's analysis bank gets its own group so its learning rate can be scaled
+    # and scheduled like the others. The fixed filterbank has no such parameters and adds no group,
+    # which keeps every existing checkpoint's optimizer state resumable.
+    frontend_params = (
+        [parameter for parameter in frontend.adaptation_parameters() if parameter.requires_grad]
+        if frontend is not None and hasattr(frontend, "adaptation_parameters") else []
+    )
+    frontend_ids = {id(parameter) for parameter in frontend_params}
+    encoder_trunk_params = [p for p in encoder_params if id(p) not in frontend_ids]
+    # Base rates live here, not in the groups: ``load_state_dict`` replaces group dicts wholesale.
+    base_lrs = [args.lr, args.lr * args.encoder_lr_scale]
+    param_groups = [
+        {"name": "comparator", "params": comparator_params, "lr": base_lrs[0]},
+        {"name": "encoder", "params": encoder_trunk_params, "lr": base_lrs[1]},
+    ]
+    if frontend_params:
+        base_lrs.append(args.lr * args.encoder_lr_scale * args.frontend_lr_scale)
+        param_groups.append({"name": "frontend", "params": frontend_params, "lr": base_lrs[2]})
+    optimizer = make_optimizer(param_groups, weight_decay=args.weight_decay, device=device)
 
     trajectory = {
         key: value for key, value in {
@@ -1278,7 +1352,7 @@ def main() -> None:
             "episodes_per_step": args.episodes_per_step,
             "frontend": args.frontend,
             "patch_seconds": args.patch_seconds,
-            "resolution_pair": args.resolution_pair,
+            "resolutions": args.resolutions,
             "center_features": args.center_features,
             "support_size": args.support_size,
             "enrollment_k": list(args.enrollment_k),
@@ -1293,6 +1367,10 @@ def main() -> None:
             "freeze_encoder": args.freeze_encoder,
             "lr": args.lr,
             "encoder_lr_scale": args.encoder_lr_scale,
+            "frontend_lr_scale": args.frontend_lr_scale,
+            "frontend_reg_weight": args.frontend_reg_weight,
+            "spans": list(args.spans) if args.frontend == "multispan" else None,
+            "frames_per_span": args.frames_per_span if args.frontend == "multispan" else None,
             "weight_decay": args.weight_decay,
             "warmup_steps": args.warmup_steps,
             "grad_clip": args.grad_clip,
@@ -1310,7 +1388,12 @@ def main() -> None:
         saved_trajectory.setdefault("queries_per_support_set", DEFAULT_QUERIES_PER_SUPPORT_SET)
         saved_trajectory.setdefault("windows_per_execution", DEFAULT_WINDOWS_PER_EXECUTION)
         saved_trajectory.setdefault("patch_seconds", PATCH_SECONDS)
-        saved_trajectory.setdefault("resolution_pair", None)
+        legacy_resolutions = saved_trajectory.pop("resolution_pair", None)
+        saved_trajectory.setdefault("resolutions", legacy_resolutions)
+        saved_trajectory.setdefault("frontend_lr_scale", 1.0)
+        saved_trajectory.setdefault("frontend_reg_weight", 0.0)
+        saved_trajectory.setdefault("spans", None)
+        saved_trajectory.setdefault("frames_per_span", None)
         if saved_trajectory != trajectory:
             raise SystemExit("resume trajectory differs from the checkpoint configuration")
         optimizer.load_state_dict(resume_blob["optimizer"])
@@ -1422,8 +1505,7 @@ def main() -> None:
 
     for step in range(start_step + 1, args.steps + 1):
         scale = _learning_rate_scale(step, warmup=args.warmup_steps, total=args.steps)
-        for group, base in zip(optimizer.param_groups,
-                               (args.lr, args.lr * args.encoder_lr_scale)):
+        for group, base in zip(optimizer.param_groups, base_lrs):
             group["lr"] = base * scale
 
         if loader is not None:
@@ -1434,6 +1516,9 @@ def main() -> None:
                 batch_size=args.episodes_per_step, **draw_kwargs,
             )
             batch = None
+        log_step = step % args.log_every == 0 or step == 1
+        if frontend is not None and hasattr(frontend, "request_runtime_telemetry"):
+            frontend.request_runtime_telemetry(log_step)
         optimizer.zero_grad(set_to_none=True)
         with _autocast(device):
             result = run_step(
@@ -1441,12 +1526,27 @@ def main() -> None:
                 encoder=encoder, comparator=comparator, text_of=text_of, device=device,
                 center=args.center_features, executor=executor, batch=batch,
             )
-        if not bool(torch.isfinite(result["loss"])):
+        frontend_reg = None
+        if args.frontend_reg_weight > 0 and frontend is not None \
+                and hasattr(frontend, "adaptation_regularization"):
+            frontend_reg = frontend.adaptation_regularization()
+        total_loss = (result["loss"] if frontend_reg is None
+                      else result["loss"] + args.frontend_reg_weight * frontend_reg)
+        if not bool(torch.isfinite(total_loss)):
             raise FloatingPointError(f"non-finite comparison loss at step {step}")
-        result["loss"].backward()
-        log_step = step % args.log_every == 0 or step == 1
+        total_loss.backward()
         encoder_grad = _parameter_grad_norm(encoder_params) if log_step else 0.0
         comparator_grad = _parameter_grad_norm(comparator_params) if log_step else 0.0
+        duration_parameters = (
+            list(encoder.duration_proj.parameters()) + [encoder.duration_gate_logit]
+            if getattr(encoder, "use_duration_embedding", False) else []
+        )
+        duration_grad = _parameter_grad_norm(duration_parameters) if log_step else 0.0
+        frontend_grad = _parameter_grad_norm(frontend_params) if log_step and frontend_params else 0.0
+        frontend_summary = (
+            {**frontend.adaptation_summary(), **frontend.runtime_summary()}
+            if log_step and frontend_params and hasattr(frontend, "adaptation_summary") else {}
+        )
         head_gradients = {}
         embedding_gradients = (
             embedding_gradient_telemetry(result)
@@ -1475,16 +1575,29 @@ def main() -> None:
                 "encoder/effective_rank": effective_rank(result["pooled"]),
                 "gradient/encoder_norm": encoder_grad,
                 "gradient/comparator_norm": comparator_grad,
+                "gradient/duration_embedding_norm": duration_grad,
+                "gradient/frontend_norm": frontend_grad,
+                "loss/frontend_reg": (
+                    float(frontend_reg.detach()) if frontend_reg is not None else 0.0
+                ),
                 "gradient/total_preclip_norm": preclip,
                 "gradient/clip_coefficient": min(1.0, args.grad_clip / max(preclip, 1e-12)),
                 "lr/comparator": optimizer.param_groups[0]["lr"],
                 "lr/encoder": optimizer.param_groups[1]["lr"],
+                "lr/frontend": (
+                    optimizer.param_groups[2]["lr"] if len(optimizer.param_groups) > 2 else 0.0
+                ),
+                "encoder/duration_gate": (
+                    float(torch.sigmoid(encoder.duration_gate_logit.detach()))
+                    if getattr(encoder, "use_duration_embedding", False) else 0.0
+                ),
                 "elapsed_s": round(time.perf_counter() - started, 1),
                 **telemetry,
                 **behavior,
                 **comparator.telemetry(),
                 **head_gradients,
                 **embedding_gradients,
+                **frontend_summary,
             }
             with log_path.open("a") as handle:
                 handle.write(json.dumps(row) + "\n")

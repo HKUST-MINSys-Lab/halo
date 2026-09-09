@@ -329,6 +329,8 @@ def encode_batch(encoder: SetTokenizerEncoder, batch: dict, device: torch.device
         batch["role_texts"],
         batch["positions"].to(device, non_blocking=True),
         patch_durations=batch["patch_durations"].to(device, non_blocking=True),
+        resolution_ids=(batch["resolution_ids"].to(device, non_blocking=True)
+                        if "resolution_ids" in batch else None),
         channel_mask=batch["channel_mask"].to(device, non_blocking=True),
         patch_padding_mask=batch["patch_padding_mask"].to(device, non_blocking=True),
         sensor_texts=batch["sensor_texts"],
@@ -341,7 +343,7 @@ def encode_batch(encoder: SetTokenizerEncoder, batch: dict, device: torch.device
 
 
 _DEVICE_BATCH_FIELDS = (
-    "patches", "rates", "patch_len", "positions", "patch_durations", "channel_mask",
+    "patches", "rates", "patch_len", "positions", "patch_durations", "resolution_ids", "channel_mask",
     "patch_padding_mask", "sensor_id", "source_rates", "labels", "sensor_bias",
 )
 
@@ -1220,7 +1222,12 @@ def _random_encoder(
     frontend: str = "fixed",
     *,
     neutral_acquisition_text: bool = False,
+    duration_range: tuple[float, float] | None = None,
+    num_resolutions: int = 2,
+    frontend_kwargs: dict | None = None,
 ) -> tuple[SetTokenizerEncoder, dict]:
+    use_duration_embedding = duration_range is not None
+    duration_min, duration_max = duration_range or (0.4, 1.5)
     config = {
         "frontend": frontend,
         "d_model": 128,
@@ -1237,6 +1244,10 @@ def _random_encoder(
         "use_sensor_isolated_retrieval": False,
         "neutral_acquisition_text": bool(neutral_acquisition_text),
         "multiresolution": False,
+        "use_duration_embedding": use_duration_embedding,
+        "duration_min_seconds": float(duration_min),
+        "duration_max_seconds": float(duration_max),
+        "num_resolutions": int(num_resolutions),
         # Constructor bounds remain valid even though multiresolution is disabled. Keeping the
         # ordinary bounds makes this checkpoint reconstructible by the shared loader.
         "short_patch_choices": [0.4],
@@ -1249,6 +1260,10 @@ def _random_encoder(
         dft_size=DFT_SIZE, frontend=frontend, trunk="temporal",
         descriptor_prediction=False, text_conditioning="factored",
         token_granularity="sensor", use_sensor_bias_conditioning=False,
+        use_duration_embedding=use_duration_embedding,
+        duration_min_seconds=duration_min, duration_max_seconds=duration_max,
+        num_resolutions=num_resolutions,
+        **(frontend_kwargs or {}),
     ).to(device)
     return encoder, config
 

@@ -282,6 +282,23 @@ def test_multiresolution_collate_covers_signal_and_retains_partial_tails():
     )
 
 
+def test_multiresolution_collate_supports_three_explicit_scales():
+    item = {
+        "data": torch.randn(300, 6), "rate": 50.0, "texts": ["x"] * 6,
+        "label_id": 0, "channel_mask": torch.ones(6, dtype=torch.bool),
+        "gravity_state": "present", "source": "synthetic",
+    }
+    out = MultiResolutionCollate(fixed_patch_seconds=(0.5, 1.0, 1.5))([item])
+    real = out["patch_padding_mask"][0]
+    assert out["resolution_count"] == 3
+    assert out["patch_seconds"] == (0.5, 1.0, 1.5)
+    assert set(out["resolution_ids"][0, real].tolist()) == {0, 1, 2}
+    for rid in range(3):
+        selected = real & out["resolution_ids"][0].eq(rid)
+        assert out["patch_starts"][0, selected].min() == 0
+        assert out["patch_ends"][0, selected].max() == 6.0
+
+
 def test_collate_carries_realized_augmentation_trace_for_both_views(index):
     ds = PretrainDataset(index, index.train[:4], augment=True, two_view=True)
     items = [ds[i] for i in range(4)]

@@ -174,7 +174,7 @@ vocabulary. Nothing in the architecture is claimed as novel.
 
 | Component | Decision | Rationale |
 |---|---|---|
-| Front end | **Fixed physical filterbank, single resolution, not learnable** | The learnable arm stayed pinned at its init; simplicity wins. Multiresolution's +0.034 is a documented option we deliberately do not take. |
+| Front end | **Fixed physical filterbank, single resolution, not learnable** | This remains the design of record. The first multi-resolution comparison lacked explicit duration identity at sensor granularity and is not decisive; a corrected 0.5/1.0/1.5 s scale-aware arm is an experiment, not yet the default. |
 | Feature extraction | **Existing Phase-A tokenizer + temporal trunk, unchanged** | No evidence that complicating it buys anything. |
 | Conditioning | **Rate and patch-duration pathways kept. Acquisition-configuration text is OFF in the core design.** Compatibility is handled at support construction instead (Section 3). | The encoder is trained on every configuration anyway; once support is compatible by construction there is nothing left for the text to tell it. The text pathway is kept in the code for the Section 6 experiment. |
 | Comparator | **Attention over the query and every support example** (no retrieval stage, no top-k) | Removes the config-ranking defect and the non-differentiable selection; K is small enough to attend over fully. |
@@ -354,8 +354,8 @@ Arm B is reported as a result about the model, not as a claim the paper rests on
 |---|---|
 | **Episode mean-centering OFF** (`--no-center-features`; centering is the DEFAULT as of 2026-09-04) | Does removing what the support rows have in common force the model to discriminate? Configuration is close to a common mode within an episode — the support all shares the query's key — and the previous design's retrieval ranked by configuration at a 7.0x lift, so this targets the measured defect directly. **Changes the step-0 function: compare raw scores at matched seeds, never paired gain.** |
 | From-scratch vs Phase-A warm start | Does one-stage training beat two, at a 35k schedule? Never tested head to head. |
-| **Fixed filterbank vs continuous kernel** (`--frontend`) | The encoder's two real front-end modes; see 6.1 — the existing head-to-head is inside the noise and must be re-run matched. |
-| Fixed single-res filterbank vs multiresolution vs learnable | Is the simple front end leaving accuracy on the table? |
+| **Fixed filterbank vs continuous kernel** (`--frontend`) | See 6.1: compare the corrected single-span and new multi-span arms with the fixed control using matched runs. |
+| Fixed 1.0 s vs scale-aware 0.5/1.0/1.5 s filterbank | Does explicit physical-duration conditioning let attention use complementary temporal scales? The earlier untagged 0.5/1.5 s arm does not answer this. |
 | Attention comparator vs cosine 1-NN vs prototype over the same encoder | Is the learned comparison worth having? (the untrained floor lives here) |
 | **Sensor-only reweighting vs fused label-in-attention** (`--comparator-readout`) | Does letting the learned part see label text help or hurt? Both share the same step-0 function, so compare by paired gain. The run launched 2026-09-07 14:27 (`imwut_compare_arm_a_fixed_35k_20260907`) is the fused arm. |
 | Compatible support vs unfiltered support, text OFF | How much does the explicit filter buy on its own? |
@@ -363,13 +363,20 @@ Arm B is reported as a result about the model, not as a claim the paper rests on
 | p in {0, 0.25, 0.5, 0.75, 1} | Does joint ZS/FS training cost few-shot accuracy? |
 | Step-0 control | Did fine-tuning help at all, paired? |
 
-### 6.1 On the two front-end modes
+### 6.1 Frontend experiments
 
-The encoder has always had two genuine front ends — the fixed physical filterbank and the
-continuous kernel bank — and both are selectable in the comparison trainer (`--frontend`), verified
-to run from scratch at the compact shape.
+The comparison trainer supports the fixed physical filterbank, single-span continuous kernel bank,
+and multi-span continuous kernel bank. The multi-span arm creates its own tagged token grid and
+uses per-span amplitude/DC normalization. Its implementation and rate contract are described in
+`CONTINUOUS_KERNEL_FRONTEND.md`. The learnable-filterbank option is retained as a separate ablation.
 
-A head-to-head already exists on disk, and it settles nothing:
+The latest completed frontend comparison is documented in
+`../results/IMWUT_TEMPORAL_RESOLUTION_ABLATION_20260908.md`. Those scores predate the corrected
+continuous observability calculation and the new multi-span frontend; neither corrected arm has
+a completed result. Current continuous modules reject historical checkpoints without their
+analysis revision marker, so reproducing older scores requires the original saved source.
+
+An earlier August head-to-head also exists on disk:
 
 | run | frontend | step | selection |
 |---|---|---:|---:|
@@ -379,8 +386,8 @@ A head-to-head already exists on disk, and it settles nothing:
 Continuous leads by 0.0082, but the two runs stopped at different steps, neither recorded a seed,
 and the measured screening noise on this setup is sd 0.0065 — the standing rule being that nothing
 under about 0.012 is real. So the gap sits inside the noise and was measured off unmatched
-schedules. Only the continuous arm has downstream adaptation results on disk, so even the
-second-stage comparison is one-sided.
+schedules. At that stage only the continuous arm had downstream adaptation results, making that
+second-stage comparison one-sided. The September report above supersedes this historical status.
 
 The honest statement is that **we do not know which front end is better**, and the paper must
 either say so or run the comparison properly: matched steps, matched seeds, at least three of them,

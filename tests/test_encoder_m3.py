@@ -83,6 +83,25 @@ def test_multiresolution_pooling_weights_scales_not_tokens():
     assert torch.allclose(out["pooled"], torch.full((1, 4), 5.0))
 
 
+def test_three_resolution_pooling_weights_each_scale_equally():
+    model = SetTokenizerEncoder(
+        d_model=4, num_layers=1, num_heads=1, dim_feedforward=8, dropout=0.0,
+        dft_size=S, num_resolutions=3,
+    )
+    model.fusion = _PassFusion()
+    model.transformer = _PassTransformer()
+    values = torch.tensor([0.0, 0.0, 10.0, 20.0, 20.0])
+    sensor = values.view(1, 5, 1, 1).expand(1, 5, 1, 4)
+    text = torch.zeros(1, 1, 1, 384)
+    text_mask = torch.ones(1, 1, 1, dtype=torch.bool)
+    out = model.encode(
+        sensor, text, text_mask, torch.arange(5).view(1, 5).float(),
+        resolution_ids=torch.tensor([[0, 0, 1, 2, 2]]),
+        patch_padding_mask=torch.ones(1, 5, dtype=torch.bool),
+    )
+    assert torch.allclose(out["pooled"], torch.full((1, 4), 10.0))
+
+
 def test_resolutions_contextualize_each_other():
     torch.manual_seed(7)
     model = SetTokenizerEncoder(

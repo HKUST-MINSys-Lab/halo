@@ -154,6 +154,11 @@ def build_encoder(ckpt: dict, device, *, training: bool = False) -> torch.nn.Mod
         descriptor_prediction = any(
             key.startswith("descriptor_head.") for key in ckpt.get("encoder", {})
         )
+    has_duration_embedding = any(
+        key.startswith("duration_proj.") or key == "duration_gate_logit"
+        for key in ckpt.get("encoder", {})
+    )
+    use_duration_embedding = bool(c.get("use_duration_embedding", has_duration_embedding))
     kw = dict(
         d_model=c["d_model"], num_layers=c["num_layers"], num_heads=c["num_heads"],
         dim_feedforward=c["dim_feedforward"],
@@ -162,12 +167,18 @@ def build_encoder(ckpt: dict, device, *, training: bool = False) -> torch.nn.Mod
         frontend=frontend,                                  # reconstruct the ACTUAL arm (was: always filterbank)
         trunk=c.get("trunk", "dual"),
         descriptor_prediction=bool(descriptor_prediction),
-        use_duration_embedding=(c.get("multiresolution", False)
-                                and c.get("token_granularity", "channel") == "channel"),
-        duration_min_seconds=min(c.get("short_patch_choices", (0.4,))),
-        duration_max_seconds=max(c.get("long_patch_choices", (1.5,))),
+        use_duration_embedding=use_duration_embedding,
+        duration_min_seconds=float(c.get(
+            "duration_min_seconds", min(c.get("short_patch_choices", (0.4,))),
+        )),
+        duration_max_seconds=float(c.get(
+            "duration_max_seconds", max(c.get("long_patch_choices", (1.5,))),
+        )),
         duration_gate_init=c.get("duration_gate_init", 0.1),
-        rope_min_period=0.4 if c.get("multiresolution", False) else 0.5,
+        num_resolutions=int(c.get("num_resolutions", 2)),
+        rope_min_period=float(c.get(
+            "rope_min_period", 0.4 if c.get("multiresolution", False) else 0.5,
+        )),
         text_conditioning=c.get("text_conditioning", "per_channel"),  # reconstruct the ACTUAL arm
         token_granularity=c.get("token_granularity", "channel"),
         sensor_bias_dim=int(sensor_bias_dim),
@@ -183,9 +194,22 @@ def build_encoder(ckpt: dict, device, *, training: bool = False) -> torch.nn.Mod
         filter_shape_max=c.get("filter_shape_max", 2.5),
         adaptive_gate_init=c.get("adaptive_gate_init", 0.1),
     )
+    if frontend == "continuous":
+        # The continuous frontend lays its analysis frames on the physical patch grid it was built
+        # for; reconstruct that grid rather than assuming one-second tokens.
+        kw["patch_seconds"] = float(c.get("patch_seconds", PATCH_SECONDS))
+    elif frontend == "multispan":
+        from model.tokenizer.multispan_kernel import MS_FRAMES_PER_SPAN, MS_SPANS_S
+
+        kw["spans"] = tuple(float(s) for s in c.get("spans", MS_SPANS_S))
+        kw["frames_per_span"] = int(c.get("frames_per_span", MS_FRAMES_PER_SPAN))
     enc = SetTokenizerEncoder(**kw)
     enc.load_state_dict(ckpt["encoder"])
-    enc.eval_resolution_pair = tuple(c.get("val_resolution_pair", VAL_RESOLUTION_PAIR))
+    enc.eval_resolutions = tuple(
+        c.get("eval_resolutions", c.get("val_resolution_pair", VAL_RESOLUTION_PAIR))
+    )
+    # Compatibility for callers and checkpoints from the two-resolution implementation.
+    enc.eval_resolution_pair = enc.eval_resolutions
     enc.eval_patch_seconds = float(c.get("patch_seconds", PATCH_SECONDS))
     enc.min_resolution_ratio = float(c.get("min_resolution_ratio", 1.75))
     enc.multiresolution = bool(c.get("multiresolution", False))
@@ -281,7 +305,7 @@ def encode_dataset_detailed(enc, data, texts, device, rate: float, gravity_state
       patch_window    (M,) local input-window row
       patch_time      (M,) window-relative patch-center seconds
       patch_duration  (M,) represented physical seconds
-      patch_resolution (M,) 0=single/short grid, 1=long grid
+      patch_resolution (M,) -1=single grid, otherwise the configured duration-grid index
 
     ``dataset``/``stream`` are only needed for a FACTORED encoder (to build the role/sensor text);
     the default per_channel path uses the ``texts`` (per-channel descriptions) exactly as before.
@@ -292,16 +316,30 @@ def encode_dataset_detailed(enc, data, texts, device, rate: float, gravity_state
     """
     if eval_patching not in {"checkpoint", "fixed-1s", "multiresolution"}:
         raise ValueError(f"unknown eval_patching mode {eval_patching!r}")
+    owns_grid = getattr(getattr(enc, "filterbank", None), "emits_token_grid", False)
+    if owns_grid and eval_patching == "multiresolution":
+        raise ValueError(
+            "The multi-span frontend owns its token grid; --patching multiresolution would "
+            "duplicate the recording. Use --patching checkpoint."
+        )
     use_multiresolution = (
         getattr(enc, "multiresolution", enc.use_duration_embedding)
         if eval_patching == "checkpoint" else eval_patching == "multiresolution"
     )
+    if owns_grid:
+        use_multiresolution = False
     single_patch_seconds = (
-        enc.eval_patch_seconds if eval_patching == "checkpoint" else PATCH_SECONDS
+        getattr(enc, "eval_patch_seconds", PATCH_SECONDS)
+        if eval_patching == "checkpoint" else PATCH_SECONDS
+    )
+    eval_resolutions = getattr(
+        enc, "eval_resolutions", getattr(enc, "eval_resolution_pair", VAL_RESOLUTION_PAIR),
     )
     collate = (
-        MultiResolutionCollate(fixed_patch_seconds=enc.eval_resolution_pair,
-                               min_resolution_ratio=enc.min_resolution_ratio)
+        MultiResolutionCollate(
+            fixed_patch_seconds=eval_resolutions,
+            min_resolution_ratio=getattr(enc, "min_resolution_ratio", 1.75),
+        )
         if use_multiresolution else MultiScaleCollate(fixed_patch_seconds=single_patch_seconds)
     )
     if source_rate is None:
@@ -388,33 +426,43 @@ def encode_dataset_detailed(enc, data, texts, device, rate: float, gravity_state
                     raise KeyError("encoder detailed export requires an out['per_patch'] tensor")
                 continue
 
-            valid = batch["patch_padding_mask"].bool()
             per_patch = out["per_patch"]
+            grid = out.get("token_grid")
+            if grid is not None:
+                # A frontend that defines its own token grid (multispan) owns the per-token
+                # metadata; the collate's patch grid only supplied the contiguous window.
+                valid = grid["token_mask"].bool().cpu()
+                token_positions = grid["positions"].float().cpu()
+                durations = grid["durations"].float().cpu()
+                resolutions = grid["resolution_ids"].long().cpu()
+            else:
+                valid = batch["patch_padding_mask"].bool()
+                token_positions = batch["positions"].float()
+                if "patch_durations" in batch:
+                    durations = batch["patch_durations"].float()
+                else:
+                    patch_len = batch["patch_len"].float()
+                    rates = batch["rates"].float().clamp_min(1e-8)
+                    durations = (
+                        patch_len / rates
+                        if patch_len.ndim == 1
+                        else patch_len / rates.unsqueeze(1)
+                    )
+                resolutions = (
+                    batch["resolution_ids"].long()
+                    if "resolution_ids" in batch
+                    else torch.zeros_like(batch["positions"], dtype=torch.long)
+                )
             valid_on_output = valid.to(per_patch.device)
             local_rows = (
                 torch.arange(len(items), dtype=torch.long).unsqueeze(1)
                 .expand_as(valid) + int(start)
             )
-            if "patch_durations" in batch:
-                durations = batch["patch_durations"].float()
-            else:
-                patch_len = batch["patch_len"].float()
-                rates = batch["rates"].float().clamp_min(1e-8)
-                durations = (
-                    patch_len / rates
-                    if patch_len.ndim == 1
-                    else patch_len / rates.unsqueeze(1)
-                )
-            resolutions = (
-                batch["resolution_ids"].long()
-                if "resolution_ids" in batch
-                else torch.zeros_like(batch["positions"], dtype=torch.long)
-            )
 
             patch_z_parts.append(per_patch[valid_on_output])
             metadata_device = per_patch.device if requires_grad else torch.device("cpu")
             patch_window_parts.append(local_rows[valid].to(metadata_device))
-            patch_time_parts.append(batch["positions"].float()[valid].to(metadata_device))
+            patch_time_parts.append(token_positions[valid].to(metadata_device))
             patch_duration_parts.append(durations[valid].to(metadata_device))
             patch_resolution_parts.append(resolutions[valid].to(metadata_device))
 
@@ -432,7 +480,7 @@ def encode_dataset_detailed(enc, data, texts, device, rate: float, gravity_state
                 sensor_window_parts.append((b_idx.cpu() + int(start)).to(metadata_device))
                 sensor_slot_parts.append(s_idx.to(metadata_device))
                 sensor_time_parts.append(
-                    batch["positions"].float().to(keep.device)[b_idx, p_idx].to(metadata_device))
+                    token_positions.to(keep.device)[b_idx, p_idx].to(metadata_device))
                 sensor_duration_parts.append(
                     durations.to(keep.device)[b_idx, p_idx].to(metadata_device))
                 sensor_resolution_parts.append(

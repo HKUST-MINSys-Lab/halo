@@ -1,7 +1,9 @@
 # Continuous physical-time frontend
 
-> **Implemented encoder arm, 2026-08-24.** Retained because temporal resolution may matter directly
-> for sequence matching and phase-local movement comparison.
+> **Implemented encoder arm, 2026-08-24; audited and corrected 2026-09-09** (see "Corrections"
+> below). Retained because temporal resolution may matter directly for sequence matching and
+> phase-local movement comparison. Both the single-span and multi-span arms are implemented.
+> The multi-span arm is ready for short end-to-end experiments; it has no trained result yet.
 
 ## Purpose
 
@@ -31,14 +33,72 @@ device boundaries. Missing axes remain explicit through validity bits.
 ## Kernel parameterization
 
 Each analysis kernel is a smooth, windowed continuous curve represented by a small Fourier basis and
-sampled at the recording's native rate. Span and carrier initialization cover human-motion time
-scales. Exact per-harmonic observability masks prevent a low-rate source from pretending to resolve
-frequencies above its acquisition bandwidth.
+sampled at the recording's native rate. Read it as a filterbank run in reverse: the 24 coefficients
+of kernel `k` ARE its amplitude spectrum on the grid `m / T_k` Hz (m = 1..12) under a Gaussian
+window; the module synthesises that spectrum into a time-domain kernel and correlates it with the
+signal at the exact sample offsets. The cos/sin pair is the analytic kernel, so the frame value
+`|z|` is a band envelope: carrier phase is discarded by design, and waveform shape inside a band is
+carried by multi-harmonic templates plus the timing of their envelope peaks across frames.
+
+**Bank geometry (2026-09-09).** Centres are log-spaced on [0.5, 15] Hz. Each kernel spans as many
+whole cycles of its centre as fit in 2 s, at most four, so the carrier harmonic sits exactly at the
+centre and all 32 (span, carrier) pairs are distinct. The frequency resolution of a kernel is set by
+its own span (`1 / T_k`, smeared by the envelope to about `0.72 / T_k`), NOT by the token duration:
+changing `patch_seconds` only changes how many frames are grouped per token. One-cycle kernels
+(0.5-1 Hz) are inherently broadband; that is the honest resolution below 1 Hz in a 2 s span.
+
+**Observability.** The mask is the fraction of a kernel's normalised coefficient energy carried by
+harmonics below the source Nyquist. At Gabor initialisation it is exactly binary (the carrier is
+live or not); it becomes fractional only once learning puts energy on harmonics a low-rate source
+cannot supply. Kernels are still built with the dead harmonics zeroed.
+
+**Patch grid.** The module is built for one physical patch duration (`patch_seconds`, default 1 s)
+and lays its 8 Hz analysis frames on that grid, so a 1.5 s token packages 12 frames (6 after the
+stride-2 stage). `analyze` refuses a batch whose full patches do not match the grid within one
+sample. The compare trainer passes `--patch-seconds` through and records it in the checkpoint
+config; `--resolutions` (several grids in one sequence) is still refused for this frontend.
 
 The implementation has 32 active analysis kernels and 135,808 frontend parameters, of which 832 are
 the continuous analysis bank. Gradients reach every learnable parameter. Mixed-rate, source-rate,
 missing-axis, accel-only, modality-isolation, and end-to-end paths have focused regression tests in
 `tests/test_continuous_kernel.py`.
+
+## Corrections (2026-09-09 audit)
+
+Verified correct: kernel synthesis and the Hilbert-pair convention, integral scaling, re-zero-mean,
+exact fractional-offset geometry, reflection padding, per-rate grouping, gradient reach, channel-only
+LayerNorm. A pure tone at a carrier gives a flat envelope across frames (min/max 0.998). Fixed:
+
+1. **Duplicate kernels.** The old rule `T = clamp(4 / f, 0.05, 2)` with a rounded carrier snapped
+   all sixteen kernels below 2 Hz onto the 0.5 Hz grid of a 2 s span: eight were the same 0.59 Hz
+   kernel, four the same 1 Hz kernel; 20 of 32 were distinct. After 35k steps of the 2026-09-08
+   continuous run the eight still had pairwise tuning-curve correlations of 0.89-0.99. Now every
+   kernel is distinct with its carrier exactly on its centre; `f_min` moved from 0.3 to 0.5 Hz
+   because nothing below `1 / t_max` was ever reachable.
+2. **Rate fingerprint from the mask.** The harmonic-slot fraction multiplied the standardised
+   response of INTACT kernels by 0.33 (8 Hz kernel at 20 Hz) and 0.42-0.67 (top kernels at 50 Hz),
+   the per-device magnitude difference Rule 2 forbids. Replaced by the retained-energy fraction.
+   The cross-rate tests had selected only fully live kernels and could not see this.
+3. **Hard-coded one-second layout.** Frames were `P x 8` regardless of patch length, so four 1.5 s
+   patches were analysed as seconds 0-4 with the last two seconds dropped and every frame marked
+   valid. The layout now follows `patch_seconds`; foreign grids raise.
+4. **Trainer wiring.** The compare trainer trained the analysis bank at the full encoder rate with
+   no pull toward the Gabor initialisation and no telemetry (the pretraining path had all three).
+   It now has `--frontend-lr-scale`, `--frontend-reg-weight` (both default to the old behaviour) and
+   logs the `frontend/*` shape-shift, envelope, gain and observability summaries.
+5. The Gabor-initialisation test probed three kernels at 3x spacing and fed one 6 s "patch", so it
+   analysed only its first second; it now sweeps every kernel at 3% spacing on a real grid.
+
+Not changed: the resolution flag (`duration / span`, clamped) is a constant 1.0 for every 6 s
+window and therefore 32 dead input dimensions; kept for checkpoint compatibility. Existing
+continuous checkpoints load unchanged (spans and carriers are buffers) but score under the new mask.
+
+**Pooled-frame agreement with the fixed filterbank.** Averaging the squared envelope over a
+patch's frames reproduces the fixed filterbank's per-patch log band energy with per-band
+correlation 0.84-0.95 for every band above 0.8 Hz on stationary band-limited noise (0.74 for the
+one-cycle kernels). Reversing a window in time changes the continuous token by 32% and the fixed
+filterbank token by exactly 0. So the frames are a superset of the filterbank at initialisation:
+band energy plus its 125 ms envelope timing, minus carrier phase.
 
 ## Measured prior result
 
@@ -60,3 +120,89 @@ the dominant frontend cost; triad packing, dense CNN, and projection were compar
 
 Application inference must re-profile complete continuous sessions. Reusing overlapping analysis
 frames is likely more important than optimizing the ordinary dense CNN.
+
+## Multi-span tokenization (BUILT 2026-09-09, `--frontend multispan`, not yet trained)
+
+Direction from the user: a bank is only meaningful with a real variety of physical spans, each
+span's responses kept at a temporal resolution that does not throw away what that span resolved,
+all of it self-attended with explicit time and span identity, and pooled into one vector for
+comparison; query and support must go through the same encoder with gradients. Implemented in
+`model/tokenizer/multispan_kernel.py` as a separate frontend arm; the single-span continuous arm
+remains available. It reuses the multi-resolution filterbank machinery (tagged token
+grids, centre-time RoPE, log-duration embedding, equal-weight per-resolution pooling) rather than
+duplicating it.
+
+**Bank.** Span groups `T in {0.25, 0.5, 1, 2}` s (`--spans`). Within a group the kernels are the
+harmonics of `1 / T`, capped at both 15 Hz and harmonic 12: 3, 7, 12 and 12 kernels, 34 in total.
+Their highest initial carrier frequencies are 12, 14, 12 and 6 Hz respectively. This intentional
+capacity cap keeps the experiment small; it is not full coverage to 15 Hz at every span. The same
+frequency is measured at several spans (4 Hz sits in every
+group), narrowband at long spans and broadband at short ones: a two-dimensional tiling of the
+time-frequency plane. Each kernel keeps its 24 learnable coefficients, envelope and gain; the rate
+contract (exact sample offsets, integral scaling, re-zero-mean, energy-retained observability mask)
+is unchanged and tested per group (cross-rate correlation > 0.97 at 20/25/50 vs 100 Hz).
+
+**Frames per group.** Stride `T / frames_per_span` (`--frames-per-span`, default 4: twice the
+envelope's Nyquist rate of ~1.45 / T). A 6 s window yields 96 + 48 + 24 + 12 = 180 tokens per
+sensor. The grid follows the longest recording in the batch; shorter recordings are masked beyond
+their own duration and get exactly the tokens they get alone (tested).
+
+**Tokens.** One token per (group, frame, sensor): the group's standardised kernel magnitudes on the
+three axes, its observability entries, the span's edge support at that frame, the local log
+amplitude and signed DC over the span, and the axis-validity bits, through one linear map per
+group. Every token carries its physical centre time (RoPE, fastest period = two strides of the
+finest group, 0.125 s by default), its span (duration embedding over [0.25, 2] s) and its group
+(`resolution_id`, `num_resolutions = 4`). The encoder's forward takes these from the frontend
+instead of the collate, so the collate's patch grid only supplies the contiguous window: 1 s and
+1.5 s collates give identical tokens (tested). The dense CNN and ordered flatten are gone;
+reversing a recording reverses each group's token sequence and changes the pooled vector through
+RoPE, where the fixed filterbank is reversal-invariant (tested).
+
+Kernel magnitudes have frozen per-kernel statistics. Local amplitude and signed DC have frozen
+per-span statistics, fitted on live training samples only. Missing axes and padding never
+contribute to calibration; unobserved groups fall back to mean zero and scale one.
+
+Checkpoints record `multiresolution=true`, `token_grid_owner=frontend`, and the actual spans in
+`eval_resolutions`. These describe the output tokens. Input still uses one non-overlapping patch
+grid; `--patching checkpoint` selects that packaging automatically. Explicit evaluation
+`--patching multiresolution` and multiple input resolution IDs are rejected because concatenating
+those grids would duplicate the raw recording.
+
+**Checkpoint revision.** Current continuous modules save `_frontend_revision=2`. Earlier
+checkpoints without this marker are rejected with an actionable error: they were trained with
+different observability mathematics or, for the multi-span pilot, shared amplitude/DC statistics.
+Reproduce those historical runs using their original commit and saved source patch. Training the
+corrected frontend requires a fresh run and fresh evaluation. Do not add a revision marker to an
+old checkpoint to bypass the check. The 2026-09-08 continuous score is historical, not a score for
+this implementation; see `docs/results/IMWUT_TEMPORAL_RESOLUTION_ABLATION_20260908.md`.
+
+**Pooling and gradients.** Mean within group, equal weight across groups (the existing rule).
+Every query and support window of an episode goes through the same encoder in one forward pass and
+the `neighbors` objective keeps support vectors attached, so gradients reach the kernels from both
+sides; `frontend/*` telemetry and `--frontend-lr-scale` / `--frontend-reg-weight` apply.
+
+**Cost, measured on the RTX 4090** (40 steps, `neighbors` readout, four episodes per step, capped
+corpus, four loader workers): 43 ms per step against 17 ms for the fixed filterbank, i.e. 2.6x,
+so a 35k-step run is about 25 minutes. Per-token export for the evaluation adapter follows the
+frontend's grid (`out["token_grid"]`).
+
+**Not done.** JEPA masking is refused on the grid (Phase-A pretraining does not support this
+frontend); only short smoke runs have been launched; the per-group projection is linear, a small per-group
+temporal mixer before attention is an obvious ablation if the trunk proves too shallow for 180
+tokens.
+
+Smoke and tests: `tests/test_multispan_kernel.py` plus the encoder/export suites, including
+normalization, checkpoint revision checks and refusal of duplicated input grids.
+
+Verification on 2026-09-09: 179 focused tests passed. A three-step real-corpus RTX 4090 smoke
+completed with finite training/validation losses and nonzero query, support, kernel and duration
+gradients. Reloading its checkpoint through the detailed evaluator exported 120 tokens for a
+4 s recording and 180 for a 6 s recording, with valid physical times. The invalid multi-resolution
+input override raised an error before encoding. Local diagnostic artifacts are in
+`/tmp/halo_multispan_fixes_20260909/`; these smoke scores are not performance results.
+
+```bash
+/home/alex/code/HALO/legacy_code/.venv/bin/python -m training.compare.train --frontend multispan \
+  --comparator-readout neighbors --out training/compare/outputs/<run> [--spans 0.25 0.5 1 2] \
+  [--frames-per-span 4] [--frontend-lr-scale 1.0] [--frontend-reg-weight 0.0]
+```

@@ -1135,12 +1135,16 @@ class MultiScaleCollate:
 
 
 class MultiResolutionCollate:
-    """Present one randomly drawn short and long patch grid in the same token sequence.
+    """Present several physical-duration patch grids in the same token sequence.
 
     Unlike ``MultiScaleCollate``, this collate retains partial tail patches and emits a true
     length for every token. Tokens are sorted by physical center time, with ``resolution_ids``
-    distinguishing short (0) from long (1) supports. Signal augmentation has already happened
-    once in ``PretrainDataset``; both grids therefore describe exactly the same augmented view.
+    identifying each duration in ascending order. Signal augmentation has already happened once
+    in ``PretrainDataset``; every grid therefore describes exactly the same augmented view.
+
+    With no fixed durations, the Phase-A augmentation retains its historical random short/long
+    pair. A fixed sequence may contain two or more durations, which is used by the scale-aware
+    comparison experiment.
     """
 
     def __init__(
@@ -1148,7 +1152,7 @@ class MultiResolutionCollate:
         dft_size: int = DFT_SIZE,
         short_choices: Sequence[float] = SHORT_PATCH_SECONDS_CHOICES,
         long_choices: Sequence[float] = LONG_PATCH_SECONDS_CHOICES,
-        fixed_patch_seconds: tuple[float, float] | None = None,
+        fixed_patch_seconds: Sequence[float] | None = None,
         max_batch_tokens: int = MAX_BATCH_TOKENS,
         min_resolution_ratio: float = MIN_RESOLUTION_RATIO,
         seed: int = SEED,
@@ -1170,14 +1174,16 @@ class MultiResolutionCollate:
             if long >= self.min_resolution_ratio * short
         )
         if self.fixed is not None:
-            short, long = map(float, self.fixed)
-            if long < self.min_resolution_ratio * short:
+            fixed = tuple(sorted(set(map(float, self.fixed))))
+            if len(fixed) < 2 or fixed[0] <= 0:
+                raise ValueError("fixed multi-resolution durations require at least two positive values")
+            if fixed[-1] < self.min_resolution_ratio * fixed[0]:
                 raise ValueError("fixed resolution pair does not satisfy min_resolution_ratio")
-            self.fixed = (short, long)
+            self.fixed = fixed
         elif not self._valid_pairs:
             raise ValueError("no short/long duration pair satisfies min_resolution_ratio")
 
-    def _patch_seconds(self, batch: list[dict]) -> tuple[float, float]:
+    def _patch_seconds(self, batch: list[dict]) -> tuple[float, ...]:
         if self.fixed is not None:
             return self.fixed
         key = _batch_identity_seed(batch, self.seed)
@@ -1194,7 +1200,7 @@ class MultiResolutionCollate:
             max_seconds = max(
                 float(item["data"].shape[0]) / max(float(item["rate"]), 1e-9) for item in batch
             )
-            def _tokens(pair: tuple[float, float]) -> int:
+            def _tokens(pair: tuple[float, ...]) -> int:
                 return n * sum(int(np.ceil(max_seconds / p)) for p in pair)
             affordable = [p for p in pairs if _tokens(p) <= self.max_batch_tokens]
             pairs = affordable or [max(pairs, key=lambda p: p[0] + p[1])]
@@ -1216,7 +1222,7 @@ class MultiResolutionCollate:
                 out["sensor_bias_b"] = out_b["sensor_bias"]
         return out
 
-    def _collate_impl(self, batch: list[dict], pair: tuple[float, float]) -> dict:
+    def _collate_impl(self, batch: list[dict], pair: tuple[float, ...]) -> dict:
         B = len(batch)
         rates = torch.zeros(B)
         source_rates = torch.zeros(B)
@@ -1289,6 +1295,7 @@ class MultiResolutionCollate:
             "patch_starts": patch_starts,
             "patch_ends": patch_ends,
             "resolution_ids": resolution_ids,
+            "resolution_count": len(pair),
             "patch_seconds": pair,
             "texts": [item["texts"] for item in batch],
             # Factored text conditioning (docs/design/TEXT_CONDITIONING.md §4b), read ONLY by the

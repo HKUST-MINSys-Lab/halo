@@ -1,6 +1,7 @@
 """Per-patch export must preserve the historical pooled encoder API."""
 
 import numpy as np
+import pytest
 import torch
 
 from training.tokenizer.eval_transfer import (encode_dataset, encode_dataset_detailed,
@@ -28,6 +29,21 @@ class _DummyEncoder(torch.nn.Module):
         mask = patch_padding_mask.to(per_patch.dtype)
         pooled = (per_patch * mask.unsqueeze(-1)).sum(1) / mask.sum(1, keepdim=True)
         return {"pooled": pooled, "per_patch": per_patch}
+
+
+def test_frontend_owned_grid_cannot_receive_duplicate_resolution_views():
+    from types import SimpleNamespace
+
+    enc = _DummyEncoder(multiresolution=True)
+    enc.filterbank = SimpleNamespace(emits_token_grid=True)
+    data = np.ones((1, 300, 6), dtype=np.float32)
+    with pytest.raises(ValueError, match="duplicate the recording"):
+        encode_dataset_detailed(enc, data, ["x"] * 6, torch.device("cpu"), 50.0,
+                                eval_patching="multiresolution")
+    # Even when the checkpoint advertises multiple output resolutions, its input is one grid.
+    result = encode_dataset_detailed(enc, data, ["x"] * 6, torch.device("cpu"), 50.0)
+    assert len(result["patch_Z"]) == 6
+    assert float(result["patch_duration"].sum()) == pytest.approx(6.0)
 
 
 def test_detailed_export_keeps_pooled_result_and_excludes_padding():

@@ -202,23 +202,118 @@ def test_padded_region_cannot_leak_into_the_output(tokenizer):
 
 
 def test_gabor_init_is_a_band_pass_bank_not_noise(tokenizer):
-    """At init each kernel must peak near its own centre frequency — that is what makes step 0
-    comparable to the physical filterbank instead of a random projection."""
+    """EVERY kernel must peak at its own centre frequency at initialisation — that is what makes
+    step 0 comparable to the physical filterbank instead of a random projection.
+
+    The earlier version probed three kernels at 3x spacing and so never saw that the 2 s span cap
+    had collapsed sixteen low kernels onto four; this sweeps all of them at ~3% spacing.
+    """
     rate = 100.0
-    for k in (8, 16, 24):
-        span = float(tokenizer.spans[k])
-        centre = float(tokenizer.centres[k])
-        t = torch.arange(int(rate * 6.0), dtype=torch.float32) / rate
-        best, best_freq = -1.0, None
-        for probe in (centre / 3.0, centre, centre * 3.0):
-            signal = torch.sin(2 * math.pi * probe * t).view(1, 1, -1, 1)
-            lengths = torch.tensor([[signal.shape[2]]], dtype=torch.long)
-            with torch.no_grad():
-                energy = tokenizer.analyze(signal, rate, lengths)["compressed"][0, 0, k].mean()
-            if float(energy) > best:
-                best, best_freq = float(energy), probe
-        assert best_freq == pytest.approx(centre, rel=1e-6), (
-            f"kernel {k} (centre {centre:.2f} Hz) responded most to {best_freq:.2f} Hz")
+    freqs = torch.exp(torch.linspace(math.log(0.4), math.log(16.0), 120))
+    t = torch.arange(int(rate * 6.0)) / rate
+    signals = torch.sin(2 * math.pi * freqs.view(-1, 1) * t.view(1, -1))
+    patches = signals.view(len(freqs), 6, 100, 1)
+    lengths = torch.full((len(freqs), 6), 100, dtype=torch.long)
+    with torch.no_grad():
+        energy = tokenizer.analyze(patches, rate, lengths)["compressed"][:, 0]     # (n, K, frames)
+    fpp = tokenizer.frames_per_patch
+    interior = energy[..., 2 * fpp:4 * fpp].mean(-1)          # seconds 2-4: fully supported
+    peak = freqs[interior.argmax(0)]
+    ratio = (peak / tokenizer.centres).log().abs()
+    # A kernel holding ONE cycle is inherently broadband (spectral sd ~0.72 x its centre): its
+    # mirror image and the zero-mean constraint push the measured peak ~10-16% above the carrier.
+    # That is the honest resolution below 1 Hz in a 2 s span, not a placement error, so those
+    # kernels get a looser bound; every multi-cycle kernel must sit within the sweep's spacing.
+    tolerance = torch.where(tokenizer.carrier == 1, math.log(1.25), math.log(1.08))
+    worst = int((ratio - tolerance).argmax())
+    assert bool((ratio < tolerance).all()), (
+        f"kernel {worst} (centre {float(tokenizer.centres[worst]):.2f} Hz) peaks at "
+        f"{float(peak[worst]):.2f} Hz")
+
+
+def test_kernel_bank_is_distinct_with_carriers_on_centres(tokenizer):
+    """A bank of 32 kernels with only 20 distinct members is 12 wasted slots that learning did not
+    recover (measured on the 2026-09-08 continuous run). Spans hold whole cycles so carriers sit
+    exactly on the log-spaced centres and no two (span, carrier) pairs coincide."""
+    pairs = {(round(float(s), 6), int(c)) for s, c in zip(tokenizer.spans, tokenizer.carrier)}
+    assert len(pairs) == tokenizer.K
+    carrier_hz = tokenizer.carrier.float() / tokenizer.spans
+    assert torch.allclose(carrier_hz, tokenizer.centres, rtol=1e-5)
+    assert bool((tokenizer.spans <= 2.0 + 1e-6).all())
+    assert int(tokenizer.carrier.min()) >= 1 and int(tokenizer.carrier.max()) <= tokenizer.M
+
+
+def test_f_min_must_fit_one_cycle_in_the_longest_span():
+    with pytest.raises(ValueError, match="one whole cycle"):
+        ContinuousKernelTokenizer(f_min=0.3, t_max=2.0)
+
+
+def test_observability_is_retained_coefficient_energy_not_slot_count():
+    """An INTACT kernel must never be rescaled by the sampling rate. The harmonic-slot fraction did
+    exactly that (x0.33 for an intact 8 Hz kernel at 20 Hz, x0.5-0.67 for the top kernels at 50 Hz),
+    a per-device magnitude fingerprint. The mask is the coefficient energy that survives the cut."""
+    module = ContinuousKernelTokenizer().eval()
+    for rate in (20.0, 25.0, 50.0, 100.0):
+        nyq, _ = module.masks(rate, torch.tensor([6.0]))
+        carrier_live = module.carrier.float() / module.spans <= module.nyquist_margin * rate / 2
+        assert torch.equal(nyq[0] > 0.5, carrier_live)
+        assert bool(((nyq[0] == 0) | (nyq[0] == 1)).all()), f"{rate} Hz rescales an intact kernel"
+    # Once learning spreads energy onto a harmonic a 20 Hz source cannot supply, the mask reports
+    # how much of the learned filter survives — here half.
+    k = module.K - 1                                   # 15 Hz kernel, span 0.267 s
+    with torch.no_grad():
+        module.cos_coeff.zero_()
+        module.sin_coeff.zero_()
+        module.cos_coeff[k, 0] = 1.0                   # harmonic 1: 3.75 Hz, live at 20 Hz
+        module.sin_coeff[k, module.M - 1] = 1.0        # harmonic 12: 45 Hz, dead at 20 Hz
+    nyq, _ = module.masks(20.0, torch.tensor([6.0]))
+    assert float(nyq[0, k]) == pytest.approx(0.5, abs=1e-6)
+
+
+@pytest.mark.parametrize("patch_seconds,per", [(0.5, 25), (1.5, 75)])
+def test_patch_duration_is_a_constructor_property(patch_seconds, per):
+    """Frames are laid out on the physical patch grid the module was built for, so a 1.5 s token
+    packages 12 frames (6 after the stride-2 stage) and the analysis covers the whole window. The
+    previous layout assumed one-second patches and silently analysed only the first P seconds."""
+    torch.manual_seed(0)
+    module = ContinuousKernelTokenizer(patch_seconds=patch_seconds).eval()
+    rate = 50.0
+    signal = torch.from_numpy(_band_limited_signal(rate)).view(1, -1, 1)
+    n_patches = signal.shape[1] // per
+    patches = signal[:, :n_patches * per].reshape(1, n_patches, per, 1)
+    lengths = torch.full((1, n_patches), per, dtype=torch.long)
+    with torch.no_grad():
+        out = module.analyze(patches, rate, lengths)
+        tokens = module.project(out)
+    assert tokens.shape[:2] == (1, n_patches)
+    assert module.frames_per_token == module.F * patch_seconds / 2
+    assert out["compressed"].shape[-1] == n_patches * module.frames_per_patch
+    last_centre = module._frame_geometry(rate, n_patches, torch.device("cpu"))["frame_time"][-1]
+    assert float(last_centre) == pytest.approx(n_patches * patch_seconds - 0.5 / module.F, abs=1e-5)
+    assert bool(out["frame_valid"].all())
+    one_second, one_len, _ = _as_patches(_band_limited_signal(rate), rate)
+    with pytest.raises(ValueError, match="different patch grid"):
+        module.analyze(one_second, rate, one_len)
+
+
+def test_default_module_refuses_a_foreign_patch_grid(tokenizer):
+    patches = torch.randn(1, 4, 75, 1)
+    lengths = torch.full((1, 4), 75, dtype=torch.long)
+    with pytest.raises(ValueError, match="different patch grid"):
+        tokenizer.analyze(patches, 50.0, lengths)
+
+
+def test_a_short_final_patch_is_still_accepted(tokenizer):
+    patches = torch.randn(1, 3, 50, 1)
+    lengths = torch.tensor([[50, 50, 20]])
+    with torch.no_grad():
+        out = tokenizer(patches, 50.0, lengths, patch_mask=torch.ones(1, 3, dtype=torch.bool))
+    assert out.shape[1] == 3
+
+
+def test_invalid_patch_seconds_are_rejected():
+    with pytest.raises(ValueError, match="even integer"):
+        ContinuousKernelTokenizer(patch_seconds=0.3)
 
 
 def test_norm_statistics_round_trip(tokenizer):

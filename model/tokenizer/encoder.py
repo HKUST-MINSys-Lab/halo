@@ -35,6 +35,7 @@ import torch.nn.functional as F
 
 from .channel_text import ChannelTextFusion, FactoredChannelTextFusion, TokenTextEncoder
 from .continuous_kernel import ContinuousKernelTokenizer
+from .multispan_kernel import MultiSpanKernelTokenizer
 from .filterbank import PhysicalFilterbankTokenizer
 from .sensor_tokens import ConditioningProjection, DescriptorHead, SensorFold
 from ..blocks import AttentionSpec
@@ -75,6 +76,7 @@ class SetTokenizerEncoder(nn.Module):
         duration_min_seconds: float = 0.4,
         duration_max_seconds: float = 1.5,
         duration_gate_init: float = 0.1,
+        num_resolutions: int = 2,
         rope_min_period: float = ROPE_MIN_PERIOD_S,
         **filterbank_kwargs,
     ):
@@ -85,17 +87,15 @@ class SetTokenizerEncoder(nn.Module):
         self.duration_max_seconds = float(duration_max_seconds)
         if not 0 < self.duration_min_seconds < self.duration_max_seconds:
             raise ValueError("duration bounds must satisfy 0 < min < max")
+        self.num_resolutions = int(num_resolutions)
+        if self.num_resolutions < 2:
+            raise ValueError("num_resolutions must be at least 2")
         if text_conditioning not in ("per_channel", "factored"):
             raise ValueError("text_conditioning must be 'per_channel' or 'factored'")
         self.text_conditioning = text_conditioning
         if token_granularity not in ("channel", "sensor"):
             raise ValueError("token_granularity must be 'channel' or 'sensor'")
         self.token_granularity = token_granularity
-        if token_granularity == "sensor" and self.use_duration_embedding:
-            raise ValueError(
-                "sensor granularity does not use a separate duration embedding; physical-time RoPE, "
-                "filterbank resolution flags, and duration-weighted pooling carry temporal scale"
-            )
         self.sensor_bias_dim = int(sensor_bias_dim)
         self.use_sensor_bias_conditioning = bool(use_sensor_bias_conditioning)
         if trunk not in ("dual", "temporal"):
@@ -108,16 +108,16 @@ class SetTokenizerEncoder(nn.Module):
         self.use_sensor_isolated_retrieval = (
             False if trunk == "temporal" else bool(use_sensor_isolated_retrieval)
         )
-        if frontend not in {"fixed", "learnable", "continuous"}:
-            raise ValueError("frontend must be 'fixed', 'learnable', or 'continuous'")
-        if frontend == "continuous" and token_granularity != "sensor":
+        if frontend not in {"fixed", "learnable", "continuous", "multispan"}:
+            raise ValueError("frontend must be 'fixed', 'learnable', 'continuous' or 'multispan'")
+        if frontend in ("continuous", "multispan") and token_granularity != "sensor":
             raise ValueError(
-                "the continuous frontend jointly models each xyz triad and therefore requires "
+                "the continuous frontends jointly model each xyz triad and therefore require "
                 "token_granularity='sensor'"
             )
         self.frontend = frontend
         # Attribute stays named `filterbank` for checkpoint compatibility.
-        if frontend == "continuous":
+        if frontend in ("continuous", "multispan"):
             # dft_size is padding capacity for the physical FFT, not a continuous-kernel setting.
             continuous_kwargs = dict(filterbank_kwargs)
             for physical_only in (
@@ -126,7 +126,12 @@ class SetTokenizerEncoder(nn.Module):
                 "adaptive_gate_init",
             ):
                 continuous_kwargs.pop(physical_only, None)
-            self.filterbank = ContinuousKernelTokenizer(d_model=d_model, **continuous_kwargs)
+            if frontend == "continuous":
+                self.filterbank = ContinuousKernelTokenizer(d_model=d_model, **continuous_kwargs)
+            else:
+                # Span-grouped kernels emitting a physical-time token grid; the collate's patch
+                # grid only supplies the contiguous window (see multispan_kernel.py).
+                self.filterbank = MultiSpanKernelTokenizer(d_model=d_model, **continuous_kwargs)
         else:
             self.filterbank = PhysicalFilterbankTokenizer(
                 learnable=frontend == "learnable", d_model=d_model, **filterbank_kwargs,
@@ -139,7 +144,8 @@ class SetTokenizerEncoder(nn.Module):
             # The continuous front end already fuses a fixed xyz triad with a dense CNN.  The
             # physical filterbank still emits per-axis rows and needs the separate fold.
             self.sensor_fold = (
-                None if frontend == "continuous" else SensorFold(d_model=d_model, dropout=dropout)
+                None if frontend in ("continuous", "multispan")
+                else SensorFold(d_model=d_model, dropout=dropout)
             )
             self.descriptor_proj = ConditioningProjection(384, d_model, dropout=dropout,
                                                           gate_bias_init=gate_bias_init)
@@ -212,6 +218,61 @@ class SetTokenizerEncoder(nn.Module):
         # Runtime-only acceleration hook. The trainer may install a compiled bound ``forward`` here;
         # keeping the actual module untouched preserves ordinary state_dict keys and eager eval loads.
         self._compiled_transformer_forward = None
+
+    def _add_duration_embedding(
+        self,
+        tokens: torch.Tensor,
+        patch_durations: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Condition every patch token on its physical temporal support.
+
+        Centre-time RoPE says *where* a token is located. This embedding says how much physical
+        time the token summarizes, which is essential when several patch grids share one attention
+        sequence. Log time makes multiplicative scale changes (0.5 -> 1.0 -> 2.0 seconds) evenly
+        spaced; the bounded gate introduces the new signal gently without blocking gradients.
+        """
+        if not self.use_duration_embedding:
+            return tokens
+        if patch_durations is None:
+            raise ValueError("patch_durations are required when duration embedding is enabled")
+        if patch_durations.shape != tokens.shape[:2]:
+            raise ValueError(
+                f"patch_durations must have shape {tuple(tokens.shape[:2])}, "
+                f"got {tuple(patch_durations.shape)}"
+            )
+        lo = math.log(self.duration_min_seconds)
+        span = math.log(self.duration_max_seconds) - lo
+        valid_duration = patch_durations > 0
+        log_d = patch_durations.clamp(min=self.duration_min_seconds).log()
+        normalized = (2.0 * (log_d - lo) / span - 1.0).clamp(-1.0, 1.0)
+        duration_emb = self.duration_proj(normalized.unsqueeze(-1).to(tokens.dtype))
+        duration_emb = duration_emb * valid_duration.unsqueeze(-1)
+        return tokens + torch.sigmoid(self.duration_gate_logit) * duration_emb.unsqueeze(2)
+
+    def _resolution_weights(
+        self,
+        resolution_ids: torch.Tensor,
+        patch_weight: torch.Tensor,
+        patch_durations: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return duration weights per patch/resolution and their per-resolution sums."""
+        if resolution_ids.shape != patch_weight.shape:
+            raise ValueError(
+                f"resolution_ids must have shape {tuple(patch_weight.shape)}, "
+                f"got {tuple(resolution_ids.shape)}"
+            )
+        valid = resolution_ids.ge(0) & resolution_ids.lt(self.num_resolutions) \
+            & patch_weight.gt(0)
+        one_hot = F.one_hot(
+            resolution_ids.clamp(0, self.num_resolutions - 1),
+            num_classes=self.num_resolutions,
+        ).to(patch_weight.dtype)
+        duration = (
+            patch_durations.to(patch_weight.dtype)
+            if patch_durations is not None else patch_weight
+        )
+        weights = one_hot * (valid.to(patch_weight.dtype) * duration).unsqueeze(-1)
+        return weights, weights.sum(dim=1)
 
     # ------------------------------------------------------------------ shareable stages
     # The forward splits into (tokenize · encode_texts · encode) so a training step that
@@ -419,17 +480,7 @@ class SetTokenizerEncoder(nn.Module):
             tokens = torch.where(
                 token_mask.unsqueeze(-1), self.mask_token.expand_as(tokens), tokens
             )
-        if self.use_duration_embedding:
-            if patch_durations is None:
-                raise ValueError("patch_durations are required when duration embedding is enabled")
-            lo = math.log(self.duration_min_seconds)
-            span = math.log(self.duration_max_seconds) - lo
-            valid_duration = patch_durations > 0
-            log_d = patch_durations.clamp(min=self.duration_min_seconds).log()
-            normalized = (2.0 * (log_d - lo) / span - 1.0).clamp(-1.0, 1.0)
-            duration_emb = self.duration_proj(normalized.unsqueeze(-1))
-            duration_emb = duration_emb * valid_duration.unsqueeze(-1)
-            tokens = tokens + torch.sigmoid(self.duration_gate_logit) * duration_emb.unsqueeze(2)
+        tokens = self._add_duration_embedding(tokens, patch_durations)
         if self.text_conditioning == "factored":
             if sensor_text_embs is None or sensor_text_masks is None or sensor_id is None:
                 raise ValueError("factored text_conditioning requires sensor_text_embs / "
@@ -484,16 +535,13 @@ class SetTokenizerEncoder(nn.Module):
         else:
             # Equal resolution weight: twelve short tokens must not outweigh four long
             # tokens merely because their temporal grid is denser.
-            valid_r = (resolution_ids >= 0) & (resolution_ids < 2) & (patch_w > 0)
-            one_hot = F.one_hot(resolution_ids.clamp(0, 1), num_classes=2).to(per_patch.dtype)
             # Within a resolution, weight each patch by its REPRESENTED duration so a partial tail
             # patch (a short window-crop remainder) contributes proportionally, not as a full-length
             # patch (F1). When every patch in a resolution has equal duration (e.g. eval's evenly
             # divided window) the constant factor cancels — this reduces to the uniform mean.
-            dur_w = (patch_durations.to(per_patch.dtype) if patch_durations is not None
-                     else patch_w.to(per_patch.dtype))
-            scale_w = one_hot * (valid_r.to(per_patch.dtype) * dur_w).unsqueeze(-1)  # (B,P,2)
-            denom = scale_w.sum(dim=1)                                    # (B,2)
+            scale_w, denom = self._resolution_weights(
+                resolution_ids, patch_w, patch_durations,
+            )
             summaries = torch.einsum("bpd,bps->bsd", per_patch, scale_w) \
                 / denom.clamp(min=1e-6).unsqueeze(-1)
             active = (denom > 0).to(per_patch.dtype)
@@ -568,6 +616,11 @@ class SetTokenizerEncoder(nn.Module):
             tokens = torch.where(token_mask.unsqueeze(-1),
                                  self.mask_token.expand_as(tokens), tokens)
 
+        # A centre-time encoding cannot distinguish overlapping 0.5, 1.0 and 1.5 second tokens
+        # whose centres coincide. Add the physical span before descriptor conditioning and temporal
+        # attention so all scales can contextualize one another explicitly.
+        tokens = self._add_duration_embedding(tokens, patch_durations)
+
         # Legacy dual-trunk checkpoints can request a shallow sensor-isolated retrieval branch.
         # The active temporal trunk forces this option off: its final output below is already
         # sensor-isolated, carries all temporal layers, and includes descriptor conditioning.
@@ -634,12 +687,9 @@ class SetTokenizerEncoder(nn.Module):
             pooled = (per_patch * temporal_w.unsqueeze(-1)).sum(dim=1) \
                 / temporal_w.sum(dim=1, keepdim=True).clamp(min=1e-6)
         else:
-            valid_r = (resolution_ids >= 0) & (resolution_ids < 2) & (patch_w > 0)
-            one_hot = F.one_hot(resolution_ids.clamp(0, 1), num_classes=2).to(per_patch.dtype)
-            duration = (patch_durations.to(per_patch.dtype) if patch_durations is not None
-                        else patch_w.to(per_patch.dtype))
-            scale_w = one_hot * (valid_r.to(per_patch.dtype) * duration).unsqueeze(-1)
-            denom_r = scale_w.sum(dim=1)
+            scale_w, denom_r = self._resolution_weights(
+                resolution_ids, patch_w, patch_durations,
+            )
             sums = torch.einsum("bpd,bpr->brd", per_patch, scale_w)
             means = sums / denom_r.clamp(min=1e-6).unsqueeze(-1)
             present = (denom_r > 0).to(per_patch.dtype)
@@ -658,13 +708,13 @@ class SetTokenizerEncoder(nn.Module):
             sensor_context = (h * context_w.view(B, P, 1, 1)).sum(dim=1) \
                 / context_w.sum(dim=1).clamp(min=1e-6).view(B, 1, 1)
         else:
-            context_w = one_hot * (valid_r.to(h.dtype) * duration).unsqueeze(-1)
+            context_w = scale_w.to(h.dtype)
             context_denom = context_w.sum(dim=1)
             context_by_resolution = torch.einsum("bpsd,bpr->brsd", h, context_w) \
-                / context_denom.clamp(min=1e-6).view(B, 2, 1, 1)
+                / context_denom.clamp(min=1e-6).view(B, self.num_resolutions, 1, 1)
             active_context = (context_denom > 0).to(h.dtype)
             sensor_context = (
-                context_by_resolution * active_context.view(B, 2, 1, 1)
+                context_by_resolution * active_context.view(B, self.num_resolutions, 1, 1)
             ).sum(dim=1) / active_context.sum(dim=1).clamp(min=1.0).view(B, 1, 1)
 
         descriptor_pred = (self.descriptor_head(sensor_context)
@@ -708,12 +758,38 @@ class SetTokenizerEncoder(nn.Module):
             sensor_descriptors, sensor_text_ids = self.encode_sensor_descriptors_unique(
                 sensor_texts, device,
             )
-            sensor_tokens = self.tokenize(
-                patches, sampling_rate_hz, patch_len_samples,
-                channel_mask=channel_mask, source_rate_hz=source_rate_hz,
-                sensor_id=sensor_id, n_sensors=sensor_text_ids.shape[1],
-            )
-            return self._encode_sensor(
+            grid = None
+            if getattr(self.filterbank, "emits_token_grid", False):
+                # The frontend defines the token grid: centre times, spans and group ids replace
+                # the collate's patch metadata for RoPE, the duration embedding and pooling.
+                if token_mask is not None:
+                    raise ValueError("JEPA token masking is not defined on the multi-span token grid")
+                if resolution_ids is not None:
+                    live = (resolution_ids >= 0 if patch_padding_mask is None
+                            else patch_padding_mask.bool())
+                    # Raw patches must partition one recording, not repeat it at several scales.
+                    single_grid = ((resolution_ids == 0) | ~live).all()
+                    if patches.device.type == "cpu":
+                        if not bool(single_grid):
+                            raise ValueError("multi-span frontend requires a single input patch grid")
+                    else:
+                        torch._assert_async(single_grid,
+                                            "multi-span frontend requires a single input patch grid")
+                grid = self.filterbank.token_grid(
+                    patches, sampling_rate_hz, patch_len_samples, source_rate_hz=source_rate_hz,
+                    patch_mask=patch_padding_mask, sensor_id=sensor_id, channel_mask=channel_mask,
+                    n_sensors=sensor_text_ids.shape[1],
+                )
+                sensor_tokens = grid["tokens"]
+                positions, patch_durations = grid["positions"], grid["durations"]
+                resolution_ids, patch_padding_mask = grid["resolution_ids"], grid["token_mask"]
+            else:
+                sensor_tokens = self.tokenize(
+                    patches, sampling_rate_hz, patch_len_samples,
+                    channel_mask=channel_mask, source_rate_hz=source_rate_hz,
+                    sensor_id=sensor_id, n_sensors=sensor_text_ids.shape[1],
+                )
+            encoded = self._encode_sensor(
                 sensor_tokens, None, None, positions,
                 patch_durations=patch_durations, resolution_ids=resolution_ids,
                 token_mask=token_mask, channel_mask=channel_mask,
@@ -724,6 +800,11 @@ class SetTokenizerEncoder(nn.Module):
                 return_retrieval_tokens=return_retrieval_tokens,
                 retrieval_only=retrieval_only,
             )
+            if grid is not None:
+                encoded["token_grid"] = {
+                    key: grid[key] for key in ("positions", "durations", "resolution_ids", "token_mask")
+                }
+            return encoded
         sensor_tokens = self.tokenize(
             patches, sampling_rate_hz, patch_len_samples,
             channel_mask=channel_mask, source_rate_hz=source_rate_hz,

@@ -455,6 +455,25 @@ def test_multiresolution_sensor_pooling_is_duration_weighted():
                           atol=1e-5, rtol=1e-5)
 
 
+def test_sensor_tokens_receive_trainable_duration_identity():
+    from model.tokenizer.encoder import SetTokenizerEncoder
+
+    enc = SetTokenizerEncoder(
+        d_model=16, num_layers=1, num_heads=4, dim_feedforward=32, dropout=0.0,
+        token_granularity="sensor", use_duration_embedding=True,
+        duration_min_seconds=0.5, duration_max_seconds=1.5, num_resolutions=3,
+    )
+    tokens = torch.zeros(1, 3, 2, 16, requires_grad=True)
+    durations = torch.tensor([[0.5, 1.0, 1.5]])
+    conditioned = enc._add_duration_embedding(tokens, durations)
+    assert not torch.allclose(conditioned[:, 0], conditioned[:, 1])
+    assert not torch.allclose(conditioned[:, 1], conditioned[:, 2])
+    conditioned.square().sum().backward()
+    assert enc.duration_gate_logit.grad is not None
+    assert float(enc.duration_gate_logit.grad.abs()) > 0
+    assert all(parameter.grad is not None for parameter in enc.duration_proj.parameters())
+
+
 def test_checkpoint_reconstruction_preserves_sensor_design():
     from dataclasses import asdict
 

@@ -22,6 +22,20 @@ solves a problem a spline-through-control-points would leave open:
   physical filterbank** and any later difference is attributable to learning rather than to a
   different starting point.
 
+BANK GEOMETRY (2026-09-09)
+--------------------------
+Centres are log-spaced on `[f_min, f_max]`. A kernel spans as many WHOLE cycles of its centre as
+fit in `t_max`, up to `n_cycles`::
+
+    cycles_k = clamp(floor(f_k * t_max), 1, n_cycles),   T_k = cycles_k / f_k,   carrier = cycles_k
+
+so the carrier harmonic sits at exactly `f_k` for every kernel and every (span, carrier) pair is
+distinct. The previous rule (`T_k = clamp(n_cycles / f_k, t_min, t_max)`, carrier rounded) snapped
+all sixteen kernels below 2 Hz onto the 0.5 Hz grid of a 2 s span: eight of them were the same
+0.59 Hz kernel, four the same 1 Hz kernel, and only 20 of 32 kernels were distinct. Nothing below
+`1 / t_max` can hold one cycle, so `f_min` defaults to 0.5 Hz; the 0.3-0.5 Hz range was never
+reachable and is quasi-DC territory handled by the signed DC feature anyway.
+
 WHY IT MIGHT BEAT THE FILTERBANK (and why it might not)
 -------------------------------------------------------
 The filterbank is already rate-invariant, by working in physical frequency. What it cannot represent
@@ -46,6 +60,11 @@ THE THREE RULES THAT MAKE RATES COMPARABLE (all measured; see the design doc S12
    identify the device from response magnitude. L1 normalisation is equivalent; **L2 is actively
    harmful** (it rescales per rate and destroys amplitude comparability).
 3. **Re-zero-mean after sampling.** Discretisation breaks the exact `int w = 0`.
+4. **The observability mask is the fraction of a kernel's COEFFICIENT ENERGY that survives the
+   Nyquist cut, not the fraction of its harmonic slots.** At Gabor initialisation that is exactly
+   1 when the carrier is live and 0 otherwise. The earlier slot-count fraction multiplied an intact
+   8 Hz kernel by 0.33 at 20 Hz and by 0.5-0.67 at 50 Hz: a per-rate rescaling of the standardised
+   response, i.e. the device fingerprint Rule 2 exists to prevent.
 
 Measured cross-rate agreement with all three applied, against 100 Hz: **0.986 at 20 Hz, 0.987 at
 25 Hz, 0.998 at 50 Hz**. The residual is honest quadrature error (20 taps vs 100 taps approximating
@@ -56,6 +75,11 @@ CONTRACT
 `forward(patches, sampling_rate_hz, patch_len_samples=None, source_rate_hz=None,
 patch_mask=None) -> (B, P, C, d_model)` — identical to `PhysicalFilterbankTokenizer`. Stored and
 native acquisition rates may vary across a batch; token count is a function of duration only.
+
+The module is built for ONE physical patch duration (`patch_seconds`, default 1 s): each token
+packages `frames_per_second * patch_seconds` analysis frames, halved by the stride-2 stage. The
+analysis frames are laid out in physical time from the patch grid, so `analyze` refuses a batch
+whose full patches are not `patch_seconds` long instead of silently analysing the wrong seconds.
 """
 
 from __future__ import annotations
@@ -84,8 +108,10 @@ CK_N_HARMONICS = 12        # -> 24 coefficients per kernel (12 cos + 12 sin).
                            # and M=12 keeps 19/32. Cross-rate correlation is unaffected for the
                            # kernels that ARE intact (0.9948 vs 0.9946). M=12 buys real shape
                            # capacity for three more Nyquist-masked bands at the lowest rate.
-CK_F_MIN_HZ = 0.3          # == FB_F_MIN_HZ; below this is quasi-DC, handled by the signed DC feature
-CK_F_MAX_HZ = 15.0         # == FB_F_MAX_HZ; <= Nyquist of the lowest corpus rate (20 Hz)
+CK_F_MIN_HZ = 0.5          # = 1 / CK_T_MAX_S: the lowest frequency with one whole cycle in the
+                           # longest span. FB_F_MIN_HZ is 0.3, but no kernel of <= 2 s can carry
+                           # 0.3 Hz; below 0.5 Hz is quasi-DC, handled by the signed DC feature.
+CK_F_MAX_HZ = 15.0         # == FB_F_MAX_HZ; source-rate masking limits low-rate recordings
 CK_N_CYCLES = 4.0          # cycles of the centre frequency inside the span -> carrier at harmonic 4,
                            # so harmonics 1..8 span [f/4, 2f]: constant RELATIVE bandwidth (constant-Q
                            # arrived at from the time side rather than the frequency side)
@@ -96,6 +122,7 @@ CK_FRAMES_PER_SECOND = 8   # output frame rate: 125 ms, resolves the arm-swing a
 CK_NYQUIST_MARGIN = 0.9    # == FB_NYQUIST_MARGIN
 CK_ENVELOPE_SIGMA = 0.22   # Gaussian envelope width in normalised time
 CK_FRAME_CHUNK = 24        # amortize gather/einsum launches while keeping allocator pressure modest
+CK_PATCH_SECONDS = 1.0     # physical duration of one token; frames_per_second * this must be even
 
 
 class ContinuousKernelTokenizer(nn.Module):
@@ -122,6 +149,7 @@ class ContinuousKernelTokenizer(nn.Module):
         envelope_sigma: float = CK_ENVELOPE_SIGMA,
         gabor_init: bool = True,
         norm: str = "frozen",
+        patch_seconds: float = CK_PATCH_SECONDS,
     ):
         super().__init__()
         if n_kernels < 2 or n_harmonics < 1:
@@ -130,9 +158,26 @@ class ContinuousKernelTokenizer(nn.Module):
             raise ValueError("require 0 < t_min < t_max")
         if frames_per_second < 2 or frames_per_second % 2:
             raise ValueError("frames_per_second must be even and >= 2 (one stride-2 stage)")
+        if not 1 <= int(n_cycles) <= n_harmonics or n_cycles != int(n_cycles):
+            raise ValueError("n_cycles must be a whole number of carrier harmonics within n_harmonics")
+        if f_min * t_max < 1.0 - 1e-9:
+            raise ValueError(
+                f"f_min={f_min} Hz cannot hold one whole cycle in t_max={t_max} s; raise f_min to "
+                f"at least {1.0 / t_max:.3f} Hz or lengthen t_max"
+            )
+        frames_per_patch = float(frames_per_second) * float(patch_seconds)
+        if patch_seconds <= 0 or abs(frames_per_patch - round(frames_per_patch)) > 1e-6 \
+                or int(round(frames_per_patch)) % 2:
+            raise ValueError(
+                f"patch_seconds={patch_seconds} must make frames_per_second * patch_seconds an even "
+                f"integer (got {frames_per_patch}) so one stride-2 stage yields whole frames per token"
+            )
         self.K = int(n_kernels)
+        self.register_buffer("_frontend_revision", torch.tensor(2, dtype=torch.long))
         self.M = int(n_harmonics)
         self.F = int(frames_per_second)
+        self.patch_seconds = float(patch_seconds)
+        self.frames_per_patch = int(round(frames_per_patch))
         self.d_model = int(d_model)
         self.nyquist_margin = float(nyquist_margin)
         self.envelope_sigma = float(envelope_sigma)
@@ -148,15 +193,19 @@ class ContinuousKernelTokenizer(nn.Module):
         self.gain_max = 2.0
 
         # --- band centres and spans (fixed physics, not learned) ---
+        # Each kernel spans as many whole cycles of its centre as fit in t_max (at most n_cycles),
+        # so its carrier harmonic sits at EXACTLY f_k and no two kernels coincide. See the module
+        # docstring, "bank geometry".
         k = torch.arange(self.K, dtype=torch.float32)
         centres = f_min * (f_max / f_min) ** (k / (self.K - 1))
-        spans = torch.clamp(n_cycles / centres, t_min, t_max)
+        cycles = torch.clamp(torch.floor(centres * t_max + 1e-6), 1.0, float(n_cycles))
+        spans = cycles / centres
+        if bool((spans < t_min - 1e-9).any()):
+            raise ValueError("a kernel span fell below t_min; lower t_min or f_max")
         self.max_span = float(spans.max())
         self.register_buffer("centres", centres)                 # (K,) Hz
         self.register_buffer("spans", spans)                     # (K,) seconds
-        # carrier harmonic: the one nearest f_k within this kernel's own span
-        carrier = torch.clamp(torch.round(centres * spans), 1, self.M).long()
-        self.register_buffer("carrier", carrier)                 # (K,)
+        self.register_buffer("carrier", cycles.long())           # (K,) harmonic index == cycles
 
         # Coefficient direction describes kernel shape; a separate bounded gain describes scale.
         # Normalising the coefficient pair removes an otherwise unidentifiable scale degree of
@@ -177,7 +226,7 @@ class ContinuousKernelTokenizer(nn.Module):
             # A Gabor wavelet at the carrier: the quadrature pair is (cos, sin) of that harmonic,
             # so at step 0 this bank approximates the physical filterbank we already trust.
             with torch.no_grad():
-                self.cos_coeff[torch.arange(self.K), carrier - 1] = 1.0
+                self.cos_coeff[torch.arange(self.K), self.carrier - 1] = 1.0
         else:
             nn.init.normal_(self.cos_coeff, std=0.3)
             nn.init.normal_(self.sin_coeff, std=0.3)
@@ -213,7 +262,7 @@ class ContinuousKernelTokenizer(nn.Module):
         self.ln1 = nn.LayerNorm(c1)
         self.conv2 = nn.Conv1d(c1, c2, 3, stride=1, padding=1)
         self.ln2 = nn.LayerNorm(c2)
-        self.frames_per_token = self.F // 2                      # after the single stride-2
+        self.frames_per_token = self.frames_per_patch // 2       # after the single stride-2
         self.in_dim = (c2 * self.frames_per_token   # ORDERED frames — the point of the design
                        + self.K                     # nyquist mask
                        + self.K                     # resolution flag
@@ -323,7 +372,7 @@ class ContinuousKernelTokenizer(nn.Module):
             return cached
         half = int(math.ceil(self.max_span * rate / 2.0)) + 2
         offsets_base = torch.arange(-half, half + 1, device=device, dtype=torch.float32)
-        frame = torch.arange(P * self.F, device=device, dtype=torch.float32)
+        frame = torch.arange(P * self.frames_per_patch, device=device, dtype=torch.float32)
         frame_time = (frame + 0.5) / self.F
         centre = torch.floor(frame_time * rate)
         sample_index = centre.unsqueeze(1) + offsets_base.unsqueeze(0)
@@ -396,7 +445,10 @@ class ContinuousKernelTokenizer(nn.Module):
               source_rate_hz=None) -> Tuple[torch.Tensor, torch.Tensor]:
         """(nyquist observability, resolution flag), each (B, K).
 
-        `nyquist`: fraction of this kernel's harmonics representable at `rate_hz`.
+        `nyquist`: fraction of this kernel's normalised COEFFICIENT ENERGY carried by harmonics
+        representable at the source rate. It is exactly binary at Gabor initialisation (the carrier
+        is live or it is not) and only becomes fractional once learning spreads energy onto harmonics
+        a low-rate source cannot supply. A harmonic-slot count would rescale intact kernels per rate.
         `resolution`: how much of the kernel's span the recording can actually supply.
         """
         duration_s = torch.as_tensor(duration_s, device=self.spans.device,
@@ -412,7 +464,9 @@ class ContinuousKernelTokenizer(nn.Module):
         harmonic_hz = m.view(1, self.M) / spans.unsqueeze(1)                    # (K,M)
         live = harmonic_hz.view(1, self.K, self.M) <= (
             self.nyquist_margin * source_rate.view(B, 1, 1) / 2.0)
-        nyq = live.to(spans.dtype).mean(dim=2)                                  # (B,K)
+        cos_coeff, sin_coeff = self._normalised_coefficients()
+        energy = (cos_coeff.square() + sin_coeff.square()).detach().to(spans.dtype)   # (K,M), rows sum to 1
+        nyq = (energy.view(1, self.K, self.M) * live.to(spans.dtype)).sum(dim=2)     # (B,K)
         res = (duration_s.unsqueeze(1) / spans.unsqueeze(0)).clamp(0.0, 1.0)    # (B, K)
         return nyq, res
 
@@ -474,7 +528,7 @@ class ContinuousKernelTokenizer(nn.Module):
         """Analyze a homogeneous stored/native-rate group without sharing recording boundaries."""
         B, _, C = window.shape
         device = window.device
-        n_frames = P * self.F
+        n_frames = P * self.frames_per_patch
         geometry = self._frame_geometry(rate, P, device)
         sample_index_all = geometry["sample_index"]
         taps = sample_index_all.shape[1]
@@ -505,6 +559,33 @@ class ContinuousKernelTokenizer(nn.Module):
             frame_valid.append((t_f.view(1, -1) < duration.view(B, 1)))
         return (torch.cat(responses, dim=3), torch.cat(edge_support, dim=2),
                 torch.cat(frame_valid, dim=1))
+
+    def _check_patch_grid(self, patch_len: torch.Tensor, patch_mask: torch.Tensor,
+                          rates: torch.Tensor) -> None:
+        """Every full patch must be `patch_seconds` long; only the last valid patch may be shorter.
+
+        Frames are laid out on the physical patch grid this module was built for. Feeding it a
+        different grid would attribute the wrong seconds to every token, silently.
+        """
+        B, P = patch_len.shape
+        # The collate partitions on ROUNDED physical boundaries, so a full patch holds
+        # rate * patch_seconds samples give or take one (25 Hz x 1.5 s alternates 37/38).
+        expected = rates.to(torch.float32) * self.patch_seconds
+        n_valid = patch_mask.sum(dim=1)
+        is_last = torch.arange(P, device=patch_len.device).view(1, P) == (n_valid - 1).view(B, 1)
+        must_be_full = patch_mask & ~is_last
+        length = patch_len.to(torch.float32)
+        fits = length <= expected.view(B, 1) + 1.0 + 1e-6
+        full = (length - expected.view(B, 1)).abs() <= 1.0 + 1e-6
+        ok = ((fits | ~patch_mask) & (full | ~must_be_full)).all()
+        message = (f"continuous frontend built for {self.patch_seconds:g} s patches received a "
+                   f"different patch grid (full patches must hold rate * {self.patch_seconds:g} "
+                   f"samples within one sample; only the final valid patch may be shorter)")
+        if patch_len.device.type == "cpu":
+            if not bool(ok):
+                raise ValueError(message)
+        else:
+            torch._assert_async(ok, message)
 
     # ------------------------------------------------------------------ the analysis stage
     def analyze(self, patches, sampling_rate_hz, patch_len_samples=None,
@@ -540,9 +621,10 @@ class ContinuousKernelTokenizer(nn.Module):
         patch_mask = (length_valid if patch_mask is None else
                       torch.as_tensor(patch_mask, device=device, dtype=torch.bool).reshape(B, P)
                       & length_valid)
+        self._check_patch_grid(patch_len_samples, patch_mask, rates)
         window, total = self.contiguous_window(patches, patch_len_samples, patch_mask)
         duration = total / rates
-        n_frames = P * self.F
+        n_frames = P * self.frames_per_patch
         magnitude = patches.new_zeros(B, C, self.K, n_frames, dtype=torch.float32)
         edge_support = patches.new_zeros(B, self.K, n_frames, dtype=torch.float32)
         frame_valid = torch.zeros(B, n_frames, device=device, dtype=torch.bool)
@@ -587,6 +669,18 @@ class ContinuousKernelTokenizer(nn.Module):
                 "frame_valid": frame_valid, "patch_valid": patch_mask,
                 "amplitude": amplitude, "dc": dc,
                 "n_patches": P, "rate": rates, "source_rate": source_rates}
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        revision = state_dict.get(prefix + "_frontend_revision")
+        if revision is None or not torch.equal(revision.cpu(), self._frontend_revision.cpu()):
+            error_msgs.append(
+                f"{prefix}continuous frontend checkpoint predates or differs from the current "
+                "analysis/normalization revision. Reproduce historical results with their saved "
+                "source revision; train a new checkpoint for the corrected frontend."
+            )
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                     missing_keys, unexpected_keys, error_msgs)
 
     # ------------------------------------------------------------------ normalisation stats
     def reset_norm_accumulator(self):
@@ -636,16 +730,15 @@ class ContinuousKernelTokenizer(nn.Module):
         self.norm_sd.copy_(torch.where(
             seen, var.sqrt().clamp_min(eps), torch.ones_like(var)).float())
         for name in ("amp", "dc"):
-            scalar_count = getattr(self, f"_{name}_acc_count")
-            if float(scalar_count) > 0:
-                count = scalar_count.clamp_min(1.0)
-                mu = getattr(self, f"_{name}_acc_sum") / count
-                var = getattr(self, f"_{name}_acc_sqsum") / count - mu.square()
-                getattr(self, f"{name}_mu").copy_(mu.float())
-                getattr(self, f"{name}_sd").copy_(var.clamp_min(0.0).sqrt().clamp_min(eps).float())
-            else:
-                getattr(self, f"{name}_mu").zero_()
-                getattr(self, f"{name}_sd").fill_(1.0)
+            observed = getattr(self, f"_{name}_acc_count")
+            count = observed.clamp_min(1.0)
+            mu = getattr(self, f"_{name}_acc_sum") / count
+            var = getattr(self, f"_{name}_acc_sqsum") / count - mu.square()
+            getattr(self, f"{name}_mu").copy_(
+                torch.where(observed > 0, mu, torch.zeros_like(mu)).float())
+            getattr(self, f"{name}_sd").copy_(torch.where(
+                observed > 0, var.clamp_min(0.0).sqrt().clamp_min(eps),
+                torch.ones_like(var)).float())
         self._norm_fitted.fill_(1.0)
 
     @torch.no_grad()
@@ -771,8 +864,12 @@ class ContinuousKernelTokenizer(nn.Module):
         x = self.conv2(x)
         x = F.gelu(self.ln2(x.transpose(1, 2)).transpose(1, 2))                  # (B*S, c2, f/2)
         c2, reduced = x.shape[1], x.shape[2]
-        per_token = max(reduced // P, 1)
-        x = x[:, :, :per_token * P].reshape(B, sensors, c2, P, per_token)
+        per_token = self.frames_per_token
+        if reduced != per_token * P:
+            raise RuntimeError(
+                f"expected {per_token} pooled frames per token ({P} tokens), got {reduced} frames"
+            )
+        x = x.reshape(B, sensors, c2, P, per_token)
         # ORDERED flatten: a rising and a falling ramp must be different inputs. An order-invariant
         # pool (mean/max/std) cannot distinguish them, which would re-destroy the sub-second
         # structure this front end exists to keep.
