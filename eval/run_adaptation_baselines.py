@@ -27,6 +27,7 @@ from eval.data import load_eval_stream
 from eval.enrollment_protocol import iter_cells, load_manifest
 from eval.perturbation import AXES, ROTATION_UNITS, SIDES, Perturbation, perturb_stream
 from eval.scoring import align_ground_truth_labels, classification_metrics
+from model.evidence.prediction import cosine_execution_pool
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -376,7 +377,7 @@ def score_positive_cell(
                 )
                 if pooled is None:
                     row_index = torch.as_tensor(execution_rows, dtype=torch.long, device=device)
-                    pooled = F.normalize(support_z[row_index].mean(0), dim=0)
+                    pooled = cosine_execution_pool(support_z[row_index])
                     if execution_feature_cache is not None:
                         execution_feature_cache[cache_key] = pooled
                 execution_features.append(pooled)

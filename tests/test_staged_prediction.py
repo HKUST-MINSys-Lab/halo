@@ -193,6 +193,56 @@ def test_execution_pooling_reuses_support_encoding_and_backpropagates():
     assert pooled.grad[[0, 5]].count_nonzero() == 0
 
 
+def test_neighbor_execution_pooling_matches_cosine_evaluation_and_backpropagates():
+    from model.evidence.prediction import cosine_execution_pool
+    from training.compare.sampling import Episode, Recording, SupportCorpus
+    from training.compare.train import split_encoded
+    from data.scripts.curate.compatibility import AcquisitionKey
+
+    recordings = [Recording(0, i, "ds", "wrist", "a", f"s{i}", f"e{i}") for i in range(3)]
+    corpus = SupportCorpus(recordings, [AcquisitionKey(
+        "watch", "wrist", ("acc_x", "acc_y", "acc_z"), "present")], [("ds", "wrist")])
+    episode = Episode(
+        query=0, support=(1,), support_candidate=(0,), candidates=("a",), gt_slot=0,
+        mode="compatible", requested_support=1, shrunk=False,
+        support_window_groups=((1, 2),), support_per_candidate=1, support_set_id=0,
+    )
+    pooled = torch.tensor([[1.0, 0.0], [10.0, 0.0], [0.0, 1.0]], requires_grad=True)
+    descriptor = F.normalize(torch.randn(3, 4), dim=-1)
+    rows = split_encoded(pooled, descriptor, [episode], corpus, cosine_support=True)
+    expected = cosine_execution_pool(pooled[torch.tensor([1, 2])])
+    torch.testing.assert_close(rows["support_feature"][0, 0], expected)
+    rows["support_feature"][0, 0, 0].backward()
+    assert pooled.grad[1:].abs().sum() > 0
+
+
+def test_random_encoder_persists_the_exact_rope_period(monkeypatch):
+    import training.tokenizer.pretrain_episodic as module
+
+    class DummyEncoder:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def to(self, _device):
+            return self
+
+    monkeypatch.setattr(module, "SetTokenizerEncoder", DummyEncoder)
+    encoder, config = module._random_encoder(
+        torch.device("cpu"), "multispan",
+        duration_range=(0.5, 1.5), num_resolutions=3,
+        frontend_kwargs={
+            "spans": (0.5, 1.0, 1.5), "frames_per_span": 8,
+            "rope_min_period": 0.125,
+        },
+    )
+    assert encoder.kwargs["rope_min_period"] == 0.125
+    assert config["rope_min_period"] == 0.125
+
+    default_encoder, default_config = module._random_encoder(torch.device("cpu"))
+    assert default_encoder.kwargs["rope_min_period"] == module.ROPE_MIN_PERIOD_S
+    assert default_config["rope_min_period"] == module.ROPE_MIN_PERIOD_S
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="autocast dtype behaviour is a CUDA property")
 @pytest.mark.parametrize("readout", ["dual_attention", "neighbors"])
 def test_staged_readouts_score_in_fp32_under_autocast(readout):

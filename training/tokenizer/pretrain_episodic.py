@@ -38,7 +38,7 @@ from data.scripts.augmentations import AugmentationConfig
 from model.blocks import AttentionSpec
 from model.evidence.engine import PHASE_B_VERSION, EngineConfig, EvidenceEngine
 from model.evidence.evidence_reranker import EvidenceRerankerConfig
-from model.tokenizer.encoder import SetTokenizerEncoder
+from model.tokenizer.encoder import ROPE_MIN_PERIOD_S, SetTokenizerEncoder
 from training.evidence.episode_labels import encode_neutral_aliases, episode_label_set
 from training.tokenizer.episodic import (
     BankSpec,
@@ -1228,6 +1228,9 @@ def _random_encoder(
 ) -> tuple[SetTokenizerEncoder, dict]:
     use_duration_embedding = duration_range is not None
     duration_min, duration_max = duration_range or (0.4, 1.5)
+    frontend_kwargs = dict(frontend_kwargs or {})
+    rope_min_period = float(frontend_kwargs.get("rope_min_period", ROPE_MIN_PERIOD_S))
+    frontend_kwargs["rope_min_period"] = rope_min_period
     config = {
         "frontend": frontend,
         "d_model": 128,
@@ -1248,6 +1251,7 @@ def _random_encoder(
         "duration_min_seconds": float(duration_min),
         "duration_max_seconds": float(duration_max),
         "num_resolutions": int(num_resolutions),
+        "rope_min_period": rope_min_period,
         # Constructor bounds remain valid even though multiresolution is disabled. Keeping the
         # ordinary bounds makes this checkpoint reconstructible by the shared loader.
         "short_patch_choices": [0.4],
@@ -1263,7 +1267,7 @@ def _random_encoder(
         use_duration_embedding=use_duration_embedding,
         duration_min_seconds=duration_min, duration_max_seconds=duration_max,
         num_resolutions=num_resolutions,
-        **(frontend_kwargs or {}),
+        **frontend_kwargs,
     ).to(device)
     return encoder, config
 

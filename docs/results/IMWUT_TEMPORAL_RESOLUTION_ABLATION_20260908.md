@@ -15,6 +15,12 @@ Commit `90d44f3` contains the original experiment implementation. The subsequent
 uses 0.5, 1.0, and 1.5 s grids, adds a bounded learned embedding of log physical duration before
 self-attention, forwards resolution identities, and balances all active scales during pooling.
 
+**RoPE reconstruction warning (2026-09-09).** The historical fixed dual-resolution checkpoint did
+not record its actual fastest RoPE period (0.5 s). The shared loader inferred 0.4 s from an older
+Phase-A convention, so the table below evaluated a slightly altered temporal encoder. Current
+comparison checkpoints persist the exact period and round-trip it. The historical dual-resolution
+number remains exploratory and must be rerun before it is used as evidence for the corrected arm.
+
 **Continuous frontend version warning (2026-09-09).** All continuous scores below describe the
 2026-09-08 implementation from commit `90d44f3` and the corresponding run's saved source patch.
 Later corrections changed the initial kernel bank and replaced the harmonic-slot observability

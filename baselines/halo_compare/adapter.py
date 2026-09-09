@@ -324,23 +324,23 @@ class HALOCompareAdapter(BaselineAdapter):
         # The manifest already chose which executions are enrolled for each candidate; the support
         # set is exactly those rows. No corpus bank, no retrieval, no selection.
         #
-        # SCALE PARITY WITH TRAINING. A training support row is the mean of a small random sample
-        # of raw pooled windows from one execution and is never L2-normalised. Evaluation averages
-        # every available window from that execution, the lower-variance estimate of the same
-        # execution mean, and likewise leaves it at the encoder's scale. Thus this is deliberate
-        # train-time execution subsampling, not bitwise-identical pooling.
-        # The closed-form cosine does not care, but two things downstream do: episode centering
-        # averages query and support rows together, so a unit-norm support row next to a raw-scale
-        # query row would let the query dominate the mean; and the learned residual was trained on
-        # raw-scale rows. ``tests/test_compare_eval_parity.py`` pins this.
+        # SCALE PARITY WITH TRAINING. Learned attention uses a raw mean because centering and its
+        # learned layers consume encoder scale. The neighbor arm first normalises each window,
+        # averages, then normalises the execution; this is the generic 1-NN evaluator's cosine
+        # geometry. Evaluation uses every available execution window while training samples a
+        # bounded subset, but both sides use the same estimator. The parity tests pin both rules.
+        from model.evidence.prediction import cosine_execution_pool
+
+        cosine_support = state["comparator"].cfg.readout == "neighbors"
         support_features = []
         support_descriptors = []
         bound: list[int] = []
         for slot, executions in enumerate(plan["support_execution_rows"]):
             for execution in executions[:support_count]:
                 index = T.as_tensor(execution, dtype=T.long, device=state["device"])
+                windows = support_feature_all.index_select(0, index)
                 support_features.append(
-                    support_feature_all.index_select(0, index).mean(dim=0)
+                    cosine_execution_pool(windows) if cosine_support else windows.mean(dim=0)
                 )
                 support_descriptors.append(F.normalize(
                     support_descriptor_all.index_select(0, index).mean(dim=0), dim=0,
@@ -374,8 +374,14 @@ class HALOCompareAdapter(BaselineAdapter):
             "support_rows": int(len(support_features)),
             "corpus_rows": 0,
             "enrolled_executions": int(len(canonical) * support_count),
-            "support_representation": "full_execution_mean_at_encoder_scale",
-            "training_support_estimator": "random_window_subset_mean_at_encoder_scale",
+            "support_representation": (
+                "unit_window_mean_then_unit_execution" if cosine_support
+                else "full_execution_mean_at_encoder_scale"
+            ),
+            "training_support_estimator": (
+                "unit_window_subset_mean_then_unit_execution" if cosine_support
+                else "random_window_subset_mean_at_encoder_scale"
+            ),
         }
 
     # ------------------------------------------------------------ zero shot

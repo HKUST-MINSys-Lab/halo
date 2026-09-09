@@ -59,6 +59,7 @@ from model.evidence.comparator import (
     comparator_config_from_checkpoint,
     comparator_logits,
 )
+from model.evidence.prediction import cosine_execution_pool
 from training.compare.corpus import support_corpus_from_index
 from training.compare.sampling import (
     DEFAULT_ENROLLMENT_K,
@@ -335,8 +336,14 @@ def split_encoded(
     descriptor: torch.Tensor,
     episodes: list[Episode],
     corpus: SupportCorpus,
+    *,
+    cosine_support: bool = False,
 ) -> dict[str, torch.Tensor]:
-    """Pool support executions once, then reuse them across queries sharing a support set."""
+    """Pool support executions once, then reuse them across queries sharing a support set.
+
+    Learned attention heads retain the encoder's raw scale.  The parameter-free neighbor arm uses
+    cosine execution pooling, matching the external 1-NN control exactly.
+    """
     device = pooled.device
     B = len(episodes)
     K = max((len(episode.support) for episode in episodes), default=0)
@@ -377,8 +384,11 @@ def split_encoded(
             group_valid[row, :len(group)] = True
         gather = torch.from_numpy(group_rows).to(device)
         valid = torch.from_numpy(group_valid).to(device).unsqueeze(-1)
-        denom = valid.sum(1).clamp_min(1).to(pooled.dtype)
-        group_feature = (pooled[gather] * valid.to(pooled.dtype)).sum(1) / denom
+        if cosine_support:
+            group_feature = cosine_execution_pool(pooled[gather], valid.squeeze(-1))
+        else:
+            denom = valid.sum(1).clamp_min(1).to(pooled.dtype)
+            group_feature = (pooled[gather] * valid.to(pooled.dtype)).sum(1) / denom
         group_descriptor = F.normalize(
             (descriptor[gather] * valid.to(descriptor.dtype)).sum(1)
             / valid.sum(1).clamp_min(1).to(descriptor.dtype), dim=-1,
@@ -576,7 +586,10 @@ def run_step(
     encoded = encode_batch(encoder, batch, device)
     pooled, descriptor = recording_rows(encoded)
 
-    rows = split_encoded(pooled, descriptor, episodes, corpus)
+    rows = split_encoded(
+        pooled, descriptor, episodes, corpus,
+        cosine_support=comparator is not None and comparator.cfg.readout == "neighbors",
+    )
     if (comparator is not None and comparator.cfg.readout == "neighbors"
             and rows["query_feature"].requires_grad):
         # Retaining these two small boundary tensors lets telemetry prove that both sides of the

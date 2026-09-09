@@ -143,6 +143,8 @@ def _run_adapter(monkeypatch, comparator, *, center: bool, relation: str = "iden
 
 def _training_layout_logits(comparator, query, support, *, center: bool):
     """``comparator_logits`` exactly as the trainer's ``run_step`` builds its inputs."""
+    from model.evidence.prediction import cosine_execution_pool
+
     q_feature, q_descriptor, _ = query
     s_feature, s_descriptor, _ = support
     candidate_text = F.normalize(torch.from_numpy(_sbert(PLAN["candidate_names"])), dim=-1)
@@ -150,7 +152,11 @@ def _training_layout_logits(comparator, query, support, *, center: bool):
     for slot, executions in enumerate(PLAN["support_execution_rows"]):
         for execution in executions[:2]:
             index = torch.as_tensor(execution)
-            rows.append(s_feature[index].mean(0))            # raw scale, like a training row
+            windows = s_feature[index]
+            rows.append(
+                cosine_execution_pool(windows)
+                if comparator.cfg.readout == "neighbors" else windows.mean(0)
+            )
             descriptors.append(F.normalize(s_descriptor[index].mean(0), dim=0))
             bound.append(slot)
     support_feature = torch.stack(rows)
@@ -245,7 +251,7 @@ def _staged_comparator(readout: str):
 
 @pytest.mark.parametrize("readout", ["dual_attention", "neighbors"])
 def test_staged_adapter_predictions_match_the_training_layout(monkeypatch, readout):
-    """Staged heads preserve raw scale, instance order and no-centering at evaluation."""
+    """Each staged head preserves its training pooling rule and instance order at evaluation."""
     comparator = _staged_comparator(readout)
     predictions, info, captured, query, support = _run_adapter(
         monkeypatch, comparator, center=False,
@@ -254,6 +260,12 @@ def test_staged_adapter_predictions_match_the_training_layout(monkeypatch, reado
     assert torch.allclose(captured["support_feature"], expected_support, atol=1e-6)
     assert predictions == [PLAN["candidate_names"][int(i)] for i in logits.argmax(1)]
     assert info["support_compatibility"] == "identical"
+    if readout == "neighbors":
+        torch.testing.assert_close(
+            captured["support_feature"].norm(dim=-1),
+            torch.ones(len(captured["support_feature"])),
+        )
+        assert info["support_representation"] == "unit_window_mean_then_unit_execution"
 
 
 def test_staged_readouts_refuse_centering(monkeypatch):

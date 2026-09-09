@@ -13,6 +13,34 @@ from model.blocks import AttentionSpec, ScaledSum, SetAttentionStack
 QUERY, SUPPORT, SUPPORT_LABEL, CANDIDATE = range(4)
 
 
+def cosine_execution_pool(
+    window_features: torch.Tensor,
+    window_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Pool windows into one execution under the cosine-retrieval geometry.
+
+    Each window contributes direction rather than unconstrained encoder norm.  The resulting
+    execution is normalised again so this operation is identical whether it is consumed by a dot
+    product or by :func:`neighbor_logits`.  ``window_mask`` is useful for padded execution groups.
+    """
+    if window_features.ndim < 2:
+        raise ValueError("execution pooling expects (..., windows, features)")
+    if window_features.shape[-2] == 0:
+        raise ValueError("an execution must contain at least one window")
+    values = F.normalize(window_features.float(), dim=-1)
+    if window_mask is None:
+        pooled = values.mean(dim=-2)
+    else:
+        if window_mask.shape != window_features.shape[:-1]:
+            raise ValueError("window mask must match every execution window")
+        weights = window_mask.unsqueeze(-1).to(values.dtype)
+        count = weights.sum(dim=-2)
+        if bool((count == 0).any()):
+            raise ValueError("each execution needs at least one valid window")
+        pooled = (values * weights).sum(dim=-2) / count
+    return F.normalize(pooled, dim=-1)
+
+
 class RecordingAttentionHead(nn.Module):
     """One shared architecture; query/candidate cosine is the only classification readout.
 
