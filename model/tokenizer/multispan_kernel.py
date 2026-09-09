@@ -15,8 +15,8 @@ continuous kernels and the rate contract but changes what a token IS:
   measured narrowband at long spans and broadband at short ones. A two-dimensional tiling of the
   time-frequency plane instead of one constant-Q line;
 * each group's envelope is sampled at its OWN temporal resolution: stride `T_g / frames_per_span`,
-  i.e. four frames per span by default, twice the envelope's own Nyquist rate. Nothing a span
-  resolved is thrown away, and nothing it cannot resolve is oversampled;
+  i.e. four frames per span by default. This is a temporal-resolution/compute choice, not a strict
+  no-aliasing guarantee for the learned responses;
 * every frame of every group becomes one token per sensor, carrying its physical centre time (for
   the trunk's RoPE), its span (the duration embedding) and its group (the resolution id). Sub-second
   order is positional inside the attention sequence, which is what the CNN's ordered flatten was
@@ -58,11 +58,14 @@ from .continuous_kernel import (
     CK_F_MAX_HZ,
     CK_N_HARMONICS,
     CK_NYQUIST_MARGIN,
+    CK_SIGMA_MIN,
+    CK_SIGMA_MAX,
+    CK_GAIN_MAX,
     ContinuousKernelTokenizer,
 )
 
 MS_SPANS_S = (0.25, 0.5, 1.0, 2.0)   # octave-spaced so the harmonic grids nest (4, 2, 1, 0.5 Hz)
-MS_FRAMES_PER_SPAN = 4               # envelope stride T/4: 2x the envelope's Nyquist rate (~1.45/T)
+MS_FRAMES_PER_SPAN = 4               # default envelope stride T/4; validate fidelity empirically
 
 
 class MultiSpanKernelTokenizer(ContinuousKernelTokenizer):
@@ -81,11 +84,16 @@ class MultiSpanKernelTokenizer(ContinuousKernelTokenizer):
         norm: str = "frozen",
     ):
         nn.Module.__init__(self)
+        self._validate_analysis_config(n_harmonics, nyquist_margin, norm)
+        if not math.isfinite(f_max) or f_max <= 0:
+            raise ValueError("f_max must be finite and positive")
         self.register_buffer("_frontend_revision", torch.tensor(2, dtype=torch.long))
         spans = tuple(sorted(float(s) for s in spans))
-        if len(spans) < 1 or spans[0] <= 0 or len(set(spans)) != len(spans):
-            raise ValueError("spans must be distinct positive durations in seconds")
-        if int(frames_per_span) < 1 or frames_per_span != int(frames_per_span):
+        if not spans or not all(math.isfinite(s) and s > 0 for s in spans) \
+                or len(set(spans)) != len(spans):
+            raise ValueError("spans must be distinct finite positive durations in seconds")
+        if not math.isfinite(frames_per_span) or frames_per_span < 1 \
+                or frames_per_span != int(frames_per_span):
             raise ValueError("frames_per_span must be a positive integer")
         if n_harmonics < 1:
             raise ValueError("need at least 1 harmonic")
@@ -102,9 +110,9 @@ class MultiSpanKernelTokenizer(ContinuousKernelTokenizer):
         self._geometry_cache: dict[tuple, dict[str, torch.Tensor]] = {}
         self._telemetry_requested = False
         self._runtime_summary: dict[str, torch.Tensor] = {}
-        self.sigma_min = 0.05
-        self.sigma_max = 0.50
-        self.gain_max = 2.0
+        self.sigma_min = CK_SIGMA_MIN
+        self.sigma_max = CK_SIGMA_MAX
+        self.gain_max = CK_GAIN_MAX
 
         # Each span has at most M carriers; long spans intentionally cover lower frequencies.
         span_of, carrier_of, group_of = [], [], []

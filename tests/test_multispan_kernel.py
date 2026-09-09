@@ -293,6 +293,25 @@ def test_legacy_analysis_cannot_silently_load_with_new_math(frontend):
         module.load_state_dict(legacy, strict=False)
 
 
+@pytest.mark.parametrize("frontend", ["continuous", "multispan"])
+@pytest.mark.parametrize("kwargs", [
+    {"norm": "frozn"}, {"nyquist_margin": 1.1}, {"nyquist_margin": float("nan")},
+    {"n_harmonics": 3.5}, {"f_max": float("inf")},
+])
+def test_invalid_analysis_settings_cannot_silently_change_the_model(frontend, kwargs):
+    from model.tokenizer.continuous_kernel import ContinuousKernelTokenizer
+
+    cls = ContinuousKernelTokenizer if frontend == "continuous" else MultiSpanKernelTokenizer
+    with pytest.raises(ValueError):
+        cls(d_model=16, **kwargs)
+
+
+@pytest.mark.parametrize("rate", [float("nan"), float("inf"), 0.0, -1.0])
+def test_nonfinite_or_nonpositive_source_rate_is_rejected(tokenizer, rate):
+    with pytest.raises(ValueError, match="finite positive rates"):
+        tokenizer.masks(50.0, torch.tensor([6.0]), source_rate_hz=rate)
+
+
 def test_encoder_rejects_multiple_input_grids():
     encoder = _encoder()
     patches = torch.randn(1, 6, 50, 6)

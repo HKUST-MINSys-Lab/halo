@@ -51,6 +51,7 @@ import torch.nn.functional as F
 
 from data.scripts.curate import deployment_policy
 from model.blocks import AttentionSpec
+from model.tokenizer.multispan_kernel import MS_SPANS_S, MS_FRAMES_PER_SPAN
 from model.evidence.comparator import (
     READOUTS,
     ComparatorConfig,
@@ -1024,10 +1025,10 @@ def main() -> None:
     parser.add_argument("--max-per-stream", type=int, default=None)
     parser.add_argument("--patch-seconds", type=float, default=PATCH_SECONDS,
                         help="single filterbank patch duration; ignored with --resolutions")
-    parser.add_argument("--spans", type=float, nargs="+", default=[0.25, 0.5, 1.0, 2.0],
+    parser.add_argument("--spans", type=float, nargs="+", default=list(MS_SPANS_S),
                         metavar="SECONDS",
                         help="multispan frontend: physical kernel spans, one token grid per span")
-    parser.add_argument("--frames-per-span", type=int, default=4,
+    parser.add_argument("--frames-per-span", type=int, default=MS_FRAMES_PER_SPAN,
                         help="multispan frontend: envelope frames per span (token stride = "
                              "span / this)")
     parser.add_argument("--resolutions", type=float, nargs="+", default=None,

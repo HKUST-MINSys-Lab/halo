@@ -14,6 +14,33 @@ kernel at different sample locations and emit the same physical output frame rat
 
 ## Current shape
 
+### Parameter and stability policy
+
+Physical constraints come from the recording metadata, while architecture choices are experiment
+settings. No dataset-name-specific gains, thresholds or branches belong in this frontend.
+
+| Quantity | Rule and rationale |
+|---|---|
+| Sampling and kernel spacing | Use seconds and the actual stored/source rates; never assume a fixed sample count means a fixed duration. |
+| Feature scale | Fit frozen statistics on source/label-balanced training samples. Kernel statistics are per kernel; multi-span amplitude/DC statistics are per span. Exclude missing channels and padding. Never recalibrate on test data. |
+| Physical units | Converters must supply the agreed units before encoding. Statistical normalization does not repair incorrect units or metadata. Avoid per-record amplitude normalization because intensity can be useful signal. |
+| Temporal identity | Derive duration-embedding bounds, resolution count and RoPE period from the configured spans. Preserve actual time positions and mask unavailable tokens. |
+| Span, harmonic and frame counts | Configurable capacity/compute choices, not physical laws or demonstrated optima. Keep the same settings across datasets in a comparison and save them with the checkpoint. |
+| Envelope/gain bounds | Shared dimensionless constants in `continuous_kernel.py`; prevent unconstrained scaling and degenerate envelopes. These are engineering choices, not dataset-specific fitted values. |
+| Numerical floors | Prevent division by zero or undefined magnitude derivatives; they do not define normal feature scale. Calibration spread and finite-gradient checks determine whether the model is operating away from those floors. |
+
+New adaptive rules need a measured failure and a clear contract. Prefer an existing shared helper
+over a parallel implementation; add a configuration knob only when it represents a useful
+experiment. Reject invalid rates, normalization modes and geometry instead of silently converting
+them into a different experiment. Keep train/evaluation preprocessing and saved model semantics
+consistent, and test mixed rates, lengths, missing channels and gradients when changing them.
+
+The default frame stride is a compute/resolution tradeoff. The Gaussian envelope is not strictly
+band-limited, and learning can change the response bandwidth, so four frames per span is not an
+exact no-aliasing guarantee. Validate temporal fidelity empirically when changing spans or frames.
+
+### Single-span layout
+
 For each accelerometer or gyroscope xyz triad:
 
 ```text
@@ -142,8 +169,9 @@ time-frequency plane. Each kernel keeps its 24 learnable coefficients, envelope 
 contract (exact sample offsets, integral scaling, re-zero-mean, energy-retained observability mask)
 is unchanged and tested per group (cross-rate correlation > 0.97 at 20/25/50 vs 100 Hz).
 
-**Frames per group.** Stride `T / frames_per_span` (`--frames-per-span`, default 4: twice the
-envelope's Nyquist rate of ~1.45 / T). A 6 s window yields 96 + 48 + 24 + 12 = 180 tokens per
+**Frames per group.** Stride `T / frames_per_span` (`--frames-per-span`, default 4, an initial
+temporal-resolution choice rather than an exact bandwidth guarantee). A 6 s window yields
+96 + 48 + 24 + 12 = 180 tokens per
 sensor. The grid follows the longest recording in the batch; shorter recordings are masked beyond
 their own duration and get exactly the tokens they get alone (tested).
 

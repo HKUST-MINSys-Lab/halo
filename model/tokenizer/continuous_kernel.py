@@ -123,6 +123,9 @@ CK_NYQUIST_MARGIN = 0.9    # == FB_NYQUIST_MARGIN
 CK_ENVELOPE_SIGMA = 0.22   # Gaussian envelope width in normalised time
 CK_FRAME_CHUNK = 24        # amortize gather/einsum launches while keeping allocator pressure modest
 CK_PATCH_SECONDS = 1.0     # physical duration of one token; frames_per_second * this must be even
+CK_SIGMA_MIN = 0.05        # envelope width as a fraction of span; an experiment capacity bound
+CK_SIGMA_MAX = 0.50
+CK_GAIN_MAX = 2.0          # bounds learned amplification independently of coefficient norm
 
 
 class ContinuousKernelTokenizer(nn.Module):
@@ -152,6 +155,11 @@ class ContinuousKernelTokenizer(nn.Module):
         patch_seconds: float = CK_PATCH_SECONDS,
     ):
         super().__init__()
+        self._validate_analysis_config(n_harmonics, nyquist_margin, norm)
+        if not all(math.isfinite(v) for v in (f_min, f_max, t_min, t_max, patch_seconds)):
+            raise ValueError("frequency, span and patch settings must be finite")
+        if not 0 < f_min < f_max:
+            raise ValueError("frequencies must satisfy 0 < f_min < f_max")
         if n_kernels < 2 or n_harmonics < 1:
             raise ValueError("need at least 2 kernels and 1 harmonic")
         if not 0.0 < t_min < t_max:
@@ -188,9 +196,9 @@ class ContinuousKernelTokenizer(nn.Module):
         self._geometry_cache: dict[tuple, dict[str, torch.Tensor]] = {}
         self._telemetry_requested = False
         self._runtime_summary: dict[str, torch.Tensor] = {}
-        self.sigma_min = 0.05
-        self.sigma_max = 0.50
-        self.gain_max = 2.0
+        self.sigma_min = CK_SIGMA_MIN
+        self.sigma_max = CK_SIGMA_MAX
+        self.gain_max = CK_GAIN_MAX
 
         # --- band centres and spans (fixed physics, not learned) ---
         # Each kernel spans as many whole cycles of its centre as fit in t_max (at most n_cycles),
@@ -271,6 +279,15 @@ class ContinuousKernelTokenizer(nn.Module):
                        + self.axes_per_sensor       # per-axis signed DC
                        + self.axes_per_sensor)      # axis-validity bits
         self.proj = nn.Linear(self.in_dim, self.d_model)
+
+    @staticmethod
+    def _validate_analysis_config(n_harmonics: int, nyquist_margin: float, norm: str) -> None:
+        if not math.isfinite(n_harmonics) or n_harmonics < 1 or int(n_harmonics) != n_harmonics:
+            raise ValueError("n_harmonics must be a positive integer")
+        if not math.isfinite(nyquist_margin) or not 0 < nyquist_margin <= 1:
+            raise ValueError("nyquist_margin must be finite and in (0, 1]")
+        if norm not in {"frozen", "none"}:
+            raise ValueError("norm must be 'frozen' or 'none'")
 
     def _normalised_coefficients(self) -> Tuple[torch.Tensor, torch.Tensor]:
         joined = torch.cat((self.cos_coeff, self.sin_coeff), dim=1)
@@ -433,12 +450,12 @@ class ContinuousKernelTokenizer(nn.Module):
             value = value.expand(B)
         if value.numel() != B:
             raise ValueError(f"{name} must be scalar or length B={B}, got {value.numel()}")
-        positive = (value > 0).all()
+        positive = ((value > 0) & torch.isfinite(value)).all()
         if value.device.type == "cpu":
             if not bool(positive):
-                raise ValueError(f"{name} must contain only positive rates")
+                raise ValueError(f"{name} must contain only finite positive rates")
         else:
-            torch._assert_async(positive, f"{name} must contain only positive rates")
+            torch._assert_async(positive, f"{name} must contain only finite positive rates")
         return value
 
     def masks(self, rate_hz, duration_s: torch.Tensor,
