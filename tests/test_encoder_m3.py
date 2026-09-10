@@ -121,6 +121,50 @@ def test_resolutions_contextualize_each_other():
     assert not torch.allclose(a["tokens"][:, :2], b["tokens"][:, :2], atol=1e-5)
 
 
+def test_encoder_can_expose_teacher_layer_states_without_changing_final_output():
+    torch.manual_seed(11)
+    model = SetTokenizerEncoder(
+        d_model=16, num_layers=2, num_heads=4, dim_feedforward=32, dropout=0.0,
+        dft_size=S,
+    ).eval()
+    model.fusion = _PassFusion()
+    sensor = torch.randn(1, 4, 1, 16)
+    text = torch.zeros(1, 1, 1, 384)
+    text_mask = torch.ones(1, 1, 1, dtype=torch.bool)
+    positions = torch.arange(4).float().view(1, 4)
+    ordinary = model.encode(sensor, text, text_mask, positions)
+    layered = model.encode(
+        sensor, text, text_mask, positions, return_layer_states=True,
+    )
+    assert len(layered["layer_states"]) == 2
+    assert all(state.shape == layered["tokens"].shape for state in layered["layer_states"])
+    assert torch.allclose(ordinary["tokens"], layered["tokens"])
+
+
+def test_padded_future_signal_cannot_change_observed_encoder_states():
+    torch.manual_seed(12)
+    model = SetTokenizerEncoder(
+        d_model=16, num_layers=2, num_heads=4, dim_feedforward=32, dropout=0.0,
+        dft_size=S,
+    ).eval()
+    model.fusion = _PassFusion()
+    tokens = torch.randn(1, 5, 1, 16)
+    changed = tokens.clone()
+    changed[:, 3:] += 10_000
+    text = torch.zeros(1, 1, 1, 384)
+    text_mask = torch.ones(1, 1, 1, dtype=torch.bool)
+    positions = torch.arange(5).float().view(1, 5)
+    visible = torch.tensor([[True, True, True, False, False]])
+    with torch.no_grad():
+        ordinary = model.encode(
+            tokens, text, text_mask, positions, patch_padding_mask=visible,
+        )["tokens"]
+        perturbed = model.encode(
+            changed, text, text_mask, positions, patch_padding_mask=visible,
+        )["tokens"]
+    assert torch.allclose(ordinary[:, :3], perturbed[:, :3], atol=1e-6)
+
+
 # ------------------------------------------------------------- variable channel counts
 @pytest.mark.parametrize("c", [3, 6, 9, 12])
 def test_consumes_any_channel_count_unchanged(enc, c):

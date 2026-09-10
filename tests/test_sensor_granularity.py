@@ -492,7 +492,9 @@ def test_checkpoint_reconstruction_preserves_sensor_design():
     assert restored.token_granularity == "sensor"
     assert restored.sensor_bias_dim == SENSOR_BIAS_DIM
     assert restored.multiresolution is True
-    assert restored.use_duration_embedding is False
+    assert restored.use_duration_embedding is True
+    assert restored.num_resolutions == 3
+    assert restored.eval_resolutions == (0.5, 1.0, 1.5)
     assert restored.fusion is None
 
     data = torch.randn(2, 300, 6).numpy()

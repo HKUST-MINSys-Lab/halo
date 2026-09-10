@@ -1057,7 +1057,7 @@ def main() -> None:
         args.episodes_per_step = 4 if staged else 8
     if args.val_episodes is None:
         args.val_episodes = (
-            len(deployment_policy.EXPANDED_PHASE_A_TRAIN_DATASETS) if staged else 64
+            len(deployment_policy.SUPERVISED_HEAD_TRAIN_DATASETS) if staged else 64
         )
     if args.label_subset is None:
         args.label_subset = [6, 14] if staged else list(DEFAULT_LABEL_SUBSET)
@@ -1156,9 +1156,12 @@ def main() -> None:
     runtime["mixed_precision"] = "bfloat16" if device.type == "cuda" else "float32"
     runtime["dynamic_loss_scaling"] = False
 
+    # The comparator has no --datasets override, so the active roster is the only path; gate it
+    # anyway so a future override cannot bypass the retirement.
+    deployment_policy.assert_no_retired_sources(deployment_policy.SUPERVISED_HEAD_TRAIN_DATASETS)
     index = CorpusIndex(
         max_per_stream=args.max_per_stream, seed=args.data_seed,
-        datasets=deployment_policy.EXPANDED_PHASE_A_TRAIN_DATASETS, alignment="native",
+        datasets=deployment_policy.SUPERVISED_HEAD_TRAIN_DATASETS, alignment="native",
     )
     print(f"[compare] corpus: {index.summary()}", flush=True)
     corpus = support_corpus_from_index(index)

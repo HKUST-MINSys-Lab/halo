@@ -14,6 +14,8 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
+from data.scripts.assembly.assemble import resample_signal
+
 # Run as `python -m data.datasets.wisdm.convert` from repo root; repo root on path for shared imports.
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
@@ -100,25 +102,57 @@ def _by_subject(sensor_dict: dict) -> dict:
     return out
 
 
+def _clock_runs(frame: pd.DataFrame) -> list[pd.DataFrame]:
+    """Return strictly increasing contiguous timestamp runs."""
+    ordered = frame.sort_values("timestamp").drop_duplicates("timestamp")
+    if ordered.empty:
+        return []
+    cuts = np.flatnonzero(np.diff(ordered["timestamp"].to_numpy(np.float64)) > GAP_SPLIT_NS) + 1
+    bounds = [0, *cuts.tolist(), len(ordered)]
+    return [ordered.iloc[lo:hi] for lo, hi in zip(bounds[:-1], bounds[1:])
+            if hi - lo >= MIN_SEG_ROWS]
+
+
+def _regularize(frame: pd.DataFrame, columns: list[str], target_hz: float = 20.0):
+    """Regularize one clock run and anti-alias it to ``target_hz``.
+
+    WISDM contains per-subject clocks near 20, 25, 50, and 100 Hz. Interpolating first onto the
+    run's measured native clock makes the small timestamp jitter regular; polyphase resampling then
+    applies the required low-pass filter before decimation.
+    """
+    t = frame["timestamp"].to_numpy(np.float64) / 1e9
+    dt = np.diff(t)
+    dt = dt[dt > 0]
+    if len(dt) == 0:
+        return np.empty(0), np.empty((0, len(columns)), np.float32)
+    source_hz = 1.0 / float(np.median(dt))
+    if not np.isfinite(source_hz) or source_hz < 1.0:
+        return np.empty(0), np.empty((0, len(columns)), np.float32)
+    native_t = t[0] + np.arange(int(np.floor((t[-1] - t[0]) * source_hz)) + 1) / source_hz
+    values = frame[columns].to_numpy(np.float64)
+    uniform = np.column_stack([np.interp(native_t, t, values[:, i])
+                               for i in range(values.shape[1])]).astype(np.float32)
+    sampled = resample_signal(uniform, source_hz, target_hz)
+    sampled_t = native_t[0] + np.arange(len(sampled), dtype=np.float64) / target_hz
+    return sampled_t, sampled
+
+
 def merged_sessions(device_label: str, accel_dict: dict, gyro_dict: dict):
     """Merge co-located accel+gyro into 6-channel sessions per subject/activity, split at clock gaps.
 
-    WISDM records phone (pocket) and watch (wrist) accel AND gyro at 20 Hz on a SHARED clock
-    (nearest accel<->gyro timestamp diff ~0 ms). The old converter emitted accel-only and gyro-only
-    sessions and the deployment policy then dropped `_gyro_`, so wisdm trained ACCEL-ONLY despite
-    having usable gyro. Here we nearest-join the gyro onto every accel row (never a fabricated
-    channel — direction='nearest' always matches an existing gyro sample), then split a
-    subject/activity into contiguous segments wherever the accel timestamp gap exceeds 200 ms.
+    The release contains several real acquisition rates despite advertising a nominal 20 Hz rate.
+    Acceleration and gyroscope are therefore gap-split independently, regularized from their real
+    timestamps, and anti-aliased to a common 20 Hz clock before they are joined. This prevents a
+    120-row 50 Hz segment from being misrepresented as six seconds and prevents nearest-neighbour
+    sample holding when the two sensor clocks differ.
     """
     accel_by_subj, gyro_by_subj = _by_subject(accel_dict), _by_subject(gyro_dict)
     sessions = []
     for subject_id, adf in accel_by_subj.items():
         gdf = gyro_by_subj.get(subject_id)
         for activity_code in sorted(adf['activity'].unique()):
-            a = adf[adf['activity'] == activity_code].sort_values('timestamp')
-            if len(a) < MIN_SEG_ROWS:
-                continue
-            g = None if gdf is None else gdf[gdf['activity'] == activity_code].sort_values('timestamp')
+            a = adf[adf['activity'] == activity_code]
+            g = None if gdf is None else gdf[gdf['activity'] == activity_code]
             if g is None or len(g) == 0:
                 continue     # require gyro so every wisdm session is a uniform 6-channel grid
             a = a.rename(columns={'x': f'{device_label}_accel_x', 'y': f'{device_label}_accel_y',
@@ -126,20 +160,33 @@ def merged_sessions(device_label: str, accel_dict: dict, gyro_dict: dict):
             g = g[['timestamp', 'x', 'y', 'z']].rename(
                 columns={'x': f'{device_label}_gyro_x', 'y': f'{device_label}_gyro_y',
                          'z': f'{device_label}_gyro_z'})
-            merged = pd.merge_asof(a, g, on='timestamp', direction='nearest')
-            ts = merged['timestamp'].to_numpy(dtype=np.float64)
-            splits = np.flatnonzero(np.diff(ts) > GAP_SPLIT_NS) + 1
-            bounds = [0, *splits.tolist(), len(merged)]
             activity_name = ACTIVITIES.get(activity_code, 'unknown')
-            for si in range(len(bounds) - 1):
-                seg = merged.iloc[bounds[si]:bounds[si + 1]]
-                if len(seg) < MIN_SEG_ROWS:
-                    continue
-                sessions.append({
-                    'session_id': f"{device_label}_{subject_id}_{activity_code}_{si}",
-                    'data': seg, 'activity_name': activity_name,
-                    'device': device_label, 'subject': str(subject_id),
-                })
+            si = 0
+            for arun in _clock_runs(a):
+                for grun in _clock_runs(g):
+                    lo = max(float(arun.timestamp.iloc[0]), float(grun.timestamp.iloc[0])) / 1e9
+                    hi = min(float(arun.timestamp.iloc[-1]), float(grun.timestamp.iloc[-1])) / 1e9
+                    if hi - lo < MIN_SEG_ROWS / 20.0:
+                        continue
+                    at, av = _regularize(arun, [f'{device_label}_accel_{x}' for x in 'xyz'])
+                    gt, gv = _regularize(grun, [f'{device_label}_gyro_{x}' for x in 'xyz'])
+                    if len(at) == 0 or len(gt) == 0:
+                        continue
+                    target = at[(at >= lo) & (at <= hi) & (at >= gt[0]) & (at <= gt[-1])]
+                    if len(target) < MIN_SEG_ROWS:
+                        continue
+                    ai = np.clip(np.rint((target - at[0]) * 20.0).astype(int), 0, len(av) - 1)
+                    gyro = np.column_stack([np.interp(target, gt, gv[:, c]) for c in range(3)])
+                    seg = pd.DataFrame({"timestamp": target * 1e9})
+                    for c, axis in enumerate("xyz"):
+                        seg[f'{device_label}_accel_{axis}'] = av[ai, c]
+                        seg[f'{device_label}_gyro_{axis}'] = gyro[:, c]
+                    sessions.append({
+                        'session_id': f"{device_label}_{subject_id}_{activity_code}_{si}",
+                        'data': seg, 'activity_name': activity_name,
+                        'device': device_label, 'subject': str(subject_id),
+                    })
+                    si += 1
     return sessions
 
 
@@ -182,7 +229,7 @@ def create_manifest():
     """Create minimal manifest.json."""
     manifest = {
         "dataset_name": "WISDM",
-        "description": "Smartphone and smartwatch activity recognition. 51 subjects performing 18 activities with accelerometer and gyroscope on phone (pocket) and watch (wrist) at 20Hz.",
+        "description": "Smartphone and smartwatch activity recognition. 51 subjects performing 18 activities with accelerometer and gyroscope on a phone in the right trouser pocket and a watch on the dominant wrist. Mixed native clocks are anti-aliased to 20 Hz during conversion.",
         "channels": [
             {
                 "name": "phone_accel_x",
@@ -290,6 +337,12 @@ def main():
 
     # Create manifest
     create_manifest()
+    metadata_path = OUTPUT_DIR / "metadata.json"
+    if metadata_path.exists():
+        metadata = json.loads(metadata_path.read_text())
+        metadata["num_sessions"] = len(labels_dict)
+        metadata.pop("num_sessions_subsampled", None)
+        metadata_path.write_text(json.dumps(metadata, indent=2))
 
     print(f"\n{'=' * 80}")
     print("Conversion complete!")

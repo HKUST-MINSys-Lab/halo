@@ -1,0 +1,40 @@
+{
+  "dataset": "synthetic_imu",
+  "display_name": "Synthetic virtual IMU (mocap-derived)",
+  "sampling_rate_hz": 60.0,
+  "pre_windowed": false,
+  "streaming_grid": true,
+  "role": "pretrain_scale",
+  "phase_a_only": true,
+  "synthetic": true,
+  "activities": [],
+  "num_subjects": null,
+  "grid_dtype": "float16",
+  "channels": [
+    "acc_x",
+    "acc_y",
+    "acc_z",
+    "gyro_x",
+    "gyro_y",
+    "gyro_z"
+  ],
+  "core_channels": {
+    "acc_x": "acc_x",
+    "acc_y": "acc_y",
+    "acc_z": "acc_z",
+    "gyro_x": "gyro_x",
+    "gyro_y": "gyro_y",
+    "gyro_z": "gyro_z"
+  },
+  "placement": [
+    "virt_head",
+    "virt_sternum",
+    "virt_pelvis",
+    "virt_lforearm",
+    "virt_rforearm",
+    "virt_rupperarm",
+    "virt_rthigh",
+    "virt_rshank"
+  ],
+  "note": "Virtual IMU synthesised from motion capture (AMASS / Motion-X++ / 100STYLE), NOT measured. Stream tokens are prefixed 'virt_' so a simulated stream is never mistaken for a real one. Diversity source only: mocap pretraining alone gives marginal gains from the sim-to-real gap (arXiv 2602.11064). Phase-A only; unlabeled. The converter rewrites this file with the placements actually built."
+}

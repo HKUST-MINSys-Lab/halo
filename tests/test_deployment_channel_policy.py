@@ -20,14 +20,18 @@ def test_primary_train_datasets_matches_trainer_roster():
         DIRECT_CONVERTED_TRAIN_DATASETS as _direct,
         EXPANDED_PHASE_A_TRAIN_DATASETS as _expanded,
         PRIMARY_TRAIN_DATASETS as _ptd,
+        RETIRED_TRAIN_DATASETS,
     )
     assert set(_ptd).isdisjoint(_direct), "a dataset cannot be both curated and direct-converted"
     union = set(_ptd) | set(_direct)
     assert union == set(TRAIN_DATASETS), (
         f"roster drift: policy declares {sorted(union - set(TRAIN_DATASETS))} extra, "
         f"missing {sorted(set(TRAIN_DATASETS) - union)}")
-    assert len(_ptd) + len(_direct) == len(TRAIN_DATASETS) == 18
-    assert _matched == _ptd
+    assert len(_ptd) + len(_direct) == len(TRAIN_DATASETS) == 14
+    # The matched recipe is FROZEN history (12 sources incl. the retired ones); the active primary
+    # roster is that list minus the retirements. They must never be the same object again.
+    assert set(_ptd) == set(_matched) - set(RETIRED_TRAIN_DATASETS)
+    assert len(_matched) == 12
     assert _expanded == TRAIN_DATASETS
 
 from data.scripts.curate.deployment_policy import (
@@ -87,7 +91,10 @@ def test_primary_streams_prune_to_three_or_six_channels(dataset):
     for spec in specs:
         curated, metadata = curate_frame(_full_source_frame(dataset, spec), spec)
         sensor_columns = tuple(c for c in curated.columns if c != "timestamp_sec")
-        assert sensor_columns == EXPECTED_PRIMARY_CHANNELS[dataset]
+        if dataset == "hhar" and spec.stream_id == "phone_waist_accel_only":
+            assert sensor_columns == ("acc_x", "acc_y", "acc_z")
+        else:
+            assert sensor_columns == EXPECTED_PRIMARY_CHANNELS[dataset]
         assert metadata.channels == sensor_columns
         assert len(sensor_columns) in (3, 6)
         assert sensor_columns == tuple(c for c in STANDARD_CHANNEL_ORDER if c in sensor_columns)
@@ -175,7 +182,8 @@ def test_default_grid_build_covers_expanded_training_roster():
     from data.scripts.build_grids import build_stream_specs
     built = {spec.dataset for spec in build_stream_specs()}
     assert built == set(TRAIN_DATASETS) | set(PRIMARY_EVAL_DATASETS)
-    assert {"dsads", "opportunity", "mmfit"} <= built
+    assert {"dsads", "mmfit"} <= built
+    assert "opportunity" not in built, "retired 2026-09-10; must leave the default build"
     assert {"extrasensory", "nhanes", "hmog", "kneepad"}.isdisjoint(built)
 
 

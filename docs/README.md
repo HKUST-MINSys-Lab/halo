@@ -42,10 +42,16 @@ representations.
 
 - [DATA_PIPELINE.md](data/DATA_PIPELINE.md) - converter, session, unit, grid, and quality contracts.
 - [DATA_HETEROGENEITY.md](data/DATA_HETEROGENEITY.md) - verified per-source sensor semantics.
+- [LABELLED_CORPUS_AUDIT_20260909.md](data/LABELLED_CORPUS_AUDIT_20260909.md) - measured audit of the
+  18 labelled training sources: validity, defects, composition, and label coverage against the target.
+- [PRETRAINING_CORPUS.md](data/PRETRAINING_CORPUS.md) - the label-free `data/pretraining/` tree:
+  composition, the float16 and 200 Hz storage decisions, and the fetch/convert/grid procedure.
 - [AUGMENTATIONS.md](design/AUGMENTATIONS.md) - available physical transformations; not automatically
   enabled for application tasks.
 - [CONTINUOUS_KERNEL_FRONTEND.md](design/CONTINUOUS_KERNEL_FRONTEND.md) - continuous physical-time
   HALO frontend.
+- [JEPA_PRETRAINING_OBJECTIVE.md](design/JEPA_PRETRAINING_OBJECTIVE.md) - implemented multi-horizon,
+  physically grounded predictive pretraining objective for the HALO encoder.
 - [TEXT_CONDITIONING.md](design/TEXT_CONDITIONING.md) - implemented acquisition-description path;
   retained as an encoder reference, not an application claim.
 - [`training/tokenizer/README.md`](../training/tokenizer/README.md) - optional representation

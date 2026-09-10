@@ -38,6 +38,15 @@ MANIFEST_PATH = REPO / "data" / "labels" / "subject_splits.json"
 SPLIT_SEED = 3431                      # matches the historical FIT_SEED
 FRACS = (0.8, 0.1, 0.1)                # train / val / test, by SUBJECT within each dataset
 
+# Authors' released workout partition. MM-Fit does not publish the person identity behind every
+# workout id, so randomly splitting workout ids cannot honestly be called person-disjoint. Keep
+# their train/validation roles and put both published test regimes in test.
+MMFIT_SPLIT = {
+    "train": frozenset({"w01", "w02", "w03", "w04", "w06", "w07", "w08", "w16", "w17", "w18"}),
+    "val": frozenset({"w14", "w15", "w19"}),
+    "test": frozenset({"w00", "w05", "w09", "w10", "w11", "w12", "w13", "w20"}),
+}
+
 
 def _split_one_dataset(subjects: Sequence[str], seed: int) -> Dict[str, str]:
     """Assign each subject of ONE dataset to train/val/test. Deterministic given (subjects, seed).
@@ -68,7 +77,11 @@ def _split_one_dataset(subjects: Sequence[str], seed: int) -> Dict[str, str]:
 # Datasets that are NOT in HALO's TRAIN_DATASETS but ARE in some baseline's head-fit corpus.
 # They must still be in the manifest, or their subjects fall through to the train fold and the
 # model's val/test folds are silently built from a different population than everyone else's.
-EXTRA_MANIFEST_DATASETS = ("hapt",)
+# The four sources retired from training on 2026-09-10 belong here too: their subjects are still
+# in the checked-in manifest and in the frozen 18-source baseline corpus, and a regeneration that
+# dropped them would let those subjects fall through to "train" for any model that still scores
+# on the old roster.
+EXTRA_MANIFEST_DATASETS = ("hapt", "uci_har", "sp_sw_har", "mhealth", "opportunity")
 
 # Cohorts that are THE SAME PEOPLE under different dataset names. Both members must land in the
 # same fold or a subject's data appears on both sides of the split.
@@ -118,7 +131,18 @@ def build_manifest(seed: int = SPLIT_SEED) -> dict:
     for ds in sorted(per_dataset):
         # seed per dataset so adding a dataset never reshuffles the others
         ds_seed = seed + int(hashlib.sha256(ds.encode()).hexdigest()[:8], 16) % 100000
-        assign = _split_one_dataset(per_dataset[ds], ds_seed)
+        if ds == "mmfit":
+            present = set(per_dataset[ds])
+            published = set().union(*MMFIT_SPLIT.values())
+            if present != published:
+                raise RuntimeError(
+                    f"MM-Fit workout roster differs from the published split: "
+                    f"missing={sorted(published - present)}, extra={sorted(present - published)}"
+                )
+            assign = {workout: fold for fold, workouts in MMFIT_SPLIT.items()
+                      for workout in workouts}
+        else:
+            assign = _split_one_dataset(per_dataset[ds], ds_seed)
         counts = {"train": 0, "val": 0, "test": 0}
         for subj, fold in assign.items():
             assignment[f"{ds}:{subj}"] = fold

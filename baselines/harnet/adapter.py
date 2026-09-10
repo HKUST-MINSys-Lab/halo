@@ -161,7 +161,8 @@ def _load_harnet(num_classes: int, device) -> nn.Module:
     return model
 
 
-def _to_30hz_150(windows: np.ndarray, rate_hz: float) -> np.ndarray:
+def _to_30hz_150(windows: np.ndarray, rate_hz: float,
+                  lengths: np.ndarray | None = None) -> np.ndarray:
     """(N, T, 3) at `rate_hz` -> (N, 3, 150) at 30 Hz for harnet5.
 
     Resample to 30 Hz (polyphase, anti-aliased), then center-crop to 150 samples
@@ -170,16 +171,21 @@ def _to_30hz_150(windows: np.ndarray, rate_hz: float) -> np.ndarray:
     <=6 s eval grids are always cropped).
     """
     frac = Fraction(int(round(TARGET_HZ)), int(round(rate_hz))).limit_denominator(1000)
-    y = resample_poly(windows.astype(np.float64), frac.numerator, frac.denominator, axis=1)
-    L = y.shape[1]
-    if L > TARGET_LEN:
-        off = (L - TARGET_LEN) // 2
-        y = y[:, off:off + TARGET_LEN, :]
-    elif L < TARGET_LEN:
-        total = TARGET_LEN - L
-        left = total // 2
-        y = np.pad(y, ((0, 0), (left, total - left), (0, 0)), mode="wrap")
-    return np.transpose(y, (0, 2, 1)).astype(np.float32)   # (N, 3, 150)
+    valid = (np.asarray(lengths, dtype=np.int64) if lengths is not None
+             else np.full(len(windows), windows.shape[1], dtype=np.int64))
+    out = []
+    for window, length in zip(windows, valid):
+        y = resample_poly(window[:int(length)].astype(np.float64), frac.numerator,
+                          frac.denominator, axis=0)
+        if len(y) > TARGET_LEN:
+            off = (len(y) - TARGET_LEN) // 2
+            y = y[off:off + TARGET_LEN]
+        elif len(y) < TARGET_LEN:
+            total = TARGET_LEN - len(y)
+            left = total // 2
+            y = np.pad(y, ((left, total - left), (0, 0)), mode="wrap")
+        out.append(y)
+    return np.transpose(np.asarray(out), (0, 2, 1)).astype(np.float32)
 
 
 def _select_accel(windows: np.ndarray, channels: List[str]) -> np.ndarray:
@@ -209,12 +215,15 @@ def _extract_feats(model: nn.Module, x_n3l: np.ndarray, device) -> np.ndarray:
 
 def _load_grid(dataset: str, stream: str):
     """Read a grid directly (train datasets have no eval_labels.json, so the
-    eval loader cannot open them). Returns (windows, labels, subjects, channels, rate)."""
-    gdir = eval_data.DATASETS_DIR / dataset / "grids" / "non_harmonised" / stream
+    eval loader cannot open them). Returns windows, labels, subjects, channels, rate, and lengths."""
+    gdir = eval_data.DATASETS_DIR / dataset / "grids" / "native" / stream
     windows = np.load(gdir / "data.npy")
     meta = json.loads((gdir / "meta.json").read_text())
+    lengths_path = gdir / meta.get("lengths_file", "lengths.npy")
+    lengths = (np.load(lengths_path) if lengths_path.exists()
+               else np.full(len(windows), windows.shape[1], dtype=np.int32))
     return (windows, list(meta["labels"]), list(map(str, meta["subjects"])),
-            list(meta["channels"]), float(meta["rate_hz"]))
+            list(meta["channels"]), float(meta["rate_hz"]), lengths)
 
 
 def _gravity_dc(windows: np.ndarray, channels: List[str]) -> float:
@@ -239,7 +248,9 @@ def _fit_fp(vocab) -> str:
     from eval.splits import manifest_fingerprint
     return fit_fingerprint(model='harnet', vocab=list(vocab), split=manifest_fingerprint(),
                            hp=[FIT_EPOCHS, FIT_BATCH, FIT_LR, FIT_SEED], probe=PROBE_SPEC,
-                           cap=(MATCHED_MAX_PER_STREAM if CORPUS_MODE == 'matched' else None), corpus=CORPUS_MODE, datasets=_corpus_datasets(), backbone=HARNET_NAME + SSL_HUB_TAG)
+                           cap=(MATCHED_MAX_PER_STREAM if CORPUS_MODE == 'matched' else None),
+                           corpus=CORPUS_MODE, datasets=_corpus_datasets(),
+                           backbone=HARNET_NAME + SSL_HUB_TAG, prep="native-length-aware-v2")
 
 
 @register
@@ -255,11 +266,11 @@ class HarnetAdapter(ConSEAdapter):
 
     # ---- gravity compatibility (disclosed N/A instead of a bad number) --------
     def is_incompatible(self, dataset: str):
-        streams = eval_data.list_streams(dataset)
+        streams = eval_data.list_streams(dataset, alignment="native")
         if not streams:
             return None
         try:
-            windows, _, _, channels, _ = _load_grid(dataset, streams[0])
+            windows, _, _, channels, _, _ = _load_grid(dataset, streams[0])
         except FileNotFoundError:
             return None
         dc = _gravity_dc(windows, channels)
@@ -363,8 +374,8 @@ class HarnetAdapter(ConSEAdapter):
 
         feats, labs, subjs, used, skipped = [], [], [], [], []
         for ds in datasets:
-            for stream in eval_data.list_streams(ds):
-                windows, raw_labels, subjects, channels, rate = _load_grid(ds, stream)
+            for stream in eval_data.list_streams(ds, alignment="native"):
+                windows, raw_labels, subjects, channels, rate, lengths = _load_grid(ds, stream)
                 dc = _gravity_dc(windows, channels)
                 if dc < GRAVITY_MIN_G:
                     skipped.append(f"{ds}/{stream} (|DC|={dc:.3f}g)")
@@ -378,7 +389,8 @@ class HarnetAdapter(ConSEAdapter):
                 if CORPUS_MODE == "matched" and keep_idx.size > MATCHED_MAX_PER_STREAM:
                     keep_idx = np.sort(cap_rng.choice(keep_idx, MATCHED_MAX_PER_STREAM,
                                                       replace=False))
-                x = _to_30hz_150(_select_accel(windows[keep_idx], channels), rate)
+                x = _to_30hz_150(_select_accel(windows[keep_idx], channels), rate,
+                                  lengths[keep_idx])
                 feats.append(_extract_feats(model, x, fit_device))
                 labs.append(gl[keep_idx])
                 subjs.append(np.array([f"{ds}:{s}" for s in np.asarray(subjects)[keep_idx]]))
@@ -462,7 +474,8 @@ class HarnetAdapter(ConSEAdapter):
     def window_probs(self, stream, state, device) -> np.ndarray:
         model = state["model"]
         T = float(state.get("temperature", 1.0))    # calibrated temperature (#82)
-        x = _to_30hz_150(_select_accel(stream.windows, stream.channels), stream.rate_hz)
+        x = _to_30hz_150(_select_accel(stream.windows, stream.channels), stream.rate_hz,
+                          stream.lengths)
         probs = []
         with torch.no_grad():
             for s in range(0, len(x), EMBED_BATCH):
@@ -471,7 +484,8 @@ class HarnetAdapter(ConSEAdapter):
         return np.concatenate(probs, axis=0)
 
     def window_features(self, stream, state, device) -> np.ndarray:
-        x = _to_30hz_150(_select_accel(stream.windows, stream.channels), stream.rate_hz)
+        x = _to_30hz_150(_select_accel(stream.windows, stream.channels), stream.rate_hz,
+                          stream.lengths)
         return _extract_feats(state["model"], x, device)
 
     def predict_candidates_from_features(self, features, candidates, state, device):

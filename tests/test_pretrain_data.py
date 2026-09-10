@@ -15,6 +15,7 @@ pytestmark = pytest.mark.skipif(
 
 from training.tokenizer.pretrain_data import (  # noqa: E402
     CHANNELS,
+    DFT_SIZE,
     PATCH_SECONDS_CHOICES,
     CorpusIndex,
     MultiResolutionCollate,
@@ -210,11 +211,26 @@ def test_collate_shapes_and_positions(index, ps):
     out = collate([ds[i] for i in range(8)])
     P = out["patches"].shape[1]
     assert P == max(1, round(6.0 / ps))
-    assert out["patches"].shape == (8, P, 256, 6)
+    assert out["patches"].shape == (8, P, DFT_SIZE, 6)
     assert out["positions"].shape == (8, P)
+    assert out["patch_starts"].shape == (8, P)
+    assert out["patch_ends"].shape == (8, P)
+    assert out["resolution_ids"].shape == (8, P)
+    assert out["resolution_count"] == 1
     # positions are patch CENTERS in seconds
     assert torch.allclose(out["positions"][0, 0], torch.tensor(ps / 2))
-    assert (out["patch_len"] >= 1).all()
+    assert torch.allclose(
+        out["positions"], 0.5 * (out["patch_starts"] + out["patch_ends"]),
+    )
+    assert (out["resolution_ids"][out["patch_padding_mask"]] == 0).all()
+    assert (out["resolution_ids"][~out["patch_padding_mask"]] == -1).all()
+    # Every REAL patch carries at least one sample. Padding patches are legitimately empty
+    # (see test_patch_padding_mask_flags_phantom_patches); asserting >= 1 on them only ever
+    # passed while the first eight training rows happened to be full-length windows, and the
+    # 2026-09-10 roster change surfaced a short recording in that slice.
+    real = out["patch_padding_mask"]
+    assert (out["patch_len"][real] >= 1).all()
+    assert (out["patch_len"][~real] == 0).all()
 
 
 def test_collate_handles_per_sample_rates(index):
@@ -297,6 +313,19 @@ def test_multiresolution_collate_supports_three_explicit_scales():
         selected = real & out["resolution_ids"][0].eq(rid)
         assert out["patch_starts"][0, selected].min() == 0
         assert out["patch_ends"][0, selected].max() == 6.0
+
+
+@pytest.mark.parametrize("rate", [200.0, 240.0])
+def test_default_long_patch_fits_high_rate_pretraining_sources(rate):
+    item = {
+        "data": torch.randn(round(6 * rate), 6), "rate": rate, "texts": ["x"] * 6,
+        "label_id": 0, "channel_mask": torch.ones(6, dtype=torch.bool),
+        "gravity_state": "present", "source": "synthetic",
+    }
+    out = MultiResolutionCollate(fixed_patch_seconds=(0.5, 1.0, 1.5))([item])
+    long = out["patch_padding_mask"][0] & out["resolution_ids"][0].eq(2)
+    assert out["patch_len"][0, long].max() == round(1.5 * rate)
+    assert out["patches"].shape[2] == DFT_SIZE
 
 
 def test_collate_carries_realized_augmentation_trace_for_both_views(index):
@@ -387,10 +416,17 @@ def test_temperature_sampler_can_batch_by_sensor_count_without_changing_marginal
 
 
 def test_no_hapt_uci_leak(index):
-    """hapt (UCI-HAR re-release) must be dropped from the corpus (sweep finding E)."""
+    """hapt (UCI-HAR re-release) must be dropped from the corpus (sweep finding E).
+
+    uci_har itself was retired on 2026-09-10 (window-overlap leakage), so it no longer serves as
+    the "still present" anchor this test once used; the guard is now that neither half of the
+    duplicate, nor any other retired source, reaches the corpus by default.
+    """
+    from data.scripts.curate.deployment_policy import RETIRED_TRAIN_DATASETS
     datasets = {r.dataset for r in index.refs}
     assert "hapt" not in datasets
-    assert "uci_har" in datasets
+    assert datasets.isdisjoint(RETIRED_TRAIN_DATASETS), sorted(datasets & set(RETIRED_TRAIN_DATASETS))
+    assert len(datasets) == 14
 
 
 def test_patch_padding_mask_flags_phantom_patches(index):

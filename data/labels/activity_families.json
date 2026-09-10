@@ -23,7 +23,6 @@
       "running",
       "running_on_a_treadmill",
       "stairs",
-      "turning",
       "vehicle",
       "walking",
       "walking_and_talking",
@@ -68,6 +67,7 @@
       "falling_with_protection"
     ],
     "food_drink": [
+      "baking",
       "cutting_fruit",
       "cutting_vegetables",
       "drinking",
@@ -79,6 +79,8 @@
       "making_tea",
       "picking_fruit",
       "pouring_water",
+      "refill",
+      "refill_water",
       "taking_medicine"
     ],
     "personal_care": [
@@ -88,15 +90,32 @@
       "washing_hands"
     ],
     "domestic_tasks": [
+      "bathroom_cleaning_bathtub",
+      "bathroom_cleaning_mirror",
+      "bathroom_cleaning_toilet",
+      "bathroom_cleaning_washbasin",
+      "cleaning_bathroom",
+      "cleaning_door",
+      "cleaning_shelf",
       "cleaning_table",
+      "cleaning_the_cupboard",
+      "dusting_furniture",
+      "dusting_model_cars",
       "emptying_dishwasher",
       "floor_cleaning",
       "folding_clothes",
+      "folding_laundry",
+      "hanging_up_laundry",
       "ironing",
+      "ironing_laundry",
       "opening_curtains",
       "opening_windows",
       "putting_away_dishes",
+      "refill_bucket",
+      "sorting_documents",
       "throwing_garbage",
+      "tidy_up_the_cupboard",
+      "tidy_up_the_wardrobe",
       "vacuum_cleaning",
       "washing_dishes",
       "watering_plants",
@@ -104,6 +123,7 @@
     ],
     "desk_communication": [
       "answering_phone",
+      "working_on_the_computer",
       "opening_envelope",
       "reading",
       "talking_standing",
@@ -138,8 +158,26 @@
       "throwing"
     ],
     "manual_object_work": [
+      "build_with_lego",
+      "cutting_cardboard",
+      "cutting_wood",
+      "doing_a_puzzle",
       "dragging",
-      "picking_up"
+      "drawing",
+      "picking_up",
+      "removing_protective_film"
+    ],
+    "outdoor_animal_care": [
+      "cutting_plants_near_water",
+      "feeding_the_chickens",
+      "feeding_the_dog",
+      "gardening_with_a_rake",
+      "petting_the_dog",
+      "playing_with_the_dog",
+      "removing_plants_near_water",
+      "sowing_seeds",
+      "sweeping_the_yard",
+      "working_in_the_garden"
     ],
     "upper_limb_exercise": [
       "arms_frontal_crossing",

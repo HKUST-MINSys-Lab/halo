@@ -29,6 +29,7 @@ from eval import data as eval_data
 
 TARGET_HZ = 20
 TARGET_LEN = 120          # 6 s @ 20 Hz
+PREP_SCHEMA = "native-length-aware-v2"
 SIX_CHANNELS = ("acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z")
 
 # Same-data method arm: use the design-of-record Phase-A roster from the deployment
@@ -37,12 +38,15 @@ TRAIN_DATASETS = tuple(EXPANDED_PHASE_A_TRAIN_DATASETS)
 
 
 def load_grid(dataset: str, stream: str):
-    """Read a grid directly. Returns (windows, labels, subjects, channels, rate)."""
-    gdir = eval_data.DATASETS_DIR / dataset / "grids" / "non_harmonised" / stream
+    """Read a native grid; returns windows, labels, subjects, channels, rate, and lengths."""
+    gdir = eval_data.DATASETS_DIR / dataset / "grids" / "native" / stream
     windows = np.load(gdir / "data.npy")
     meta = json.loads((gdir / "meta.json").read_text())
+    lengths_path = gdir / meta.get("lengths_file", "lengths.npy")
+    lengths = (np.load(lengths_path) if lengths_path.exists()
+               else np.full(len(windows), windows.shape[1], dtype=np.int32))
     return (windows, list(meta["labels"]), list(map(str, meta["subjects"])),
-            list(meta["channels"]), float(meta["rate_hz"]))
+            list(meta["channels"]), float(meta["rate_hz"]), lengths)
 
 
 def to_six_channels(windows: np.ndarray, channels: List[str]) -> np.ndarray:
@@ -57,25 +61,32 @@ def to_six_channels(windows: np.ndarray, channels: List[str]) -> np.ndarray:
     return out
 
 
-def resample_crop_pad(windows: np.ndarray, rate_hz: float) -> np.ndarray:
+def resample_crop_pad(windows: np.ndarray, rate_hz: float,
+                      lengths: np.ndarray | None = None) -> np.ndarray:
     """(N, T, 6) at `rate_hz` -> (N, 120, 6) at 20 Hz (resample + center-crop /
     wrap-pad)."""
     frac = Fraction(int(round(TARGET_HZ)), int(round(rate_hz))).limit_denominator(1000)
-    y = resample_poly(windows.astype(np.float64), frac.numerator, frac.denominator, axis=1)
-    L = y.shape[1]
-    if L > TARGET_LEN:
-        off = (L - TARGET_LEN) // 2
-        y = y[:, off:off + TARGET_LEN, :]
-    elif L < TARGET_LEN:
-        total = TARGET_LEN - L
-        left = total // 2
-        y = np.pad(y, ((0, 0), (left, total - left), (0, 0)), mode="wrap")
-    return y.astype(np.float32)
+    valid = (np.asarray(lengths, dtype=np.int64) if lengths is not None
+             else np.full(len(windows), windows.shape[1], dtype=np.int64))
+    out = []
+    for window, length in zip(windows, valid):
+        y = resample_poly(window[:int(length)].astype(np.float64), frac.numerator,
+                          frac.denominator, axis=0)
+        if len(y) > TARGET_LEN:
+            off = (len(y) - TARGET_LEN) // 2
+            y = y[off:off + TARGET_LEN]
+        elif len(y) < TARGET_LEN:
+            total = TARGET_LEN - len(y)
+            left = total // 2
+            y = np.pad(y, ((left, total - left), (0, 0)), mode="wrap")
+        out.append(y)
+    return np.asarray(out, dtype=np.float32)
 
 
-def grid_to_contract(windows: np.ndarray, channels: List[str], rate_hz: float) -> np.ndarray:
+def grid_to_contract(windows: np.ndarray, channels: List[str], rate_hz: float,
+                     lengths: np.ndarray | None = None) -> np.ndarray:
     """Full grid-window -> LiMU-BERT contract input (N, 120, 6), native g."""
-    return resample_crop_pad(to_six_channels(windows, channels), rate_hz)
+    return resample_crop_pad(to_six_channels(windows, channels), rate_hz, lengths)
 
 
 def iter_train_streams(max_per_stream: int | None = None,
@@ -84,14 +95,14 @@ def iter_train_streams(max_per_stream: int | None = None,
     stream, X6 being (n, 120, 6) native-g contract input."""
     rng = np.random.RandomState(seed)
     for ds in TRAIN_DATASETS:
-        for stream in eval_data.list_streams(ds):
-            windows, labels, subjects, channels, rate = load_grid(ds, stream)
+        for stream in eval_data.list_streams(ds, alignment="native"):
+            windows, labels, subjects, channels, rate, lengths = load_grid(ds, stream)
             subjects = np.asarray(subjects)
             labels = np.asarray(labels, dtype=object)
             if max_per_stream is not None and len(windows) > max_per_stream:
                 sel = rng.choice(len(windows), size=max_per_stream, replace=False)
-                windows, labels, subjects = windows[sel], labels[sel], subjects[sel]
-            x6 = grid_to_contract(windows, channels, rate)
+                windows, labels, subjects, lengths = windows[sel], labels[sel], subjects[sel], lengths[sel]
+            x6 = grid_to_contract(windows, channels, rate, lengths)
             yield ds, stream, x6, list(labels), subjects
 
 

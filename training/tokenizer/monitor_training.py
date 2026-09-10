@@ -90,11 +90,14 @@ def assess(run_dir: Path, stale_seconds: float = 120.0) -> dict:
         alert("critical", "stale_heartbeat",
               f"Training log has not changed for {heartbeat_age:.0f} seconds.")
 
+    future_mode = config.get("jepa_mode", "masked") == "future"
     critical_numeric = (
-        "total", "jepa", "vicreg", "grad/total_preclip", "grad/encoder",
-        "descriptor/loss", "grad/sensor_fold", "grad/descriptor_projection",
-        "grad/bias_projection", "grad/descriptor_head",
-        "repr_encoder/effective_rank", "repr_projector/effective_rank",
+        "total", "future/loss", "physical/loss", "collapse/total", "jepa", "vicreg",
+        "grad/total_preclip", "grad/encoder", "grad/future_predictor",
+        "grad/physical_decoder", "descriptor/loss", "grad/sensor_fold",
+        "grad/descriptor_projection", "grad/bias_projection", "grad/descriptor_head",
+        "repr_encoder/effective_rank", "repr_retrieval/effective_rank",
+        "repr_projector/effective_rank",
     )
     for row in train[-12:]:
         bad = [key for key in critical_numeric if key in row and not _finite(row[key])]
@@ -107,12 +110,30 @@ def assess(run_dir: Path, stale_seconds: float = 120.0) -> dict:
         alert("critical", "jepa_zero_targets",
               f"{latest['jepa_zero_target_frac_window']:.2%} of recent JEPA-eligible windows "
               "had no target.")
-    if (config.get("token_granularity") == "sensor" and latest_step > warmup_steps
+    if future_mode and int(latest.get("future/leakage_count", 0)) != 0:
+        alert("critical", "future_context_leakage",
+              f"Future-context leakage count is {latest['future/leakage_count']}.")
+    if future_mode and latest_step > warmup_steps:
+        horizon_counts = [value for key, value in latest.items()
+                          if key.startswith("future/horizon_") and key.endswith("_count")]
+        if horizon_counts and any(int(value) == 0 for value in horizon_counts):
+            alert("warning", "empty_future_horizon",
+                  "At least one configured future-horizon bin received no target in the latest batch.")
+        physical_rows = [row for row in train[-6:]
+                         if _finite(row.get("physical/improvement_over_zero"))]
+        physical_gain = _median(physical_rows, "physical/improvement_over_zero")
+        if (latest_step > warmup_steps + 500 and len(physical_rows) >= 4
+                and float(config.get("physical_weight", 0.0)) > 0.0
+                and math.isfinite(physical_gain) and physical_gain <= 0.0):
+            alert("warning", "physical_decoder_below_zero_baseline",
+                  f"Recent physical-decoder improvement over zero is {physical_gain:.4f}.")
+    if (not future_mode and config.get("token_granularity") == "sensor"
+            and latest_step > warmup_steps
             and float(config.get("descriptor_weight", 0.0)) > 0.0
             and float(latest.get("descriptor/target_window_fraction", 0.0)) <= 0.0):
         alert("critical", "descriptor_no_targets",
               "No descriptor-mask target was produced in the latest telemetry window.")
-    if (config.get("token_granularity") == "sensor"
+    if (not future_mode and config.get("token_granularity") == "sensor"
             and float(config.get("descriptor_weight", 0.0)) > 0.0
             and latest_step > warmup_steps + 500):
         descriptor_rows = [
@@ -146,18 +167,33 @@ def assess(run_dir: Path, stale_seconds: float = 120.0) -> dict:
         encoder_rank = float(latest.get("repr_encoder/effective_rank", float("nan")))
         d_model = int(config.get("d_model", 256))
         jepa_margin = _median(recent, "jepa/margin")
-        vicreg_margin = _median(recent, "vicreg/margin")
+        companion_margin = (_median(recent, "physical/improvement_over_zero")
+                            if future_mode else _median(recent, "vicreg/margin"))
         if (math.isfinite(encoder_rank) and encoder_rank < max(4.0, 0.05 * d_model)
-                and jepa_margin < 0.05 and vicreg_margin < 0.05):
+                and jepa_margin < 0.05 and companion_margin <= 0.0):
             alert("warning", "possible_representation_collapse",
-                  "Encoder rank and both aligned-pair margins are simultaneously low.")
+                  "Encoder rank, predictive margin, and the auxiliary objective are "
+                  "simultaneously weak.")
 
-        geometry = [row for row in train if "grad_objective/jepa_share" in row]
+        objective_names = (("future", "physical", "collapse") if future_mode
+                           else ("jepa", "vicreg"))
+        geometry = [row for row in train
+                    if any(f"grad_objective/{name}_share" in row
+                           for name in objective_names)]
         if geometry:
-            share = _median(geometry[-3:], "grad_objective/jepa_share")
-            if share < 0.15 or share > 0.85:
+            shares = {
+                name: _median(geometry[-3:], f"grad_objective/{name}_share")
+                for name in objective_names
+            }
+            finite_shares = {name: value for name, value in shares.items()
+                             if math.isfinite(value)}
+            weak = {name: value for name, value in finite_shares.items() if value < 0.02}
+            dominant = {name: value for name, value in finite_shares.items() if value > 0.90}
+            if weak or dominant:
+                values = ", ".join(f"{name}={value:.1%}"
+                                   for name, value in finite_shares.items())
                 alert("warning", "objective_gradient_imbalance",
-                      f"Recent JEPA encoder-gradient share is {share:.1%}.")
+                      f"Recent encoder-gradient shares are imbalanced: {values}.")
 
         clip = _median(recent, "grad/clip_coefficient")
         if math.isfinite(clip) and clip < 0.05:
@@ -217,6 +253,12 @@ def assess(run_dir: Path, stale_seconds: float = 120.0) -> dict:
         },
         "loss": {
             "total": latest.get("total"),
+            "future_weighted": latest.get("loss_weighted/future"),
+            "physical_weighted": latest.get("loss_weighted/physical"),
+            "collapse_weighted": latest.get("loss_weighted/collapse"),
+            "physical_improvement_over_zero": latest.get(
+                "physical/improvement_over_zero"),
+            "collapse_min_std": latest.get("collapse/min_std"),
             "jepa_weighted": latest.get("loss_weighted/jepa"),
             "vicreg_weighted": latest.get("loss_weighted/vicreg"),
             "descriptor_weighted": latest.get("loss_weighted/descriptor"),
@@ -231,17 +273,26 @@ def assess(run_dir: Path, stale_seconds: float = 120.0) -> dict:
             "total_preclip": latest.get("grad/total_preclip"),
             "clip_coefficient": latest.get("grad/clip_coefficient"),
             "jepa_share": latest.get("grad_objective/jepa_share"),
+            "future_share": latest.get("grad_objective/future_share"),
+            "physical_share": latest.get("grad_objective/physical_share"),
+            "collapse_share": latest.get("grad_objective/collapse_share"),
             "objective_cosine": latest.get("grad_cosine/jepa_vs_vicreg"),
+            "future_physical_cosine": latest.get("grad_cosine/future_vs_physical"),
+            "future_collapse_cosine": latest.get("grad_cosine/future_vs_collapse"),
             "amp_scale": latest.get("amp/scale"),
             "amp_skipped_total": latest.get("amp/skipped_updates_total"),
             "sensor_fold": latest.get("grad/sensor_fold"),
             "descriptor_projection": latest.get("grad/descriptor_projection"),
             "bias_projection": latest.get("grad/bias_projection"),
             "descriptor_head": latest.get("grad/descriptor_head"),
+            "future_predictor": latest.get("grad/future_predictor"),
+            "physical_decoder": latest.get("grad/physical_decoder"),
         },
         "representation": {
             "encoder_effective_rank": latest.get("repr_encoder/effective_rank"),
             "encoder_min_std": latest.get("repr_encoder/min_std"),
+            "visible_effective_rank": latest.get("repr_retrieval/effective_rank"),
+            "visible_min_std": latest.get("repr_retrieval/min_std"),
             "projector_effective_rank": latest.get("repr_projector/effective_rank"),
             "teacher_effective_rank": latest.get("repr_teacher/effective_rank"),
         },
@@ -257,6 +308,9 @@ def assess(run_dir: Path, stale_seconds: float = 120.0) -> dict:
             "augmentation_rate": latest.get("data/augmentation_rate_window", {}),
             "zero_target_fraction": latest.get("jepa_zero_target_frac_window"),
             "ineligible_fraction": latest.get("jepa_ineligible_frac_window"),
+            "context_fraction": latest.get("future/context_fraction_tokens"),
+            "target_fraction": latest.get("future/target_fraction_tokens"),
+            "leakage_count": latest.get("future/leakage_count"),
             "descriptor_target_window_fraction": latest.get(
                 "descriptor/target_window_fraction"),
             "input_finite_fraction": latest.get("data/input_finite_fraction"),

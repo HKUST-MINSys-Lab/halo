@@ -1,7 +1,8 @@
-"""Empirical health report for the consolidated JEPA + augmentation-VICReg objectives.
+"""CPU/data health report for the default multi-horizon future-JEPA objective.
 
-This is a CPU/data diagnostic: it draws real temperature-sampled batches, measures honest JEPA
-supervision after validity masking, and verifies that both augmented VICReg views are populated.
+The diagnostic draws real temperature-sampled windows, creates the exact aligned 0.5/1.0/1.5
+second grids used by training, and audits context/target eligibility, horizon coverage, resolution
+alignment, and future leakage. It intentionally does not instantiate the neural model.
 
 Run: /home/alex/code/HALO/legacy_code/.venv/bin/python -m training.tokenizer.objective_health
 """
@@ -16,10 +17,13 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from training.tokenizer.losses_repr import make_sensor_mask_plan
+from training.tokenizer.future_jepa import (
+    DEFAULT_HORIZON_BINS_SECONDS,
+    make_future_target_plan,
+)
 from training.tokenizer.pretrain_data import (
     CorpusIndex,
-    MultiScaleCollate,
+    MultiResolutionCollate,
     PretrainDataset,
     SEED,
     TemperatureSampler,
@@ -30,6 +34,7 @@ from training.tokenizer.pretrain_data import (
 OUT = Path(__file__).resolve().parent / "outputs" / "objective_health"
 N_BATCHES = 20
 BATCH_SIZE = 256
+PATCH_DURATIONS = (0.5, 1.0, 1.5)
 
 
 def distribution(values: list[float]) -> dict[str, float]:
@@ -51,7 +56,7 @@ def main() -> None:
     np.random.seed(0)
     random.seed(0)
     index = CorpusIndex(seed=SEED)
-    dataset = PretrainDataset(index, index.train, augment=True, two_view=True)
+    dataset = PretrainDataset(index, index.train, augment=False, two_view=False)
     sensor_batch_groups = [
         len(modalities_present(index.refs[key.stream_i].mask)) for key in index.train
     ]
@@ -72,98 +77,119 @@ def main() -> None:
         sampler=sampler,
         batch_size=BATCH_SIZE,
         drop_last=True,
-        collate_fn=MultiScaleCollate(fixed_patch_seconds=1.0, seed=0, two_view=True),
+        collate_fn=MultiResolutionCollate(
+            fixed_patch_seconds=PATCH_DURATIONS, seed=0, two_view=False,
+        ),
         num_workers=0,
         worker_init_fn=_seed_worker,
     )
 
-    supervised_tokens: list[float] = []
-    masked_fractions: list[float] = []
-    dead_windows = 0
-    source_counts: dict[str, int] = {}
-
-    temporal_by_source: dict[str, list[int]] = {}
-    descriptor_events = 0
-    config_pair_mismatches = 0
-    unexpected_augmentations = 0
+    context_tokens: list[float] = []
+    target_tokens: list[float] = []
+    context_fractions: list[float] = []
+    target_fractions: list[float] = []
+    target_resolutions = [0 for _ in PATCH_DURATIONS]
+    target_horizons = [0 for _ in DEFAULT_HORIZON_BINS_SECONDS]
+    batches_missing_resolution = 0
+    batches_missing_horizon = 0
     ineligible_windows = 0
-    planner_failures = 0
+    eligible_without_target = 0
+    overlap_tokens = 0
+    boundary_leaks = 0
+    source_counts: dict[str, int] = {}
+    source_targets: dict[str, list[int]] = {}
+    source_ineligible: dict[str, int] = {}
 
+    generator = torch.Generator().manual_seed(SEED)
     for batch in loader:
-        batch_size, _, _, _ = batch["patches"].shape
-        valid = batch["patch_padding_mask"]
-        n_sensors = max(len(texts) for texts in batch["sensor_texts"])
-        present = torch.tensor([
-            [sensor < len(texts) for sensor in range(n_sensors)]
-            for texts in batch["sensor_texts"]
-        ], dtype=torch.bool)
-        plan = make_sensor_mask_plan(
-            batch_size, valid.shape[1], n_sensors, valid_patches=valid,
-            sensor_present=present, sensor_placement=batch["sensor_placement"],
-            descriptor_event_p=0.0,
+        plan = make_future_target_plan(
+            batch["patch_starts"],
+            batch["patch_ends"],
+            batch["patch_padding_mask"],
+            batch["resolution_ids"],
+            horizon_bins_seconds=DEFAULT_HORIZON_BINS_SECONDS,
+            generator=generator,
         )
-        real = valid.unsqueeze(2) & present.unsqueeze(1)
-        supervised = plan.token_mask & real
-        counts = supervised.flatten(1).sum(1)
-        totals = real.flatten(1).sum(1).clamp(min=1)
-        eligible = real.flatten(1).sum(1) > 1
-        supervised_tokens.extend(counts.float().tolist())
-        masked_fractions.extend((counts / totals).tolist())
-        dead_windows += int(counts.eq(0).sum())
-        ineligible_windows += int((~eligible).sum())
-        planner_failures += int((counts.eq(0) & eligible).sum())
+        valid = batch["patch_padding_mask"]
+        valid_counts = valid.sum(dim=1).clamp_min(1)
+        context_counts = plan.context_mask.sum(dim=1)
+        target_counts = plan.target_mask.sum(dim=1)
+        context_tokens.extend(context_counts.float().tolist())
+        target_tokens.extend(target_counts.float().tolist())
+        context_fractions.extend((context_counts / valid_counts).float().tolist())
+        target_fractions.extend((target_counts / valid_counts).float().tolist())
+        ineligible_windows += int((~plan.eligible).sum())
+        eligible_without_target += int((plan.eligible & target_counts.eq(0)).sum())
+        overlap_tokens += int((plan.context_mask & plan.target_mask).sum())
 
-        token_masked = plan.token_mask.any(dim=2)
-        descriptor_events += int((plan.descriptor_mask & present).sum())
+        boundary = plan.context_end[:, None]
+        boundary_leaks += int((plan.context_mask
+                               & (batch["patch_ends"] > boundary + 1e-7)).sum())
+        boundary_leaks += int((plan.target_mask
+                               & (batch["patch_starts"] < boundary - 1e-7)).sum())
 
-        for source, row in zip(batch["sources"], token_masked):
+        batch_resolution_counts = []
+        for rid in range(len(PATCH_DURATIONS)):
+            count = int((plan.target_mask & batch["resolution_ids"].eq(rid)).sum())
+            target_resolutions[rid] += count
+            batch_resolution_counts.append(count)
+        batches_missing_resolution += int(any(count == 0 for count in batch_resolution_counts))
+
+        batch_horizon_counts = []
+        for lo, hi in DEFAULT_HORIZON_BINS_SECONDS:
+            selected = plan.target_mask & plan.horizon_seconds.ge(lo) & plan.horizon_seconds.lt(hi)
+            count = int(selected.sum())
+            target_horizons[len(batch_horizon_counts)] += count
+            batch_horizon_counts.append(count)
+        batches_missing_horizon += int(any(count == 0 for count in batch_horizon_counts))
+
+        for source, count, eligible in zip(
+            batch["sources"], target_counts.tolist(), plan.eligible.tolist(),
+        ):
             source_counts[source] = source_counts.get(source, 0) + 1
-            temporal_by_source.setdefault(source, []).append(int(row.sum()))
-
-        required_view_b = {
-            "patches_b", "rates_b", "positions_b", "channel_mask_b", "patch_padding_mask_b"
-        }
-        missing = required_view_b - set(batch)
-        if missing:
-            raise RuntimeError(f"VICReg view is missing collate fields {sorted(missing)}")
-        config_pair_mismatches += int(not (
-            torch.equal(batch["channel_mask"], batch["channel_mask_b"])
-            and torch.equal(batch["sensor_placement"], batch["sensor_placement_b"])
-            and torch.allclose(batch["rates"], batch["rates_b"])
-            and torch.allclose(batch["source_rates"], batch["source_rates_b"])
-        ))
-        for traces in (batch["augmentations"], batch["augmentations_b"]):
-            unexpected_augmentations += sum(bool(trace) for trace in traces)
+            source_targets.setdefault(source, []).append(int(count))
+            source_ineligible[source] = source_ineligible.get(source, 0) + int(not eligible)
 
     windows = N_BATCHES * BATCH_SIZE
     report = {
         "batches": N_BATCHES,
         "windows": windows,
-        "jepa": {
-            "mask_mode": "sensor_granularity",
-            "supervised_tokens_per_window": distribution(supervised_tokens),
-            "masked_fraction_of_real_tokens": distribution(masked_fractions),
-            "zero_supervision_windows": dead_windows,
-            "zero_supervision_fraction": round(dead_windows / windows, 4),
-            "ineligible_one_token_windows": ineligible_windows,
-            "eligible_windows_without_target": planner_failures,
-            "descriptor_events": descriptor_events,
-            "descriptor_events_per_window": round(descriptor_events / windows, 4),
-            "mean_masked_time_positions_by_source": {
-                source: round(float(np.mean(values)), 2)
-                for source, values in sorted(temporal_by_source.items())
+        "patch_durations_seconds": PATCH_DURATIONS,
+        "future_jepa": {
+            "context_tokens_per_window": distribution(context_tokens),
+            "target_tokens_per_window": distribution(target_tokens),
+            "context_fraction_of_real_tokens": distribution(context_fractions),
+            "target_fraction_of_real_tokens": distribution(target_fractions),
+            "ineligible_windows": ineligible_windows,
+            "ineligible_fraction": round(ineligible_windows / windows, 4),
+            "eligible_windows_without_target": eligible_without_target,
+            "context_target_overlap_tokens": overlap_tokens,
+            "boundary_leak_tokens": boundary_leaks,
+            "target_count_by_resolution": {
+                f"{duration:g}s": target_resolutions[rid]
+                for rid, duration in enumerate(PATCH_DURATIONS)
+            },
+            "target_count_by_horizon": {
+                f"[{lo:g},{hi:g})s": target_horizons[i]
+                for i, (lo, hi) in enumerate(DEFAULT_HORIZON_BINS_SECONDS)
+            },
+            "batches_missing_a_resolution": batches_missing_resolution,
+            "batches_missing_a_horizon": batches_missing_horizon,
+            "mean_targets_by_source": {
+                source: round(float(np.mean(values)), 3)
+                for source, values in sorted(source_targets.items())
+            },
+            "ineligible_fraction_by_source": {
+                source: round(source_ineligible[source] / count, 4)
+                for source, count in sorted(source_counts.items())
             },
         },
-        "vicreg": {
-            "augmentation_pairs_per_batch": BATCH_SIZE,
-            "batches_with_config_mismatch_between_views": config_pair_mismatches,
-            "views_with_unexpected_augmentation": unexpected_augmentations,
-        },
         "sampled_source_share": {
-            source: round(count / windows, 4) for source, count in sorted(source_counts.items())
+            source: round(count / windows, 4)
+            for source, count in sorted(source_counts.items())
         },
     }
-    (OUT / "report.json").write_text(json.dumps(report, indent=2))
+    (OUT / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
 
 

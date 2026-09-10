@@ -42,6 +42,28 @@ data/datasets/*/manifest.json
 data/datasets/*/labels.json
 data/datasets/*/events.json
 data/datasets/*/debug_*.png
+
+# Label-free pretraining tree (data/pretraining/). Same generated artefacts as the labelled
+# tree above: everything here is rebuilt by a fetcher or converter and must never be committed.
+# This corpus is designed to reach ~110 GB, so an unignored grids/ directory is not a nuisance,
+# it is a repository-destroying commit.
+data/pretraining/*/downloads/
+data/pretraining/*/download/
+data/pretraining/*/raw/
+data/pretraining/*/sessions/
+data/pretraining/*/processed/
+data/pretraining/*/grids/
+data/pretraining/*/manifest.json
+data/pretraining/*/labels.json
+data/pretraining/*/events.json
+data/pretraining/*/debug_*.png
+# Nymeria converts into sibling dataset directories, so its generated output can also land one
+# level deeper than the module that produced it.
+data/pretraining/*/*/downloads/
+data/pretraining/*/*/sessions/
+data/pretraining/*/*/grids/
+data/pretraining/*/*/manifest.json
+data/pretraining/*/*/labels.json
 data/**/bundles/
 
 # Application-study datasets are deliberately isolated from the representation-training corpus.

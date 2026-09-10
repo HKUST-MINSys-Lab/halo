@@ -17,8 +17,8 @@ Two estimators, in increasing order of how much they prove:
    separate the label from the rest of its own protocol? One-vs-rest, subject-disjoint kNN, rescaled
    so 0 = chance and 1 = perfect.
 
-2. ``paired_contrast`` — restricted to datasets where several streams record the SAME sessions
-   simultaneously (sp_sw_har phone+watch, xrf_v2's six streams, opportunity, realdisp, mmfit). Same
+2. ``paired_contrast`` — restricted to active datasets where several streams record the SAME
+   sessions simultaneously (xrf_v2, realdisp, mmfit, DSADS, FORTH-TRACE, and NFI-FARED). Same
    subjects, same events, same clock: the ONLY thing that differs is where the sensor sits. A large
    per-label spread across simultaneous streams is the jumping-jacks effect, measured. A small spread
    falsifies the premise, and would mean the admissibility gate has nothing to gate on.
@@ -53,7 +53,7 @@ OUT_PATH = Path("training/evidence/outputs/resolvability.json")
 # Datasets whose streams are simultaneous views of the same sessions. Only these support the
 # paired contrast; everywhere else "different placement" is confounded with different subjects and
 # protocols, which is exactly the confound the contrast exists to remove.
-PAIRED_DATASETS = ("sp_sw_har", "xrf_v2", "opportunity", "realdisp", "mmfit")
+PAIRED_DATASETS = ("xrf_v2", "realdisp", "mmfit", "dsads", "forth_trace", "nfi_fared")
 
 MAX_WINDOWS_PER_STREAM = 3000
 MIN_WINDOWS_PER_LABEL = 20

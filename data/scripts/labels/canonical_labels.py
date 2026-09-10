@@ -33,7 +33,9 @@ SYNONYMS = {
     # --- stairs (direction preserved: ascending == up, descending == down) ---
     "ascending_stairs": "walking_upstairs",        # pamap2
     "going_up_stairs": "walking_upstairs",         # unimib_shar
-    "climbing_stairs": "walking_upstairs",         # mhealth
+    # FORTH-TRACE and mHealth both use this label for ascent AND descent. Inventing an upward
+    # direction corrupts the target; retain the same undirected concept as WISDM's `stairs`.
+    "climbing_stairs": "stairs",
     "climbingup": "walking_upstairs",              # realworld
     "descending_stairs": "walking_downstairs",     # pamap2
     "going_down_stairs": "walking_downstairs",     # unimib_shar

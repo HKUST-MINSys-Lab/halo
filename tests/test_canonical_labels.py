@@ -31,6 +31,7 @@ def test_specific_synonym_merges():
     assert canonicalize("bicycling") == "cycling"
     assert canonicalize("ascending_stairs") == "walking_upstairs"
     assert canonicalize("going_down_stairs") == "walking_downstairs"
+    assert canonicalize("climbing_stairs") == "stairs"
     assert canonicalize("sit_to_stand") == "standing_up_from_sitting"
     assert canonicalize("lie_to_stand") == "standing_up_from_lying"
     assert canonicalize("standing_up_from_laying") == "standing_up_from_lying"

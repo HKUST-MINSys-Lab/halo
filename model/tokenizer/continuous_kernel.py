@@ -870,6 +870,10 @@ class ContinuousKernelTokenizer(nn.Module):
         if self.norm == "frozen":
             compressed = (compressed - self.norm_mu.view(1, 1, K, 1)) / self.norm_sd.view(1, 1, K, 1)
         compressed = compressed * analysis["nyquist"].view(B, 1, K, 1)
+        # Invalid frames still contain reflected analysis values. Zero them before the temporal CNN
+        # so padding, or signal beyond a future-JEPA context boundary, cannot enter a valid token.
+        frame_valid = analysis["frame_valid"].view(B, 1, 1, n_frames)
+        compressed = compressed * frame_valid.to(compressed.dtype)
         # (B,C,K,T) -> (B,S,xyz,K,T).  The extra trash slot receives absent channels and is sliced.
         source = compressed * live.view(B, C, 1, 1).to(compressed.dtype)
         packed = compressed.new_zeros(B, total_slots + 1, K, n_frames)
@@ -877,9 +881,16 @@ class ContinuousKernelTokenizer(nn.Module):
         packed.scatter_(1, target.view(B, C, 1, 1).expand(B, C, K, n_frames), source)
         x = packed[:, :total_slots].reshape(B * sensors, self.axes_per_sensor * K, n_frames)
         x = self.conv1(x)
+        # Conv1 output j is centred on input frame 2*j. Using max-pool validity would mark the first
+        # future output valid merely because its left neighbour is observed; Conv2 could then carry
+        # that boundary activation back into the final context token.
+        conv_valid = analysis["frame_valid"][:, ::2].unsqueeze(1)
+        conv_valid = conv_valid.expand(B, sensors, -1).reshape(B * sensors, 1, -1)
         x = F.gelu(self.ln1(x.transpose(1, 2)).transpose(1, 2))
+        x = x * conv_valid.to(x.dtype)
         x = self.conv2(x)
         x = F.gelu(self.ln2(x.transpose(1, 2)).transpose(1, 2))                  # (B*S, c2, f/2)
+        x = x * conv_valid.to(x.dtype)
         c2, reduced = x.shape[1], x.shape[2]
         per_token = self.frames_per_token
         if reduced != per_token * P:

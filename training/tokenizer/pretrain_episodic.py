@@ -1365,6 +1365,8 @@ def main() -> None:
                         help="seed for the concept holdout and the validation episodes, kept "
                              "SEPARATE from --seed so every run is scored on the same draw")
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--allow-retired", action="store_true",
+                        help="allow retired datasets only for deliberate historical reproduction")
     parser.add_argument("--profile-steps", type=int, default=0,
                         help="measure this many real steps (phase timers + op table), then exit")
     parser.add_argument(
@@ -1430,7 +1432,7 @@ def main() -> None:
     if args.smoke:
         args.steps, args.val_every, args.val_episodes = 3, 3, 2
         args.warmup_steps, args.num_workers, args.calib_batches = 1, 0, 1
-        args.datasets = ["uci_har", "wisdm", "mhealth", "pamap2"]
+        args.datasets = ["wisdm", "pamap2", "capture24", "unimib_shar"]
         args.candidate_counts, args.query_labels_per_episode, args.max_support = [4, 8], 4, 2
         args.bank_windows = 32
 
@@ -1439,6 +1441,9 @@ def main() -> None:
         "base_nearest" if args.phase_b_regime == "zero-shot" else "enrolled_1nn"
     )
     args.reference_mode = reference_mode
+
+    from data.scripts.curate.deployment_policy import assert_no_retired_sources
+    assert_no_retired_sources(tuple(args.datasets), allow=args.allow_retired)
 
     device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available()
                           else "cpu")

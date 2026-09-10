@@ -588,7 +588,8 @@ class DualBranchTransformer(nn.Module):
         channel_mask: Optional[torch.Tensor] = None,
         patch_padding_mask: Optional[torch.Tensor] = None,
         positions: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_layer_states: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         """
         Process input through dual-branch transformer.
 
@@ -602,11 +603,13 @@ class DualBranchTransformer(nn.Module):
         Returns:
             Output tensor of shape (batch_size, num_patches, num_channels, d_model)
         """
-        # Apply transformer layers
+        layer_states = []
         for layer in self.layers:
             x = layer(x, temporal_mask, channel_mask, patch_padding_mask, positions=positions)
+            if return_layer_states:
+                layer_states.append(x)
 
-        return x
+        return (x, tuple(layer_states)) if return_layer_states else x
 
     def retrieval_context(
         self,
@@ -708,7 +711,8 @@ class TemporalTrunk(nn.Module):
         patch_padding_mask: Optional[torch.Tensor] = None,
         positions: Optional[torch.Tensor] = None,
         stop_after: Optional[int] = None,
-    ) -> torch.Tensor:
+        return_layer_states: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         """``channel_mask`` is accepted and ignored: sensors never mix in this trunk.
 
         ``stop_after`` runs a prefix of the stack, which is how the retrieval representation is
@@ -722,14 +726,21 @@ class TemporalTrunk(nn.Module):
             mask = self._expand(mask, sensors)
 
         depth = self.num_layers if stop_after is None else min(int(stop_after), self.num_layers)
+        layer_states = []
         for layer in range(depth):
             attended = self.attn[layer](
                 self.attn_norm[layer](flat), mask, key_padding_mask=padding, positions=pos,
             )
             flat = flat + self.dropout(attended)
             flat = flat + self.dropout(self.ffn[layer](self.ffn_norm[layer](flat)))
+            if return_layer_states:
+                state = self.out_norm(flat).reshape(
+                    batch, sensors, patches, dim,
+                ).permute(0, 2, 1, 3)
+                layer_states.append(state)
         flat = self.out_norm(flat)
-        return flat.reshape(batch, sensors, patches, dim).permute(0, 2, 1, 3)
+        output = flat.reshape(batch, sensors, patches, dim).permute(0, 2, 1, 3)
+        return (output, tuple(layer_states)) if return_layer_states else output
 
     def retrieval_context(
         self,

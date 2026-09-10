@@ -1,0 +1,38 @@
+{
+  "dataset": "nymeria_aria",
+  "display_name": "Nymeria - Project Aria headset + miniAria wristband IMUs (decimated to 200 Hz)",
+  "sampling_rate_hz": 200.0,
+  "pre_windowed": false,
+  "streaming_grid": true,
+  "role": "pretrain_scale",
+  "phase_a_only": true,
+  "activities": [],
+  "num_subjects": null,
+  "channels": [
+    "acc_x",
+    "acc_y",
+    "acc_z",
+    "gyro_x",
+    "gyro_y",
+    "gyro_z"
+  ],
+  "core_channels": {
+    "acc_x": "acc_x",
+    "acc_y": "acc_y",
+    "acc_z": "acc_z",
+    "gyro_x": "gyro_x",
+    "gyro_y": "gyro_y",
+    "gyro_z": "gyro_z"
+  },
+  "extra_channels": [],
+  "placement": "the head (Project Aria glasses), the left wrist and the right wrist (miniAria wristbands), simultaneous",
+  "stream_tokens": [
+    "aria_head",
+    "aria_lwrist",
+    "aria_rwrist"
+  ],
+  "unit": "g",
+  "gravity_state": "present",
+  "note": "One IMU per device (imu-right / 1202-1 at ~800 Hz preferred, imu-left / 1202-2 at ~1 kHz as fallback; the choice is recorded per run in manifest.json). Aria reports accel in m/s^2 and gyro in rad/s already in the device frame; accel is divided by 9.80665 -> g, gravity PRESENT. Non-uniform device timestamps are resampled onto the sensor's nominal uniform clock, then anti-alias filtered and decimated to exactly 200 Hz (scipy.signal.resample_poly, Kaiser FIR, cutoff at the 100 Hz output Nyquist). 200 Hz is far above the frontend's ~14 Hz f_max; keeping 1 kHz would cost 5x for nothing. Gaps > 0.5 s split the session into _pNN parts rather than being interpolated across. The observer headset is excluded: it is worn by a second person following the participant. Unlabeled: reserved marker __unlabeled__, Phase-A only. Grids are float16.",
+  "grid_dtype": "float16"
+}

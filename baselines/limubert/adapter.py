@@ -111,7 +111,8 @@ def _fit_fp(vocab) -> str:
     from eval.splits import manifest_fingerprint
     return fit_fingerprint(model='limubert', vocab=list(vocab), split=manifest_fingerprint(),
                            hp=[FIT_EPOCHS, FIT_BATCH, FIT_LR, FIT_SEED], probe=PROBE_SPEC,
-                           cap=HEAD_FIT_MAX_PER_STREAM, backbone='limubert-selfpretrained')
+                           cap=HEAD_FIT_MAX_PER_STREAM, backbone='limubert-selfpretrained',
+                           prep=prep.PREP_SCHEMA)
 
 
 class _LayerNorm(nn.Module):
@@ -281,7 +282,8 @@ class LiMUBERTAdapter(ConSEAdapter):
         meta_path = _BACKBONE_CKPT.with_suffix(".meta.json")
         import json as _json
         meta = _json.loads(meta_path.read_text()) if meta_path.exists() else {}
-        if (meta.get("schema_version") != 1
+        if (meta.get("schema_version") != 2
+                or meta.get("prep_schema") != prep.PREP_SCHEMA
                 or meta.get("acc_convention") != "g"
                 or meta.get("corpus_profile") != "expanded_phase_a"
                 or meta.get("recipe") != "full"
@@ -402,7 +404,7 @@ class LiMUBERTAdapter(ConSEAdapter):
     def window_probs(self, stream, state, device) -> np.ndarray:
         backbone, head = state["backbone"], state["head"]
         T = float(state.get("temperature", 1.0))    # calibrated temperature (#82)
-        x6 = prep.grid_to_contract(stream.windows, stream.channels, stream.rate_hz)
+        x6 = prep.grid_to_contract(stream.windows, stream.channels, stream.rate_hz, stream.lengths)
         feats = _features(backbone, x6, device)
         probs = []
         with torch.no_grad():
@@ -412,7 +414,7 @@ class LiMUBERTAdapter(ConSEAdapter):
         return np.concatenate(probs, axis=0)
 
     def window_features(self, stream, state, device) -> np.ndarray:
-        x6 = prep.grid_to_contract(stream.windows, stream.channels, stream.rate_hz)
+        x6 = prep.grid_to_contract(stream.windows, stream.channels, stream.rate_hz, stream.lengths)
         return _features(state["backbone"], x6, device)
 
     def predict_candidates_from_features(self, features, candidates, state, device):

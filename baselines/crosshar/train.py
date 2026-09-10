@@ -46,7 +46,7 @@ CROSSHAR_REPO = Path("/home/alex/code/HALO/legacy_code/auxiliary_repos/CrossHAR"
 
 _HERE = Path(__file__).resolve().parent
 BACKBONE_CKPT = _HERE / "crosshar_backbone.pt"
-METADATA_SCHEMA = 1
+METADATA_SCHEMA = 2
 
 
 def _seed_worker(worker_id):
@@ -269,6 +269,7 @@ def main(argv=None):
         "model": "crosshar",
         "corpus_profile": "expanded_phase_a",
         "train_datasets": list(prep.TRAIN_DATASETS),
+        "prep_schema": prep.PREP_SCHEMA,
         "input_contract": {"rate_hz": prep.TARGET_HZ, "samples": prep.TARGET_LEN,
                            "channels": list(prep.SIX_CHANNELS),
                            "acc_convention": "g_then_per_window_instance_norm"},

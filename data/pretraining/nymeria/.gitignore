@@ -1,0 +1,22 @@
+# Tracked (authored): fetch.py, convert.py, README.md, module_metadata.json and the two
+# per-dataset metadata templates (nymeria_xsens.metadata.json, nymeria_aria.metadata.json).
+# Everything below is generated.
+#
+# NOTE: the two DATASET directories (data/pretraining/nymeria_xsens/ and
+# data/pretraining/nymeria_aria/) are siblings of this package, so they are not reachable
+# from this file. The root .gitignore's data/datasets/*/ block does not cover
+# data/pretraining/* either — that gap is real for nhanes today and needs one line in the
+# root .gitignore, which this module does not own.
+
+# Your personal, licence-issued, time-limited URL manifest. Credential-like and
+# non-redistributable under CC BY-NC 4.0 — never commit it.
+downloads/
+url.json
+url.filtered.json
+fetch_manifest.json
+
+# Converter outputs written into this package.
+labels.json
+manifest.json
+sessions/
+grids/

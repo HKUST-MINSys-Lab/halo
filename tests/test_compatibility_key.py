@@ -106,7 +106,7 @@ def test_cross_dataset_wrist_streams_are_compatible():
     a = stream_key("dsads", "left_wrist")
     b = stream_key("forth_trace", "left_wrist")
     assert are_compatible(a, b)
-    assert a.device_family == "watch"
+    assert a.device_family == "body_imu"
 
 
 def test_gravity_removed_is_never_compatible_with_gravity_present():
@@ -219,4 +219,6 @@ def test_training_corpus_has_multi_dataset_pools():
     for (dataset, _stream), key in corpus_keys().items():
         if dataset in train:
             pools.setdefault(key, set()).add(dataset)
-    assert max(len(datasets) for datasets in pools.values()) >= 5
+    # Truthful hardware profiles still leave cross-source pools; they no longer manufacture a
+    # watch equivalence for wrist-mounted Xsens/Shimmer research nodes.
+    assert max(len(datasets) for datasets in pools.values()) >= 3

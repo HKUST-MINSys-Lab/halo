@@ -571,6 +571,25 @@ def test_features_do_not_depend_on_how_long_the_rest_of_the_recording_was():
         "was extended -- a duration fingerprint has leaked in")
 
 
+def test_future_patch_mask_blocks_signal_and_gradient_from_hidden_suffix():
+    torch.manual_seed(17)
+    module = ContinuousKernelTokenizer(d_model=16).eval()
+    patches = torch.randn(1, 6, 50, 3, requires_grad=True)
+    changed = patches.detach().clone()
+    changed[:, 3:] += 1000.0
+    lengths = torch.full((1, 6), 50, dtype=torch.long)
+    prefix = torch.tensor([[True, True, True, False, False, False]])
+    with torch.no_grad():
+        original = module(patches.detach(), 50.0, lengths, patch_mask=prefix)
+        perturbed = module(changed, 50.0, lengths, patch_mask=prefix)
+    assert torch.allclose(original, perturbed, atol=1e-6)
+
+    output = module(patches, 50.0, lengths, patch_mask=prefix)
+    output.square().mean().backward()
+    assert patches.grad[:, :3].abs().sum() > 0
+    assert patches.grad[:, 3:].abs().sum() == 0
+
+
 def test_harmonic_count_is_enough_for_the_shapes_this_front_end_claims():
     """The motivating claim is that a time-domain kernel can match an asymmetric impact, which a
     Gaussian band cannot. Assert the basis can actually express one."""

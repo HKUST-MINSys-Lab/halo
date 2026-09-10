@@ -4,10 +4,11 @@ A small, deliberately diverse slice of the corpus for running tokenizer experime
 It spans sampling rate (20/50/100 Hz), on-body placement, channel modality (acc-only vs
 acc+gyro), and gravity present/removed, with a held-out dataset for cross-config transfer.
 
-    6 train streams / 5 datasets:
+    7 train streams / 5 datasets:
       wisdm phone_pocket   20 Hz  pocket  acc+gyro  gravity     (only 20 Hz — low-rate stress)
       wisdm watch_wrist    20 Hz  wrist   acc+gyro  gravity
-      uci_har phone_waist  50 Hz  waist   acc+gyro  gravity
+      hhar phone_waist     50 Hz  waist   acc+gyro  gravity
+      hhar phone_waist_accel_only 50 Hz waist acc-only gravity
       unimib phone_pocket  50 Hz  pocket  acc-only  gravity     (the 3-channel case)
       pamap2 watch_wrist  100 Hz  wrist   acc+gyro  gravity
       kuhar phone_waist   100 Hz  waist   acc+gyro  REMOVED
@@ -27,7 +28,7 @@ import numpy as np
 
 # Train datasets for the subset. wisdm contributes both its streams (20 Hz pocket + wrist); the
 # rest one each. CorpusIndex splits subjects disjointly within each dataset.
-SUBSET_TRAIN_DATASETS = ("wisdm", "uci_har", "unimib_shar", "pamap2", "kuhar")
+SUBSET_TRAIN_DATASETS = ("wisdm", "hhar", "unimib_shar", "pamap2", "kuhar")
 
 # Held-out for cross-config transfer (unseen dataset -> every window is an unseen config).
 SUBSET_HELDOUT_DATASETS = ("xrf_v2",)
@@ -37,7 +38,9 @@ DEFAULT_CAP = 10_000            # per-stream window cap (keeps the subset balanc
 # Placement label per (dataset, stream) for the config-decodability / cross-config metrics.
 PLACEMENT = {
     ("wisdm", "phone_pocket"): "pocket", ("wisdm", "watch_wrist"): "wrist",
-    ("uci_har", "phone_waist"): "waist", ("unimib_shar", "phone_pocket"): "pocket",
+    ("hhar", "phone_waist"): "waist",
+    ("hhar", "phone_waist_accel_only"): "waist",
+    ("unimib_shar", "phone_pocket"): "pocket",
     ("pamap2", "watch_wrist"): "wrist", ("kuhar", "phone_waist"): "waist",
     ("xrf_v2", "left_wrist"): "wrist", ("xrf_v2", "right_wrist"): "wrist",
     ("xrf_v2", "left_pocket"): "pocket", ("xrf_v2", "right_pocket"): "pocket",
@@ -48,6 +51,8 @@ PLACEMENT = {
 def build_subset_index(cap: int = DEFAULT_CAP, seed: int | None = None):
     """CorpusIndex restricted to the subset train datasets, subject-disjoint train/val split."""
     from training.tokenizer.pretrain_data import CorpusIndex, SEED
+    from data.scripts.curate.deployment_policy import assert_no_retired_sources
+    assert_no_retired_sources(SUBSET_TRAIN_DATASETS)
     return CorpusIndex(max_per_stream=cap, seed=SEED if seed is None else seed,
                        datasets=SUBSET_TRAIN_DATASETS)
 
@@ -55,6 +60,8 @@ def build_subset_index(cap: int = DEFAULT_CAP, seed: int | None = None):
 def build_heldout_index(cap: int = DEFAULT_CAP, seed: int | None = None):
     """CorpusIndex over the held-out config datasets (all windows are unseen configs)."""
     from training.tokenizer.pretrain_data import CorpusIndex, SEED
+    from data.scripts.curate.deployment_policy import assert_no_retired_sources
+    assert_no_retired_sources(SUBSET_HELDOUT_DATASETS)
     return CorpusIndex(max_per_stream=cap, seed=SEED if seed is None else seed,
                        datasets=SUBSET_HELDOUT_DATASETS)
 

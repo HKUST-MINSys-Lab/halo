@@ -1,0 +1,31 @@
+{
+  "dataset": "ego_exo4d",
+  "display_name": "Ego-Exo4D Aria head IMU (bounded subset)",
+  "sampling_rate_hz": 200.0,
+  "pre_windowed": false,
+  "streaming_grid": true,
+  "role": "pretrain_scale",
+  "phase_a_only": true,
+  "activities": [],
+  "num_subjects": null,
+  "channels": [
+    "acc_x",
+    "acc_y",
+    "acc_z",
+    "gyro_x",
+    "gyro_y",
+    "gyro_z"
+  ],
+  "core_channels": {
+    "acc_x": "acc_x",
+    "acc_y": "acc_y",
+    "acc_z": "acc_z",
+    "gyro_x": "gyro_x",
+    "gyro_y": "gyro_y",
+    "gyro_z": "gyro_z"
+  },
+  "extra_channels": [],
+  "grid_dtype": "float16",
+  "placement": "the head (smart glasses)",
+  "note": "Head-mounted Project Aria IMU only (no video/audio/gaze). One IMU per take, imu-right (1202-1, ~800 Hz) preferred over imu-left (1202-2, ~1 kHz). Accel m/s^2 -> g with gravity present; gyro rad/s; Aria device frame. Anti-aliased (zero-phase FIR, 80 Hz passband) and resampled onto a uniform 200 Hz grid, because the frontend's f_max is ~14 Hz and native-rate storage would cost 4-5x for content the model never reads. Sessions split at IMU gaps > 0.5 s rather than interpolating across dropouts; parts keep 'aria_head' as a matchable substring. Subject id is p<participant_uid> from takes.json, falling back to the capture uid when absent (see manifest.json: subject_id_source). Label-free: every session carries the reserved marker __unlabeled__; Phase-A self-supervision only, never a Phase-B evidence-bank source. Licence-gated (https://ego4d-data.org/, ~2 day approval). This file is the static descriptor; convert.py rewrites it with the realized subject/stream counts."
+}

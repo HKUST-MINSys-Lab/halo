@@ -74,7 +74,7 @@ FIELDS = (
     "gravity_magnitude",     # median ||acc|| on quiescent windows      (accel only)
     "gravity_presence",      # median norm of per-window DC vector       (accel only)
     "noise_floor",           # rms energy above MOTION_BAND_HZ, quiescent
-    "quantization_step",     # smallest positive gap between adjacent distinct values
+    "quantization_step",     # robust low quantile of non-zero temporal increments
     "clip_fraction",         # fraction of samples at an observed rail
     "rate_fidelity",         # native acquisition rate / stored array rate
     "rest_bias",             # median ||signal|| on quiescent windows   (gyro: rest offset)
@@ -134,26 +134,29 @@ def _high_band_rms(data: np.ndarray, rate_hz: float) -> float:
 
 
 def _quantization_step(values: np.ndarray) -> float:
-    """Smallest positive gap between adjacent distinct sample values.
+    """Robust estimate of the smallest repeatable sample increment.
 
     A 16-bit sensor at +-8 g quantises to ~2.4e-4 g; a float-normalised stream shows ~1e-7 or the
     resolution of whatever transform was applied. This is the field that catches "someone has already
     processed this data" independent of any activity content.
     """
-    flat = values.reshape(-1)
-    flat = flat[np.isfinite(flat)]
-    if flat.size < 2:
+    data = np.asarray(values)
+    if data.ndim == 1:
+        data = data[:, None]
+    if data.ndim not in (2, 3) or data.shape[-2] < 2:
         return float("nan")
-    # Subsample for cost; the minimum gap is a robust statistic under subsampling because it is
-    # determined by the ADC grid, which every sample lies on.
-    if flat.size > 200_000:
-        flat = flat[:: flat.size // 200_000]
-    uniq = np.unique(flat)
-    if uniq.size < 2:
-        return float("nan")
-    gaps = np.diff(uniq)
-    gaps = gaps[gaps > 0]
-    return float(np.min(gaps)) if gaps.size else float("nan")
+    # A global minimum over sorted float values measures roundoff and mixes axes with different
+    # offsets. Estimate each axis from a low non-zero consecutive-change quantile instead.
+    estimates = []
+    for axis in range(data.shape[-1]):
+        # Difference only along time. Never join the end of one independent window to the start
+        # of the next, which would turn inter-window offsets into a fake quantization step.
+        delta = np.abs(np.diff(data[..., axis], axis=-1 if data.ndim == 3 else 0)).reshape(-1)
+        delta = delta[np.isfinite(delta)]
+        delta = delta[delta > np.finfo(np.float32).eps]
+        if len(delta):
+            estimates.append(float(np.percentile(delta, 5.0)))
+    return float(np.median(estimates)) if estimates else float("nan")
 
 
 def _clip_fraction(values: np.ndarray) -> float:

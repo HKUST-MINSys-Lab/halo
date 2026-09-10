@@ -39,6 +39,16 @@ RATE_HZ = 80.0
 WINDOW_SECONDS = 6.0
 WINDOW_SAMPLES = int(RATE_HZ * WINDOW_SECONDS)
 UNLABELED = "__unlabeled__"
+#: Max-axis standard deviation, in g, below which a six-second window is indistinguishable
+#: from a motionless device. Measured as the NHANES noise floor in the 2026-07 corpus audit.
+STILL_G = 0.003
+#: Share of a subject's hour budget deliberately drawn from the low-motion end, so sleep and
+#: sedentary posture stay represented instead of being selected away.
+STILL_FRACTION = 1.0 / 3.0
+#: Default hours per participant. Twelve spans a day and a night while keeping breadth of
+#: SUBJECTS the dominant axis: under the sampler's per-subject n^0.5 tempering, 3,000 people
+#: at 12 h is worth far more than 500 people at a full week.
+DEFAULT_MAX_HOURS = 12
 OUTPUT_COLUMNS = ("acc_x", "acc_y", "acc_z")
 _STAMP = re.compile(r"\.(2000-\d{2}-\d{2}-\d{2}-\d{2}-\d{2})-000-P0000\.sensor\.csv$")
 
@@ -90,6 +100,57 @@ def _evenly_spaced(members: list[tarfile.TarInfo], max_hours: int | None) -> lis
     return [members[int(index)] for index in indices]
 
 
+def motion_score(xyz: np.ndarray) -> float:
+    """Fraction of six-second windows in ``xyz`` that carry more than sensor noise.
+
+    A window counts as moving when its largest per-axis standard deviation exceeds
+    ``STILL_G``. That threshold is the release's own noise floor, not a tuned constant: the
+    2026-07 audit measured 43% of NHANES windows below 0.003 g of max-axis std, which is the
+    signature of an ActiGraph resting against a mattress rather than of human movement.
+
+    Pure and cheap so hour selection can be unit-tested without tar archives.
+    """
+    usable = (len(xyz) // WINDOW_SAMPLES) * WINDOW_SAMPLES
+    if usable < WINDOW_SAMPLES:
+        return 0.0
+    windows = xyz[:usable].reshape(-1, WINDOW_SAMPLES, xyz.shape[1])
+    spread = np.nanstd(windows, axis=1).max(axis=1)
+    return float(np.mean(spread > STILL_G))
+
+
+def select_hours(
+    scores: "list[float] | np.ndarray",
+    max_hours: int | None,
+    still_fraction: float = STILL_FRACTION,
+) -> list[int]:
+    """Choose which hourly files to keep, given each one's :func:`motion_score`.
+
+    Free-living wrist data is mostly stillness, and a masked-prediction objective learns
+    nothing from predicting a motionless window from its motionless neighbours. But an
+    all-motion corpus is not free-living either, and sleep and sedentary posture are exactly
+    the content the DC/gravity part of the frontend reads. So the budget is split: the top
+    ``1 - still_fraction`` of hours by motion, plus a ``still_fraction`` minority drawn from
+    the low-motion end, both kept in chronological order.
+
+    Returns indices into ``scores``, sorted, so the caller preserves time order.
+    """
+    total = len(scores)
+    if max_hours is None or total <= max_hours:
+        return list(range(total))
+    order = list(np.argsort(np.asarray(scores, dtype=float), kind="stable"))
+    n_still = min(int(round(max_hours * still_fraction)), max_hours)
+    n_moving = max_hours - n_still
+    chosen = set(order[:n_still]) | set(order[total - n_moving:] if n_moving else [])
+    # Rounding collisions (an hour landing in both ends of a short record) can leave the set
+    # short of budget; top it up from the unused middle, most-moving first.
+    if len(chosen) < max_hours:
+        for index in reversed(order):
+            if len(chosen) >= max_hours:
+                break
+            chosen.add(index)
+    return sorted(chosen)
+
+
 def _complete_blocks(
     frame: pd.DataFrame,
     intervals: list[tuple[datetime, datetime]],
@@ -107,7 +168,9 @@ def _complete_blocks(
     # Sensor gaps are boundaries even when no published QC interval covers them.
     stamp_ns = timestamps.astype("int64", copy=False).to_numpy()
     dt = np.diff(stamp_ns) / 1e9
-    boundaries = np.flatnonzero((~good[1:]) | (~good[:-1]) | (dt > 2.5 / RATE_HZ)) + 1
+    boundaries = np.flatnonzero(
+        (~good[1:]) | (~good[:-1]) | (dt > 2.5 / RATE_HZ) | (dt <= 0.0)
+    ) + 1
     bounds = np.r_[0, boundaries, len(frame)]
     blocks = []
     for start, end in zip(bounds[:-1], bounds[1:]):
@@ -123,7 +186,8 @@ def convert(
     raw_dir: Path = DOWNLOADS,
     output_dir: Path = DS_DIR,
     limit_subjects: int | None = None,
-    max_hours_per_subject: int | None = 24,
+    max_hours_per_subject: int | None = DEFAULT_MAX_HOURS,
+    selection: str = "motion",
 ) -> bool:
     archives = sorted(raw_dir.glob("*.tar.bz2"))
     if limit_subjects is not None:
@@ -131,7 +195,7 @@ def convert(
     if not archives:
         raise FileNotFoundError(
             f"no participant archives under {raw_dir}; run "
-            "`python -m data.datasets.nhanes.fetch --subjects <N>`"
+            "`python -m data.pretraining.nhanes.fetch --subjects <N>`"
         )
 
     sessions_dir = output_dir / "sessions"
@@ -154,9 +218,40 @@ def convert(
                 continue
             qc = _read_qc(archive, members)
             intervals = _qc_intervals(qc, _member_start(sensor_members[0].name))
-            chosen = _evenly_spaced(sensor_members, max_hours_per_subject)
+            if selection == "evenly_spaced":
+                chosen = _evenly_spaced(sensor_members, max_hours_per_subject)
+                hour_blocks = {}
+            else:
+                # Motion-aware selection has to read every candidate hour to score it, so the
+                # decoded blocks are cached and reused rather than decompressed twice.
+                hour_blocks = {}
+                scores = []
+                for member in sensor_members:
+                    handle = archive.extractfile(member)
+                    if handle is None:
+                        stats["unreadable_hour"] += 1
+                        hour_blocks[member.name] = []
+                        scores.append(-1.0)
+                        continue
+                    frame = pd.read_csv(
+                        io.BytesIO(handle.read()),
+                        usecols=["HEADER_TIMESTAMP", "X", "Y", "Z"],
+                    )
+                    blocks_here = _complete_blocks(frame, intervals)
+                    hour_blocks[member.name] = blocks_here
+                    scores.append(
+                        motion_score(np.concatenate(blocks_here, axis=0))
+                        if blocks_here else -1.0
+                    )
+                keep = select_hours(scores, max_hours_per_subject)
+                chosen = [sensor_members[index] for index in keep]
+                stats["hours_scored"] += len(sensor_members)
+
             blocks: list[np.ndarray] = []
             for member in chosen:
+                if member.name in hour_blocks:
+                    blocks.extend(hour_blocks[member.name])
+                    continue
                 handle = archive.extractfile(member)
                 if handle is None:
                     stats["unreadable_hour"] += 1
@@ -201,6 +296,9 @@ def convert(
                 "gravity_state": "present",
                 "phase_a_only": True,
                 "max_hours_per_subject": max_hours_per_subject,
+                "hour_selection": selection,
+                "still_threshold_g": STILL_G,
+                "still_fraction": STILL_FRACTION,
                 "note": "No activity labels; reserved marker __unlabeled__.",
             },
             indent=2,
@@ -216,13 +314,19 @@ def main() -> None:
     parser.add_argument("--raw-dir", type=Path, default=DOWNLOADS)
     parser.add_argument("--output-dir", type=Path, default=DS_DIR)
     parser.add_argument("--limit-subjects", type=int)
-    parser.add_argument("--max-hours-per-subject", type=int, default=24)
+    parser.add_argument("--max-hours-per-subject", type=int, default=DEFAULT_MAX_HOURS)
+    parser.add_argument("--selection", choices=("motion", "evenly_spaced"), default="motion",
+                        help="How to spend the hour budget. 'motion' ranks every candidate hour "
+                             "by moving-window fraction and keeps the most active plus a "
+                             "one-third still minority; 'evenly_spaced' takes an unbiased spread "
+                             "and decompresses only the chosen hours (much cheaper, more stillness).")
     args = parser.parse_args()
     if not convert(
         raw_dir=args.raw_dir,
         output_dir=args.output_dir,
         limit_subjects=args.limit_subjects,
         max_hours_per_subject=args.max_hours_per_subject,
+        selection=args.selection,
     ):
         raise SystemExit("no NHANES sessions were produced")
 

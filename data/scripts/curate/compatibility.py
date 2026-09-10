@@ -134,6 +134,10 @@ PLACEMENT_SITE: dict[str, str] = {
     "the right shin": "right_shin",
     "the left calf": "left_calf",
     "the right calf": "right_calf",
+    # "Shank" is the whole lower-leg segment an inertial suit tracks; shin and calf are its
+    # anterior and posterior faces. Distinct sites, but equivalent — see EQUIVALENT_SITES.
+    "the left shank": "left_shank",
+    "the right shank": "right_shank",
     # ---- knee / ankle -----------------------------------------------------
     "the outer side of the left knee": "left_knee",
     "the outer side of the right knee": "right_knee",
@@ -144,10 +148,20 @@ PLACEMENT_SITE: dict[str, str] = {
     "the lower back": "lower_back",
     "the chest": "chest",
     "the torso": "torso",
+    # Nymeria's suit and its synthetic counterpart mount at the sternum. That is the chest,
+    # so it is grouped with it below rather than pretending to be a separate observation.
+    "the sternum": "sternum",
+    # The pelvis is its own site, NOT pooled with waist/hip/belt: a pelvis-strapped suit
+    # tracker moves with the body segment, while a belt or waistband unit can rotate and slip
+    # against it. Grouping them would let one support a query about the other.
+    "the pelvis": "pelvis",
     # ---- head -------------------------------------------------------------
     "an earbud in the ear": "ear_unspecified",
     "an earbud in the left ear": "left_ear",
     "the head (smart glasses)": "head",
+    # A head-strapped suit tracker observes the same site as glasses do; the device family
+    # already separates them in the key, so the SITE should not also pretend to.
+    "the head": "head",
     # ---- muscle bellies (kneepad; mapped for completeness, not used for Nov 1) ---
     "the left gastrocnemius": "left_gastrocnemius",
     "the right gastrocnemius": "right_gastrocnemius",
@@ -179,7 +193,11 @@ EQUIVALENT_SITES: tuple[frozenset[str], ...] = (
     frozenset({"left_pocket", "right_pocket", "pocket_unspecified", "front_pocket"}),
     frozenset({"waist", "hip", "belt"}),
     frozenset({"left_thigh", "right_thigh", "thigh_unspecified"}),
-    frozenset({"left_shin", "right_shin", "left_calf", "right_calf"}),
+    frozenset({
+        "left_shin", "right_shin", "left_calf", "right_calf",
+        "left_shank", "right_shank",
+    }),
+    frozenset({"chest", "sternum"}),
     frozenset({"left_knee", "right_knee"}),
     frozenset({"back", "lower_back"}),
     frozenset({"left_ear", "ear_unspecified"}),

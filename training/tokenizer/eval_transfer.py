@@ -28,6 +28,7 @@ import torch
 
 from data.scripts.eda.grid_io import discover_grids
 from model.tokenizer.encoder import SetTokenizerEncoder
+from model.tokenizer.filterbank import FB_DFT_SIZE
 from training.tokenizer.pretrain_data import (DFT_SIZE, modalities_present,
                                               stream_channel_descriptions,
                                               stream_sensor_bias, stream_sensor_texts,
@@ -159,23 +160,28 @@ def build_encoder(ckpt: dict, device, *, training: bool = False) -> torch.nn.Mod
         for key in ckpt.get("encoder", {})
     )
     use_duration_embedding = bool(c.get("use_duration_embedding", has_duration_embedding))
+    future_durations = tuple(float(value) for value in c.get("future_patch_durations", ()))
+    duration_defaults = future_durations or tuple(c.get("short_patch_choices", (0.4,))) \
+        + tuple(c.get("long_patch_choices", (1.5,)))
     kw = dict(
         d_model=c["d_model"], num_layers=c["num_layers"], num_heads=c["num_heads"],
         dim_feedforward=c["dim_feedforward"],
         dropout=float(c.get("dropout", 0.1)) if training else 0.0,
-        dft_size=DFT_SIZE,
+        # Capacity was implicit before the high-rate corpus expansion. Missing metadata therefore
+        # means the historical 256-sample architecture; every new checkpoint serializes its value.
+        dft_size=int(c.get("dft_size", FB_DFT_SIZE)),
         frontend=frontend,                                  # reconstruct the ACTUAL arm (was: always filterbank)
         trunk=c.get("trunk", "dual"),
         descriptor_prediction=bool(descriptor_prediction),
         use_duration_embedding=use_duration_embedding,
         duration_min_seconds=float(c.get(
-            "duration_min_seconds", min(c.get("short_patch_choices", (0.4,))),
+            "duration_min_seconds", min(duration_defaults),
         )),
         duration_max_seconds=float(c.get(
-            "duration_max_seconds", max(c.get("long_patch_choices", (1.5,))),
+            "duration_max_seconds", max(duration_defaults),
         )),
         duration_gate_init=c.get("duration_gate_init", 0.1),
-        num_resolutions=int(c.get("num_resolutions", 2)),
+        num_resolutions=int(c.get("num_resolutions", max(2, len(future_durations)))),
         rope_min_period=float(c.get(
             "rope_min_period", 0.4 if c.get("multiresolution", False) else 0.5,
         )),
@@ -201,12 +207,15 @@ def build_encoder(ckpt: dict, device, *, training: bool = False) -> torch.nn.Mod
     elif frontend == "multispan":
         from model.tokenizer.multispan_kernel import MS_FRAMES_PER_SPAN, MS_SPANS_S
 
-        kw["spans"] = tuple(float(s) for s in c.get("spans", MS_SPANS_S))
+        kw["spans"] = tuple(float(s) for s in c.get(
+            "multispan_durations", c.get("spans", MS_SPANS_S),
+        ))
         kw["frames_per_span"] = int(c.get("frames_per_span", MS_FRAMES_PER_SPAN))
     enc = SetTokenizerEncoder(**kw)
     enc.load_state_dict(ckpt["encoder"])
     enc.eval_resolutions = tuple(
-        c.get("eval_resolutions", c.get("val_resolution_pair", VAL_RESOLUTION_PAIR))
+        c.get("eval_resolutions", future_durations
+              or c.get("val_resolution_pair", VAL_RESOLUTION_PAIR))
     )
     # Compatibility for callers and checkpoints from the two-resolution implementation.
     enc.eval_resolution_pair = enc.eval_resolutions
@@ -335,12 +344,19 @@ def encode_dataset_detailed(enc, data, texts, device, rate: float, gravity_state
     eval_resolutions = getattr(
         enc, "eval_resolutions", getattr(enc, "eval_resolution_pair", VAL_RESOLUTION_PAIR),
     )
+    # The collate capacity is part of a fixed-filterbank checkpoint's architecture. New Phase-A
+    # runs use 512 samples for 240 Hz x 1.5 s, while historical and direct-test encoders may use
+    # 256. Padding to the mutable current default makes those encoders fail before inference.
+    eval_dft_size = int(getattr(enc.filterbank, "S", DFT_SIZE))
     collate = (
         MultiResolutionCollate(
             fixed_patch_seconds=eval_resolutions,
             min_resolution_ratio=getattr(enc, "min_resolution_ratio", 1.75),
+            dft_size=eval_dft_size,
         )
-        if use_multiresolution else MultiScaleCollate(fixed_patch_seconds=single_patch_seconds)
+        if use_multiresolution else MultiScaleCollate(
+            fixed_patch_seconds=single_patch_seconds, dft_size=eval_dft_size,
+        )
     )
     if source_rate is None:
         source_rate = STREAM_SOURCE_RATE_HZ.get(f"{dataset}/{stream}", float(rate))

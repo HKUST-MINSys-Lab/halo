@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import glob
 import json
+import re
 import shutil
 from collections import Counter
 from pathlib import Path
@@ -69,11 +70,34 @@ LABEL_MAP = {
     "Disinfecting hands": "disinfecting_hands",
 }
 
+COMMENT_LABEL_ALIASES = {
+    "cleaning the cupboar": "cleaning the cupboard",
+    "cleaning the door": "cleaning door",
+    "building with lego": "build with lego",
+    "pet the dog": "petting the dog",
+    "play with the dog": "playing with the dog",
+    "working in the gartden": "working in the garden",
+}
+
+
+def _comment_marker(description: str) -> tuple[str, str] | None:
+    """Parse visit-four ``'<activity> start/end'`` comment markers."""
+    match = re.fullmatch(r"\s*(.*?)\s+(start|end)\s*", description, flags=re.IGNORECASE)
+    if match is None:
+        return None
+    name = re.sub(r"\s+", " ", match.group(1).strip().lower())
+    return COMMENT_LABEL_ALIASES.get(name, name), match.group(2).lower()
+
+
+def _open_label(name: str) -> str:
+    """Stable readable identifier for a clearly delimited free-living activity."""
+    return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
 
 def event_segments(event_csv: str, wrist_epoch0: float):
     """Yield (canonical_label, t0_epoch_s, t1_epoch_s) from a start/end event log.
 
-    HARMES has a per-recording clock bug: for 4 of 20 participants the event-log clock is
+    HARMES has a per-recording clock offset: some event logs differ from the WearOS wrist clock by
     exactly one hour (DST/timezone) behind the WearOS wrist clock, so the labels would not
     overlap the IMU at all. We correct by snapping the event->wrist start offset to the
     NEAREST WHOLE HOUR (0 for the well-aligned majority, +/-3600 for the offenders). Only
@@ -88,11 +112,18 @@ def event_segments(event_csv: str, wrist_epoch0: float):
         d, ty, t = row["Description"], row["Type"], float(row["Time"]) + off
         if d == "RECORD" or d.lower().startswith("deleted"):
             continue
+        if ty == "comment":
+            marker = _comment_marker(d)
+            if marker is None:
+                continue
+            d, ty = marker
         if ty == "start":
             stack[d] = t
         elif ty == "end" and d in stack:
             t0 = stack.pop(d)
-            canon = LABEL_MAP.get(d)
+            canon = LABEL_MAP.get(d, LABEL_MAP.get(d.title()))
+            if canon is None and row["Type"].strip() == "comment":
+                canon = _open_label(d)
             if canon is not None and t > t0:
                 yield canon, t0, t
 
@@ -123,13 +154,13 @@ def resample_runs(epoch_s: np.ndarray, sig: np.ndarray):
 def create_manifest() -> dict:
     chans = [{"name": c, "stream": "wrist",
               "description": (f"{'accelerometer' if 'acc' in c else 'gyroscope'} {c[-1]}-axis of a "
-                              f"WearOS smartwatch on the dominant wrist in "
+              f"WearOS smartwatch on the right wrist in "
                               f"{'m/s^2 (gravity present)' if 'acc' in c else 'rad/s'}"),
               "sampling_rate_hz": NATIVE_RATE}
              for c in ("acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z")]
     return {
         "dataset_name": "HARMES (right-wrist IMU)",
-        "description": ("Hand Activity Recognition from Multimodal Egocentric Sensing: dominant-wrist "
+        "description": ("Hand Activity Recognition from Multimodal Egocentric Sensing: right-wrist "
                         "WearOS IMU, 20 participants, 15 fine-grained kitchen/bathroom hand ADLs "
                         "(cleaning, cooking, hygiene) at 50 Hz. Accelerometer m/s^2 (gravity present); "
                         "gyroscope rad/s. Left-wrist Puck.js excluded (unrecoverable gyro scale)."),

@@ -1,6 +1,6 @@
 {
   "display_name": "PAMAP2",
-  "num_sessions": 4377,
+  "num_sessions": 106,
   "sampling_rate_hz": 100,
   "channels": [
     "heart_rate",
@@ -141,5 +141,6 @@
     107,
     109
   ],
-  "role": "train"
+  "role": "train",
+  "protocol_scope": "The 12 required Protocol activities are used. Optional-protocol recordings are intentionally excluded so every included subject follows the same activity protocol."
 }

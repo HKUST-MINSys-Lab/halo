@@ -93,8 +93,11 @@ Smoke scores are wiring checks, not evidence of model quality. Checkpoint readou
 2. Track head-specific gradients, query/support signal, support ablations, rank and losses.
    For new heads `base_logits` is a neighbor floor (uniform without enrollment), not the old vote;
    `neighbor_floor/*` telemetry describes this floor, NOT internal attention weights.
-3. Encoder learning-rate changes and frontend/temporal-resolution changes are postponed. JEPA
-   future-latent prediction and physical-feature reconstruction remain proposals, not active losses.
+3. Encoder learning-rate changes and frontend/temporal-resolution changes remain separate from the
+   completed comparator runs described here. The future-JEPA and physical-feature objective has
+   since been implemented in `training/tokenizer/pretrain.py`; see
+   [`JEPA_PRETRAINING_OBJECTIVE.md`](JEPA_PRETRAINING_OBJECTIVE.md). It has not retroactively changed
+   the checkpoints or results recorded in this dated comparison design.
 
 ### Sources
 

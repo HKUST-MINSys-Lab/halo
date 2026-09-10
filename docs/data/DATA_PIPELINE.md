@@ -24,13 +24,16 @@ How raw datasets become the gridded corpus. Every stage is one module in `data/s
 | alignment | rate | channels | labels | who consumes it |
 |---|---|---|---|---|
 | `native` | native (20/50/100 Hz) | 6-ch `[acc,gyro]` + mask | canonical | HALO representation training and historical evidence-engine experiments |
-| `harmonised` | 60 Hz | 6-ch `[acc,gyro]` + mask | canonical | layout-locked baselines that need a fixed rate |
+| `harmonised` | 60 Hz | 6-ch `[acc,gyro]` + mask | canonical | legacy fixed-rate exports and explicit ablations |
 | `non_harmonised` | native | native 3/6-ch | native | the default `run_baselines` scoring alignment |
 
 Native grids retain the valid samples from each recording but partition them into non-overlapping
 contexts of at most six seconds. The final shorter context is right-padded on disk and accompanied by
 `lengths.npy`. HALO loaders slice to that valid length before augmentation and form fixed one-second
-patches, including one honest final short patch. The baseline grid regimes remain full-window only.
+patches, including one honest final short patch. Corpus-matched CrossHAR, LiMU-BERT, and HARNet
+training also starts from these native windows, trims each row by `lengths.npy`, and then performs
+anti-aliased resampling plus crop/padding to the published model input contract. Their old fitted
+backbones and heads are intentionally rejected by preprocessing schema checks and must be retrained.
 
 `placement_strict` → phones only (drops the watch datasets).
 

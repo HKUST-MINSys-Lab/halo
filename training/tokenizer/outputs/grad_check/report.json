@@ -1,45 +1,41 @@
 {
   "device": "cpu",
   "batch": [
-    64,
-    6,
+    32,
+    22,
     2
   ],
   "loss": {
-    "jepa": 0.9747194051742554,
-    "vicreg": 21.101520538330078,
-    "vicreg_pooled": 23.649938583374023,
-    "vicreg_retrieval": 18.553102493286133
+    "total": 2.519657611846924,
+    "future": 0.6844315528869629,
+    "physical": 0.3431723415851593,
+    "collapse": 11.936424255371094
   },
   "activation_rms": {
-    "channel_tokens": 0.5871,
-    "sensor_tokens": 0.99967,
-    "text_descriptors": 0.05103,
-    "descriptor_conditioned": 0.98652,
-    "fully_conditioned": 0.98652,
-    "conditioning_delta": 0.1177,
-    "pooled": 0.91869,
-    "vicreg_projection": 0.17272
+    "sensor_tokens": 0.5765641331672668,
+    "visible_student_states": 0.9999954700469971,
+    "teacher_targets": 0.9999945759773254,
+    "future_predictions": 0.5616008043289185,
+    "physical_predictions": 0.12856289744377136
   },
-  "conditioning_delta_ratio": 0.11774,
   "gradient_norms": {
-    "encoder": 7.598542213439941,
-    "jepa_predictor": 1.4571888446807861,
-    "vicreg_projector": 1.0393640995025635,
-    "sensor_fold": 5.865495681762695,
-    "descriptor_projection": 0.6646932363510132,
-    "descriptor_head": 0.0,
-    "transformer_layers": [
-      1.6579865217208862,
-      0.9094994068145752
-    ]
+    "encoder": 0.7536876797676086,
+    "future_predictor": 1.0134929418563843,
+    "physical_decoder": 0.20477676391601562
   },
   "dead_parameters": [],
+  "planner": {
+    "eligible_fraction": 1.0,
+    "target_queries": 325,
+    "leakage_count": 0
+  },
   "checks": {
+    "teacher_frozen": true,
     "text_encoder_frozen": true,
     "no_dead_trainable_parameters": true,
-    "conditioning_scale_reasonable": true,
-    "finite_activations": true,
-    "finite_loss": true
+    "all_active_modules_receive_gradients": true,
+    "finite_loss": true,
+    "future_context_has_no_leakage": true,
+    "future_targets_exist": true
   }
 }

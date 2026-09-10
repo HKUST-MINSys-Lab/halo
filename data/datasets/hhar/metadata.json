@@ -1,7 +1,6 @@
 {
   "display_name": "HHAR",
-  "num_sessions": 2005,
-  "num_sessions_subsampled": 15000,
+  "num_sessions": 2265,
   "sampling_rate_hz": 50,
   "channels": [
     "acc_x",

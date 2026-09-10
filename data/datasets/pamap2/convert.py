@@ -216,7 +216,7 @@ def create_manifest():
 
     manifest = {
         "dataset_name": "PAMAP2",
-        "description": "Physical activity monitoring with 3 IMUs (hand, chest, ankle) and heart rate. 9 subjects performing 12 protocol activities including walking, running, cycling, and household tasks.",
+        "description": "Physical activity monitoring with 3 IMUs (hand, chest, ankle) and heart rate. 9 subjects performing the 12 required protocol activities including walking, running, cycling, and household tasks. Optional-protocol recordings are intentionally excluded so included subjects share one protocol.",
         "channels": channels
     }
 
@@ -267,6 +267,11 @@ def main():
 
     # Create manifest
     create_manifest()
+    metadata_path = OUTPUT_DIR / "metadata.json"
+    if metadata_path.exists():
+        metadata = json.loads(metadata_path.read_text())
+        metadata["num_sessions"] = len(all_labels)
+        metadata_path.write_text(json.dumps(metadata, indent=2))
 
     print(f"\n{'=' * 80}")
     print("Conversion complete!")

@@ -11,7 +11,11 @@ from typing import Iterable, Sequence
 import numpy as np
 
 
+from data.scripts.curate.corpus_roots import grid_search_roots
+
 REPO = Path(__file__).resolve().parents[3]
+# Retained as the labelled-tree constant for callers that address it directly. Grid DISCOVERY
+# spans every corpus root (labelled + label-free pretraining) via ``grid_search_roots()``.
 DATASETS_DIR = REPO / "data" / "datasets"
 _FINGERPRINT_CACHE: dict[tuple, str] = {}
 
@@ -50,8 +54,23 @@ class GridRef:
         return float(self.load_lengths().sum()) / self.rate_hz
 
     def load_data(self) -> np.ndarray:
-        """Memory-map the grid so callers read only selected windows."""
+        """Memory-map the grid so callers read only selected windows.
+
+        The array dtype is whatever the build stored: ``float32`` for labelled sources,
+        ``float16`` for label-free scale sources (see ``build_grids._store_dtype``). Values
+        are in the same physical units either way, and every read path in the repo ends in
+        ``np.asarray(..., dtype=np.float32)``, which upcasts transparently. Read
+        :attr:`store_dtype` if a caller genuinely needs to branch on it.
+        """
         return np.load(self.grid_dir / "data.npy", mmap_mode="r")
+
+    @property
+    def store_dtype(self) -> np.dtype:
+        """On-disk sample dtype, read without mapping the whole grid."""
+        with open(self.grid_dir / "data.npy", "rb") as handle:
+            version = np.lib.format.read_magic(handle)
+            header = np.lib.format._read_array_header(handle, version)
+        return np.dtype(header[2])
 
     def load_lengths(self) -> np.ndarray:
         """True samples per row; legacy grids without the sidecar are all full-length."""
@@ -63,12 +82,25 @@ class GridRef:
 
 def discover_grids(
     alignment: str = "harmonised",
-    datasets_dir: Path = DATASETS_DIR,
+    datasets_dir: Path | None = None,
 ) -> list[GridRef]:
-    """Discover and validate all persisted grids for one alignment."""
+    """Discover and validate all persisted grids for one alignment.
+
+    Searches every corpus root by default (``data/datasets`` and ``data/pretraining``), so a
+    label-free scale source is found without callers knowing which tree holds it. Pass
+    ``datasets_dir`` to restrict discovery to one root.
+    """
     refs: list[GridRef] = []
     pattern = f"*/grids/{alignment}/*/meta.json"
-    for meta_path in sorted(datasets_dir.glob(pattern)):
+    roots = (datasets_dir,) if datasets_dir is not None else grid_search_roots()
+    meta_paths = sorted(
+        (path for root in roots for path in root.glob(pattern)),
+        # <root>/<dataset>/grids/<alignment>/<stream>/meta.json — sort by (dataset, stream)
+        # so discovery order is identical to the single-root glob it replaces. Ordering is
+        # load-bearing: CorpusIndex seeds its sampling off the ref list.
+        key=lambda path: (path.parts[-5], path.parts[-2]),
+    )
+    for meta_path in meta_paths:
         grid_dir = meta_path.parent
         data_path = grid_dir / "data.npy"
         mask_path = grid_dir / "mask.npy"

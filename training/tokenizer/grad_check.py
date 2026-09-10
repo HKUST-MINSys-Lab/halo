@@ -1,14 +1,15 @@
-"""Activation and gradient-flow diagnostic for the canonical Phase-A sensor model.
+"""One-batch activation and gradient check for the default future-JEPA model.
 
-Runs one real CPU batch through fixed-one-second sensor-granularity JEPA and rotation VICReg. It
-checks conditioning scale, per-module gradients, frozen text parameters, and dead trainable
-parameters in the reference recipe.
+This uses real corpus windows on CPU and exercises the same student, EMA-teacher, predictor,
+physical decoder, and patch-collapse paths as the trainer. It is diagnostic only; it does not
+update a checkpoint.
 
 Run: /home/alex/code/HALO/legacy_code/.venv/bin/python -m training.tokenizer.grad_check
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import random
 from pathlib import Path
@@ -17,14 +18,24 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from training.tokenizer.losses_repr import (
-    make_sensor_mask_plan,
-    masked_ema_latent_loss,
-    phase_a_loss,
-    vicreg,
+from training.tokenizer.future_jepa import (
+    balanced_future_latent_loss,
+    balanced_physical_loss,
+    combine_future_losses,
+    fixed_filterbank_physical_targets,
+    gather_token_rows,
+    make_future_target_plan,
+    normalized_teacher_target,
+    patch_variance_covariance,
 )
+from training.tokenizer.losses_repr import fold_analysis_to_sensors
 from training.tokenizer.pretrain import PipelineAModel, PretrainConfig
-from training.tokenizer.pretrain_data import SEED, CorpusIndex, MultiScaleCollate, PretrainDataset
+from training.tokenizer.pretrain_data import (
+    SEED,
+    CorpusIndex,
+    MultiResolutionCollate,
+    PretrainDataset,
+)
 
 OUT = Path(__file__).resolve().parent / "outputs" / "grad_check"
 
@@ -34,8 +45,11 @@ def rms(value: torch.Tensor) -> float:
 
 
 def module_grad_norm(module: nn.Module) -> float:
-    squares = [parameter.grad.detach().float().square().sum()
-               for parameter in module.parameters() if parameter.grad is not None]
+    squares = [
+        parameter.grad.detach().float().square().sum()
+        for parameter in module.parameters()
+        if parameter.grad is not None
+    ]
     return float(torch.stack(squares).sum().sqrt()) if squares else 0.0
 
 
@@ -44,164 +58,209 @@ def main() -> None:
     torch.manual_seed(0)
     np.random.seed(0)
     random.seed(0)
-    # Diagnostics must never take a shared GPU implicitly.
     device = torch.device("cpu")
     cfg = PretrainConfig(
-        d_model=64, num_layers=2, num_heads=4, dim_feedforward=128,
-        device=str(device), text_conditioning="factored", token_granularity="sensor",
-        multiresolution=False, descriptor_weight=0.0,
+        d_model=64,
+        num_layers=2,
+        num_heads=4,
+        dim_feedforward=128,
+        device=str(device),
+        text_conditioning="factored",
+        token_granularity="sensor",
+        multiresolution=True,
+        future_teacher_top_layers=2,
+        future_predictor_dim=64,
+        future_predictor_heads=4,
+        descriptor_weight=0.0,
     )
     index = CorpusIndex(max_per_stream=200, seed=SEED)
-    # CorpusIndex is stream-ordered. Taking rows 0..63 would inspect Capture-24 accelerometer only,
-    # making cross-sensor attention and descriptor retrieval structurally inactive. Stratify across
-    # the whole index so every canonical module receives a meaningful opportunity for gradient.
-    diagnostic_keys = [index.train[i] for i in np.linspace(
-        0, len(index.train) - 1, 64, dtype=np.int64,
-    )]
-    dataset = PretrainDataset(index, diagnostic_keys, augment=True, two_view=True)
-    collate = MultiScaleCollate(fixed_patch_seconds=1.0, seed=SEED, two_view=True)
-    batch = collate([dataset[i] for i in range(len(diagnostic_keys))])
+    diagnostic_keys = [
+        index.train[i]
+        for i in np.linspace(0, len(index.train) - 1, 32, dtype=np.int64)
+    ]
+    dataset = PretrainDataset(index, diagnostic_keys, augment=False, two_view=False)
+    batch = MultiResolutionCollate(
+        fixed_patch_seconds=cfg.future_patch_durations, seed=SEED,
+    )([dataset[i] for i in range(len(diagnostic_keys))])
 
     model = PipelineAModel(cfg).to(device)
     frontend = model.encoder.filterbank
     frontend.reset_norm_accumulator()
     frontend.accumulate_norm_stats(
-        batch["patches"].to(device), batch["rates"].to(device),
-        batch["patch_len"].to(device),
-        patch_mask=batch["patch_padding_mask"].to(device),
-        channel_mask=batch["channel_mask"].to(device),
-        source_rate_hz=batch["source_rates"].to(device),
+        batch["patches"], batch["rates"], batch["patch_len"],
+        patch_mask=batch["patch_padding_mask"],
+        channel_mask=batch["channel_mask"],
+        source_rate_hz=batch["source_rates"],
     )
     frontend.finalize_norm_stats()
+    target_frontend = model.physical_target_analyzer
+    target_frontend.load_state_dict(frontend.state_dict())
+    teacher = copy.deepcopy(model.encoder).eval().requires_grad_(False)
 
-    def encode(suffix: str = "", token_mask=None, descriptor_mask=None):
-        patches = batch[f"patches{suffix}"].to(device)
-        rates = batch[f"rates{suffix}"].to(device)
-        lengths = batch[f"patch_len{suffix}"].to(device)
-        positions = batch[f"positions{suffix}"].to(device)
-        channel_mask = batch[f"channel_mask{suffix}"].to(device)
-        patch_mask = batch[f"patch_padding_mask{suffix}"].to(device)
-        patch_durations = batch[f"patch_durations{suffix}"].to(device)
-        tokens = model.encoder.tokenize(
-            patches, rates, lengths,
+    patches = batch["patches"].float()
+    rates = batch["rates"]
+    lengths = batch["patch_len"]
+    positions = batch["positions"]
+    durations = batch["patch_durations"]
+    resolutions = batch["resolution_ids"]
+    patch_valid = batch["patch_padding_mask"]
+    channel_mask = batch["channel_mask"]
+    sensor_id = batch["sensor_id"]
+    n_sensors = max(map(len, batch["sensor_texts"]))
+
+    plan = make_future_target_plan(
+        batch["patch_starts"], batch["patch_ends"], patch_valid, resolutions,
+        context_fraction=cfg.future_context_fraction,
+        horizon_bins_seconds=cfg.future_horizon_bins_seconds,
+        generator=torch.Generator().manual_seed(SEED),
+    )
+    analysis = model.encoder.analyze(
+        patches, rates, lengths, source_rate_hz=batch["source_rates"],
+    )
+    sensor_tokens = model.encoder.project_tokens(
+        analysis, sensor_id=sensor_id, channel_mask=channel_mask,
+        n_sensors=n_sensors,
+    )
+    descriptors, descriptor_ids = model.encoder.encode_sensor_descriptors_unique(
+        batch["sensor_texts"], device,
+    )
+    student_tokens = sensor_tokens * plan.context_mask[:, :, None, None].to(sensor_tokens.dtype)
+    student = model.encoder.encode(
+        student_tokens, None, None, positions,
+        patch_durations=durations,
+        resolution_ids=resolutions,
+        channel_mask=channel_mask,
+        patch_padding_mask=plan.context_mask,
+        sensor_descriptors=descriptors,
+        sensor_id=sensor_id,
+        sensor_text_ids=descriptor_ids,
+        return_retrieval_tokens=False,
+    )
+
+    with torch.no_grad():
+        teacher_tokens = teacher.project_tokens(
+            analysis.detach(), sensor_id=sensor_id, channel_mask=channel_mask,
+            n_sensors=n_sensors,
+        )
+        teacher_output = teacher.encode(
+            teacher_tokens, None, None, positions,
+            patch_durations=durations,
+            resolution_ids=resolutions,
             channel_mask=channel_mask,
-            source_rate_hz=batch[f"source_rates{suffix}"].to(device),
-            sensor_id=batch[f"sensor_id{suffix}"].to(device),
-            n_sensors=max(map(len, batch[f"sensor_texts{suffix}"])),
+            patch_padding_mask=patch_valid,
+            sensor_descriptors=descriptors,
+            sensor_id=sensor_id,
+            sensor_text_ids=descriptor_ids,
+            return_retrieval_tokens=False,
+            return_layer_states=True,
         )
-        sensor_descriptors, sensor_text_ids = model.encoder.encode_sensor_descriptors_unique(
-            batch[f"sensor_texts{suffix}"], device,
-        )
-        text = text_mask = role_ids = sensor_text = sensor_text_mask = None
-        sensor_id = batch[f"sensor_id{suffix}"].to(device)
-        output = model.encoder.encode(
-            tokens, text, text_mask, positions,
-            patch_durations=patch_durations,
-            token_mask=token_mask,
-            channel_mask=channel_mask, patch_padding_mask=patch_mask,
-            sensor_text_embs=sensor_text, sensor_text_masks=sensor_text_mask,
-            sensor_descriptors=sensor_descriptors,
-            sensor_id=sensor_id, role_text_ids=role_ids, sensor_text_ids=sensor_text_ids,
-            descriptor_mask=descriptor_mask,
-        )
-        return (tokens, text, text_mask, sensor_text, sensor_text_mask, sensor_id,
-                sensor_text_ids, output)
-
-    (tokens, text, text_mask, sensor_text, sensor_text_mask, sensor_id,
-     sensor_text_ids, clean) = encode()
-    batch_size, patches, sensors = clean["tokens"].shape[:3]
-    plan = make_sensor_mask_plan(
-        batch_size, patches, sensors, device=device,
-        valid_patches=batch["patch_padding_mask"].to(device),
-        sensor_present=clean["sensor_present"],
-        sensor_placement=batch["sensor_placement"].to(device),
+    teacher_grid = normalized_teacher_target(
+        teacher_output["layer_states"], top_k=cfg.future_teacher_top_layers,
     )
-    *_, masked = encode(token_mask=plan.token_mask)
-    *_, view_b = encode("_b")
-    jepa_prediction = model.jepa_predictor(masked["tokens"])
-    jepa_mask = (plan.token_mask & masked["sensor_present"].unsqueeze(1)
-                 & batch["patch_padding_mask"].to(device).unsqueeze(2))
-    jepa = masked_ema_latent_loss(
-        jepa_prediction, clean["tokens"].detach(), jepa_mask,
-        token_durations=batch["patch_durations"].to(device),
+    context_valid = plan.context_mask.unsqueeze(2) & student["sensor_present"].unsqueeze(1)
+    prediction, target_indices, query_valid = model.future_predictor(
+        student["tokens"], context_valid, plan.target_mask,
+        positions, durations, resolutions, plan.horizon_seconds,
+        student["descriptor"], student["sensor_present"],
     )
-    z_a = model.vicreg_projector(clean["pooled"])
-    z_b = model.vicreg_projector(view_b["pooled"])
-    pooled_vicreg = vicreg(z_a, z_b)
-    row_valid = (batch["patch_padding_mask"].to(device).unsqueeze(2)
-                 & batch["patch_padding_mask_b"].to(device).unsqueeze(2)
-                 & clean["sensor_present"].unsqueeze(1)
-                 & view_b["sensor_present"].unsqueeze(1))
-    row_vicreg = vicreg(clean["retrieval_tokens"][row_valid],
-                        view_b["retrieval_tokens"][row_valid])
-    vicreg_total = 0.5 * (pooled_vicreg.total + row_vicreg.total)
-    loss = phase_a_loss(jepa, vicreg_total)
+    teacher_targets = gather_token_rows(teacher_grid, target_indices)
+    query_resolutions = resolutions.gather(1, target_indices[..., 0])
+    future_loss = balanced_future_latent_loss(
+        prediction, teacher_targets, query_valid, query_resolutions,
+        num_resolutions=len(cfg.future_patch_durations),
+    )
 
+    target_analysis = target_frontend.analyze(
+        patches, rates, lengths, source_rate_hz=batch["source_rates"],
+    )
+    physical_channels, physical_channel_valid = fixed_filterbank_physical_targets(
+        target_analysis,
+        n_bands=target_frontend.n_bands,
+        use_resolution_mask=target_frontend.use_resolution_mask,
+        use_amplitude=target_frontend.use_amplitude,
+        use_dc=target_frontend.use_dc,
+        include_amplitude=False,
+    )
+    physical_grid, _ = fold_analysis_to_sensors(
+        physical_channels, sensor_id, channel_mask, n_sensors=n_sensors,
+    )
+    physical_valid_grid, _ = fold_analysis_to_sensors(
+        physical_channel_valid.to(physical_channels.dtype),
+        sensor_id, channel_mask, n_sensors=n_sensors,
+    )
+    physical_targets = gather_token_rows(physical_grid, target_indices)
+    physical_valid = gather_token_rows(physical_valid_grid, target_indices)
+    physical_prediction = model.physical_decoder(prediction)
+    physical_loss = balanced_physical_loss(
+        physical_prediction, physical_targets, query_valid, query_resolutions,
+        physical_valid, num_resolutions=len(cfg.future_patch_durations),
+    )
+    collapse = patch_variance_covariance(
+        student["tokens"], context_valid,
+        resolution_ids=resolutions,
+        num_resolutions=len(cfg.future_patch_durations),
+        variance_weight=cfg.collapse_variance_weight,
+        covariance_weight=cfg.collapse_covariance_weight,
+        target_std=cfg.collapse_target_std,
+    )
+    loss = combine_future_losses(
+        future_loss, physical_loss, collapse.total,
+        future_weight=cfg.jepa_weight,
+        physical_weight=cfg.physical_weight,
+        collapse_weight=cfg.collapse_weight,
+    )
     model.zero_grad(set_to_none=True)
     loss.total.backward()
 
-    encoder = model.encoder
-    if encoder.sensor_fold is None:
-        folded = tokens
-        present = encoder.filterbank.sensor_presence(
-            sensor_id, batch["channel_mask"].to(device), sensors,
-        )
-    else:
-        folded, present = encoder.sensor_fold(
-            tokens, sensor_id, batch["channel_mask"].to(device), n_sensors=sensors,
-        )
-    descriptor_conditioned = encoder.descriptor_proj(folded, clean["descriptor"], present)
-    magnitudes = {
-        "channel_tokens": rms(tokens),
-        "sensor_tokens": rms(folded),
-        "text_descriptors": rms(clean["descriptor"]),
-        "descriptor_conditioned": rms(descriptor_conditioned),
-        "fully_conditioned": rms(descriptor_conditioned),
-        "conditioning_delta": rms(descriptor_conditioned - folded),
-        "pooled": rms(clean["pooled"]),
-        "vicreg_projection": rms(z_a),
-    }
-    conditioning_ratio = magnitudes["conditioning_delta"] / max(
-        magnitudes["sensor_tokens"], 1e-9,
-    )
-    gradients = {
-        "encoder": module_grad_norm(encoder),
-        "jepa_predictor": module_grad_norm(model.jepa_predictor),
-        "vicreg_projector": module_grad_norm(model.vicreg_projector),
-        "descriptor_projection": module_grad_norm(encoder.descriptor_proj),
-        "descriptor_head": module_grad_norm(encoder.descriptor_head),
-        "transformer_layers": [module_grad_norm(layer) for layer in encoder.transformer.layers],
-    }
-    if encoder.sensor_fold is not None:
-        gradients["sensor_fold"] = module_grad_norm(encoder.sensor_fold)
-    dead = [name for name, parameter in model.named_parameters()
-            if parameter.requires_grad and (parameter.grad is None or not bool(parameter.grad.any()))]
-    checks = {
-        "text_encoder_frozen": not any(
-            parameter.grad is not None for parameter in encoder.text_encoder.parameters()
-        ),
-        "no_dead_trainable_parameters": not dead,
-        # Factored conditioning intentionally starts as a light residual (gate bias -2).
-        "conditioning_scale_reasonable": 0.03 < conditioning_ratio < 10.0,
-        "finite_activations": all(value == value and abs(value) < 1e4
-                                  for value in magnitudes.values()),
-        "finite_loss": bool(torch.isfinite(loss.total)),
-    }
+    active_modules = {"encoder": model.encoder, **model.pretraining_heads()}
+    gradients = {name: module_grad_norm(module) for name, module in active_modules.items()}
+    dead = [
+        name for name, parameter in model.named_parameters()
+        if parameter.requires_grad and (parameter.grad is None or not bool(parameter.grad.any()))
+    ]
+    leakage = int((plan.context_mask & plan.target_mask).sum())
+    leakage += int((plan.context_mask
+                    & (batch["patch_ends"] > plan.context_end[:, None] + 1e-7)).sum())
+    leakage += int((plan.target_mask
+                    & (batch["patch_starts"] < plan.context_end[:, None] - 1e-7)).sum())
     report = {
         "device": str(device),
-        "batch": [batch_size, patches, sensors],
-        "loss": {"jepa": float(jepa.detach()), "vicreg": float(vicreg_total.detach()),
-                 "vicreg_pooled": float(pooled_vicreg.total.detach()),
-                 "vicreg_retrieval": float(row_vicreg.total.detach())},
-        "activation_rms": {key: round(value, 5) for key, value in magnitudes.items()},
-        "conditioning_delta_ratio": round(conditioning_ratio, 5),
+        "batch": [int(patches.shape[0]), int(patches.shape[1]), n_sensors],
+        "loss": {
+            "total": float(loss.total.detach()),
+            "future": float(future_loss.detach()),
+            "physical": float(physical_loss.detach()),
+            "collapse": float(collapse.total.detach()),
+        },
+        "activation_rms": {
+            "sensor_tokens": rms(sensor_tokens),
+            "visible_student_states": rms(student["tokens"][context_valid]),
+            "teacher_targets": rms(teacher_targets[query_valid]),
+            "future_predictions": rms(prediction[query_valid]),
+            "physical_predictions": rms(physical_prediction[query_valid]),
+        },
         "gradient_norms": gradients,
         "dead_parameters": dead,
-        "checks": checks,
+        "planner": {
+            "eligible_fraction": float(plan.eligible.float().mean()),
+            "target_queries": int(query_valid.sum()),
+            "leakage_count": leakage,
+        },
+        "checks": {
+            "teacher_frozen": not any(parameter.requires_grad for parameter in teacher.parameters()),
+            "text_encoder_frozen": not any(
+                parameter.grad is not None for parameter in model.encoder.text_encoder.parameters()
+            ),
+            "no_dead_trainable_parameters": not dead,
+            "all_active_modules_receive_gradients": all(value > 0 for value in gradients.values()),
+            "finite_loss": bool(torch.isfinite(loss.total)),
+            "future_context_has_no_leakage": leakage == 0,
+            "future_targets_exist": bool(query_valid.any()),
+        },
     }
-    (OUT / "report.json").write_text(json.dumps(report, indent=2))
+    (OUT / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
-    print(f"GRAD CHECK: {'PASS' if all(checks.values()) else 'ISSUES'}")
+    print(f"GRAD CHECK: {'PASS' if all(report['checks'].values()) else 'ISSUES'}")
 
 
 if __name__ == "__main__":

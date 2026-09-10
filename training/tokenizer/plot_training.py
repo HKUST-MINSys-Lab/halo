@@ -82,60 +82,97 @@ def _legend(axis, **kwargs):
 def render(log_path: Path, out_path: Path):
     S, V = load(log_path)
     fig, ax = plt.subplots(4, 3, figsize=(18, 15))
+    future_mode = any("future/loss" in row for row in S)
 
-    loss_keys = (("total", "total"), ("loss_weighted/jepa", "JEPA family"),
-                 ("loss_weighted/descriptor", "descriptor part"),
-                 ("loss_weighted/vicreg", "VICReg weighted"))
+    loss_keys = (("total", "total"),
+                 (("loss_weighted/future", "future") if future_mode
+                  else ("loss_weighted/jepa", "masked JEPA")),
+                 (("loss_weighted/physical", "physical") if future_mode
+                  else ("loss_weighted/descriptor", "descriptor")),
+                 (("loss_weighted/collapse", "collapse") if future_mode
+                  else ("loss_weighted/vicreg", "VICReg")))
     for key, label in loss_keys:
         fallback = {"loss_weighted/jepa": "jepa", "loss_weighted/vicreg": "vicreg"}.get(key)
         _line(ax[0, 0], S, key if series(S, key)[0] else fallback, label, smooth=True, lw=1.1)
     ax[0, 0].set_title("weighted losses (EWMA)"); _legend(ax[0, 0], fontsize=7)
 
-    for key, label in (("vicreg/invariance", "invariance"), ("vicreg/variance", "variance"),
-                       ("vicreg/covariance", "covariance"), ("vicreg/min_std", "min std")):
+    component_keys = ((
+        ("physical/loss", "physical"),
+        ("physical/zero_baseline", "zero baseline"),
+        ("collapse/variance", "variance penalty"),
+        ("collapse/covariance", "covariance penalty"),
+    ) if future_mode else (
+        ("vicreg/invariance", "invariance"), ("vicreg/variance", "variance"),
+        ("vicreg/covariance", "covariance"), ("vicreg/min_std", "min std"),
+    ))
+    for key, label in component_keys:
         _line(ax[0, 1], S, key, label, smooth=True, lw=1.0)
-    ax[0, 1].set_title("VICReg components"); _legend(ax[0, 1], fontsize=7)
+    ax[0, 1].set_title("physical and collapse terms" if future_mode else "VICReg components")
+    _legend(ax[0, 1], fontsize=7)
 
-    for key, label in (("jepa/margin", "JEPA margin"), ("vicreg/margin", "VICReg margin"),
-                       ("descriptor/top1", "descriptor top-1"),
-                       ("descriptor/chance_top1", "descriptor chance")):
+    quality_keys = ((
+        ("jepa/margin", "future target margin"),
+        ("physical/improvement_over_zero", "physical gain over zero"),
+        ("collapse/min_std", "visible min std"),
+        ("future/eligible_fraction", "eligible fraction"),
+    ) if future_mode else (
+        ("jepa/margin", "JEPA margin"), ("vicreg/margin", "VICReg margin"),
+        ("descriptor/top1", "descriptor top-1"),
+        ("descriptor/chance_top1", "descriptor chance"),
+    ))
+    for key, label in quality_keys:
         _line(ax[0, 2], S, key, label, smooth=True, lw=1.1)
     ax[0, 2].axhline(0.0, color="black", lw=0.6)
-    ax[0, 2].set_title("pair margins and descriptor retrieval")
+    ax[0, 2].set_title("predictive health" if future_mode
+                       else "pair margins and descriptor retrieval")
     _legend(ax[0, 2], fontsize=7)
 
-    for key, label in (("grad/total_preclip", "total"), ("grad/encoder", "encoder"),
-                       ("grad/jepa_predictor", "JEPA head"),
-                       ("grad/vicreg_projector", "VICReg head"),
-                       ("grad/descriptor_head", "descriptor head"),
-                       ("grad/bias_projection", "bias projection")):
+    gradient_keys = ((
+        ("grad/total_preclip", "total"), ("grad/encoder", "encoder"),
+        ("grad/future_predictor", "future predictor"),
+        ("grad/physical_decoder", "physical decoder"),
+        ("grad/descriptor_projection", "descriptor projection"),
+    ) if future_mode else (
+        ("grad/total_preclip", "total"), ("grad/encoder", "encoder"),
+        ("grad/jepa_predictor", "JEPA head"),
+        ("grad/vicreg_projector", "VICReg head"),
+        ("grad/descriptor_head", "descriptor head"),
+        ("grad/bias_projection", "bias projection"),
+    ))
+    for key, label in gradient_keys:
         _line(ax[1, 0], S, key, label, lw=0.9)
     ax[1, 0].set_yscale("log"); ax[1, 0].set_title("gradient norms (pre-clip)")
     _legend(ax[1, 0], fontsize=7)
 
-    for key, label in (("grad_objective/jepa", "JEPA"),
-                       ("grad_objective/vicreg", "VICReg")):
+    objective_names = (("future", "physical", "collapse") if future_mode
+                       else ("jepa", "vicreg"))
+    for name in objective_names:
+        key, label = f"grad_objective/{name}", name
         _line(ax[1, 1], S, key, label, marker="o", ms=3, lw=1.0)
     ax[1, 1].set_yscale("log"); ax[1, 1].set_title("objective gradients on encoder")
     _legend(ax[1, 1], fontsize=7)
     geometry = ax[1, 1].twinx()
-    _line(geometry, S, "grad_objective/jepa_share", "JEPA share", color="tab:green",
-          marker=".", lw=0.8)
-    _line(geometry, S, "grad_cosine/jepa_vs_vicreg", "cosine", color="tab:red",
-          marker=".", lw=0.8)
+    share_name = "future" if future_mode else "jepa"
+    _line(geometry, S, f"grad_objective/{share_name}_share", f"{share_name} share",
+          color="tab:green", marker=".", lw=0.8)
+    cosine_key = ("grad_cosine/future_vs_physical" if future_mode
+                  else "grad_cosine/jepa_vs_vicreg")
+    _line(geometry, S, cosine_key, "objective cosine", color="tab:red", marker=".", lw=0.8)
     geometry.set_ylim(-1.05, 1.05)
     _legend(geometry, fontsize=6, loc="lower right")
 
-    for key, label in (("repr_encoder/effective_rank", "encoder"),
-                       ("repr_projector/effective_rank", "projector"),
+    for key, label in (("repr_encoder/effective_rank", "pooled encoder"),
+                       (("repr_retrieval/effective_rank", "visible patch states")
+                        if future_mode else ("repr_projector/effective_rank", "projector")),
                        ("repr_teacher/effective_rank", "EMA teacher")):
         _line(ax[1, 2], S, key, label, lw=1.0)
     ax[1, 2].set_title("representation effective rank"); _legend(ax[1, 2], fontsize=7)
 
-    for key, label in (("repr_encoder/min_std", "encoder min"),
-                       ("repr_encoder/mean_std", "encoder mean"),
-                       ("repr_projector/min_std", "projector min"),
-                       ("repr_projector/mean_std", "projector mean")):
+    spread_prefix = "repr_retrieval" if future_mode else "repr_projector"
+    for key, label in (("repr_encoder/min_std", "pooled min"),
+                       ("repr_encoder/mean_std", "pooled mean"),
+                       (f"{spread_prefix}/min_std", "patch min"),
+                       (f"{spread_prefix}/mean_std", "patch mean")):
         _line(ax[2, 0], S, key, label, smooth=True, lw=0.9)
     ax[2, 0].set_title("representation spread"); _legend(ax[2, 0], fontsize=7)
 
@@ -198,6 +235,17 @@ def render(log_path: Path, out_path: Path):
     clip_values = series(S, "grad/clip_coefficient")[1]
     clipped_fraction = (sum(v < 1.0 for v in clip_values) / len(clip_values)
                         if clip_values else float("nan"))
+    objective_summary = (
+        f"future margin : {latest.get('jepa/margin', float('nan')):.3f}\n"
+        f"physical gain : {latest.get('physical/improvement_over_zero', float('nan')):.3f}\n"
+        f"future leak   : {latest.get('future/leakage_count', 0)}\n"
+        f"ineligible    : {latest.get('jepa_ineligible_frac_window', float('nan')):.2%}\n"
+        if future_mode else
+        f"zero targets  : {latest.get('jepa_zero_target_frac_window', float('nan')):.2%}\n"
+        f"descriptor tgt: {latest.get('descriptor/target_window_fraction', float('nan')):.2%}\n"
+        f"descriptor top: {latest.get('descriptor/top1', float('nan')):.2%}\n"
+        f"descriptor rnd: {latest.get('descriptor/chance_top1', float('nan')):.2%}\n"
+    )
     txt = (f"step          : {S[-1]['step'] if S else 0}\n"
            f"val points   : {len(V)}\n"
            f"best selection: {best:.3f}\n"
@@ -205,10 +253,7 @@ def render(log_path: Path, out_path: Path):
            f"last total    : {series(S, 'total')[1][-1] if series(S, 'total')[1] else float('nan'):.3f}\n"
            f"steps/s       : {latest.get('perf/steps_per_s', float('nan')):.2f}\n"
            f"ETA minutes   : {latest.get('perf/eta_minutes', float('nan')):.1f}\n"
-           f"zero targets  : {latest.get('jepa_zero_target_frac_window', float('nan')):.2%}\n"
-           f"descriptor tgt: {latest.get('descriptor/target_window_fraction', float('nan')):.2%}\n"
-           f"descriptor top: {latest.get('descriptor/top1', float('nan')):.2%}\n"
-           f"descriptor rnd: {latest.get('descriptor/chance_top1', float('nan')):.2%}\n"
+           f"{objective_summary}"
            f"input finite  : {latest.get('data/input_finite_fraction', float('nan')):.6f}\n"
            f"input abs max : {latest.get('data/input_abs_max', float('nan')):.2f}\n"
            f"AMP skips     : {latest.get('amp/skipped_updates_total', 0)}\n"

@@ -297,7 +297,7 @@ def test_default_expander_is_the_historical_control_architecture():
     256 -> 128 -> 128 (49,408 params vs 98,688), so it stopped being control-equivalent to every
     earlier run it was being compared against.
     """
-    projector = PipelineAModel(PretrainConfig()).vicreg_projector
+    projector = PipelineAModel(PretrainConfig(jepa_mode="masked")).vicreg_projector
     assert [projector[0].in_features, projector[0].out_features] == [256, 256]
     assert [projector[2].in_features, projector[2].out_features] == [256, 128]
     assert sum(p.numel() for p in projector.parameters()) == 98_688

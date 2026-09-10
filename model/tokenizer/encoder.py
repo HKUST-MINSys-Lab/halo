@@ -9,9 +9,9 @@ Assembly (build plan M3; EVIDENCE_ENGINE.md §5.2.1):
                                                       │
     sensor description ──frozen LM──> gated projection ──────> acquisition semantics
                                                       │
-    JEPA token_mask ──> learned [MASK] token (BEFORE conditioning, so the model knows WHICH
-                      sensor is hidden — masked-sensor modeling needs the identity
-                      of the thing it must reconstruct)
+    future JEPA ──> only past tokens enter student attention; metadata-only target queries live
+                    in the pretraining predictor, outside this encoder
+    masked control ──> learned [MASK] token before conditioning
                                                       │
     DualBranchTransformer: temporal attention with PHYSICAL-TIME RoPE (seconds, never
     patch index) + cross-sensor attention (sensor-mask aware). Sensors carry no positional
@@ -302,10 +302,17 @@ class SetTokenizerEncoder(nn.Module):
             )
         return self.filterbank.project(token_in)
 
-    def analyze(self, patches, sampling_rate_hz, patch_len_samples, source_rate_hz=None):
+    def analyze(self, patches, sampling_rate_hz, patch_len_samples, source_rate_hz=None,
+                patch_mask=None):
         """Parameter-free (fixed arm) physical feature, shareable across encoder copies."""
-        return self.filterbank.analyze(patches, sampling_rate_hz, patch_len_samples,
-                                       source_rate_hz=source_rate_hz)
+        kwargs = {"source_rate_hz": source_rate_hz}
+        if patch_mask is not None:
+            if not getattr(self.filterbank, "emits_sensor_tokens", False):
+                raise ValueError("raw-prefix patch masks are only supported by continuous frontends")
+            kwargs["patch_mask"] = patch_mask
+        return self.filterbank.analyze(
+            patches, sampling_rate_hz, patch_len_samples, **kwargs,
+        )
 
     def project_tokens(self, token_in, *, sensor_id=None, channel_mask=None,
                        n_sensors=None) -> torch.Tensor:
@@ -455,6 +462,7 @@ class SetTokenizerEncoder(nn.Module):
         descriptor_mask: Optional[torch.Tensor] = None,    # (B,N_sensors) True = hide the descriptor
         return_retrieval_tokens: bool = True,
         retrieval_only: bool = False,
+        return_layer_states: bool = False,
     ) -> dict[str, torch.Tensor]:
         if self.token_granularity == "sensor":
             return self._encode_sensor(
@@ -468,6 +476,7 @@ class SetTokenizerEncoder(nn.Module):
                 sensor_bias=sensor_bias, descriptor_mask=descriptor_mask,
                 return_retrieval_tokens=return_retrieval_tokens,
                 retrieval_only=retrieval_only,
+                return_layer_states=return_layer_states,
             )
         if retrieval_only:
             raise ValueError("retrieval_only is implemented only for sensor-granularity tokens")
@@ -509,13 +518,20 @@ class SetTokenizerEncoder(nn.Module):
         else:
             tokens = self.fusion(tokens, text_embs, text_masks)
 
-        transformer_forward = self._compiled_transformer_forward or self.transformer
-        h = transformer_forward(
-            tokens,
-            channel_mask=channel_mask,
-            patch_padding_mask=patch_padding_mask,
-            positions=positions,
-        )                                                                # (B,P,C,d)
+        if return_layer_states:
+            transformer_forward = self._compiled_transformer_forward or self.transformer
+            h, layer_states = transformer_forward(
+                tokens, channel_mask=channel_mask,
+                patch_padding_mask=patch_padding_mask, positions=positions,
+                return_layer_states=True,
+            )
+        else:
+            transformer_forward = self._compiled_transformer_forward or self.transformer
+            h = transformer_forward(
+                tokens, channel_mask=channel_mask,
+                patch_padding_mask=patch_padding_mask, positions=positions,
+            )
+            layer_states = ()
 
         # Pooling respects the masks: absent channels / padded patches contribute nothing.
         weights = h.new_ones(B, P, C)
@@ -548,7 +564,10 @@ class SetTokenizerEncoder(nn.Module):
             pooled = (summaries * active.unsqueeze(-1)).sum(dim=1) \
                 / active.sum(dim=1, keepdim=True).clamp(min=1.0)
 
-        return {"tokens": h, "per_patch": per_patch, "pooled": pooled}
+        output = {"tokens": h, "per_patch": per_patch, "pooled": pooled}
+        if return_layer_states:
+            output["layer_states"] = layer_states
+        return output
 
     # ------------------------------------------------------------------ sensor granularity
     def _encode_sensor(
@@ -571,6 +590,7 @@ class SetTokenizerEncoder(nn.Module):
         descriptor_mask: Optional[torch.Tensor] = None,    # (B,N) True = hide the descriptor
         return_retrieval_tokens: bool = True,
         retrieval_only: bool = False,
+        return_layer_states: bool = False,
     ) -> dict[str, torch.Tensor]:
         """The design-of-record forward: fold to sensor tokens, condition, attend, pool.
 
@@ -668,9 +688,18 @@ class SetTokenizerEncoder(nn.Module):
                 )
             tokens = self.bias_proj(tokens, sensor_bias.to(tokens.dtype), sensor_present)
 
-        transformer_forward = self._compiled_transformer_forward or self.transformer
-        h = transformer_forward(tokens, channel_mask=sensor_present,
-                                patch_padding_mask=patch_padding_mask, positions=positions)
+        if return_layer_states:
+            transformer_forward = self._compiled_transformer_forward or self.transformer
+            h, layer_states = transformer_forward(
+                tokens, channel_mask=sensor_present,
+                patch_padding_mask=patch_padding_mask, positions=positions,
+                return_layer_states=True,
+            )
+        else:
+            transformer_forward = self._compiled_transformer_forward or self.transformer
+            h = transformer_forward(tokens, channel_mask=sensor_present,
+                                    patch_padding_mask=patch_padding_mask, positions=positions)
+            layer_states = ()
         if return_retrieval_tokens and retrieval_tokens is None:
             retrieval_tokens = h
 
@@ -720,11 +749,14 @@ class SetTokenizerEncoder(nn.Module):
         descriptor_pred = (self.descriptor_head(sensor_context)
                            if self.descriptor_prediction_enabled
                            and self.descriptor_head is not None else None)
-        return {"tokens": h, "retrieval_tokens": retrieval_tokens,
-                "per_patch": per_patch, "pooled": pooled,
-                "sensor_context": sensor_context, "sensor_present": sensor_present,
-                "descriptor": descriptor,
-                "descriptor_pred": descriptor_pred}
+        output = {"tokens": h, "retrieval_tokens": retrieval_tokens,
+                  "per_patch": per_patch, "pooled": pooled,
+                  "sensor_context": sensor_context, "sensor_present": sensor_present,
+                  "descriptor": descriptor,
+                  "descriptor_pred": descriptor_pred}
+        if return_layer_states:
+            output["layer_states"] = layer_states
+        return output
 
     # ------------------------------------------------------------------------ forward
     def forward(

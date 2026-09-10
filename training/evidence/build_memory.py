@@ -46,7 +46,7 @@ import numpy as np
 import torch
 
 from data.scripts.eda.grid_io import discover_grids, grid_corpus_fingerprint
-from data.scripts.labels.canonical_labels import canonicalize
+from data.scripts.labels.canonical_labels import NON_SEMANTIC_LABELS, canonicalize
 from eval.scoring import get_sbert_encoder
 from training.tokenizer.eval_transfer import (
     build_encoder,
@@ -73,8 +73,25 @@ _DEFAULT_OUT = Path(__file__).resolve().parent / "outputs" / "memory_bank.pt"
 _GLOBAL_LABELS = _REPO / "data/labels/global_labels.json"
 
 
-def _load_vocab() -> list[str]:
-    return list(json.loads(_GLOBAL_LABELS.read_text())["labels"])
+def _load_vocab(ckpt: dict) -> list[str]:
+    """Load the current supervised vocabulary without silently relabelling old checkpoints.
+
+    A label-free encoder checkpoint legitimately contains only ``__unlabeled__`` and is paired
+    with the current supervised bank vocabulary. Historical labelled checkpoints, however, are
+    reproducible only with the exact semantic vocabulary they recorded.
+    """
+    vocab = list(json.loads(_GLOBAL_LABELS.read_text())["labels"])
+    checkpoint_labels = {
+        canonicalize(str(label)) for label in ckpt.get("label_ids", {})
+        if canonicalize(str(label)) not in NON_SEMANTIC_LABELS
+    }
+    if checkpoint_labels and checkpoint_labels != set(vocab):
+        raise ValueError(
+            "checkpoint semantic vocabulary differs from data/labels/global_labels.json; "
+            "rebuild with its frozen vocabulary or retrain the checkpoint rather than silently "
+            f"changing label indices (checkpoint={len(checkpoint_labels)}, current={len(vocab)})"
+        )
+    return vocab
 
 
 def _backbone_fp(ckpt_path: Path) -> str:
@@ -287,14 +304,25 @@ def main() -> None:
           f"frontend={ckpt['config'].get('frontend')}, "
           f"MR={ckpt['config'].get('multiresolution')}, d={d_model}", flush=True)
 
-    vocab = _load_vocab()
+    vocab = _load_vocab(ckpt)
     label_to_idx = {l: i for i, l in enumerate(vocab)}
     rng = np.random.RandomState(20260720)
 
-    # Build from the roster the ENCODER was trained on (F4), not the current TRAIN_DATASETS: a bank
-    # encoded over a different roster than the checkpoint saw is unattributable. None config => full.
-    roster = tuple(ckpt["config"].get("train_datasets") or TRAIN_DATASETS)
-    print(f"[memory] roster from checkpoint config: {sorted(roster)}", flush=True)
+    # Label-free Phase A and supervised memory construction intentionally use disjoint corpora.
+    # Historical labelled checkpoints retain their frozen training roster for reproducibility.
+    checkpoint_labels = {
+        canonicalize(str(label)) for label in ckpt.get("label_ids", {})
+        if canonicalize(str(label)) not in NON_SEMANTIC_LABELS
+    }
+    phase_a_roster = tuple(ckpt["config"].get("train_datasets") or TRAIN_DATASETS)
+    if checkpoint_labels:
+        roster = phase_a_roster
+        roster_source = "labelled checkpoint"
+    else:
+        from data.scripts.curate.deployment_policy import SUPERVISED_HEAD_TRAIN_DATASETS
+        roster = tuple(SUPERVISED_HEAD_TRAIN_DATASETS)
+        roster_source = "supervised bank policy (label-free Phase A checkpoint)"
+    print(f"[memory] roster from {roster_source}: {sorted(roster)}", flush=True)
     refs = sorted((r for r in discover_grids("native") if r.dataset in roster),
                   key=lambda r: r.key)
     Z_parts, y_parts, subj_parts, cfg_parts, event_parts, event_verified_parts = [], [], [], [], [], []
@@ -632,6 +660,7 @@ def main() -> None:
                 "selection_metric": selection_metric,
                 "selection_value": float(selection_value),
                 "training_datasets": list(roster),
+                "phase_a_training_datasets": list(phase_a_roster),
             },
             bank=payload,
             training_regime=NATIVE_JOINT_EPISODIC_REGIME,

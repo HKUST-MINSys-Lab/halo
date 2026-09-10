@@ -108,6 +108,35 @@ def test_monitor_does_not_require_disabled_descriptor_objective(tmp_path):
     assert not any(item["code"].startswith("descriptor_") for item in report["alerts"])
 
 
+def test_monitor_uses_future_jepa_health_fields(tmp_path):
+    row = _healthy(step=1_000)
+    row.update({
+        "future/loss": 0.5,
+        "physical/loss": 0.2,
+        "physical/improvement_over_zero": 0.1,
+        "collapse/total": 1.0,
+        "collapse/min_std": 0.4,
+        "future/leakage_count": 1,
+        "future/horizon_0_count": 10,
+        "future/horizon_1_count": 10,
+        "future/horizon_2_count": 10,
+        "grad_objective/future_share": 0.7,
+        "grad_objective/physical_share": 0.2,
+        "grad_objective/collapse_share": 0.1,
+        "repr_retrieval/effective_rank": 32.0,
+    })
+    _write_run(tmp_path, [row], steps=2_000)
+    config = json.loads((tmp_path / "run_config.json").read_text())
+    config["jepa_mode"] = "future"
+    (tmp_path / "run_config.json").write_text(json.dumps(config))
+    report = assess(tmp_path)
+    assert report["status"] == "critical"
+    assert any(item["code"] == "future_context_leakage" for item in report["alerts"])
+    assert report["loss"]["physical_improvement_over_zero"] == 0.1
+    assert report["gradients"]["future_share"] == 0.7
+    assert report["representation"]["visible_effective_rank"] == 32.0
+
+
 def test_monitor_writes_machine_and_human_snapshots_and_plot(tmp_path):
     _write_run(tmp_path, [_healthy()])
     report = write_report(tmp_path, stale_seconds=120, render=True)

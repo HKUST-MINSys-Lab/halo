@@ -38,6 +38,16 @@ ACC_UNIT_G = frozenset({
     "xrf_v2",     # 5-pos IMU acc in g (verified still |acc|~0.9-1.0); AirPods total acc=grav+userAccel (g).
     "extrasensory",  # converter normalizes Android m/s^2, iPhone g (author split), and watch milli-g.
     "nhanes",        # CDC PAX80_G release is calibrated triaxial acceleration in g.
+    # Label-free pretraining sources. Every one of these converters emits g at the session
+    # contract boundary, so nothing is rescaled here. They are listed anyway because the
+    # policy test requires a documented unit decision per dataset, and "the converter already
+    # did it" is a decision that should be written down rather than inferred.
+    "nymeria_xsens",   # Xsens sensor-frame acceleration is m/s^2 at source; the converter
+                       # restores gravity and divides by 9.80665 before writing sessions.
+    "nymeria_aria",    # Project Aria reports m/s^2; the converter divides by 9.80665.
+    "ego_exo4d",       # Same Aria device family and the same conversion.
+    "synthetic_imu",   # SYNTHETIC: finite-differenced from mocap, expressed in g by
+                       # construction (see synthetic_imu/synthesis.py).
     "spar",          # Apple Watch 2/3 export already in g, gravity present. Verified over all 280
                      # files: the lowest-gyro decile of each file has median |acc| = 1.026 g. Whole-
                      # file medians run 0.99-2.47 g because these are vigorous arm exercises, so the

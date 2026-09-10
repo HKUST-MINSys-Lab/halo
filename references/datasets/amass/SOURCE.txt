@@ -1,0 +1,3 @@
+https://openaccess.thecvf.com/content_ICCV_2019/html/Mahmood_AMASS_Archive_of_Motion_Capture_As_Surface_Shapes_ICCV_2019_paper.html
+https://amass.is.tue.mpg.de/
+https://github.com/nghorbani/amass

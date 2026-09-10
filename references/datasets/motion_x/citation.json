@@ -1,0 +1,15 @@
+{
+  "name": "motion_x",
+  "category": "datasets",
+  "paper_title": "Motion-X: A Large-scale 3D Expressive Whole-body Human Motion Dataset",
+  "authors": "Jing Lin, Ailing Zeng, Shunlin Lu, Yuanhao Cai, Ruimao Zhang, Haoqian Wang, Lei Zhang",
+  "year": "2023",
+  "venue": "Advances in Neural Information Processing Systems (NeurIPS) 36, Datasets and Benchmarks Track",
+  "doi": "",
+  "paper_url": "https://arxiv.org/abs/2307.00818",
+  "pdf_url": "https://arxiv.org/pdf/2307.00818",
+  "data_or_code_url": "https://motion-x-dataset.github.io/",
+  "license": "CC BY-NC-SA 4.0 for Motion-X's own annotations; each of the underlying 13+ sub-datasets/video sources keeps its own licence and requires separate approval before use",
+  "bibtex": "@inproceedings{lin2023motionx,\n  title     = {Motion-X: A Large-scale 3D Expressive Whole-body Human Motion Dataset},\n  author    = {Lin, Jing and Zeng, Ailing and Lu, Shunlin and Cai, Yuanhao and Zhang, Ruimao and Wang, Haoqian and Zhang, Lei},\n  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},\n  volume    = {36},\n  year      = {2023},\n  url       = {https://arxiv.org/abs/2307.00818}\n}",
+  "notes": "15.6M frame-level whole-body SMPL-X pose annotations + frame-level pose descriptions, 81.1K motion sequences, sequence-level semantic labels; ~144 hours of motion (verified via project page/README), unified to 30 fps. Built by an automatic whole-body motion-and-text annotation pipeline applied to existing single/multi-view video sources (not a new capture), so it is a large-scale AGGREGATION+annotation dataset like AMASS, not raw sensor capture -- contains SMPL-X mesh parameters, no IMU. Licence: annotations under CC BY-NC-SA 4.0 (Attribution-NonCommercial-ShareAlike 4.0 International); each source sub-dataset retains its own licence and requires separate approval, so full access is gated behind a request form at motion-x-dataset.github.io plus per-source agreements. Successor MOTION-X++ (Yuhong Zhang, Jing Lin, Ailing Zeng, Guanlin Wu, Shunlin Lu, Yurong Fu, Yuanhao Cai, Ruimao Zhang, Haoqian Wang, Lei Zhang; arXiv:2501.05098, 2025) scales this up to 19.5M annotations, 120.5K sequences, 180.9 hours, plus 80.8K RGB videos and 45.3K audio tracks, via an improved annotation pipeline; local review copy saved as motion_x_plusplus_paper.pdf alongside the primary Motion-X paper.pdf. Verified 2026-09-09."
+}

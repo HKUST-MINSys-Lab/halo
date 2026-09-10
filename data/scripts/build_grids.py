@@ -38,6 +38,8 @@ import pandas as pd
 
 from data.scripts.assembly import baseline_view
 from data.scripts.assembly.assemble import Grid, assemble, resample_signal
+from data.scripts.curate.corpus_roots import dataset_root as _resolve_dataset_root
+from data.scripts.curate.corpus_roots import roots_under
 from data.scripts.curate.deployment_policy import (
     DIRECT_CONVERTED_TRAIN_DATASETS,
     EXPANDED_PHASE_A_TRAIN_DATASETS,
@@ -54,8 +56,9 @@ HARMONISED_RATE_HZ = 60
 WINDOW_SECONDS = 6.0
 
 # The three build regimes. (name/dir, resample target, canonical labels, channel view):
-#   harmonised     — 60 Hz + canonical labels + 6-ch pad+mask. The fixed-layout baselines
-#                    (CrossHAR/LiMU-BERT/harnet) REQUIRE a uniform rate; this is their crutch.
+#   harmonised     — 60 Hz + canonical labels + 6-ch pad+mask. Legacy fixed-rate exports.
+#                    Current CrossHAR/LiMU-BERT/HARNet adapters start from `native`, trim each
+#                    partial window by `lengths.npy`, then anti-alias/resample to their contract.
 #   non_harmonised — native rate + native labels + native 3/6-ch width. The raw eval/baseline source.
 #   native         — native rate + canonical labels + 6-ch pad+mask. HALO's source: the filterbank
 #                    tokenizer is rate-invariant, so HALO trains on REAL native rates (no 60 Hz
@@ -157,7 +160,7 @@ def iter_sessions(dataset: str, spec: StreamSpec,
     ``keep_ids`` (if given) restricts to that set of session ids — used by the class-balanced cap for
     huge free-living datasets (capture24) so we never load the full corpus into memory.
     """
-    ds_dir = REPO / "data" / "datasets" / dataset
+    ds_dir = dataset_root(dataset)
     # Native rate is a dataset property (metadata.json). The session manifest stores rate per-channel;
     # a single deployment stream shares one rate, so the dataset rate is authoritative.
     native_rate = float(json.loads((ds_dir / "metadata.json").read_text())["sampling_rate_hz"])
@@ -209,17 +212,62 @@ def iter_sessions(dataset: str, spec: StreamSpec,
 
 def _pre_windowed(dataset: str) -> bool:
     """Whether a dataset is distributed as fixed short segments (metadata `pre_windowed: true`)."""
-    meta = REPO / "data" / "datasets" / dataset / "metadata.json"
+    meta = dataset_root(dataset) / "metadata.json"
     return bool(meta.exists() and json.loads(meta.read_text()).get("pre_windowed", False))
 
 
 def _max_hours_per_class(dataset: str) -> Optional[float]:
     """Per-class hour cap for a huge free-living dataset (metadata `max_hours_per_class`), else None."""
-    meta = REPO / "data" / "datasets" / dataset / "metadata.json"
+    meta = dataset_root(dataset) / "metadata.json"
     if not meta.exists():
         return None
     v = json.loads(meta.read_text()).get("max_hours_per_class")
     return float(v) if v else None
+
+
+def dataset_root(dataset: str) -> Path:
+    """Directory holding ``dataset``, resolved under THIS module's ``REPO``.
+
+    Going through the module global rather than importing the resolved path keeps the
+    long-standing test contract that monkeypatching ``build_grids.REPO`` redirects the whole
+    pipeline at an isolated tree.
+    """
+    return _resolve_dataset_root(dataset, roots=roots_under(REPO))
+
+
+def _grid_root(out_root: Optional[Path], dataset: str) -> Path:
+    """Directory holding ``dataset``'s grids.
+
+    ``out_root`` is an explicit override used by tests and scratch builds. Left as ``None``
+    (the production default) each dataset writes beside its own sessions, which resolves to
+    whichever corpus root actually holds it — ``data/datasets`` or ``data/pretraining``.
+    """
+    return (out_root / dataset) if out_root is not None else dataset_root(dataset)
+
+
+def _store_dtype(dataset: str) -> np.dtype:
+    """On-disk sample dtype for this dataset's grids (metadata ``grid_dtype``, default float32).
+
+    Label-free scale sources declare ``"grid_dtype": "float16"``. Halving grid bytes is what
+    makes a corpus of tens of thousands of stream-hours fit on one disk, and it costs nothing
+    the model can see: the frontend reads band energies below ~14 Hz, and float16 resolves
+    ~0.001 g at 1 g, which is exactly the precision NHANES itself publishes.
+
+    float16 rather than a scaled int16 on purpose. Both are two bytes, but a reader that
+    forgets to dequantize an int16 grid gets values wrong by the scale factor and silently
+    trains on garbage, whereas a reader that forgets a float16 grid gets correct values in a
+    narrower dtype. Every existing read path already ends in ``np.asarray(..., float32)``,
+    which upcasts float16 transparently.
+    """
+    meta = dataset_root(dataset) / "metadata.json"
+    if not meta.exists():
+        return np.dtype(np.float32)
+    name = json.loads(meta.read_text()).get("grid_dtype", "float32")
+    if name not in ("float32", "float16"):
+        raise ValueError(
+            f"{dataset}: unsupported grid_dtype {name!r}; use 'float32' or 'float16'"
+        )
+    return np.dtype(name)
 
 
 def _streaming_grid_enabled(dataset: str) -> bool:
@@ -229,7 +277,7 @@ def _streaming_grid_enabled(dataset: str) -> bool:
     final concatenate. This flag is authored in metadata.json and affects only
     the write strategy, never corpus membership or sample selection.
     """
-    meta = REPO / "data" / "datasets" / dataset / "metadata.json"
+    meta = dataset_root(dataset) / "metadata.json"
     return bool(meta.exists() and json.loads(meta.read_text()).get("streaming_grid", False))
 
 
@@ -258,7 +306,7 @@ def _capped_session_ids(dataset: str, spec: StreamSpec, max_hours: float) -> set
     """Class-balanced keep-set for `dataset`'s stream, reading only parquet row-counts (cheap)."""
     import pyarrow.parquet as pq_meta  # metadata-only read; no data loaded
     from collections import defaultdict
-    ds_dir = REPO / "data" / "datasets" / dataset
+    ds_dir = dataset_root(dataset)
     native_rate = float(json.loads((ds_dir / "metadata.json").read_text())["sampling_rate_hz"])
     labels_map = json.loads((ds_dir / "labels.json").read_text()) if (ds_dir / "labels.json").exists() else {}
     per_class = defaultdict(list)
@@ -372,10 +420,11 @@ def _write_streaming_grid(
             mask = grid.mask
             channels = grid.channels
             rate_out = float(grid.rate_hz)
-        elif shape != sample_shape or grid.channels != channels:
+        elif shape != sample_shape or grid.channels != channels or not np.array_equal(grid.mask, mask):
             raise ValueError(
                 f"{dataset}/{spec.stream_id}/{alignment}: inconsistent session grid "
-                f"shape/channels: first={sample_shape, channels}, got={shape, grid.channels}"
+                f"shape/channels/mask: first={sample_shape, channels, mask.tolist()}, "
+                f"got={shape, grid.channels, grid.mask.tolist()}"
             )
         total += len(grid.data)
 
@@ -395,15 +444,16 @@ def _write_streaming_grid(
         _save(out_root, spec, empty, subjects)
         return
 
-    destination = out_root / dataset / "grids" / alignment / spec.stream_id
+    destination = _grid_root(out_root, dataset) / "grids" / alignment / spec.stream_id
     destination.mkdir(parents=True, exist_ok=True)
     temp_data = destination / "data.npy.part"
     if temp_data.exists():
         temp_data.unlink()
+    store_dtype = _store_dtype(dataset)
     mapped = np.lib.format.open_memmap(
         temp_data,
         mode="w+",
-        dtype=np.float32,
+        dtype=store_dtype,
         shape=(total, *sample_shape),
     )
     labels: list[str] = []
@@ -480,6 +530,7 @@ def _write_streaming_grid(
                 "subjects": subjects,
                 "event_ids": event_ids,
                 "lengths_file": "lengths.npy",
+                "store_dtype": str(store_dtype),
                 "partial_windows": int(np.count_nonzero(lengths < sample_shape[0])),
             }
         )
@@ -499,7 +550,8 @@ def build(out_root: Optional[Path] = None, datasets: Optional[Sequence[str]] = N
     Pass `datasets` to build only those (e.g. after a single converter re-run); pass `alignments` to
     build only some regimes (e.g. `["native"]` to add the HALO grids without rebuilding the rest).
     """
-    out_root = out_root or (REPO / "data" / "datasets")
+    # ``out_root`` is an explicit override (tests, scratch builds). Left unset, each dataset
+    # writes beside its own sessions, which may be either corpus root.
     want = set(datasets) if datasets else None
     regimes = [a for a in _ALIGNMENTS if alignments is None or a[0] in set(alignments)]
     # Optional scale streams are considered only when explicitly named. The default includes every
@@ -578,10 +630,11 @@ def build_stream_specs(datasets: Optional[Sequence[str]] = None) -> Tuple[Stream
     return tuple(merged)
 
 
-def _save(out_root: Path, spec: StreamSpec, grid: Grid, subjects: List) -> None:
-    d = out_root / spec.dataset / "grids" / grid.alignment / spec.stream_id
+def _save(out_root: Optional[Path], spec: StreamSpec, grid: Grid, subjects: List) -> None:
+    d = _grid_root(out_root, spec.dataset) / "grids" / grid.alignment / spec.stream_id
     d.mkdir(parents=True, exist_ok=True)
-    np.save(d / "data.npy", grid.data)
+    store_dtype = _store_dtype(spec.dataset)
+    np.save(d / "data.npy", np.asarray(grid.data, dtype=store_dtype))
     np.save(d / "mask.npy", grid.mask)
     lengths = (grid.lengths if grid.lengths is not None
                else np.full(len(grid.data), grid.data.shape[1], dtype=np.int32))
@@ -592,6 +645,7 @@ def _save(out_root: Path, spec: StreamSpec, grid: Grid, subjects: List) -> None:
         "labels": list(map(str, grid.labels)), "subjects": list(map(str, subjects)),
         "event_ids": list(map(str, grid.event_ids or [])),
         "lengths_file": "lengths.npy",
+        "store_dtype": str(store_dtype),
         "partial_windows": int(np.count_nonzero(lengths < (grid.data.shape[1]
                                                                if grid.data.ndim == 3 else 0))),
     }))

@@ -68,6 +68,22 @@ MS_SPANS_S = (0.25, 0.5, 1.0, 2.0)   # octave-spaced so the harmonic grids nest 
 MS_FRAMES_PER_SPAN = 4               # default envelope stride T/4; validate fidelity empirically
 
 
+def multispan_frame_count(
+    spans: Sequence[float], duration_s: float, frames_per_span: int = MS_FRAMES_PER_SPAN,
+) -> int:
+    """Number of physical-time tokens emitted for one sensor and recording."""
+
+    spans = tuple(float(span) for span in spans)
+    if (not spans or not math.isfinite(duration_s) or duration_s <= 0
+            or frames_per_span <= 0
+            or any(not math.isfinite(span) or span <= 0 for span in spans)):
+        raise ValueError("spans, duration, and frames_per_span must be finite and positive")
+    return sum(
+        max(1, int(math.ceil(duration_s * frames_per_span / float(span) - 1e-6)))
+        for span in spans
+    )
+
+
 class MultiSpanKernelTokenizer(ContinuousKernelTokenizer):
     """Span-grouped continuous kernels emitting a physical-time token grid."""
 
@@ -198,6 +214,30 @@ class MultiSpanKernelTokenizer(ContinuousKernelTokenizer):
         return [max(1, int(math.ceil(duration_s * self.frames_per_span / T - 1e-6)))
                 for T in self.span_list]
 
+    def token_metadata(self, duration_seconds: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Build the signal-independent physical token grid for a batch of recordings."""
+        if duration_seconds.ndim != 1 or not bool((duration_seconds > 0).all()):
+            raise ValueError("duration_seconds must be a positive (B,) tensor")
+        batch = duration_seconds.shape[0]
+        device = duration_seconds.device
+        counts = self.frame_counts(float(duration_seconds.max()))
+        positions, durations, ids, masks = [], [], [], []
+        for group, count in enumerate(counts):
+            span = self.span_list[group]
+            center = (torch.arange(count, device=device, dtype=torch.float32) + 0.5) \
+                * (span / self.frames_per_span)
+            positions.append(center.view(1, count).expand(batch, count))
+            durations.append(torch.full((batch, count), span, device=device))
+            ids.append(torch.full((batch, count), group, device=device, dtype=torch.long))
+            masks.append(center.view(1, count) < duration_seconds.view(batch, 1))
+        return {
+            "positions": torch.cat(positions, dim=1),
+            "durations": torch.cat(durations, dim=1),
+            "resolution_ids": torch.cat(ids, dim=1),
+            "token_mask": torch.cat(masks, dim=1),
+            "frame_counts": counts,
+        }
+
     # ------------------------------------------------------------------ geometry and kernels
     def _group_geometry(self, rate: float, g: int, n_frames: int,
                         device: torch.device) -> dict[str, torch.Tensor]:
@@ -306,7 +346,8 @@ class MultiSpanKernelTokenizer(ContinuousKernelTokenizer):
         raise ValueError(f"patch_len_samples must be scalar, (B,), or (B,P)=({B},{P})")
 
     def analyze_grid(self, patches, sampling_rate_hz, patch_len_samples=None,
-                     source_rate_hz=None, patch_mask=None) -> dict:
+                     source_rate_hz=None, patch_mask=None,
+                     grid_duration_seconds: torch.Tensor | None = None) -> dict:
         """Per-group frame magnitudes, edge support, validity and local summaries."""
         B, P, S, C = patches.shape
         device = patches.device
@@ -327,8 +368,14 @@ class MultiSpanKernelTokenizer(ContinuousKernelTokenizer):
                       & length_valid)
         window, total = self.contiguous_window(patches, patch_len, patch_mask)
         duration = total / rates
-        # One synchronisation: the grid length follows the longest recording in the batch.
-        n_frames = self.frame_counts(float(duration.max()))
+        # A past-only student can analyze a shorter prefix while retaining the teacher's complete
+        # output shape. This keeps physical target indices aligned without exposing future signal.
+        grid_duration = duration if grid_duration_seconds is None else torch.as_tensor(
+            grid_duration_seconds, device=device, dtype=duration.dtype,
+        ).reshape(B)
+        if not bool((grid_duration + 1e-6 >= duration).all()):
+            raise ValueError("grid duration cannot be shorter than analyzed signal duration")
+        n_frames = self.frame_counts(float(grid_duration.max()))
         groups = []
         for g in range(self.G):
             k, n = self.group_sizes[g], n_frames[g]
@@ -461,10 +508,12 @@ class MultiSpanKernelTokenizer(ContinuousKernelTokenizer):
 
     def token_grid(self, patches, sampling_rate_hz, patch_len_samples=None,
                    source_rate_hz=None, patch_mask=None, sensor_id=None,
+                   grid_duration_seconds=None,
                    channel_mask=None, n_sensors=None) -> dict[str, torch.Tensor]:
         with torch.autocast(device_type=patches.device.type, enabled=False):
             analysis = self.analyze_grid(patches.float(), sampling_rate_hz, patch_len_samples,
-                                         source_rate_hz=source_rate_hz, patch_mask=patch_mask)
+                                         source_rate_hz=source_rate_hz, patch_mask=patch_mask,
+                                         grid_duration_seconds=grid_duration_seconds)
         return self.project_grid(analysis, sensor_id=sensor_id, channel_mask=channel_mask,
                                  n_sensors=n_sensors)
 

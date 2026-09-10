@@ -1,0 +1,8 @@
+https://arxiv.org/abs/2510.16258
+https://www.meta.com/emerging-tech/codec-avatars/embody-3d/
+https://github.com/facebookresearch/embody-3d
+
+CANDIDATE: licence terms for the dataset itself (distinct from the CC BY-NC 4.0 toolbox repo licence)
+could not be confirmed from this machine -- the repo README points to a "XRCIA license" on the
+meta.com project page, but that page did not expose license text to an automated fetch. Do not treat
+this dataset as cleared for use until the licence text has been read by a human.

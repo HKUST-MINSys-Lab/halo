@@ -5,8 +5,9 @@ Design decisions carried in from the gates:
     touched); the original 12-dataset matched recipe remains an explicit comparison arm. Native sampling
     RATE (no 60 Hz resample) + canonical labels + 6-ch pad+mask. The filterbank tokenizer is
     rate-invariant, so HALO trains on the corpus's REAL native rates (20/50/100 Hz) instead of a
-    homogenized 60 Hz base — the 60 Hz "harmonised" grids are the layout-locked baselines' crutch,
-    not HALO's. Source-balanced sampling (no per-stream cap) spreads each activity across configs.
+    homogenized 60 Hz base. Corpus-matched layout-locked baseline adapters now begin from the same
+    native windows and perform their required anti-aliased resampling locally. Source-balanced
+    sampling (no per-stream cap) spreads each activity across configs.
   * Subject-disjoint train/val split per dataset.
   * Label-free hierarchical temperature sampling is the sole Phase-A sampler.
   * The reference augmentation is one independent SO(3) rotation per positive view. More aggressive
@@ -70,8 +71,10 @@ VAL_RESOLUTION_PAIR = (0.5, 1.5)
 # RTX 4090. 12,288 therefore admits every draw through batch 512 (worst case 11,264 tokens) without
 # silently changing the augmentation distribution. Set 0 to disable.
 MAX_BATCH_TOKENS = 12_288
-DFT_SIZE = 256                   # covers the 100 Hz x 1 s reference patches and all retained
-                                 # multi-resolution ablation choices (up to 150 samples)
+# Covers the largest declared future-JEPA patch in the label-free corpus: 240 Hz x 1.5 s = 360
+# samples. Keeping one power-of-two capacity across collate, encoder, frozen physical targets and
+# evaluation avoids frontend-specific truncation or a run that succeeds only on low-rate sources.
+DFT_SIZE = 512
 # Streams whose SOURCE (acquisition) rate differs from the rate the grid is stored at, because a
 # converter resampled them onto the dataset-wide grid rate. Upsampling cannot create information, so
 # the filterbank must take its Nyquist/observability bound from the ACQUISITION rate while the DFT
@@ -593,7 +596,7 @@ def _seed_worker(worker_id: int) -> None:
 class PretrainDataset(Dataset):
     """One item = one augmented window: variable (T', 6) data + rate + texts + label.
 
-    ``two_view`` (VICReg objective): also emit an independently augmented second view
+    ``two_view`` (historical masked-JEPA/VICReg control): also emit an independently augmented second view
     window under ``item["view_b"]`` (its own signal augmentation, rate, channel_mask and
     augmentation-consistent channel text). The collate patchifies it into the ``*_b`` keys."""
 
@@ -745,7 +748,8 @@ class PretrainDataset(Dataset):
             ref.dataset, ref.stream, neutral=self.neutral_acquisition_text,
         )
         slot = {c: k for k, c in enumerate(CHANNELS)}
-        # Draw acquisition CONFIG once. Both VICReg views then independently draw only nuisance
+        # Historical masked control: draw acquisition CONFIG once. Both VICReg views then
+        # independently draw only nuisance
         # variation from clones of that configured sample. This is both the intended semantics and
         # substantially cheaper than replaying every CONFIG transform under saved global RNG state.
         configured = self.config_augmenter(self._raw_sample(ref, key, base_texts))
@@ -891,6 +895,31 @@ class TemperatureSampler(Sampler[int]):
         self.epoch = 0
 
     @staticmethod
+    def _draw_with_replacement(
+        weights: torch.Tensor, count: int, generator: torch.Generator,
+    ) -> torch.Tensor:
+        """Draw from arbitrarily large categorical tables without the 2^24 torch limit."""
+        max_categories = 1 << 24
+        if weights.numel() <= max_categories:
+            return torch.multinomial(weights, count, replacement=True, generator=generator)
+        # Hierarchical draw: choose a bounded contiguous block by its exact mass, then a row
+        # inside that block. This is mathematically the same categorical distribution while
+        # keeping every torch.multinomial call within its supported category count.
+        chunk = 1 << 20
+        starts = torch.arange(0, weights.numel(), chunk, device=weights.device)
+        masses = torch.stack([weights[start:start + chunk].sum() for start in starts])
+        choices = torch.multinomial(masses, count, replacement=True, generator=generator)
+        result = torch.empty(count, dtype=torch.long)
+        for choice in torch.unique(choices, sorted=True).tolist():
+            output = torch.nonzero(choices == choice).flatten()
+            start = int(starts[choice])
+            local = torch.multinomial(
+                weights[start:start + chunk], len(output), replacement=True, generator=generator,
+            )
+            result[output] = local + start
+        return result
+
+    @staticmethod
     def _draw_unique_batches(
         weights: torch.Tensor,
         n_batches: int,
@@ -900,9 +929,7 @@ class TemperatureSampler(Sampler[int]):
         """Weighted rows with replacement across batches and without replacement within one."""
         n_samples = n_batches * batch_size
         extra = max(batch_size * 4, n_samples // 500)
-        draws = torch.multinomial(
-            weights, n_samples + extra, replacement=True, generator=generator,
-        )
+        draws = TemperatureSampler._draw_with_replacement(weights, n_samples + extra, generator)
         batches = draws[:n_samples].clone().view(-1, batch_size)
         ordered = batches.sort(dim=1).values
         duplicate_rows = (
@@ -919,9 +946,8 @@ class TemperatureSampler(Sampler[int]):
                     continue
                 while True:
                     if extra_pos >= len(extras):
-                        extras.extend(torch.multinomial(
-                            weights, max(batch_size * 4, 4096), replacement=True,
-                            generator=generator,
+                        extras.extend(TemperatureSampler._draw_with_replacement(
+                            weights, max(batch_size * 4, 4096), generator,
                         ).tolist())
                     replacement = extras[extra_pos]
                     extra_pos += 1
@@ -1033,7 +1059,7 @@ class MultiScaleCollate:
         self.dft_size = dft_size
         self.patch_choices = tuple(patch_choices)
         self.fixed = fixed_patch_seconds
-        # Augmentation VICReg: patchify the independently augmented positive view into `*_b` keys.
+        # Historical masked control: patchify the independent VICReg view into `*_b` keys.
         self.two_view = two_view
         self.seed = seed
 
@@ -1049,10 +1075,11 @@ class MultiScaleCollate:
         ps = self._patch_seconds(batch)
         out = self._collate_impl(batch, ps)
         if self.two_view and batch and "view_b" in batch[0]:
-            # Second positive view uses the same patch duration; JEPA uses only view A.
+            # Historical masked control: the positive view uses the same patch duration.
             out_b = self._collate_impl([item["view_b"] for item in batch], ps)
             for k in ("patches", "patch_len", "rates", "source_rates", "positions",
-                      "patch_durations", "texts",
+                      "patch_durations", "patch_starts", "patch_ends", "resolution_ids",
+                      "resolution_count", "texts",
                       "role_texts", "sensor_texts", "sensor_target_texts", "sensor_id",
                       "sensor_placement",
                       "channel_mask", "patch_padding_mask", "augmentations"):
@@ -1079,6 +1106,8 @@ class MultiScaleCollate:
         rates = np.zeros(B, dtype=np.float32)
         source_rates = np.zeros(B, dtype=np.float32)
         positions = np.zeros((B, P), dtype=np.float32)
+        patch_starts = np.zeros((B, P), dtype=np.float32)
+        patch_ends = np.zeros((B, P), dtype=np.float32)
 
         for b, item in enumerate(batch):
             data, rate = item["data"], item["rate"]
@@ -1093,6 +1122,8 @@ class MultiScaleCollate:
                 patch_len[b, p] = length
                 patch_durations[b, p] = length / rate
                 positions[b, p] = (start + 0.5 * length) / rate
+                patch_starts[b, p] = start / rate
+                patch_ends[b, p] = end / rate
                 usable += 1
             patch_pad[b, :usable] = True
             rates[b] = rate
@@ -1104,6 +1135,14 @@ class MultiScaleCollate:
             "source_rates": torch.from_numpy(source_rates),
             "positions": torch.from_numpy(positions),
             "patch_durations": torch.from_numpy(patch_durations),
+            "patch_starts": torch.from_numpy(patch_starts),
+            "patch_ends": torch.from_numpy(patch_ends),
+            "resolution_ids": torch.where(
+                torch.from_numpy(patch_pad),
+                torch.zeros((B, P), dtype=torch.long),
+                torch.full((B, P), -1, dtype=torch.long),
+            ),
+            "resolution_count": 1,
             "patch_seconds": ps,
             "texts": [item["texts"] for item in batch],
             # Factored text conditioning (docs/design/TEXT_CONDITIONING.md §4b), read ONLY by the
@@ -1165,7 +1204,7 @@ class MultiResolutionCollate:
         self.max_batch_tokens = int(max_batch_tokens)
         self.min_resolution_ratio = float(min_resolution_ratio)
         self.seed = int(seed)
-        # Augmentation VICReg: patchify the independently augmented positive view into `*_b` keys.
+        # Historical masked control: patchify the independent VICReg view into `*_b` keys.
         self.two_view = bool(two_view)
         self._valid_pairs = tuple(
             (short, long)
@@ -1210,7 +1249,7 @@ class MultiResolutionCollate:
         pair = self._patch_seconds(batch)
         out = self._collate_impl(batch, pair)
         if self.two_view and batch and "view_b" in batch[0]:
-            # Second positive view uses the same resolution pair; JEPA uses only view A.
+            # Historical masked control: the positive view uses the same resolution pair.
             out_b = self._collate_impl([item["view_b"] for item in batch], pair)
             for k in ("patches", "patch_len", "rates", "source_rates", "positions", "patch_durations",
                       "resolution_ids", "texts", "role_texts", "sensor_texts",

@@ -13,8 +13,8 @@ from data.datasets.extrasensory.convert import (
     _phone_platforms,
     read_phone,
 )
-from data.datasets.nhanes.convert import RATE_HZ, WINDOW_SAMPLES, _complete_blocks
-from data.datasets.nhanes.fetch import _ArchiveLinkParser
+from data.pretraining.nhanes.convert import RATE_HZ, WINDOW_SAMPLES, _complete_blocks
+from data.pretraining.nhanes.fetch import _ArchiveLinkParser
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -130,6 +130,22 @@ def test_nhanes_gap_and_qc_boundaries_never_form_cross_gap_windows():
     blocks = _complete_blocks(frame, [(qc_start, qc_end)])
     assert [len(block) for block in blocks] == [WINDOW_SAMPLES, WINDOW_SAMPLES]
     assert all(np.allclose(block[:, 2], 1.0) for block in blocks)
+
+
+def test_nhanes_backward_timestamp_is_a_hard_boundary():
+    n = WINDOW_SAMPLES * 2
+    start = datetime(2020, 1, 1)
+    timestamps = np.array([start + timedelta(seconds=i / RATE_HZ) for i in range(n)])
+    # A device clock reset between complete windows must not create a deceptively continuous run.
+    timestamps[WINDOW_SAMPLES:] = [
+        start + timedelta(seconds=i / RATE_HZ) for i in range(WINDOW_SAMPLES)
+    ]
+    frame = pd.DataFrame({
+        "HEADER_TIMESTAMP": timestamps,
+        "X": np.zeros(n), "Y": np.zeros(n), "Z": np.ones(n),
+    })
+    blocks = _complete_blocks(frame, [])
+    assert [len(block) for block in blocks] == [WINDOW_SAMPLES, WINDOW_SAMPLES]
 
 
 def test_nhanes_live_index_absolute_links_are_parsed():

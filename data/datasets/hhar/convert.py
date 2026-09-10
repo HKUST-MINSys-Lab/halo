@@ -21,6 +21,8 @@ import pandas as pd
 from pathlib import Path
 from typing import Dict, List
 
+from data.scripts.assembly.assemble import resample_signal
+
 
 # Activity mapping (original names to standardized)
 ACTIVITIES = {
@@ -86,13 +88,25 @@ def load_and_merge_sensor_data(acc_path: Path, gyro_path: Path) -> pd.DataFrame:
     gyro_df = gyro_df.sort_values(['user', 'device', 'activity', 'timestamp_ns']).reset_index(drop=True)
 
     merged_data = []
-    keys = acc_df[['user', 'device', 'activity']].drop_duplicates()
-    for user, device, activity in keys.itertuples(index=False):
-        acc_subset = acc_df[(acc_df['user'] == user) & (acc_df['device'] == device)
-                            & (acc_df['activity'] == activity)].sort_values('timestamp_ns')
-        gyro_subset = gyro_df[(gyro_df['user'] == user) & (gyro_df['device'] == device)
-                              & (gyro_df['activity'] == activity)].sort_values('timestamp_ns')
-        if len(acc_subset) == 0 or len(gyro_subset) == 0:
+    key_columns = ['user', 'device', 'activity']
+    # The old loop boolean-scanned both 10M-row frames once per key. Grouping once preserves the
+    # exact physical key while avoiding hundreds of full-corpus passes.
+    gyro_groups = gyro_df.groupby(key_columns, sort=False, observed=True)
+    gyro_keys = set(gyro_groups.groups)
+    for (user, device, activity), acc_subset in acc_df.groupby(
+        key_columns, sort=False, observed=True
+    ):
+        acc_subset = acc_subset.sort_values('timestamp_ns')
+        key = (user, device, activity)
+        gyro_subset = (gyro_groups.get_group(key).sort_values('timestamp_ns')
+                       if key in gyro_keys else None)
+        if gyro_subset is None or len(gyro_subset) == 0:
+            # Galaxy S+ has no gyroscope rows in the release. Preserve it as an honest
+            # accelerometer-only stream rather than silently deleting the only 50 Hz phone model.
+            missing = acc_subset.copy()
+            for column in ('gyro_x', 'gyro_y', 'gyro_z'):
+                missing[column] = np.nan
+            merged_data.append(missing)
             continue
 
         # Match gyro to acc timestamps within one physical device (50ms tolerance)
@@ -107,7 +121,9 @@ def load_and_merge_sensor_data(acc_path: Path, gyro_path: Path) -> pd.DataFrame:
         merged_data.append(merged)
 
     result = pd.concat(merged_data, ignore_index=True)
-    print(f"    Merged: {len(result):,} samples with both acc and gyro")
+    n_accel_only = int(result['gyro_x'].isna().sum())
+    print(f"    Prepared: {len(result):,} samples "
+          f"({n_accel_only:,} from accelerometer-only devices)")
 
     return result
 
@@ -128,18 +144,25 @@ def resample_stream(group, rate=TARGET_SAMPLE_RATE):
     gap = max(0.25, 10.0 * med)               # a real clock break, not sample jitter
     breaks = np.nonzero(dt > gap)[0] + 1       # a new segment starts after each gap
     bounds = np.concatenate([[0], breaks, [len(g)]]).astype(int)
-    cols = ['acc_x', 'acc_y', 'acc_z', 'gyro_x', 'gyro_y', 'gyro_z']
+    all_cols = ['acc_x', 'acc_y', 'acc_z', 'gyro_x', 'gyro_y', 'gyro_z']
+    cols = [column for column in all_cols if column in g and g[column].notna().any()]
     arr = {c: g[c].to_numpy(np.float64) for c in cols}
     segments = []
     for a, b in zip(bounds[:-1], bounds[1:]):
         ts = t[a:b] - t[a]
         if len(ts) < 2 or ts[-1] <= 0:
             continue
-        n = int(ts[-1] * rate) + 1
-        grid = np.arange(n) / rate
-        out = {'timestamp_sec': grid}
-        for c in cols:
-            out[c] = np.interp(grid, ts, arr[c][a:b])
+        local_dt = np.diff(ts)
+        local_dt = local_dt[local_dt > 0]
+        if len(local_dt) == 0:
+            continue
+        source_rate = 1.0 / float(np.median(local_dt))
+        source_grid = np.arange(int(np.floor(ts[-1] * source_rate)) + 1) / source_rate
+        uniform = np.column_stack([np.interp(source_grid, ts, arr[c][a:b]) for c in cols])
+        sampled = resample_signal(uniform, source_rate, rate)
+        out = {'timestamp_sec': np.arange(len(sampled), dtype=np.float64) / rate}
+        for ci, c in enumerate(cols):
+            out[c] = sampled[:, ci]
         segments.append(pd.DataFrame(out))
     return segments
 
@@ -172,7 +195,9 @@ def convert_sessions(df: pd.DataFrame, sessions_dir: Path) -> Dict[str, List[str
             # Subject id (user a-i) for subject-disjoint splits; read by build_grids.iter_sessions.
             seg['subject'] = str(user)
 
-            session_id = f"hhar_{user}_{device}_{activity}_{seg_idx:03d}"
+            accel_only = not {'gyro_x', 'gyro_y', 'gyro_z'} <= set(seg.columns)
+            kind = "accel_only" if accel_only else "imu"
+            session_id = f"hhar_{kind}_{user}_{device}_{activity}_{seg_idx:03d}"
             session_dir = sessions_dir / session_id
             session_dir.mkdir(parents=True, exist_ok=True)
             # Columns: timestamp_sec, acc_x/y/z, gyro_x/y/z (native m/s²), subject.
@@ -189,7 +214,7 @@ def create_manifest():
     """Create minimal manifest.json."""
     manifest = {
         "dataset_name": "HHAR",
-        "description": "Heterogeneity Human Activity Recognition dataset. 9 users performing 6 activities with smartphones (Nexus 4, Galaxy S+, Galaxy S3, S3 mini) carried in a WAIST POUCH. Phones sampled at their native 50-200 Hz; resampled to a true 50 Hz here. Triaxial accelerometer and gyroscope (phone data only; watch streams not used).",
+        "description": "Heterogeneity Human Activity Recognition dataset. 9 users performing 6 activities with smartphones (Nexus 4, Galaxy S+, Galaxy S3, S3 mini) carried in a waist pouch. Phones sampled at 50-200 Hz and are anti-aliased to 50 Hz. Galaxy S+ is accelerometer-only because the release has no gyroscope rows for that model; the other phones retain both sensors.",
         "channels": [
             {
                 "name": "acc_x",
@@ -274,6 +299,12 @@ def main():
 
     # Create manifest
     create_manifest()
+    metadata_path = OUTPUT_DIR / "metadata.json"
+    if metadata_path.exists():
+        metadata = json.loads(metadata_path.read_text())
+        metadata["num_sessions"] = len(labels_dict)
+        metadata.pop("num_sessions_subsampled", None)
+        metadata_path.write_text(json.dumps(metadata, indent=2))
 
     # Print summary
     print(f"\n{'=' * 80}")
@@ -281,7 +312,7 @@ def main():
     print(f"{'=' * 80}")
     print(f"Output: {OUTPUT_DIR}")
     print(f"  - {len(labels_dict)} raw sessions (whole recordings; not pre-windowed)")
-    print("  - 6 channels (acc + gyro)")
+    print("  - 3 channels for Galaxy S+; 6 channels for devices with gyroscope data")
     print(f"  - {TARGET_SAMPLE_RATE} Hz sampling rate")
 
     # Activity distribution

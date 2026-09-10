@@ -44,7 +44,7 @@ LIMU_REPO = Path("/home/alex/code/HALO/legacy_code/auxiliary_repos/LIMU-BERT-Pub
 
 _HERE = Path(__file__).resolve().parent
 BACKBONE_CKPT = _HERE / "limubert_backbone.pt"
-METADATA_SCHEMA = 1
+METADATA_SCHEMA = 2
 
 
 def _seed_worker(worker_id):
@@ -184,6 +184,7 @@ def main(argv=None):
         "corpus_profile": "expanded_phase_a",
         "acc_convention": "g",
         "train_datasets": list(prep.TRAIN_DATASETS),
+        "prep_schema": prep.PREP_SCHEMA,
         "input_contract": {"rate_hz": prep.TARGET_HZ, "samples": prep.TARGET_LEN,
                            "channels": list(prep.SIX_CHANNELS), "acc_convention": "g"},
         "recipe": args.recipe,

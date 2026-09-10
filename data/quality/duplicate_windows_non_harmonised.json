@@ -1,6 +1,6 @@
 {
   "alignment": "non_harmonised",
-  "grid_fingerprint": "d0628845a3b6e485f85e1fde9baeae9d4b0cb1d143f91ad4ee9579a1d09b48a8",
+  "grid_fingerprint": "5e916150d472e5b689d811bfacd43cb1b6b1d4491eb975f061b6a2811be0e23b",
   "stream_fingerprints": {
     "capture24/watch_wrist": "a9a9f0e64f9d55b8af8d475c197202f52db338dc7e39f005d95746fa16c9da69",
     "dsads/chest": "650cf3614e27f40365c73b4698e308483909bd84de4f503f91752641f441125c",
@@ -8,14 +8,15 @@
     "dsads/left_wrist": "ecd71a3797fd3b3ece97c3fe5c53b08922784854e53bef7f9f532cdf3683cce4",
     "dsads/right_knee": "b8eeef23542b5bb7d200e345264c4071789fddb528083d2e2d58b2a1cf57c34b",
     "dsads/right_wrist": "af7d52fcd14235b411b2b473b592a29f03d016679602d79e8a8bf83f6e245dd4",
-    "forth_trace/left_ankle": "242d6f8cc29c5526f1bf873a9b0cfd237f8c1fcc1b52651b3511f7af6f2f42c3",
-    "forth_trace/left_wrist": "6e0eae0b73f0422720b31c2f6f9370e2699198763f41b21078eae887dd2102e5",
-    "forth_trace/right_thigh": "1542989aa93bda3994d104ffd023fd8779d6c0a3948b3de072a99efd7efd9c6e",
-    "forth_trace/right_wrist": "d7d65c42dc6c43c7fe10ac24c2fcad574a53bdaaaf927e7b6cc990328211ccb9",
-    "forth_trace/torso": "9e88b118ddffbf0b74b70462e294e7b2acd9f41e570b63f3fb513f25d2a44ca7",
+    "forth_trace/left_ankle": "766ae2384e7ccdd0643f3614042bdd2847140c15579965a291b8720884b7667f",
+    "forth_trace/left_wrist": "b5727266173190bf7c9bb9d16f248e7935fc9491eb077954d1d7e5a847941b6f",
+    "forth_trace/right_thigh": "ba14a9df9a0ee8731aaa9233ffd125f7374425b55421db0bcafb319164e2f4cf",
+    "forth_trace/right_wrist": "548549ef5bcae47392ce7398c91bf6abc1940f94784de368fa6e953009d1c997",
+    "forth_trace/torso": "9ba0a966804cf704bf03c127b8bd1d3f3e48c6b1022449814c72aef52531a59d",
     "hapt/phone_waist": "3acac3ce0653cb401e53dd6b9cf413e281c22dcdab20d7df0d8c69db253ef1e2",
-    "harmes/watch_wrist": "12d36927dc8f45d222be55a53df3489abb46df635b060b1e100984d633d0071d",
-    "hhar/phone_waist": "a146b4672653bf958e219b7007aca752b64903c2b3f1da9df7cab6bb558a0af5",
+    "harmes/watch_wrist": "91610792e593e3ba5c294f8b4761f86181ce64b3387a7801781e191ed9d7230a",
+    "hhar/phone_waist": "92dad1a8e0cfea50b1b8fe12c5a6ae06b4b411f02ce67da876ffa6823a506442",
+    "hhar/phone_waist_accel_only": "4bf00087efb30804c8e6dff02332fdc9e4d6052a6689d778de36619e9a64a67c",
     "inclusivehar/phone_waist": "3ebfaa63a4d65f5a1d1e7688e6963d0befae714ed35ca9215c3c492fbfec1ae0",
     "kneepad/left_gastrocnemius": "c159af3b37d648ad68826516a6932a02de7c5e81e2187bd86849b0683d0ff94d",
     "kneepad/left_hamstrings": "6673e0fc6742b62c2285988b6dbdbd5a24808b73ae363f4345746da70b10db95",
@@ -66,15 +67,15 @@
     "spar/watch_right_wrist": "99af498134709830221aa6b847d4fad917c65c8becf732b4e17c97ba956530b3",
     "tnda_har/watch_wrist": "2ad593c93b367cb350509b05e1555c832ddbc9101a8420f9cce73f5cf00fac6a",
     "uci_har/phone_waist": "0b2a8911715a7a47f7c58914ae445d79c7e6a18e2aebb655dd9951db01770460",
-    "unimib_shar/phone_pocket": "44fcddf93336c9cad1b7dde77589355cfc0f193861313416083d73ce5c423066",
+    "unimib_shar/phone_pocket": "c1cfd386180416765182fce436f9b06609954e6ed6a4677d129f17a5608565c7",
     "upper_limb_use/control_left_wrist": "f9dff971e38cc498636852ea6d2ea8287cb4c00055ea84c0ac489262b07c3c6c",
     "upper_limb_use/control_right_wrist": "dcd7de7da5f290e8ac256b2bbf13af98a3ce3855dd742704feb61d37f4dfa145",
     "upper_limb_use/patient_affected_wrist": "3e458849fba728c6ba19e9b6cb9b0f49649a7fe87bb56cd61f476c001601b9de",
     "upper_limb_use/patient_unaffected_wrist": "38b1b6c25d1e512c1d7a4f73205b8eee4ed34246644d505a9e5d351ef374a6a4",
     "usc_had/phone_hip": "9b0afd13b47e874d023c5ace65c496873b4bb41f46f87b813d77443b2fd3ea6e",
     "ut_complex/watch_wrist": "245eacb20ec29337daec199a69f45ee12ffbfa89ed7aa365f9bbfe3d3f1df79f",
-    "wisdm/phone_pocket": "f6173cc055cfb01bc9f4191c3713ae272e664d30cd27fb580f7ea1b8c3b94f07",
-    "wisdm/watch_wrist": "fd76e52b5460526a10742b7e265c8f478fd36e9d37c5f1ffcca2fbde45af3ab1",
+    "wisdm/phone_pocket": "9effe8a49d3c2a4d80600ab154b536ca8136e5294e04b043d45b812c6759fbcc",
+    "wisdm/watch_wrist": "9a98b992711ac2b9df5c3482d0580b2f124878beba9d8f93cf4c1312dcbcd02f",
     "xrf_v2/airpods_ear": "9fdf9563c8668be8705b50860b8c955923310d59fe3e2e4ac647fef68a72a602",
     "xrf_v2/glasses": "e3806a14266783974cce6f25f3476dae65f48a47c4375b4017f1ef84eb33e7cb",
     "xrf_v2/left_pocket": "f94dd10c1366569fc7819cc6bf7d0ea1374d2c9cd06a751382994533503f3c1d",
@@ -83,6 +84,10 @@
     "xrf_v2/right_wrist": "b0887c23f6db07b8dddeb75d4d7c4ea02e9bc2699679aedc99263fe51b6f51a6"
   },
   "windows": {
+    "harmes/watch_wrist": [
+      5543,
+      5618
+    ],
     "kuhar/phone_waist": [
       8510,
       8511,
@@ -1162,6 +1167,13 @@
     ]
   },
   "summary": [
+    [
+      "harmes/watch_wrist",
+      2,
+      26051,
+      1,
+      1
+    ],
     [
       "kuhar/phone_waist",
       75,

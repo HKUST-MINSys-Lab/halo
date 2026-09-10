@@ -37,8 +37,24 @@ def test_live_encoder_carries_checkpoint_evaluation_grid():
     )
     enc = PipelineAModel(cfg).encoder
     assert enc.multiresolution is True
-    assert enc.eval_resolution_pair == tuple(cfg.val_resolution_pair)
+    assert enc.eval_resolution_pair == tuple(cfg.future_patch_durations)
     assert enc.min_resolution_ratio == cfg.min_resolution_ratio
+
+
+def test_checkpoint_without_dft_metadata_uses_historical_capacity():
+    from training.tokenizer.eval_transfer import build_encoder
+
+    cfg = PretrainConfig(
+        d_model=32, num_layers=1, num_heads=4, dim_feedforward=64,
+        dft_size=256, token_granularity="sensor", multiresolution=False,
+    )
+    original = PipelineAModel(cfg).encoder
+    legacy_config = vars(cfg).copy()
+    legacy_config.pop("dft_size")
+    restored = build_encoder(
+        {"config": legacy_config, "encoder": original.state_dict()}, "cpu",
+    )
+    assert restored.filterbank.S == 256
 
 
 def test_eval_subset_covers_streams_before_refilling_large_source():

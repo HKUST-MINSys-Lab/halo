@@ -1,0 +1,25 @@
+{
+  "display_name": "NHANES PAX80_G (bounded subset)",
+  "sampling_rate_hz": 80,
+  "channels": [
+    "acc_x",
+    "acc_y",
+    "acc_z"
+  ],
+  "core_channels": {
+    "acc_x": "acc_x",
+    "acc_y": "acc_y",
+    "acc_z": "acc_z"
+  },
+  "extra_channels": [],
+  "placement": "non-dominant wrist",
+  "num_subjects": null,
+  "activities": [],
+  "role": "pretrain_scale",
+  "phase_a_only": true,
+  "streaming_grid": true,
+  "note": "Public NHANES 2011-2014 ActiGraph GT3X+ raw 80 Hz acceleration in g, non-dominant wrist. No activity annotations: every session carries __unlabeled__ and is barred from label vocabulary, validation probes, and the Phase-B bank. Fetching is bounded and deterministic; full-corpus download (~2.2 TB compressed) is intentionally unavailable. Hour budget is spent motion-aware by default (see convert.select_hours) because free-living wrist data is mostly stillness. Grids are float16.",
+  "dataset": "nhanes",
+  "grid_dtype": "float16",
+  "pre_windowed": false
+}

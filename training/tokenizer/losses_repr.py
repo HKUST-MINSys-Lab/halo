@@ -1,8 +1,10 @@
-"""The two universal, label-free Phase-A objectives.
+"""Historical masked-JEPA/VICReg control and shared representation-loss utilities.
 
 ``JEPA`` masks physical-time intervals and channels in a student view, then predicts the
 corresponding contextual tokens from a clean EMA teacher. ``VICReg`` aligns two independent
 augmentations of every window while preserving per-dimension variance and reducing redundancy.
+These paths run only under ``pretrain --jepa-mode masked``; the default future objective lives in
+``future_jepa.py``. Sensor folding remains shared by both implementations.
 """
 
 from __future__ import annotations
@@ -497,7 +499,7 @@ def masked_ema_latent_loss(
 
 @dataclass
 class PhaseALossOutput:
-    """Weighted two-objective loss used by the Phase-A trainer."""
+    """Weighted legacy-control loss returned in masked mode."""
 
     total: torch.Tensor
     terms: dict[str, torch.Tensor]

@@ -1,0 +1,15 @@
+{
+  "name": "ego_exo4d",
+  "category": "datasets",
+  "paper_title": "Ego-Exo4D: Understanding Skilled Human Activity from First- and Third-Person Perspectives",
+  "authors": "Kristen Grauman and others",
+  "year": "2024",
+  "venue": "IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR) 2024, pp. 19383-19400",
+  "doi": "",
+  "paper_url": "https://arxiv.org/abs/2311.18259",
+  "pdf_url": "https://arxiv.org/pdf/2311.18259",
+  "data_or_code_url": "https://docs.ego-exo4d-data.org/",
+  "license": "Ego4D/Ego-Exo4D data licence agreement (signed licence required for access; not a Creative Commons licence)",
+  "bibtex": "@inproceedings{grauman2024egoexo4d,\n  title     = {Ego-Exo4D: Understanding Skilled Human Activity from First- and Third-Person Perspectives},\n  author    = {Grauman, Kristen and Westbury, Andrew and Torresani, Lorenzo and Kitani, Kris and Malik, Jitendra and {and 96 others}},\n  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},\n  pages     = {19383--19400},\n  year      = {2024},\n  url       = {https://arxiv.org/abs/2311.18259}\n}",
+  "notes": "Consortium paper with 100 listed authors (verified via arXiv citation metadata: starts Grauman, Westbury, Torresani, Kitani, Malik, ... ends with senior/PI names Arbelaez, Bertasius, Crandall, Damen, Engel, Farinella, Furnari, Ghanem, Hoffman, Jawahar, Newcombe, Park, Rehg, Sato, Savva, Shi, Shou, Wray); 'authors' field abbreviated to the first author per this repo's convention for very large author lists, since no existing entry here has a precedent for 100+ names. Abstract (verified against arXiv metadata, not the task-supplied figure): 740 participants from 13 cities worldwide, 123 different natural scene contexts, captures 1 to 42 minutes each, 1,286 hours of video combined (NOT 1,422 h as sometimes quoted secondhand -- 1,286 h is the number in the arXiv abstract itself). Simultaneously-captured egocentric (Project Aria glasses) and exocentric (static camera rig) video of skilled activities (sports, music, dance, bike repair, cooking, etc.), plus multichannel audio, eye gaze, 3D point clouds, camera poses, IMU, and multiple paired language descriptions including novel 'expert commentary' from coaches/teachers. Aria IMU: two IMUs per device, nominally ~800 Hz and ~1 kHz (Aria hardware spec, consistent across Aria-based Meta releases including Nymeria); the docs site labels the streams imu-right/imu-left but exact per-take rates were not independently re-verified beyond the general Aria spec. Access: sign the Ego4D/Ego-Exo4D licence agreement (processing takes about 2 days per the docs site), install `pip install ego4d>=1.7.1`, configure AWS credentials, then run the `egoexo` CLI with `--parts <name>`. Verified download part sizes from docs.ego-exo4d-data.org: `take_vrs_noimagestream` (IMU/metadata without video) = 995.592 GB, `take_vrs` (full VRS incl. video) = 12,301.458 GB, `all` = 38,449.753 GB; there is no separate IMU-only part smaller than take_vrs_noimagestream. Verified 2026-09-09."
+}

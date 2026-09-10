@@ -160,7 +160,7 @@ stability, or runtime over raw and physical-feature controls.
 | temporal attention | contextualizes each patch with nearby patches | local phase and transition context | implemented | generic pretraining can smooth boundaries or collapse useful variation |
 | cross-sensor attention | mixes simultaneous sensor streams in the dual trunk | coordinated multi-placement motion | implemented | benefit may not transfer to single-watch or single-phone deployment |
 | factored acquisition text | MiniLM sensor identity plus axis-role projection | unseen wording and configuration context | operational, but prior parity result is effectively null | source-string memorization; text cannot correct calibration or observability |
-| JEPA plus VICReg pretraining | predicts masked latent context and aligns augmented views without labels | broad reusable local representation | useful HAR representation, task suitability unproven | learned invariance may erase within-class change and boundary detail |
+| future-JEPA plus physical grounding | predicts multi-horizon EMA-teacher states from past-only context, decodes fixed physical features, and controls patch collapse | temporal dynamics and physically informative local representations without labels | implemented; application benefit unproven | predictable dynamics can still smooth rare changes or omit unpredictable detail |
 
 ### 4.1 What the current clean pretraining recipe does not enforce
 
@@ -169,9 +169,9 @@ gravity removal, and text perturbation probabilities to zero. This makes the ref
 simple and avoids training away unmeasured task information. It also means robustness to those
 changes does not arise from an explicit positive-pair objective.
 
-The label-free JEPA and VICReg objectives operate on views of the same source window. They do not
-explicitly identify walking from different datasets, two subjects performing the same exercise, or
-two placements observing one synchronized movement as positives. The frontend can make those inputs
+The label-free future-JEPA objective operates within one source window. It does not explicitly
+identify walking from different datasets, two subjects performing the same exercise, or two
+placements observing one synchronized movement as equivalent. The frontend can make those inputs
 physically better formed, but the objective is not directly teaching cross-source movement identity.
 
 Neither frontend is inherently rotation invariant. The fixed arm computes per-axis band energy and

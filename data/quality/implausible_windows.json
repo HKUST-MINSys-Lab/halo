@@ -1,6 +1,6 @@
 {
   "alignment": "native",
-  "grid_fingerprint": "bfbb5e403f1a3a10f180fec98c4c9ebcfce007f6f4fcce10e993069d858e942d",
+  "grid_fingerprint": "b3f4b653a9a5575dbbd5a54d3225ba74ad563d0e58ba7642963eca010139d848",
   "stream_fingerprints": {
     "capture24/watch_wrist": "e035c8696d0246a5162d3358ffe4febd77855ec1f10501611a92ba557ba22f78",
     "dsads/chest": "4acc820b6178979f4fd55bb6881155c11232323cc8590281cd6940343be08f03",
@@ -11,14 +11,15 @@
     "extrasensory/phone_hand": "7b41fe2d4410c312125567e94fce257c19f683bc9ee23bda2836ebcb0b292d85",
     "extrasensory/phone_pocket": "6362d9e17321b37111e941c330722c3121966b6bcfc84ac401c026afaa099a08",
     "extrasensory/watch_wrist": "c366998dbbdbef07fc326e2fbc64126daa13375746bce2f8f265e2471a7ec8c6",
-    "forth_trace/left_ankle": "ee0e6111330863c84f0b3d7466d5be91a18e93e0e498c4f479ee2fb1c0e54ea9",
-    "forth_trace/left_wrist": "0f26fcf0e3c8c473b7c291925fd3f087238b0ec03afd87bb780bb92e47be3e33",
-    "forth_trace/right_thigh": "6c4fbb6b096957be9fccb6369f58e23c2cfaaf1e725845c941f865863179da8c",
-    "forth_trace/right_wrist": "9e94e9c78370d88aa8b1d0edb1496ac953dc2639fee8e805403edf6637067396",
-    "forth_trace/torso": "e0ec90fb641d794f444c0b72fdbce73d8a9194af11377f0bd7680a07e4e6e9b2",
+    "forth_trace/left_ankle": "a6ff59c388822cc3652b0566063c1a7998cdb25183d197f0c6b7927792a223c7",
+    "forth_trace/left_wrist": "789ed3b0447f7bcf7bfb21373f164db7f7b0119bce2d1b4322b7d80e267f716c",
+    "forth_trace/right_thigh": "4fde337f50f541a53c3810396499478b478f9538a5841f377c1a1908db9e308c",
+    "forth_trace/right_wrist": "a9ae558735df80ff36692f1068d7b99d22f574051787f6753c6a4a8a2a4bf93c",
+    "forth_trace/torso": "e363d098ef088fdeb9c967f9b93a97d314ba025ec90ed33113c279756351fa72",
     "hapt/phone_waist": "2f2a2ec0612f58a21c9a2c721215e236e39c51ad4911378132ba60c64b08beeb",
-    "harmes/watch_wrist": "3c15c75d02e86087edf35aebd25e049c5ce7e9105c01ab18b8d602ee3be1db69",
-    "hhar/phone_waist": "17c8e9324d85ed8d1b61bb313a689e548e1bf0ac526e1c9c9974c91c54dbffcc",
+    "harmes/watch_wrist": "ba96cf5fe792920a2ea9928a756274c59a97aab63c6f9b469ff386deb93bd46b",
+    "hhar/phone_waist": "868060b09ba929dd62788f7e9726469493d390e3ec2ff9631ac294403bf16535",
+    "hhar/phone_waist_accel_only": "b3753f43d1b3b49eecfa2432c67c3e329df5b58d2a87f45229a5917794c548c3",
     "hmog/phone_hand": "d79e4bde8368a6a0ea1decb6b7de71af7b54f743ad93eda51b575f63496e3043",
     "inclusivehar/phone_waist": "2c0a3fa6bfbc215082d62f613934112043762b09c7dc28844c35cc4e7d550197",
     "kneepad/left_gastrocnemius": "dc0c056f3cfd2cc39c287a750a660d146c76f95724ab6108d20e370a8ef2f8ee",
@@ -79,8 +80,8 @@
     "upper_limb_use/patient_unaffected_wrist": "ae52f2ff29678c46cce2e5209bfbb03eb82134231f6770842b5a65337f438a0a",
     "usc_had/phone_hip": "ae9119aa5ee79a091e4f74b1d41984b21cbf65e34046a38a0eb3feb4157895bc",
     "ut_complex/watch_wrist": "9163bd50fc5b536b037c6f067138b76b5090ebc7a18ad25721b19960fd0a199d",
-    "wisdm/phone_pocket": "ee7a1eb63a3a543a30a32b040a3e08da2831b233f033bf7eb2924cf90f53123d",
-    "wisdm/watch_wrist": "baec2c2fd17d5ac7eefbc0342d3cd835827b2ec15ef636dab8a235f76f013668",
+    "wisdm/phone_pocket": "833419ddb1e9ec663772c3c345506d83e0ee399a455123ccdba5f0bb82eb930e",
+    "wisdm/watch_wrist": "e18cb783a04fbfd43fec8d70a101cd322ba5c306a5d3e4ebfef84e07e0c07b2f",
     "xrf_v2/airpods_ear": "196f7670ae42f42bfd99eeb3eb03964fe96327d94fe5970b073ee84711c7b7fb",
     "xrf_v2/glasses": "bdf123a0292a25a2a82ae335c3aa3fbecfed63af9a9b0e7eb8c1ae7e85f29c1e",
     "xrf_v2/left_pocket": "a227d84a965b0f8d93167b962e11f8a6208dbc66ebad5da2f684943976277612",
@@ -194,14 +195,6 @@
     ],
     "phytmo/left_shin": [
       2295
-    ],
-    "wisdm/phone_pocket": [
-      6408,
-      21761
-    ],
-    "wisdm/watch_wrist": [
-      8889,
-      16367
     ]
   },
   "summary": [
@@ -227,22 +220,6 @@
       5130,
       18.417499542236328,
       16.445100784301758,
-      0
-    ],
-    [
-      "wisdm/phone_pocket",
-      2,
-      40213,
-      34.98486328125,
-      8.00248908996582,
-      0
-    ],
-    [
-      "wisdm/watch_wrist",
-      2,
-      32014,
-      34.917301177978516,
-      8.00248908996582,
       0
     ]
   ]

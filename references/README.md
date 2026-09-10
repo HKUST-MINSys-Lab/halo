@@ -14,18 +14,19 @@ tracked locators from which a clean checkout can recover them.
 
 ## Current inventory
 
-There are 46 dataset entries and 9 baseline entries, with 55 parseable `citation.json` files, 56
-locally readable PDFs, and 7 saved HTML documents (counted 2026-08-31). Every entry has a
+There are 52 dataset entries and 9 baseline entries, with 61 parseable `citation.json` files, 64
+locally readable PDFs, and 7 saved HTML documents (counted 2026-09-09). Every entry has a
 `citation.json` and `SOURCE.txt`.
 
 Dataset entries:
 
-`aidlab_har`, `alameda`, `c_mhad`, `capture24`, `cops`, `crossfit`, `dsads`, `extrasensory`,
-`forth_trace`, `hapt`, `harmes`, `harth`, `hhar`, `hmog`, `inclusivehar`, `kneepad`, `kuhar`,
-`mhealth`, `mmfit`, `mobiact`, `monipar`, `motionsense`, `nfi_fared`, `nhanes`, `oca`, `openpack`,
-`opportunity`, `pamap2`, `phytmo`, `realdisp`, `realworld`, `recgym`, `recofit`, `rehab120`,
-`shoaib`, `sp_sw_har`, `spar`, `tnda_har`, `uci_har`, `unimib_shar`, `upper_limb_use`, `usc_had`,
-`ut_complex`, `wear`, `wisdm`, and `xrf_v2`.
+`100style`, `aidlab_har`, `alameda`, `amass`, `c_mhad`, `capture24`, `cops`, `crossfit`, `dsads`,
+`ego_exo4d`, `embody3d`, `extrasensory`, `forth_trace`, `hapt`, `harmes`, `harth`, `hhar`, `hmog`,
+`inclusivehar`, `kneepad`, `kuhar`, `mhealth`, `mmfit`, `mobiact`, `monipar`, `motion_x`,
+`motionsense`, `nfi_fared`, `nhanes`, `nymeria`, `oca`, `openpack`, `opportunity`, `pamap2`,
+`phytmo`, `realdisp`, `realworld`, `recgym`, `recofit`, `rehab120`, `shoaib`, `sp_sw_har`, `spar`,
+`tnda_har`, `uci_har`, `unimib_shar`, `upper_limb_use`, `usc_had`, `ut_complex`, `wear`, `wisdm`,
+and `xrf_v2`.
 
 Baseline entries retained for representation comparison and historical reproduction:
 

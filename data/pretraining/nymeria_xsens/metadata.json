@@ -1,0 +1,43 @@
+{
+  "dataset": "nymeria_xsens",
+  "display_name": "Nymeria - Xsens MVN Link 17-tracker suit (8 placements)",
+  "sampling_rate_hz": 240.0,
+  "pre_windowed": false,
+  "streaming_grid": true,
+  "role": "pretrain_scale",
+  "phase_a_only": true,
+  "activities": [],
+  "num_subjects": null,
+  "channels": [
+    "acc_x",
+    "acc_y",
+    "acc_z",
+    "gyro_x",
+    "gyro_y",
+    "gyro_z"
+  ],
+  "core_channels": {
+    "acc_x": "acc_x",
+    "acc_y": "acc_y",
+    "acc_z": "acc_z",
+    "gyro_x": "gyro_x",
+    "gyro_y": "gyro_y",
+    "gyro_z": "gyro_z"
+  },
+  "extra_channels": [],
+  "placement": "eight of the suit's seventeen trackers, simultaneous: head, sternum (T8), pelvis, left forearm, right forearm, right upper arm, right thigh, right shank",
+  "stream_tokens": [
+    "xsens_head",
+    "xsens_sternum",
+    "xsens_pelvis",
+    "xsens_lforearm",
+    "xsens_rforearm",
+    "xsens_rupperarm",
+    "xsens_rthigh",
+    "xsens_rshank"
+  ],
+  "unit": "g",
+  "gravity_state": "present",
+  "note": "Device-frame accelerometer reconstructed from MVNX sensorFreeAcceleration (gravity-removed, global frame) rotated by sensorOrientation with +9.80665 m/s^2 re-added along the world up axis, then divided by 9.80665 -> g with gravity PRESENT. Gyroscope is segment angularVelocity (global) rotated into the same sensor frame; rad/s. Falls back to segment acceleration + orientation when sensor-level fields are absent (recorded in manifest.json as acceleration_source). Unlabeled: reserved marker __unlabeled__, Phase-A only. Grids are float16.",
+  "grid_dtype": "float16"
+}

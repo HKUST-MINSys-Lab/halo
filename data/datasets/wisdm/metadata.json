@@ -1,7 +1,6 @@
 {
   "display_name": "WISDM",
-  "num_sessions": 164623,
-  "num_sessions_subsampled": 15000,
+  "num_sessions": 2012,
   "sampling_rate_hz": 20,
   "channels": [
     "phone_accel_x",

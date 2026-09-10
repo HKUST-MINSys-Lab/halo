@@ -1,0 +1,15 @@
+{
+  "name": "amass",
+  "category": "datasets",
+  "paper_title": "AMASS: Archive of Motion Capture as Surface Shapes",
+  "authors": "Naureen Mahmood, Nima Ghorbani, Nikolaus F. Troje, Gerard Pons-Moll, Michael J. Black",
+  "year": "2019",
+  "venue": "IEEE/CVF International Conference on Computer Vision (ICCV) 2019, pp. 5442-5451",
+  "doi": "10.1109/ICCV.2019.00554",
+  "paper_url": "https://openaccess.thecvf.com/content_ICCV_2019/html/Mahmood_AMASS_Archive_of_Motion_Capture_As_Surface_Shapes_ICCV_2019_paper.html",
+  "pdf_url": "https://openaccess.thecvf.com/content_ICCV_2019/papers/Mahmood_AMASS_Archive_of_Motion_Capture_As_Surface_Shapes_ICCV_2019_paper.pdf",
+  "data_or_code_url": "https://amass.is.tue.mpg.de/",
+  "license": "Non-commercial scientific research licence (free registration at amass.is.tue.mpg.de); commercial use requires contacting ps-license@tue.mpg.de",
+  "bibtex": "@inproceedings{mahmood2019amass,\n  title     = {AMASS: Archive of Motion Capture as Surface Shapes},\n  author    = {Mahmood, Naureen and Ghorbani, Nima and Troje, Nikolaus F. and Pons-Moll, Gerard and Black, Michael J.},\n  booktitle = {Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV)},\n  pages     = {5442--5451},\n  year      = {2019},\n  doi       = {10.1109/ICCV.2019.00554},\n  url       = {https://amass.is.tue.mpg.de/}\n}",
+  "notes": "Unifies 15 pre-existing optical marker-based motion-capture datasets (e.g. CMU, HumanEva, TotalCapture, ACCAD, BMLmovi) into one consistent SMPL/SMPL-H parameterisation via the MoSh++ pipeline (marker-to-shape fitting). ~40 hours of mocap, 344 subjects, 11,265 motions (verified as the exact motion count via multiple secondary sources; abstract/README figures commonly round this to '~11,000'). Non-commercial licence with free registration at amass.is.tue.mpg.de; the loader/preparation code (github.com/nghorbani/amass) is MIT-licensed but the DATA itself is under the MPI-IS non-commercial research licence, and commercial use requires contacting ps-license@tue.mpg.de. IMPORTANT for this repo: AMASS contains no raw inertial sensor readings at all -- it is pure SMPL/SMPL-H pose-and-shape parameters recovered from optical mocap. Here it is used only as a source of high-fidelity body kinematics from which synthetic IMU streams are generated (e.g. via virtual sensor placement + finite-difference/simulated accelerometer-gyroscope derivation), not as a real-inertial-data source. Verified 2026-09-09."
+}

@@ -1,0 +1,42 @@
+{
+  "dataset": "nymeria",
+  "display_name": "Nymeria (Xsens 17-IMU suit + Aria head/wrist)",
+  "pre_windowed": false,
+  "streaming_grid": true,
+  "role": "pretrain_scale",
+  "phase_a_only": true,
+  "activities": [],
+  "num_subjects": null,
+  "channels": [
+    "acc_x",
+    "acc_y",
+    "acc_z",
+    "gyro_x",
+    "gyro_y",
+    "gyro_z"
+  ],
+  "core_channels": {
+    "acc_x": "acc_x",
+    "acc_y": "acc_y",
+    "acc_z": "acc_z",
+    "gyro_x": "gyro_x",
+    "gyro_y": "gyro_y",
+    "gyro_z": "gyro_z"
+  },
+  "extra_channels": [],
+  "placement": "eight simultaneous body placements: head, sternum (T8), pelvis, left/right forearm, right upper arm, right thigh, right shank (Xsens MVN Link suit) plus head and both wrists (Project Aria headset + miniAria wristbands)",
+  "is_module_descriptor": true,
+  "grid_builder_datasets": [
+    "nymeria_xsens",
+    "nymeria_aria"
+  ],
+  "note": "MODULE DESCRIPTOR ONLY. Deliberately NOT named metadata.json: data/scripts/curate/corpus_roots.py treats any directory containing a metadata.json as a dataset, so a metadata.json here would make 'nymeria' a phantom third dataset beside the two real ones. It also carries no scalar sampling_rate_hz, because this module produces TWO native rates -- the Xsens suit at 240 Hz and the decimated Aria IMUs at 200 Hz -- and build_grids.py reads one rate per dataset directory. convert.py copies the two templates above into data/pretraining/nymeria_xsens/metadata.json and data/pretraining/nymeria_aria/metadata.json, which is where corpus_roots.dataset_root() resolves them. Label-free: every session carries the reserved marker __unlabeled__; Phase-A self-supervision only, never a Phase-B evidence-bank source. Licence CC BY-NC 4.0 (non-commercial).",
+  "sampling_rate_hz_by_dataset": {
+    "nymeria_xsens": 240.0,
+    "nymeria_aria": 200.0
+  },
+  "dataset_metadata_templates": {
+    "nymeria_xsens": "nymeria_xsens.metadata.json",
+    "nymeria_aria": "nymeria_aria.metadata.json"
+  }
+}

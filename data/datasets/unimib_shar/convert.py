@@ -62,11 +62,13 @@ def process(acc_data, acc_labels):
     shutil.rmtree(sessions_dir, ignore_errors=True)   # clear stale (e.g. old CSV-based) sessions
     sessions_dir.mkdir(parents=True, exist_ok=True)
     labels_dict = {}
+    recordings = {}
     subjects = set()
 
     for i in range(acc_data.shape[0]):
         activity_id = int(acc_labels[i][0])
         subject_id = int(acc_labels[i][1])
+        trial_id = int(acc_labels[i][2])
         if activity_id not in ACTIVITIES:
             continue
         activity_name = ACTIVITIES[activity_id]
@@ -86,9 +88,13 @@ def process(acc_data, acc_labels):
         session_dir.mkdir(exist_ok=True)
         frame.to_parquet(session_dir / "data.parquet", index=False)
         labels_dict[session_id] = [activity_name]
+        # Distributed windows from one subject/activity/trial heavily overlap. The release's trial
+        # id is therefore the physical execution boundary used by enrollment leakage guards.
+        recordings[session_id] = f"subject{subject_id:02d}_act{activity_id:02d}_trial{trial_id:02d}"
         subjects.add(subject_id)
 
     (OUTPUT_DIR / "labels.json").write_text(json.dumps(labels_dict, indent=2))
+    (OUTPUT_DIR / "recordings.json").write_text(json.dumps(recordings, indent=2))
     print(f"Created {len(labels_dict)} sessions across {len(subjects)} subjects")
     return labels_dict, sorted(subjects)
 

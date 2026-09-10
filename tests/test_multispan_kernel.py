@@ -223,6 +223,27 @@ def test_gradients_reach_every_parameter(tokenizer):
         assert float(parameter.grad.abs().sum()) > 0, f"{name} gradient is identically zero"
 
 
+def test_past_only_grid_cannot_read_or_backpropagate_through_future_signal():
+    torch.manual_seed(19)
+    module = MultiSpanKernelTokenizer(d_model=16, spans=(0.5, 1.0, 1.5)).eval()
+    patches = torch.randn(1, 6, 50, 3, requires_grad=True)
+    changed = patches.detach().clone()
+    changed[:, 3:] += 1000.0
+    lengths = torch.full((1, 6), 50, dtype=torch.long)
+    prefix = torch.tensor([[True, True, True, False, False, False]])
+    kwargs = {"patch_mask": prefix, "grid_duration_seconds": torch.tensor([6.0])}
+    with torch.no_grad():
+        original = module.token_grid(patches.detach(), 50.0, lengths, **kwargs)
+        perturbed = module.token_grid(changed, 50.0, lengths, **kwargs)
+    assert torch.equal(original["token_mask"], perturbed["token_mask"])
+    assert torch.allclose(original["tokens"], perturbed["tokens"], atol=1e-6)
+
+    output = module.token_grid(patches, 50.0, lengths, **kwargs)
+    output["tokens"][output["token_mask"]].square().mean().backward()
+    assert patches.grad[:, :3].abs().sum() > 0
+    assert patches.grad[:, 3:].abs().sum() == 0
+
+
 def test_norm_statistics_round_trip_and_ignore_absent_channels():
     torch.manual_seed(0)
     reference = MultiSpanKernelTokenizer(d_model=16).eval()
