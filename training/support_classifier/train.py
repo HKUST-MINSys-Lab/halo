@@ -1152,10 +1152,8 @@ def main() -> None:
         # exact-key support), so it enters the learned path only when acquisition text is ON.
         comparator = SupportComparator(spec, ComparatorConfig(
             readout=args.comparator_readout,
-            use_descriptor=False,
         )).to(device)
-    print(f"[compare] comparator readout={comparator.cfg.readout} "
-          f"use_descriptor={comparator.cfg.use_descriptor}", flush=True)
+    print(f"[compare] comparator readout={comparator.cfg.readout}", flush=True)
     if hasattr(encoder, "mask_token"):
         encoder.mask_token.requires_grad_(False)
     if args.freeze_encoder:

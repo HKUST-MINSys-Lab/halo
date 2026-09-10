@@ -30,7 +30,6 @@ class ComparatorConfig:
     n_slots: int = 64
     identity_gain_init: float = 0.25
     readout: str = "sensor_only"
-    use_descriptor: bool = False
 
     def __post_init__(self) -> None:
         if self.readout != "sensor_only":
@@ -42,6 +41,8 @@ class ComparatorConfig:
 def comparator_config_from_checkpoint(saved: dict) -> ComparatorConfig:
     """Restore only checkpoints made by the retained architecture."""
     config = dict(saved)
+    # Pre-cleanup sensor-only checkpoints carried this inert compatibility switch.
+    config.pop("use_descriptor", None)
     if config.get("readout", "sensor_only") != "sensor_only":
         raise ValueError("checkpoint uses a retired support-classifier readout")
     return ComparatorConfig(**config)

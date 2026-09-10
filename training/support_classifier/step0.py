@@ -83,10 +83,9 @@ def main() -> None:
     # Written by our own Phase-A trainer; `config` holds plain Python values beside the tensors.
     checkpoint = torch.load(args.phase_a, map_location="cpu", weights_only=False)
     d_model = int(checkpoint["config"].get("d_model", 128))
-    neutral = bool(checkpoint["config"].get("neutral_acquisition_text", False))
     spec = AttentionSpec(d_model=d_model, n_heads=args.n_heads, ffn_mult=2, dropout=0.1)
     comparator = SupportComparator(spec, ComparatorConfig(
-        n_layers=args.n_layers, readout=args.comparator_readout, use_descriptor=not neutral,
+        n_layers=args.n_layers, readout=args.comparator_readout,
     ))
 
     gap = assert_identity_at_init(comparator, center=args.center_features)
@@ -100,7 +99,7 @@ def main() -> None:
         "comparator": comparator.state_dict(),
         "comparator_config": dataclasses.asdict(comparator.cfg),
         "attention_spec": dataclasses.asdict(spec),
-        "args": {"neutral_acquisition_text": neutral, "phase_a": str(args.phase_a),
+        "args": {"phase_a": str(args.phase_a),
                  "center_features": bool(args.center_features)},
         "step": 0,
         "identity_gap": gap,

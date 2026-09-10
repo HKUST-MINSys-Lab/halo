@@ -39,19 +39,19 @@ def _episode(B=2, C=4, K=6, seed=0):
     }
 
 
-def _module(use_descriptor=False, wake=0.0):
+def _module(wake=0.0):
     torch.manual_seed(0)
     m = SupportComparator(SPEC, ComparatorConfig(
-        text_dim=TEXT, n_layers=2, n_slots=16, readout="sensor_only", use_descriptor=use_descriptor,
+        text_dim=TEXT, n_layers=2, n_slots=16, readout="sensor_only",
     )).eval()
     if wake:
         torch.nn.init.normal_(m.shift_head.weight, std=wake)
     return m
 
 
-def test_default_config_is_sensor_only_without_descriptor():
+def test_default_config_is_sensor_only():
     cfg = ComparatorConfig()
-    assert cfg.readout == "sensor_only" and cfg.use_descriptor is False
+    assert cfg.readout == "sensor_only"
     with pytest.raises(ValueError):
         ComparatorConfig(readout="attention")
 
