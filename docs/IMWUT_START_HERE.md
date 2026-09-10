@@ -46,6 +46,11 @@ The support-conditioned classifier is an encoder-transfer control. It is distinc
 from Task 1: Task 1 aligns a reference sequence against a complete query timeline;
 the classifier scores a bounded query against candidate-labelled support executions.
 
+The agreed direction for complete recordings, training crops, and efficient length grouping is
+specified in [RECORDING_LENGTH_BATCHING_PLAN.md](design/RECORDING_LENGTH_BATCHING_PLAN.md).
+Its status section distinguishes the implemented Task-1 frozen-representation path from the pending
+raw-input and end-to-end encoder work.
+
 ## Data and results
 
 The application manifests define the only labelled sources that may enter each

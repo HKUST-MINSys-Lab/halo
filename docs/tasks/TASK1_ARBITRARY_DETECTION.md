@@ -5,14 +5,15 @@
 > representation contracts, and reporting rules remain in the documents linked from
 > [`docs/README.md`](../README.md).
 
-**Implementation status, 2026-08-31.** Native-time cache episodes, independent reference/query
+**Implementation status, 2026-09-10.** Native-time cache episodes, independent reference/query
 construction, join guards, target-absent episodes, bounded open-begin/open-end soft-DTW, endpoint
 training, temporal suppression, and encoder/head gradient telemetry are mechanically implemented.
 Cached pair preflight now rejects changes in device family, placement, canonical channel set, or
 gravity convention.
-Short real-cache smokes pass. The recording cohort and frozen HALO representation-cache format are
-implemented; task-specific episode manifests, threshold calibration, long training, and sealed
-evaluation remain deliberately outstanding.
+Short real-cache smokes pass. Task-specific manifests, development threshold calibration, and
+sealed evaluation use declared recording intervals. Training uses a versioned complete/cropped
+query policy; [RECORDING_LENGTH_BATCHING_PLAN.md](../design/RECORDING_LENGTH_BATCHING_PLAN.md)
+defines the implementation and telemetry contract.
 
 Before constructing a training `DataLoader`, run `audit_cached_event_pairs` and persist both its
 eligible pair list and its rejected pair reasons in the task manifest. Events crossing invalid
@@ -40,10 +41,13 @@ or clinician confirms that it is the intended task.
 
 ## 2. Episode representation
 
-The canonical training query is **120 physical seconds**, independent of sampling rate. This is long
-enough to contain targets, hard distractors, and meaningful target-absent background while producing
-only about 120 positions for an encoder with one-second patches. Longer deployment recordings are
-processed in overlapping 120-second blocks and detections are merged in physical time.
+The primary query is the complete declared source interval, independent of sampling rate. A declared
+interval can be a source-native monitoring block when its annotations and negative-background claims
+apply to that block. Training mixes complete query views with contiguous crops. In a cropped logical
+batch, a duration observed in the central ranks of that batch becomes the cap; shorter recordings
+remain complete. Evaluation uses the complete declared interval and never applies a stochastic crop.
+This produces varied durations while controlling padding without treating one fixed duration as a
+scientific property of the method.
 
 Reference duration remains variable. References are padded only within a batch and carry an honest
 valid-time mask. The common episode schema is:
@@ -52,7 +56,7 @@ valid-time mask. The common episode schema is:
 reference:
     one independently recorded execution, variable duration
 query:
-    120 s continuous or constructed timeline
+    complete declared continuous or constructed timeline; training may use a recorded crop view
 targets:
     zero or more [start_sec, end_sec] intervals
 metadata:
@@ -61,9 +65,9 @@ masks:
     valid samples/patches, padding, and artificial-join guard intervals
 ```
 
-The 120-second choice is an initial engineering default, not a scientific claim. A 60-second arm may
-be profiled for end-to-end training throughput, but all methods in a comparison receive the same
-physical query duration.
+Every method in a comparison receives the same declared query intervals and the same pre-generated
+training view plan. A cropped cached embedding is labelled as a full-context feature crop; an
+input-truncation experiment crops the raw signal before encoding.
 
 ## 3. Data pools
 

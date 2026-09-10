@@ -24,6 +24,12 @@ import numpy as np
 import torch
 
 from applications.motion_monitoring.data.examples import open_cache
+from applications.motion_monitoring.batching import (
+    central_duration_cap,
+    nearest_length_indices,
+    padding_fraction,
+    plan_duration,
+)
 from applications.motion_monitoring.data.manifests import read_cohort_manifest
 from applications.motion_monitoring.evaluation import fingerprint_protocol
 from applications.motion_monitoring.evaluation_manifests import (
@@ -61,7 +67,7 @@ def _crop_sequence(sequence: EmbeddingSequence, start: float, end: float) -> Emb
     )
 
 
-def _training_episode(unit, recordings, representations, *, seconds: float, rng):
+def _training_episode(unit, recordings, representations, *, seconds: float | None, rng):
     reference_recording = recordings[unit.reference_cache_index]
     query_recording = recordings[unit.query_cache_index]
     reference = from_motion_sequence(
@@ -76,10 +82,13 @@ def _training_episode(unit, recordings, representations, *, seconds: float, rng)
     query = from_motion_sequence(
         representations.get(unit.dataset, unit.query_recording_id, unit.query_stream_id)
     )
+    # A manifest block is a declared query unit, not a training convenience crop.
+    if getattr(unit, "query_interval_sec", None) is not None:
+        query = _crop_sequence(query, *map(float, unit.query_interval_sec))
     timeline_start = float(query.intervals_sec[0, 0])
     timeline_end = float(query.intervals_sec[-1, 1])
-    width = min(seconds, timeline_end - timeline_start)
-    if unit.target_intervals_sec:
+    width = timeline_end - timeline_start if seconds is None else min(seconds, timeline_end - timeline_start)
+    if width < timeline_end - timeline_start - 1e-9 and unit.target_intervals_sec:
         target_start, target_end = rng.choice(unit.target_intervals_sec)
         low = max(timeline_start, target_end - width)
         high = min(target_start, timeline_end - width)
@@ -99,11 +108,13 @@ def _training_episode(unit, recordings, representations, *, seconds: float, rng)
         )
         if crop_start is None:
             raise ValueError("no training crop preserves every intersected target")
-    else:
+    elif width < timeline_end - timeline_start - 1e-9:
         high = max(timeline_start, timeline_end - width)
         crop_start = timeline_start if high <= timeline_start else rng.uniform(timeline_start, high)
+    else:
+        crop_start = timeline_start
     query = _crop_sequence(query, crop_start, crop_start + width)
-    return episode_from_recordings(
+    episode = episode_from_recordings(
         reference_recording,
         query_recording,
         reference,
@@ -117,6 +128,85 @@ def _training_episode(unit, recordings, representations, *, seconds: float, rng)
         reference_rng=rng,
         guard_intervals_sec=unit.guard_intervals_sec,
     )
+    return replace(
+        episode,
+        metadata={
+            **episode.metadata,
+            "query_view_mode": (
+                "complete" if width >= timeline_end - timeline_start - 1e-9 else "cropped"
+            ),
+            "query_source_duration_sec": timeline_end - timeline_start,
+            "query_retained_duration_sec": width,
+        },
+    )
+
+
+def _query_duration(unit, representations) -> float:
+    """Declared query duration before any stochastic training crop."""
+
+    sequence = from_motion_sequence(
+        representations.get(unit.dataset, unit.query_recording_id, unit.query_stream_id)
+    )
+    if getattr(unit, "query_interval_sec", None) is not None:
+        sequence = _crop_sequence(sequence, *map(float, unit.query_interval_sec))
+    return float(sequence.intervals_sec[-1, 1] - sequence.intervals_sec[0, 0])
+
+
+def _draw_logical_units(groups, datasets_by_status, *, batch_size: int, rng):
+    """Draw relationships first; duration planning cannot alter this distribution."""
+
+    units = []
+    for index in range(batch_size):
+        status = bool(index % 2)
+        dataset = rng.choice(datasets_by_status[status])
+        units.append(rng.choice(groups[(status, dataset)]))
+    return units
+
+
+def _draw_length_matched_units(
+    groups,
+    datasets_by_status,
+    *,
+    batch_size: int,
+    representations,
+    rng,
+    candidate_multiplier: int = 4,
+):
+    """Choose a balanced logical batch from a small, random length candidate pool."""
+
+    if candidate_multiplier < 1:
+        raise ValueError("candidate multiplier must be positive")
+    pool = _draw_logical_units(
+        groups, datasets_by_status, batch_size=batch_size * candidate_multiplier, rng=rng
+    )
+    durations = [_query_duration(unit, representations) for unit in pool]
+    target = central_duration_cap(durations, rng)
+    selected = []
+    for status in (False, True):
+        candidates = [index for index, unit in enumerate(pool) if unit.target_present == status]
+        required = sum(bool(index % 2) == status for index in range(batch_size))
+        if required == 0:
+            continue
+        local = nearest_length_indices(
+            [durations[index] for index in candidates],
+            count=required,
+            target_seconds=target,
+            rng=rng,
+        )
+        selected.extend(candidates[index] for index in local)
+    rng.shuffle(selected)
+    return [pool[index] for index in selected]
+
+
+def _minimum_target_duration(units) -> float:
+    """Smallest shared query cap that can retain every selected complete target."""
+
+    durations = [
+        float(end - start)
+        for unit in units
+        for start, end in unit.target_intervals_sec
+    ]
+    return max(durations, default=0.0)
 
 
 def _pooled_metrics(rows: list[dict[str, float]]) -> dict[str, float]:
@@ -207,6 +297,17 @@ OPERATING_POINT_PROTOCOL: dict[str, Any] = {
     ),
     "nms_iou": 0.3,
     "match_iou": 0.5,
+}
+
+# This records how the frozen-representation trainer formed query views.  It is
+# saved with the head because a crop of cached contextual features is not the
+# same experimental condition as cropping raw signal before an end-to-end pass.
+TRAINING_VIEW_POLICY: dict[str, Any] = {
+    "schema_version": 1,
+    "query_views": "complete-or-central-duration-crop",
+    "complete_batch_length_matching": "bounded_candidate_pool",
+    "reference_views": "complete_bounded_execution_only",
+    "positive_crop_rule": "retain_an_entire_target_or_reject",
 }
 
 
@@ -544,7 +645,7 @@ def fit_head(
     feature_dim: int,
     steps: int,
     batch_size: int,
-    query_seconds: float,
+    query_seconds: float | None,
     projection_dim: int,
     learning_rate: float,
     weight_decay: float,
@@ -552,11 +653,17 @@ def fit_head(
     telemetry_every: int,
     seed: int,
     device: str,
+    query_complete_probability: float = 0.0,
+    adaptive_query_duration: bool = False,
 ) -> tuple[DifferentiableSubsequenceMatcher, list[dict[str, Any]], int]:
     """Train one head on ``units``; return (model, telemetry, episode rejections)."""
 
-    if steps <= 0 or batch_size <= 0 or query_seconds <= 0:
-        raise ValueError("steps, batch size, and query duration must be positive")
+    if steps <= 0 or batch_size <= 0:
+        raise ValueError("steps and batch size must be positive")
+    if query_seconds is not None and query_seconds <= 0:
+        raise ValueError("query duration cap must be positive when supplied")
+    if not 0 <= query_complete_probability <= 1:
+        raise ValueError("query complete probability must be in [0, 1]")
     if telemetry_every <= 0:
         raise ValueError("telemetry interval must be positive")
     if learning_rate <= 0 or weight_decay < 0:
@@ -581,30 +688,89 @@ def fit_head(
     rejection_count = 0
     for step in range(steps):
         episodes = []
-        attempts = 0
-        while len(episodes) < batch_size and attempts < batch_size * 20:
-            status = bool(len(episodes) % 2)
-            dataset = rng.choice(datasets_by_status[status])
-            unit = rng.choice(groups[(status, dataset)])
-            attempts += 1
-            try:
-                episodes.append(
-                    _training_episode(
-                        unit,
-                        recording_caches[unit.dataset],
-                        representations,
-                        seconds=query_seconds,
-                        rng=rng,
-                    )
+        duration_plan = None
+        used_cap = None
+        for _ in range(20):
+            # Pick the view mode before length matching. Complete views use a bounded random
+            # candidate pool to control padding; cropped views preserve a directly sampled mix.
+            complete = rng.random() < query_complete_probability
+            if complete:
+                logical_units = _draw_length_matched_units(
+                    groups, datasets_by_status, batch_size=batch_size,
+                    representations=representations, rng=rng,
                 )
-            except ValueError:
+                duration_plan = plan_duration(
+                    [_query_duration(unit, representations) for unit in logical_units],
+                    complete_probability=1.0, rng=rng,
+                )
+            else:
+                logical_units = _draw_logical_units(
+                    groups, datasets_by_status, batch_size=batch_size, rng=rng
+                )
+                if adaptive_query_duration:
+                    duration_plan = plan_duration(
+                        [_query_duration(unit, representations) for unit in logical_units],
+                        complete_probability=0.0, rng=rng,
+                    )
+                else:
+                    if query_seconds is None:
+                        raise ValueError(
+                            "a fixed cropped view requires --query-seconds; "
+                            "enable adaptive query duration for observed caps"
+                        )
+                    duration_plan = DurationPlan("cropped", query_seconds, query_seconds)
+            cap = duration_plan.cap_seconds
+            if cap is not None:
+                cap = max(cap, _minimum_target_duration(logical_units))
+            if cap is not None and query_seconds is not None:
+                cap = min(cap, query_seconds)
+            if cap is not None and cap + 1e-9 < _minimum_target_duration(logical_units):
+                # An explicit engineering cap cannot create a partial positive target.
                 rejection_count += 1
+                continue
+            candidate_episodes = []
+            for unit in logical_units:
+                try:
+                    candidate_episodes.append(
+                        _training_episode(
+                            unit,
+                            recording_caches[unit.dataset],
+                            representations,
+                            seconds=cap,
+                            rng=rng,
+                        )
+                    )
+                except ValueError:
+                    rejection_count += 1
+                    break
+            if len(candidate_episodes) == batch_size:
+                episodes = candidate_episodes
+                used_cap = cap
+                break
         if len(episodes) < batch_size:
             raise RuntimeError("could not assemble a complete eligible Task-1 batch")
         batch = collate_detection_episodes(episodes).to(device)
         result = train_step(model, batch, optimizer, grad_clip=grad_clip)
         if step == 0 or (step + 1) % telemetry_every == 0 or step + 1 == steps:
-            telemetry.append({"step": step + 1, "loss": result.loss, **result.telemetry})
+            query_lengths = [int(item.query.valid.sum()) for item in episodes]
+            reference_lengths = [int(item.reference.valid.sum()) for item in episodes]
+            retained = [float(item.metadata["query_retained_duration_sec"]) for item in episodes]
+            source = [float(item.metadata["query_source_duration_sec"]) for item in episodes]
+            telemetry.append({
+                "step": step + 1,
+                "loss": result.loss,
+                **result.telemetry,
+                "batch/query_padding_fraction": padding_fraction(query_lengths),
+                "batch/reference_padding_fraction": padding_fraction(reference_lengths),
+                "batch/query_source_duration_mean_sec": float(np.mean(source)),
+                "batch/query_retained_duration_mean_sec": float(np.mean(retained)),
+                "batch/query_complete_fraction": float(np.mean([
+                    item.metadata["query_view_mode"] == "complete" for item in episodes
+                ])),
+                "batch/query_duration_cap_sec": (
+                    0.0 if used_cap is None else float(used_cap)
+                ),
+            })
     model.eval()
     return model, telemetry, rejection_count
 
@@ -642,6 +808,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         steps=args.steps,
         batch_size=args.batch_size,
         query_seconds=args.query_seconds,
+        query_complete_probability=args.query_complete_probability,
+        adaptive_query_duration=True,
         projection_dim=args.projection_dim,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
@@ -665,7 +833,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 
     args.output.mkdir(parents=True, exist_ok=True)
     checkpoint = {
-        "schema_version": 2,
+        "schema_version": 3,
         "feature_dim": first.embeddings.shape[1],
         "projection_dim": args.projection_dim,
         "model_state_dict": model.state_dict(),
@@ -678,6 +846,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             None if train_common is None else fingerprint_protocol(train_common)
         ),
         "operating_point_protocol": dict(OPERATING_POINT_PROTOCOL),
+        "training_view_policy": {
+            **TRAINING_VIEW_POLICY,
+            "query_complete_probability": args.query_complete_probability,
+            "query_crop_cap_seconds": args.query_seconds,
+            "adaptive_query_duration": True,
+        },
         "operating_point": {
             key: value for key, value in learned_point.items() if key != "rejections"
         },
@@ -701,6 +875,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "batch_size": args.batch_size,
         "telemetry": telemetry,
         "operating_point_protocol": dict(OPERATING_POINT_PROTOCOL),
+        "training_view_policy": {
+            **TRAINING_VIEW_POLICY,
+            "query_complete_probability": args.query_complete_probability,
+            "query_crop_cap_seconds": args.query_seconds,
+            "adaptive_query_duration": True,
+        },
         "learned": learned_point,
         "direct": direct_point,
     }
@@ -731,7 +911,14 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--query-seconds", type=float, default=60.0)
+    parser.add_argument(
+        "--query-seconds", type=float,
+        help="optional upper bound for cropped query views; complete views ignore it",
+    )
+    parser.add_argument(
+        "--query-complete-probability", type=float, default=0.5,
+        help="probability that a logical training batch uses complete query views",
+    )
     parser.add_argument("--projection-dim", type=int, default=128)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
