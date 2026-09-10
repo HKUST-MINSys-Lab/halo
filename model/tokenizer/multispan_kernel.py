@@ -9,8 +9,8 @@ The single-span `ContinuousKernelTokenizer` runs one constant-Q bank at 8 frames
 packs four ordered frames into a one-second token through a dense CNN. This module keeps the
 continuous kernels and the rate contract but changes what a token IS:
 
-* the bank is organised by physical SPAN. Group `g` has span `T_g` seconds (default 0.25, 0.5, 1,
-  2 s) and holds one Gabor kernel per harmonic of `1 / T_g`, capped at both `f_max` and
+* the bank is organised by physical SPAN. Group `g` has span `T_g` seconds (default 0.5, 1,
+  1.5 s) and holds one Gabor kernel per harmonic of `1 / T_g`, capped at both `f_max` and
   `n_harmonics / T_g`, so the same frequency is
   measured narrowband at long spans and broadband at short ones. A two-dimensional tiling of the
   time-frequency plane instead of one constant-Q line;
@@ -64,7 +64,7 @@ from .continuous_kernel import (
     ContinuousKernelTokenizer,
 )
 
-MS_SPANS_S = (0.25, 0.5, 1.0, 2.0)   # octave-spaced so the harmonic grids nest (4, 2, 1, 0.5 Hz)
+MS_SPANS_S = (0.5, 1.0, 1.5)
 MS_FRAMES_PER_SPAN = 4               # default envelope stride T/4; validate fidelity empirically
 
 

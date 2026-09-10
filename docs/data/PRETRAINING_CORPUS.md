@@ -1,18 +1,16 @@
 # The label-free pretraining corpus
 
 > Built 2026-09-09. Operational reference for `data/pretraining/`. The design argument that
-> selected these sources is in
-> [`../design/LABEL_FREE_SCALE_AND_JEPA_AUDIT_20260909.md`](../design/LABEL_FREE_SCALE_AND_JEPA_AUDIT_20260909.md);
-> the per-source access steps are in each source's own `README.md`. This page is the
-> contract and the operating procedure.
+> selected these sources is in the active JEPA objective and design documents. The per-source
+> access steps are in each source's own `README.md`. This page is the corpus contract and
+> operating procedure.
 
 ## Why a separate tree
 
 The JEPA objective reads no labels, so the ceiling on pretraining data is download and disk,
 not annotation. That makes the natural corpus for it a different set of sources from the one
 the evaluation protocol uses, and mixing the two in one directory has a specific failure
-mode: a label-free source silently entering a label vocabulary, a validation probe, or the
-Phase-B evidence bank.
+mode: a label-free source silently entering a labelled application-task manifest or evaluation.
 
 `data/pretraining/` holds sources whose every session carries the reserved `__unlabeled__`
 marker. `data/datasets/` holds labelled sources. The `__unlabeled__` guards already enforced
@@ -25,15 +23,13 @@ so moving a source between trees is not a code change. A name present in both tr
 rather than resolving by precedence: a half-finished move leaves two copies, and silently
 preferring one would train on whichever sorted first.
 
-`eval/data.py` deliberately still addresses `data/datasets` directly. That is not an
-oversight — it structurally prevents a label-free source from ever being resolved as an
-evaluation source.
+The motion-monitoring manifests address `data/datasets` directly. That is deliberate: it
+structurally prevents a label-free source from being resolved as an application evaluation source.
 
 ## The encoder and the head no longer share data
 
 **Decision 2026-09-09.** Until now one roster did both jobs: the encoder pretrained on the same
-18 labelled corpora the comparator and classification head were then trained and selected on
-(14 since the 2026-09-10 retirement of `uci_har`, `sp_sw_har`, `mhealth` and `opportunity`).
+labelled corpora used by downstream controls and application-task heads.
 That conflates two questions that should be answerable separately. If a downstream number
 improves, it can always be read as the encoder having already met those subjects, devices and
 activities rather than as a better representation.
@@ -43,7 +39,7 @@ So the two stages now draw from disjoint trees:
 | stage | corpus | roster |
 |---|---|---|
 | encoder pretraining | `data/pretraining/` | `LABEL_FREE_PRETRAIN_DATASETS` |
-| comparator / classification head | `data/datasets/` | `SUPERVISED_HEAD_TRAIN_DATASETS` |
+| support-classification control / application heads | `data/datasets/` | task-specific manifests |
 
 Every labelled corpus is therefore genuinely out-of-sample for the encoder, which is a stronger
 and more honest transfer claim than the previous arrangement could support.

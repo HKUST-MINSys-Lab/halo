@@ -56,8 +56,8 @@ from scipy.signal import resample_poly
 
 from baselines.base import ConSEAdapter, InputContract, fit_fingerprint, global_labels, register
 from data.scripts.labels.canonical_labels import canonicalize
-from eval import data as eval_data
-from eval import scoring
+from baselines import data as eval_data
+from baselines import scoring
 
 # --- model / window contract (harnet5) ---
 HARNET_NAME = "harnet5"

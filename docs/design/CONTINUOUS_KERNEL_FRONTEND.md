@@ -148,7 +148,7 @@ the dominant frontend cost; triad packing, dense CNN, and projection were compar
 Application inference must re-profile complete continuous sessions. Reusing overlapping analysis
 frames is likely more important than optimizing the ordinary dense CNN.
 
-## Multi-span tokenization (BUILT 2026-09-09, `--frontend multispan`, not yet trained)
+## Multi-span tokenization (active encoder variant)
 
 Direction from the user: a bank is only meaningful with a real variety of physical spans, each
 span's responses kept at a temporal resolution that does not throw away what that span resolved,
@@ -159,19 +159,19 @@ remains available. It reuses the multi-resolution filterbank machinery (tagged t
 grids, centre-time RoPE, log-duration embedding, equal-weight per-resolution pooling) rather than
 duplicating it.
 
-**Bank.** Span groups `T in {0.25, 0.5, 1, 2}` s (`--spans`). Within a group the kernels are the
-harmonics of `1 / T`, capped at both 15 Hz and harmonic 12: 3, 7, 12 and 12 kernels, 34 in total.
-Their highest initial carrier frequencies are 12, 14, 12 and 6 Hz respectively. This intentional
+**Bank.** Span groups `T in {0.5, 1, 1.5}` s (`--spans`). Within a group the kernels are the
+harmonics of `1 / T`, capped at both 15 Hz and harmonic 12: 7, 12 and 12 kernels, 31 in total.
+Their highest initial carrier frequencies are 14, 12 and 8 Hz respectively. This intentional
 capacity cap keeps the experiment small; it is not full coverage to 15 Hz at every span. The same
-frequency is measured at several spans (4 Hz sits in every
-group), narrowband at long spans and broadband at short ones: a two-dimensional tiling of the
+frequency is measured at every retained span, narrowband at long spans and broadband at short ones:
+a two-dimensional tiling of the
 time-frequency plane. Each kernel keeps its 24 learnable coefficients, envelope and gain; the rate
 contract (exact sample offsets, integral scaling, re-zero-mean, energy-retained observability mask)
 is unchanged and tested per group (cross-rate correlation > 0.97 at 20/25/50 vs 100 Hz).
 
 **Frames per group.** Stride `T / frames_per_span` (`--frames-per-span`, default 4, an initial
 temporal-resolution choice rather than an exact bandwidth guarantee). A 6 s window yields
-96 + 48 + 24 + 12 = 180 tokens per
+48 + 24 + 16 = 88 tokens per
 sensor. The grid follows the longest recording in the batch; shorter recordings are masked beyond
 their own duration and get exactly the tokens they get alone (tested).
 
@@ -179,8 +179,8 @@ their own duration and get exactly the tokens they get alone (tested).
 three axes, its observability entries, the span's edge support at that frame, the local log
 amplitude and signed DC over the span, and the axis-validity bits, through one linear map per
 group. Every token carries its physical centre time (RoPE, fastest period = two strides of the
-finest group, 0.125 s by default), its span (duration embedding over [0.25, 2] s) and its group
-(`resolution_id`, `num_resolutions = 4`). The encoder's forward takes these from the frontend
+finest group, 0.25 s by default), its span (duration embedding over [0.5, 1.5] s) and its group
+(`resolution_id`, `num_resolutions = 3`). The encoder's forward takes these from the frontend
 instead of the collate, so the collate's patch grid only supplies the contiguous window: 1 s and
 1.5 s collates give identical tokens (tested). The dense CNN and ordered flatten are gone;
 reversing a recording reverses each group's token sequence and changes the pooled vector through
@@ -202,12 +202,13 @@ different observability mathematics or, for the multi-span pilot, shared amplitu
 Reproduce those historical runs using their original commit and saved source patch. Training the
 corrected frontend requires a fresh run and fresh evaluation. Do not add a revision marker to an
 old checkpoint to bypass the check. The 2026-09-08 continuous score is historical, not a score for
-this implementation; see `docs/results/IMWUT_TEMPORAL_RESOLUTION_ABLATION_20260908.md`.
+this implementation and remains archived outside the live result record.
 
 **Pooling and gradients.** Mean within group, equal weight across groups (the existing rule).
 Every query and support window of an episode goes through the same encoder in one forward pass and
-the `neighbors` objective keeps support vectors attached, so gradients reach the kernels from both
-sides; `frontend/*` telemetry and `--frontend-lr-scale` / `--frontend-reg-weight` apply.
+the retained support-classification control keeps support vectors attached, so gradients reach the
+kernels from both sides; `frontend/*` telemetry and `--frontend-lr-scale` /
+`--frontend-reg-weight` apply.
 
 **Cost, measured on the RTX 4090** (40 steps, `neighbors` readout, four episodes per step, capped
 corpus, four loader workers): 43 ms per step against 17 ms for the fixed filterbank, i.e. 2.6x,
@@ -230,7 +231,7 @@ input override raised an error before encoding. Local diagnostic artifacts are i
 `/tmp/halo_multispan_fixes_20260909/`; these smoke scores are not performance results.
 
 ```bash
-/home/alex/code/HALO/legacy_code/.venv/bin/python -m training.compare.train --frontend multispan \
-  --comparator-readout neighbors --out training/compare/outputs/<run> [--spans 0.25 0.5 1 2] \
+/home/alex/code/HALO/legacy_code/.venv/bin/python -m training.support_classifier.train --frontend multispan \
+  --out training/support_classifier/outputs/<run> [--spans 0.5 1 1.5] \
   [--frames-per-span 4] [--frontend-lr-scale 1.0] [--frontend-reg-weight 0.0]
 ```

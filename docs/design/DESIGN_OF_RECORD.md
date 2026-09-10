@@ -1,7 +1,8 @@
 # Design of record: detect, compare, and discover
 
-> **Design of record, 2026-08-30.** This replaces both the former Phase-A/Phase-B label-prediction
-> architecture and the four-task proposal-first application design on `main`.
+> **Design of record, 2026-09-10.** This is the sole live design for the IMWUT
+> movement-monitoring submission. Historical classification and retrieval systems
+> are available only through `docs/HISTORY.md`.
 
 ## 1. System boundary
 

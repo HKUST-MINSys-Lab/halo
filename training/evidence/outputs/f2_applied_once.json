@@ -1,6 +1,0 @@
-{
-  "eval-selected (top_k=0, tau=0.03) | raw": 45.9,
-  "eval-selected (top_k=0, tau=0.03) | ens": 46.2,
-  "HONEST-selected (top_k=200, tau=0.08) | raw": 45.7,
-  "HONEST-selected (top_k=200, tau=0.08) | ens": 45.9
-}

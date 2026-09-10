@@ -259,7 +259,7 @@ class UniMTSAdapter(CosineAdapter):
         train-only paraphrase ensemble (E=8; variant 0 = the raw de-underscored label)."""
         import clip
         import torch
-        from training.evidence.labeltext import label_variant_rows   # lazy (pulls no `model` pkg)
+        from training.support_classifier.label_text import label_variant_rows
 
         model = state["model"]
         rows = label_variant_rows(list(labels), self.TEXT_ENSEMBLE, seed=0,

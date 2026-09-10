@@ -1,8 +1,8 @@
 # Dataset storage inventory
 
-> **Snapshot policy, 2026-08-31.** The machine has about 1.1 TB free. Storage is not currently a
-> training blocker, but source archives, derived timelines, grids, and model artifacts must remain
-> distinguishable so accidental duplication does not grow unchecked.
+> **Retention policy, 2026-09-10.** Source archives, derived timelines, live task artifacts, and
+> historical training artifacts are deliberately separate. The active branch carries no retired
+> Phase-B checkpoint or result directory.
 
 The machine-readable inventory is
 [`data/quality/storage_inventory.json`](../../data/quality/storage_inventory.json). Regenerate it
@@ -79,9 +79,17 @@ This gives approximately **4.4 GB of conservative dataset cleanup** without touc
 sessions, or required grid layouts. Source/extracted pairs could recover substantially more, but that
 is a cold-storage decision rather than proven waste.
 
-## Non-dataset artifact warning
+## Training-artifact retention
 
-Training outputs occupy about **28.7 GB**. Two historical Phase-B memory banks under
-`training/evidence/outputs/phase_a_checkpoint_selection_20260816` account for approximately 14.7 GB
-alone. They are not dataset storage and are excluded from automatic cleanup, but they are the largest
-single archival decision if disk pressure develops.
+On 2026-09-10, 27.9 GB of retired comparison outputs were moved out of the live repository to
+`/home/alex/code/HALO/halo_archives/imwut-comparison-pre-cleanup-20260910/`:
+
+| archive | size | contents |
+|---|---:|---|
+| `evidence_outputs` | 21 GB | retired retrieval/admissibility runs and memory banks |
+| `compare_outputs` | 984 MB | retired support-classifier variants |
+| `tokenizer_outputs` | 5.9 GB | pre-cleanup tokenizer checkpoints and probes |
+
+Live training output directories begin empty under `training/tokenizer/outputs/` and
+`training/support_classifier/outputs/`. Active movement-monitoring representation caches remain in
+`applications/motion_monitoring/artifacts/`; they are not historical classifier artifacts.

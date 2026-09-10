@@ -63,17 +63,17 @@ def _analysis(module, rate, **kw):
 # bank and grid layout
 # ---------------------------------------------------------------------------------------------
 def test_bank_is_one_gabor_per_span_harmonic(tokenizer):
-    assert tokenizer.span_list == [0.25, 0.5, 1.0, 2.0]
-    assert tokenizer.group_sizes == [3, 7, 12, 12]           # capped at 15 Hz and harmonic 12
-    assert tokenizer.K == 34
+    assert tokenizer.span_list == [0.5, 1.0, 1.5]
+    assert tokenizer.group_sizes == [7, 12, 12]               # capped at 15 Hz and harmonic 12
+    assert tokenizer.K == 31
     assert torch.allclose(tokenizer.centres, tokenizer.carrier.float() / tokenizer.spans)
     assert float(tokenizer.centres.max()) <= 15.0
     pairs = {(float(s), int(c)) for s, c in zip(tokenizer.spans, tokenizer.carrier)}
     assert len(pairs) == tokenizer.K
-    # the same frequency is measured at several spans: 4 Hz sits in every group
-    assert sum(1 for c in tokenizer.centres.tolist() if abs(c - 4.0) < 1e-6) == 4
+    # the same frequency is measured at every retained span
+    assert sum(1 for c in tokenizer.centres.tolist() if abs(c - 4.0) < 1e-6) == 3
     assert [float(tokenizer.centres[tokenizer.group_slice(g)].max())
-            for g in range(tokenizer.G)] == [12.0, 14.0, 12.0, 6.0]
+            for g in range(tokenizer.G)] == [14.0, 12.0, 8.0]
 
 
 def test_token_grid_layout_follows_duration_not_rate(tokenizer):
@@ -81,9 +81,9 @@ def test_token_grid_layout_follows_duration_not_rate(tokenizer):
     for rate in (20.0, 50.0, 100.0):
         grid = _grid(tokenizer, rate)
         shapes.add(tuple(grid["tokens"].shape))
-        assert grid["tokens"].shape[1] == 96 + 48 + 24 + 12
+        assert grid["tokens"].shape[1] == 48 + 24 + 16
         assert bool(grid["token_mask"].all())
-        for g, (span, count) in enumerate(zip(tokenizer.span_list, (96, 48, 24, 12))):
+        for g, (span, count) in enumerate(zip(tokenizer.span_list, (48, 24, 16))):
             rows = grid["resolution_ids"][0] == g
             assert int(rows.sum()) == count
             assert torch.allclose(grid["durations"][0][rows], torch.full((count,), span))
@@ -276,7 +276,7 @@ def test_missing_axes_are_marked_not_invented(tokenizer):
                                  channel_mask=full, n_sensors=2)["tokens"]
         b = tokenizer.token_grid(patches, 50.0, lengths, sensor_id=sensor_id,
                                  channel_mask=accel_only, n_sensors=2)["tokens"]
-    assert a.shape == (1, 180, 2, 32) and torch.isfinite(a).all() and torch.isfinite(b).all()
+    assert a.shape == (1, 88, 2, 32) and torch.isfinite(a).all() and torch.isfinite(b).all()
     assert torch.allclose(a[:, :, 0], b[:, :, 0], atol=1e-6), "the accelerometer token changed"
     assert not torch.allclose(a[:, :, 1], b[:, :, 1]), "an absent gyroscope produced live tokens"
 
@@ -387,8 +387,8 @@ def test_encoder_uses_the_frontends_token_grid():
     with torch.no_grad():
         out = _forward(encoder, patches)
     assert out["pooled"].shape == (2, 32)
-    assert out["per_patch"].shape == (2, 180, 32)
-    assert out["token_grid"]["token_mask"].shape == (2, 180)
+    assert out["per_patch"].shape == (2, 88, 32)
+    assert out["token_grid"]["token_mask"].shape == (2, 88)
     assert torch.isfinite(out["pooled"]).all()
 
 

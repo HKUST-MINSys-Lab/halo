@@ -1,4 +1,4 @@
-"""Baseline adapter framework for the ZS-XD evaluation protocol (v2).
+"""Baseline adapter framework shared by the retained released encoders.
 
 Each baseline is a small adapter that subclasses one of two tiers and is
 registered with :func:`register`:
@@ -16,8 +16,8 @@ resampler (added later) can honour it, implements ``setup`` plus its one tier
 method, and is decorated with ``@register``. The base owns the shared plumbing —
 ground truth, the ConSE/cosine scoring, subject-stratified CIs — via
 :mod:`eval.scoring` and :mod:`eval.data`, so there is NO per-baseline dispatch
-code and no per-baseline ground-truth handling (the source of the legacy label
-bugs). No concrete baseline lives here yet; drop a ``<name>/adapter.py`` in to add one.
+code and no per-baseline ground-truth handling. The application tasks consume
+``window_features`` through ``applications.motion_monitoring.baseline_encoder``.
 """
 
 from __future__ import annotations
@@ -28,8 +28,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from eval import data as eval_data
-from eval import scoring
+from baselines import data as eval_data
+from baselines import scoring
 
 # Populated by @register at import time: name -> adapter instance.
 REGISTRY: Dict[str, "BaselineAdapter"] = {}

@@ -20,7 +20,7 @@ from applications.motion_monitoring.sequence import (
     select_stream,
     stream_to_patch_batch,
 )
-from eval.data import EvalStream
+from baselines.data import EvalStream
 
 
 PRIMARY_APPLICATION_BASELINES = ("harnet", "unimts", "normwear")

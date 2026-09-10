@@ -1,4 +1,0 @@
-[limubert] device=cuda
-[limubert] corpus: 188888 windows, shape (188888, 120, 6)
-Train Size: 151110, Vali Size: 18888, Test Size: 18890
-[limubert] train=151110 val=18888
