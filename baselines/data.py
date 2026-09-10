@@ -11,7 +11,7 @@ Each dataset stores windowed grids under::
 and a pre-registered candidate label vocabulary at
 ``data/datasets/<ds>/eval_labels.json`` (the ZS-XD target strings for that
 dataset). Harmonized grid construction may store a genuine synonym under its training-corpus
-canonical name; :func:`eval.scoring.align_ground_truth_labels` maps that internal representation
+canonical name; :func:`baselines.scoring.align_ground_truth_labels` maps that internal representation
 back to the unique frozen target string before scoring. The global ConSE training vocabulary lives at
 ``data/labels/global_labels.json``.
 
@@ -91,7 +91,7 @@ class EvalStream:
     gravity_state: Optional[str] = None
     channel_descriptions: Optional[list] = None
     # Label of the controlled acquisition perturbation applied to this view of the grid, or None
-    # for the grid as converted. Set only by :mod:`eval.perturbation`; adapters that cache per
+    # for the grid as converted. Retained diagnostic views must give it a unique name; adapters that cache per
     # stream must key on it so a perturbed and an unperturbed view of one grid never collide.
     perturbation: Optional[str] = None
     lengths: Optional[np.ndarray] = None
@@ -255,7 +255,7 @@ def load_eval_stream(
 
     The returned `gt` / `subjects` are 1:1 with `windows` (length N) and verbatim
     from the grid — align and restrict `gt` to `eval_labels` at scoring time via
-    :func:`eval.scoring.filter_ground_truth`.
+    :func:`baselines.scoring.filter_ground_truth`.
     """
     gdir = _grid_dir(dataset, stream, alignment)
     if not gdir.exists():

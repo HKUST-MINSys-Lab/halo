@@ -70,9 +70,9 @@ MIN_RECORDING_SECONDS = 1.0
 
 
 def _recording_map(dataset: str) -> dict:
-    """``{event_id_without_ordinal: recording_id}``, composed exactly as ``eval/data.py`` does.
+    """``{event_id_without_ordinal: recording_id}``, composed exactly as ``baselines/data.py`` does.
 
-    Duplicated deliberately rather than imported: ``eval.data`` pulls in the whole evaluation
+    Duplicated deliberately rather than imported: ``baselines.data`` pulls in the whole baseline
     stack, and the two paths must agree on the leakage unit even if one is refactored. The
     agreement is asserted in ``tests/test_compare_sampling.py``.
     """

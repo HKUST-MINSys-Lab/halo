@@ -225,7 +225,7 @@ def label_text_matrix(labels: list[str], device) -> torch.Tensor:
     The same frozen sentence encoder every scored path in the repo uses, so a label's vector here
     is the vector the evaluation harness would give it.
     """
-    from eval.scoring import get_sbert_encoder
+    from baselines.text import get_sbert_encoder
 
     embeddings = torch.from_numpy(get_sbert_encoder()(list(labels))).to(device)
     return F.normalize(embeddings.float(), dim=-1)

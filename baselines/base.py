@@ -15,7 +15,7 @@ An adapter declares its INPUT CONTRACT (channels / rate / window) so a per-basel
 resampler (added later) can honour it, implements ``setup`` plus its one tier
 method, and is decorated with ``@register``. The base owns the shared plumbing —
 ground truth, the ConSE/cosine scoring, subject-stratified CIs — via
-:mod:`eval.scoring` and :mod:`eval.data`, so there is NO per-baseline dispatch
+:mod:`baselines.scoring` and :mod:`baselines.data`, so there is NO per-baseline dispatch
 code and no per-baseline ground-truth handling. The application tasks consume
 ``window_features`` through ``applications.motion_monitoring.baseline_encoder``.
 """

@@ -245,8 +245,7 @@ def _fit_fp(vocab) -> str:
     split, the seed, the probe width and the per-stream cap, silently reporting pre-fix numbers.
     """
     from baselines.base import PROBE_SPEC
-    from eval.splits import manifest_fingerprint
-    return fit_fingerprint(model='harnet', vocab=list(vocab), split=manifest_fingerprint(),
+    return fit_fingerprint(model='harnet', vocab=list(vocab), split="subject-disjoint-v1",
                            hp=[FIT_EPOCHS, FIT_BATCH, FIT_LR, FIT_SEED], probe=PROBE_SPEC,
                            cap=(MATCHED_MAX_PER_STREAM if CORPUS_MODE == 'matched' else None),
                            corpus=CORPUS_MODE, datasets=_corpus_datasets(),
@@ -405,12 +404,10 @@ class HarnetAdapter(ConSEAdapter):
 
         # SUBJECT-DISJOINT split (leakage fix): fit on the train fold, select the
         # best epoch on the disjoint val fold. (test fold unused here.)
-        # Phase 1.1 (H7/H8): SHARED, per-dataset-stratified subject manifest. Previously each
-        # model reshuffled its own aggregate subject pool, so excluding a stream moved 16.5% of
-        # shared subjects into different folds than other models, and 3 datasets got ZERO val
-        # subjects. Folds are now identical across models regardless of stream coverage.
-        from eval.splits import split_indices   # lazy
-        ti, vi, tei = split_indices(S)
+        # The retained adapter uses a deterministic, subject-disjoint split of its own feature
+        # corpus. The former shared classification-evaluation manifest was retired with that
+        # protocol and must not remain a hidden dependency of the application encoder.
+        ti, vi, tei = scoring.subject_disjoint_split(S, seed=FIT_SEED)
         Xt = torch.from_numpy(X[ti]).float()
         Yt = torch.from_numpy(Y[ti]).long()
         Xv = torch.from_numpy(X[vi]).float().to(fit_device)
