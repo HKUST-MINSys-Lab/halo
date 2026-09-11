@@ -35,7 +35,10 @@ _LABELS = (
     "RightUpperArm",
     "RightForeArm",
     "LeftForeArm",
+    "LeftUpperArm",
+    "LeftUpperLeg",
     "RightUpperLeg",
+    "LeftLowerLeg",
     "RightLowerLeg",
 )
 

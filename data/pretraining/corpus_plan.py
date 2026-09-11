@@ -101,16 +101,15 @@ CORPUS_PLAN: Tuple[SourcePlan, ...] = (
     ),
     SourcePlan(
         dataset="nymeria_xsens",
-        take="all 1,100 sequences, 8 of 17 body placements",
-        streams=8,
+        take="all 1,100 sequences, 11 of 17 body placements",
+        streams=11,
         wall_hours=300.0,
         rate_hz=240.0,
         channels=6,
         wave=1,
         access="gated",
-        note="The only source with real IMU on head, torso, both arms and a leg "
-             "simultaneously. The 9 dropped Xsens sensors are left/right mirrors of "
-             "placements already kept.",
+        note="The only source with real IMU on head, torso, both arms and both legs "
+             "simultaneously. Hands, feet, and other non-target suit trackers are excluded.",
     ),
     SourcePlan(
         dataset="synthetic_imu",

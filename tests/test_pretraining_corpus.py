@@ -258,8 +258,8 @@ def test_source_sizing_is_the_documented_arithmetic():
 
 def test_multi_placement_sources_count_one_stream_hour_per_placement():
     xsens = next(s for s in corpus_plan.CORPUS_PLAN if s.dataset == "nymeria_xsens")
-    assert xsens.streams == 8
-    assert xsens.stream_hours == pytest.approx(8 * xsens.wall_hours)
+    assert xsens.streams == 11
+    assert xsens.stream_hours == pytest.approx(11 * xsens.wall_hours)
 
 
 def test_candidates_are_excluded_from_the_budget():

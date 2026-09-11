@@ -1,6 +1,6 @@
 {
   "dataset": "nymeria_xsens",
-  "display_name": "Nymeria - Xsens MVN Link 17-tracker suit (8 placements)",
+  "display_name": "Nymeria - Xsens MVN Link 17-tracker suit (11 placements)",
   "sampling_rate_hz": 240.0,
   "pre_windowed": false,
   "streaming_grid": true,
@@ -25,15 +25,18 @@
     "gyro_z": "gyro_z"
   },
   "extra_channels": [],
-  "placement": "eight of the suit's seventeen trackers, simultaneous: head, sternum (T8), pelvis, left forearm, right forearm, right upper arm, right thigh, right shank",
+  "placement": "eleven of the suit's seventeen trackers, simultaneous: head, sternum (T8), pelvis, left/right forearm, left/right upper arm, left/right thigh, left/right shank",
   "stream_tokens": [
     "xsens_head",
     "xsens_sternum",
     "xsens_pelvis",
     "xsens_lforearm",
     "xsens_rforearm",
+    "xsens_lupperarm",
     "xsens_rupperarm",
+    "xsens_lthigh",
     "xsens_rthigh",
+    "xsens_lshank",
     "xsens_rshank"
   ],
   "unit": "g",

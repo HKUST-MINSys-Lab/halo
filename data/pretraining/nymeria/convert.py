@@ -120,8 +120,11 @@ XSENS_STREAMS: Mapping[str, tuple[str, ...]] = {
     "xsens_pelvis": ("pelvis",),
     "xsens_lforearm": ("leftforearm", "lforearm", "leftlowerarm"),
     "xsens_rforearm": ("rightforearm", "rforearm", "rightlowerarm"),
+    "xsens_lupperarm": ("leftupperarm", "lupperarm"),
     "xsens_rupperarm": ("rightupperarm", "rupperarm"),
+    "xsens_lthigh": ("leftupperleg", "leftthigh", "lupperleg"),
     "xsens_rthigh": ("rightupperleg", "rightthigh", "rupperleg"),
+    "xsens_lshank": ("leftlowerleg", "leftshank", "llowerleg"),
     "xsens_rshank": ("rightlowerleg", "rightshank", "rlowerleg"),
 }
 

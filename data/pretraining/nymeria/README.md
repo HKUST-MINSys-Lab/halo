@@ -154,10 +154,11 @@ it does for `xrf_v2` and `wisdm`.
 
 | dataset | tokens |
 | --- | --- |
-| `nymeria_xsens` (240 Hz) | `xsens_head` `xsens_sternum` `xsens_pelvis` `xsens_lforearm` `xsens_rforearm` `xsens_rupperarm` `xsens_rthigh` `xsens_rshank` |
+| `nymeria_xsens` (240 Hz) | `xsens_head` `xsens_sternum` `xsens_pelvis` `xsens_lforearm` `xsens_rforearm` `xsens_lupperarm` `xsens_rupperarm` `xsens_lthigh` `xsens_rthigh` `xsens_lshank` `xsens_rshank` |
 | `nymeria_aria` (200 Hz) | `aria_head` `aria_lwrist` `aria_rwrist` |
 
-Eight of the suit's seventeen trackers are taken. `xsens_sternum` resolves to the MVN
+Eleven of the suit's seventeen trackers are taken: head, torso, and both sides of each limb.
+Hands, feet, and other non-target suit trackers are excluded. `xsens_sternum` resolves to the MVN
 Link trunk tracker, which MVNX labels **`T8`** (some exports say `Sternum`; both are
 accepted). `recording_observer` is never converted — it is worn by a second person.
 
@@ -186,9 +187,9 @@ of a scalar; this package's generated `manifest.json` has **no** `sampling_rate_
 all, so nothing can read a single rate out of it by accident.
 
 This matches what the surrounding infrastructure already expects:
-`data/pretraining/corpus_plan.py` plans `nymeria_xsens` at 240 Hz / 8 streams and
+`data/pretraining/corpus_plan.py` plans `nymeria_xsens` at 240 Hz / 11 streams and
 `nymeria_aria` at 200 Hz / 3 streams, `build_corpus.py` maps both to the single module
-`data.pretraining.nymeria`, and `deployment_policy.py` carries eight + three `StreamSpec`
+`data.pretraining.nymeria`, and `deployment_policy.py` carries eleven + three `StreamSpec`
 entries keyed on exactly the `session_contains` tokens above.
 
 **Still outstanding, and owned elsewhere:** `data/scripts/curate/accel_units.py` lists

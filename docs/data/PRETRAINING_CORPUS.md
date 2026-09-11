@@ -70,11 +70,11 @@ which is the single source of truth for the build, the tests, and this table. Ru
 | source | take | streams | stream-hours | rate | channels | GB |
 |---|---|---:|---:|---:|---:|---:|
 | `nhanes` | 3,000 participants x 12 h, motion-aware hours | 1 | 36,000 | 80 Hz | 3 | 124.4 |
-| `nymeria_xsens` | all 1,100 sequences, 8 of 17 body placements | 8 | 2,400 | 240 Hz | 6 | 24.9 |
+| `nymeria_xsens` | all 1,100 sequences, 11 of 17 body placements | 11 | 3,300 | 240 Hz | 6 | 34.2 |
 | `synthetic_imu` | AMASS + Motion-X++ (+ 100STYLE), 8 virtual placements | 8 | 1,800 | 60 Hz | 6 | 4.7 |
-| **total** | | | **40,200** | | | **154.0** |
+| **total** | | | **41,100** | | | **163.3** |
 
-Against a 180 GB budget, leaving 26.0 GB of headroom. Accel-only sources still occupy six
+Against a 180 GB budget, leaving 16.7 GB of headroom. Accel-only sources still occupy six
 grid slots because the common contract zero-pads and masks gyro. For comparison, the labelled Phase-A
 corpus supplies 3,117 stream-hours, so this is roughly a 13.6x increase in label-free signal.
 

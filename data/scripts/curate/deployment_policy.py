@@ -416,8 +416,8 @@ STREAM_SPECS: Tuple[StreamSpec, ...] = (
     # Nymeria records one motion with three device families at once, hardware-synchronised.
     # That simultaneity is the point: it is the only public source where the same movement is
     # observed from a body suit, glasses, and wristbands together, which is what a
-    # cross-configuration claim needs. Eight of the suit's seventeen trackers are kept; the
-    # nine dropped are left/right mirrors of placements already present.
+    # cross-configuration claim needs. Keep every head, torso, and bilateral limb tracker;
+    # hands, feet, and other non-target suit trackers remain excluded.
     *(
         StreamSpec("nymeria_xsens", f"xsens_{token}", "device", placement,
                    _GENERIC_ACC, _GENERIC_GYRO, "present", role="phase_a_scale",
@@ -431,8 +431,11 @@ STREAM_SPECS: Tuple[StreamSpec, ...] = (
             ("pelvis", "the pelvis"),
             ("lforearm", "the left forearm"),
             ("rforearm", "the right forearm"),
+            ("lupperarm", "the left upper arm"),
             ("rupperarm", "the right upper arm"),
+            ("lthigh", "the left thigh"),
             ("rthigh", "the right thigh"),
+            ("lshank", "the left shank"),
             ("rshank", "the right shank"),
         )
     ),
