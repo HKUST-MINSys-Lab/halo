@@ -124,6 +124,105 @@ def test_future_plan_marks_single_token_window_ineligible():
     assert not plan.target_mask.any()
 
 
+def test_missing_resolution_cannot_erase_another_resolution_target():
+    # The future interval deliberately occupies column zero and another group is context-only.
+    starts = torch.tensor([[2.0, 0.0]])
+    plan = make_future_target_plan(
+        starts, starts + 1, torch.ones_like(starts, dtype=torch.bool),
+        torch.tensor([[0, 1]]), context_fraction=(0.5, 0.5),
+    )
+    assert plan.eligible.tolist() == [True]
+    assert plan.context_mask.tolist() == [[False, True]]
+    assert plan.target_mask.tolist() == [[True, False]]
+
+
+@pytest.mark.parametrize("shape", [(0, 3), (2, 0), (2, 3)])
+def test_empty_or_fully_invalid_future_grids_are_finite_and_ineligible(shape):
+    starts = torch.full(shape, float("nan"))
+    plan = make_future_target_plan(starts, starts, torch.zeros(shape, dtype=torch.bool))
+    assert not plan.eligible.any()
+    assert not plan.context_mask.any()
+    assert not plan.target_mask.any()
+    assert torch.isfinite(plan.context_end).all()
+    assert torch.isfinite(plan.horizon_seconds).all()
+
+
+@pytest.mark.parametrize("with_groups", [False, True])
+def test_batched_planner_matches_scalar_spec_on_ragged_permuted_grids(with_groups):
+    # A scalar specification independently replays the batch RNG draws. It exercises missing
+    # groups, invalid metadata, overlapping spans, unsorted columns, and fallback boundaries.
+    rng = torch.Generator().manual_seed(37)
+    starts = torch.randint(0, 12, (24, 18), generator=rng).float() / 2
+    ends = starts + torch.randint(1, 7, starts.shape, generator=rng).float() / 2
+    groups = torch.randint(0, 3, starts.shape, generator=rng) if with_groups else None
+    valid = torch.rand(starts.shape, generator=rng) > 0.3
+    valid[0] = False
+    starts[1, :2] = float("nan")
+    fractions = (0.01, 0.02)  # forces deterministic boundary fallback on some rows
+    bins = ((0., 1.), (1., 2.), (2., 3.))
+    seed = 83
+    plan = make_future_target_plan(
+        starts, ends, valid, groups, context_fraction=fractions,
+        horizon_bins_seconds=bins, generator=torch.Generator().manual_seed(seed),
+    )
+    replay = torch.Generator().manual_seed(seed)
+    draws = torch.rand(24, 8, generator=replay)
+    anchors = torch.stack([torch.rand(24, generator=replay) for _ in bins])
+    live = valid & torch.isfinite(starts) & torch.isfinite(ends) & (ends > starts)
+    for row in range(24):
+        indices = torch.where(live[row])[0].tolist()
+        if len(indices) < 2:
+            assert not plan.eligible[row]
+            continue
+        s, e = starts[row].tolist(), ends[row].tolist()
+        first, last = min(s[i] for i in indices), max(e[i] for i in indices)
+        candidates = [first + float(fractions[0] + (fractions[1] - fractions[0]) * u)
+                      * (last - first) for u in draws[row]]
+        candidates += sorted({t for i in indices for t in (s[i], e[i]) if first < t < last})
+        boundary = next((t for t in candidates if any(e[i] <= t + 1e-7 for i in indices)
+                         and any(s[i] >= t - 1e-7 for i in indices)), None)
+        if boundary is None:
+            assert not plan.eligible[row]
+            continue
+        assert float(plan.context_end[row]) == pytest.approx(boundary, abs=1e-6)
+        future = [i for i in indices if s[i] >= boundary - 1e-7]
+        centers = [(a + b) / 2 for a, b in zip(s, e)]
+        selected = {}
+
+        def cover(anchor):
+            covering = [i for i in future if s[i] <= anchor + 1e-7 < e[i]]
+            labels = {int(groups[row, i]) if groups is not None else 0 for i in covering}
+            for label in labels:
+                matching = [i for i in covering if groups is None or int(groups[row, i]) == label]
+                chosen = min(matching, key=lambda i: (abs(centers[i] - anchor), i))
+                selected.setdefault(chosen, anchor - boundary)
+
+        for bin_id, (lo, hi) in enumerate(bins):
+            choices = sorted({centers[i] for i in future if lo <= centers[i] - boundary < hi})
+            if choices:
+                cover(choices[int(float(anchors[bin_id, row]) * len(choices))])
+        if not selected:
+            cover(min(centers[i] for i in future))
+        assert torch.where(plan.target_mask[row])[0].tolist() == sorted(selected)
+        for index, horizon in selected.items():
+            assert float(plan.horizon_seconds[row, index]) == pytest.approx(horizon, abs=1e-6)
+
+
+def test_duplicate_centers_do_not_bias_physical_anchor_sampling():
+    batch = 4096
+    # Four duplicate tokens at 2.5s and one at 3.5s must still give each time 50% probability.
+    starts = torch.tensor([[0., 2., 2., 2., 2., 3.]]).expand(batch, -1)
+    plan = make_future_target_plan(
+        starts, starts + 1, torch.ones_like(starts, dtype=torch.bool),
+        context_fraction=(0.25, 0.25), horizon_bins_seconds=((0., 5.),),
+        generator=torch.Generator().manual_seed(9),
+    )
+    assert plan.eligible.all()
+    assert plan.target_mask.sum(1).eq(1).all()
+    late_fraction = plan.target_mask[:, -1].float().mean().item()
+    assert 0.47 < late_fraction < 0.53
+
+
 def test_one_physical_anchor_selects_at_most_one_patch_per_resolution():
     starts, ends, groups, valid = _three_scale_grid(batch=1)
     for seed in range(20):

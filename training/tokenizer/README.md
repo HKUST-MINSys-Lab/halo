@@ -109,13 +109,19 @@ global row count into result claims.
 | optimizer | AdamW |
 | LR / warmup / weight decay | derived from the resolved batch; recorded in `run_config.json` |
 | gradient clip | 1.0 |
-| precision on CUDA | FP16 autocast with dynamic loss scaling; FP32 master weights and reductions |
-| default batch / steps | 384 / 20,000 |
+| precision on CUDA | BF16 neural autocast; FP32 master weights, physical analysis and loss statistics |
+| default fixed-filterbank batch / steps | 512 / 15,000 |
 
-Multi-span defaults are derived from the same 12,288 transformer-token budget. With an eight-second
-context and spans 0.5, 1.0, and 1.5 seconds at four frames per span, this is batch 96 and 80,000
-updates, preserving the fixed arm's 7.68 million sampled windows. Durations, frame density, token
-budget, and resolved schedule are serialized in the checkpoint.
+Multi-span defaults use a separate 61,440 transformer-token ceiling and a reference batch of 384.
+With an eight-second context and spans 0.5, 1.0, and 1.5 seconds at four frames per span, the resolved
+schedule is batch 384 and 20,000 updates, preserving the fixed arm's 7.68 million sampled windows.
+The fixed-filterbank token ceiling is 16,384. Durations, frame density, token budget, and resolved
+schedule are serialized in the checkpoint. These ceilings describe batch times temporal tokens;
+sensor count and frontend workspace also affect memory usage.
+
+FP16 remains an explicit `--amp-dtype fp16` option with dynamic loss scaling; BF16 uses no scaler
+and aborts on non-finite gradients before the optimizer/EMA update. Compilation is opt-in because
+it was slower for the measured dynamic workloads. Neither optimization reduces encoder capacity.
 
 Run-specific values in `run_config.json` are authoritative. The trainer rejects incompatible
 future-objective combinations instead of silently falling back to a different experiment.
@@ -123,6 +129,11 @@ future-objective combinations instead of silently falling back to a different ex
 ## Launch and smoke tests
 
 Use the project environment for commands that import Torch, SciPy, pandas, or h5py:
+
+The full-roster commands below require **all** configured sources to have usable native grids.
+`--smoke` reduces model/run size, not this requirement. For an explicitly limited local pilot,
+replace `--corpus label_free` with `--datasets nhanes synthetic_imu`; do not call that a full-corpus
+run. See the dated verification below for the current local data state.
 
 ```bash
 PY=/home/alex/code/HALO/legacy_code/.venv/bin/python
@@ -144,11 +155,62 @@ $PY -m training.tokenizer.pretrain --device cuda --corpus label_free --frontend 
   --out training/tokenizer/outputs/<multispan-run>
 ```
 
-Production prerequisites include current grid-quality caches and any required sensor-bias artifact.
+Production prerequisites include all requested native grids, the eight-second source-window
+contract, current grid-quality caches, and the labelled development grids used for selection.
+Sensor-bias augmentation is disabled by default and requires no bias artifact in this recipe.
 Resume from `last.pt` with the same trajectory-defining configuration. Checkpoints restore the
 student, EMA teacher, frozen physical-target analyzer, active pretraining heads, optimizer,
 scheduler, AMP scaler, RNG states, corpus fingerprint, and the already-resolved objective
 coefficients.
+
+## Optimization verification (2026-09-11)
+
+The vectorized future planner was checked against an independent scalar specification on ragged,
+permuted and missing-resolution grids. It preserves uniform sampling over unique physical centers,
+not over duplicated resolution tokens. Random numbers are consumed in a different order from the
+old per-recording loop: sampling rules are preserved, but seeds do not reproduce the old trajectory
+across this source change. Resume provenance checks intentionally reject changed source code.
+
+This sweep fixed an absent-resolution selection erasing a previously selected target at index zero,
+handled empty/invalid planner inputs, and removed a quadratic feasibility temporary. The continuous
+student's learned projection now follows the same mixed-precision policy as the teacher while
+signal analysis remains FP32. CUDA memory fields now report binary GiB; older fields named `gib`
+actually contained decimal GB and need multiplying by `1e9 / 1024**3` when comparing histories.
+
+Verification: 221 focused tests passed. Both full-size encoders also completed 52 CUDA BF16 updates,
+objective calibration, reduced development probes, checkpoint reconstruction, and resume to step
+54. Encoder, frontend projection, future predictor and physical decoder gradients were finite and
+nonzero; reported future-context leakage and skipped updates were zero. Frozen physical-target
+analyzer weights were identical before and after resume.
+
+| bounded GPU probe | fixed multiresolution | continuous multispan |
+|---|---:|---:|
+| batch size | 512 | 384 |
+| measured windows/s (step-50 telemetry interval) | 8,736 | 2,988 |
+| peak allocated memory (converted to GiB) | 3.77 | 8.17 |
+| encoder gradient norm at step 50 | 0.841 | 0.407 |
+| future-predictor gradient norm at step 50 | 0.400 | 0.450 |
+| physical-decoder gradient norm at step 50 | 0.180 | 0.122 |
+
+These are **mechanical smoke measurements, not model-quality results or full-corpus timing promises**.
+They used only NHANES and synthetic IMU (60/80 Hz), three normalization-calibration batches, warmup
+10, objective calibration at step 20 over five batches, and a reduced development cap of 128 windows
+per stream. The full 15k/20k LR/EMA schedules were retained with `--stop-after`; the other overrides
+are diagnostic only. Raw logs/checkpoints are local at
+`/tmp/halo_jepa_optimization_audit_20260911/` and are temporary, not publication artifacts.
+At these measured rates, 7.68 million windows alone extrapolate to about 15/43 minutes, excluding
+full-corpus loading, full calibration, validation and checkpoint overhead. Higher-rate and
+additional-placement data must be profiled once materialized; neither arm has a verified
+30-minute full-corpus guarantee.
+
+**Local production readiness: blocked on corpus materialization, not a known remaining model-code
+failure.** The configured label-free roster is NHANES, Nymeria Xsens, Nymeria Aria, Ego-Exo4D and
+synthetic IMU. As of this audit, the three Nymeria/Ego-Exo4D sources have no usable grids. NHANES has
+eight subjects and 37,512 retained windows; synthetic IMU has one actor and 31,073 retained windows
+across head, pelvis and sternum. Its other five grid directories contain zero windows. Total usable
+pilot data: **68,585 windows**, not the planned full corpus. The loader correctly refuses the default
+full-roster launch rather than silently substituting this subset. Complete/verify the requested
+sources, then run a brief representative high-rate probe before starting production training.
 
 ## Monitoring
 

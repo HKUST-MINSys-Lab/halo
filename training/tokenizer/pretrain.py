@@ -1901,7 +1901,7 @@ def main() -> None:
         two_view=two_view,
     ) if cfg.multiresolution
                      else MultiScaleCollate(fixed_patch_seconds=cfg.patch_seconds,
-                                            seed=cfg.seed, two_view=True,
+                                            seed=cfg.seed, two_view=two_view,
                                             dft_size=cfg.dft_size))
     calibration_collate = (MultiResolutionCollate(
         short_choices=cfg.short_patch_choices, long_choices=cfg.long_patch_choices,
@@ -2579,16 +2579,12 @@ def main() -> None:
                     student_lengths, student_raw_mask = truncate_patch_lengths_at_time(
                         raw_patch_len, raw_patch_starts, rates, future_context_end,
                     )
-                    student_grid = fe.token_grid(
+                    student_analysis = fe.analyze_grid(
                         patches.float(), rates, student_lengths, source_rate_hz=_src_rate,
-                        patch_mask=student_raw_mask, sensor_id=projection_sensor_id,
-                        channel_mask=channel_mask, n_sensors=projection_n_sensors,
+                        patch_mask=student_raw_mask,
                         grid_duration_seconds=full_recording_duration,
                     )
-                    student_analysis = shared_analysis = None
-                    sensor_tokens = student_grid["tokens"]
-                    if sensor_tokens.shape[1] != P:
-                        raise RuntimeError("multi-span student and physical planner grids disagree")
+                    shared_analysis = None
                 elif cfg.frontend == "fixed":
                     shared_analysis = model.encoder.analyze(
                         patches.float(), rates, patch_len, source_rate_hz=_src_rate)
@@ -2620,7 +2616,17 @@ def main() -> None:
                             )
                 enc_channel_mask = channel_mask
                 enc_texts = batch["texts"]
-            if cfg.frontend != "multispan":
+            if cfg.frontend == "multispan":
+                # Match the teacher: only physical analysis needs FP32, while the learned
+                # projection belongs in the surrounding neural autocast context.
+                student_grid = fe.project_grid(
+                    student_analysis, sensor_id=projection_sensor_id,
+                    channel_mask=enc_channel_mask, n_sensors=projection_n_sensors,
+                )
+                sensor_tokens = student_grid["tokens"]
+                if sensor_tokens.shape[1] != P:
+                    raise RuntimeError("multi-span student and physical planner grids disagree")
+            else:
                 sensor_tokens = model.encoder.project_tokens(
                     student_analysis, sensor_id=projection_sensor_id,
                     channel_mask=enc_channel_mask, n_sensors=projection_n_sensors,
@@ -3205,6 +3211,13 @@ def main() -> None:
         scaler.unscale_(opt)
         gnorms = module_grad_norms(model) if do_log else {}     # pre-clip per-module grad norms
         total_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        # BF16 has no GradScaler non-finite check. Reject a bad backward before either
+        # optimizer or EMA weights can be corrupted, even when the loss itself is finite.
+        if not scaler.is_enabled():
+            if device.type == "cuda":
+                torch._assert_async(torch.isfinite(total_grad_norm), "non-finite JEPA gradients")
+            elif not bool(torch.isfinite(total_grad_norm)):
+                raise FloatingPointError(f"non-finite JEPA gradients at step {step}")
         clip_coefficient = (min(
             1.0, float(cfg.grad_clip) / (float(total_grad_norm.detach()) + 1e-6)
         ) if do_log else None)
@@ -3365,9 +3378,9 @@ def main() -> None:
                     model.encoder.duration_gate_logit.detach()))
             if device.type == "cuda":
                 rec.update({
-                    "memory/allocated_gib": torch.cuda.memory_allocated(device) / 1e9,
-                    "memory/reserved_gib": torch.cuda.memory_reserved(device) / 1e9,
-                    "memory/peak_allocated_gib": torch.cuda.max_memory_allocated(device) / 1e9,
+                    "memory/allocated_gib": torch.cuda.memory_allocated(device) / (1024 ** 3),
+                    "memory/reserved_gib": torch.cuda.memory_reserved(device) / (1024 ** 3),
+                    "memory/peak_allocated_gib": torch.cuda.max_memory_allocated(device) / (1024 ** 3),
                 })
             print(json.dumps(rec), flush=True)
             with log_path.open("a") as f:
@@ -3511,7 +3524,7 @@ def main() -> None:
                    "val_ba_by_source": ba_by_src, "val_conse_by_source": conse_by_src}
             if device.type == "cuda":
                 # peak so far (train step + val embedding) — memory telemetry.
-                rec["peak_gib"] = round(torch.cuda.max_memory_allocated() / 1e9, 2)
+                rec["peak_gib"] = round(torch.cuda.max_memory_allocated() / (1024 ** 3), 2)
             print(json.dumps(rec), flush=True)
             with log_path.open("a") as f:
                 f.write(json.dumps(rec) + "\n")

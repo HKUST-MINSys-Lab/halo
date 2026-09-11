@@ -161,7 +161,8 @@ def make_future_target_plan(
     if not 0.0 < lo <= hi < 1.0:
         raise ValueError("context fractions must satisfy 0 < min <= max < 1")
     bins = tuple((float(a), float(b)) for a, b in horizon_bins_seconds)
-    if not bins or any(a < 0 or b <= a for a, b in bins):
+    if not bins or any(not math.isfinite(a) or not math.isfinite(b) or a < 0 or b <= a
+                       for a, b in bins):
         raise ValueError("horizon bins must be non-empty increasing positive-width intervals")
     if resolution_ids is not None and resolution_ids.shape != patch_valid.shape:
         raise ValueError("resolution_ids must match the (B,P) token grid")
@@ -177,103 +178,123 @@ def make_future_target_plan(
     context_mask = torch.zeros_like(valid)
     target_mask = torch.zeros_like(valid)
     horizon = starts.new_zeros(batch, patches)
-    eligible = torch.zeros(batch, dtype=torch.bool, device=device)
+    if not batch or not patches:
+        return FutureTargetPlan(context_end, context_mask, target_mask, horizon,
+                                torch.zeros(batch, dtype=torch.bool, device=device))
 
-    def nearest_covering_per_resolution(row: int, anchor: torch.Tensor,
-                                        candidates: torch.Tensor) -> torch.Tensor:
-        """Select at most one interval per resolution around one physical anchor."""
-        covering = (candidates & (starts[row] <= anchor + 1e-7)
-                    & (ends[row] > anchor + 1e-7))
-        chosen = torch.zeros(patches, dtype=torch.bool, device=device)
-        if resolution_ids is None:
-            indices = torch.nonzero(covering, as_tuple=False).flatten()
-            if indices.numel():
-                chosen[indices[(centers[indices] - anchor).abs().argmin()]] = True
-            return chosen
-        groups = torch.unique(resolution_ids[row, covering])
-        for group in groups:
-            indices = torch.nonzero(
-                covering & resolution_ids[row].eq(group), as_tuple=False,
-            ).flatten()
-            chosen[indices[(centers[indices] - anchor).abs().argmin()]] = True
+    # Build all context candidates in one tensor. Random candidates retain priority; sorted token
+    # boundaries are deterministic fallbacks for short or unusually staggered grids. Duplicated
+    # boundaries are harmless and avoid a Python-side unique/sort for every recording.
+    live_count = valid.sum(dim=1)
+    inf, neg_inf = float("inf"), float("-inf")
+    window_start = starts.masked_fill(~valid, inf).min(dim=1).values
+    window_end = ends.masked_fill(~valid, neg_inf).max(dim=1).values
+    duration = window_end - window_start
+    row_viable = (live_count >= 2) & torch.isfinite(duration) & duration.gt(0)
+    fractions = lo + (hi - lo) * torch.rand(
+        batch, 8, generator=generator, device=device,
+    )
+    random_boundaries = window_start[:, None] + fractions * duration[:, None]
+    interior_boundaries = torch.cat((
+        starts.masked_fill(~valid, inf), ends.masked_fill(~valid, inf),
+    ), dim=1).sort(dim=1).values
+    boundary_candidates = torch.cat((random_boundaries, interior_boundaries), dim=1)
+    candidate_valid = torch.cat((
+        row_viable[:, None].expand(-1, random_boundaries.shape[1]),
+        row_viable[:, None]
+        & interior_boundaries.gt(window_start[:, None])
+        & interior_boundaries.lt(window_end[:, None]),
+    ), dim=1)
+    # Existence needs only the earliest end and latest start. Avoid a (B, 2P+8, P)
+    # temporary when dense multi-span grids contain hundreds of intervals.
+    earliest_end = ends.masked_fill(~valid, inf).min(dim=1).values
+    latest_start = starts.masked_fill(~valid, neg_inf).max(dim=1).values
+    observed_any = earliest_end[:, None].le(boundary_candidates + 1e-7)
+    future_any = latest_start[:, None].ge(boundary_candidates - 1e-7)
+    feasible = candidate_valid & observed_any & future_any
+    has_boundary = feasible.any(dim=1)
+    first_feasible = feasible.to(torch.int8).argmax(dim=1)
+    boundary = boundary_candidates.gather(1, first_feasible[:, None]).squeeze(1)
+    boundary = torch.where(has_boundary, boundary, torch.zeros_like(boundary))
+    context_mask = (
+        valid & ends.le(boundary[:, None] + 1e-7) & has_boundary[:, None]
+    )
+    future_mask = (
+        valid & starts.ge(boundary[:, None] - 1e-7) & has_boundary[:, None]
+    )
+    context_end.copy_(boundary)
+
+    centers = 0.5 * (starts + ends)
+    center_horizons = centers - boundary[:, None]
+    if resolution_ids is None:
+        resolution_groups: tuple[int | None, ...] = (None,)
+    else:
+        resolution_groups = tuple(
+            int(group) for group in torch.unique(resolution_ids[valid]).tolist()
+            if int(group) >= 0
+        )
+
+    def select_covering(anchor: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+        """Select the closest covering interval per row and resolution."""
+
+        covering = (
+            future_mask & rows[:, None]
+            & starts.le(anchor[:, None] + 1e-7)
+            & ends.gt(anchor[:, None] + 1e-7)
+        )
+        chosen = torch.zeros_like(valid)
+        for group in resolution_groups:
+            candidates = covering if group is None else covering & resolution_ids.eq(group)
+            distance = (centers - anchor[:, None]).abs().masked_fill(~candidates, inf)
+            index = distance.argmin(dim=1)
+            present = candidates.any(dim=1)
+            # An absent group has argmin index zero; it must not erase a previous
+            # group's selection at that position.
+            keep = chosen.gather(1, index[:, None]) | present[:, None]
+            chosen.scatter_(1, index[:, None], keep)
         return chosen
 
-    # Planning is a tiny O(B*P) control-path operation over at most a few dozen patches. Keeping
-    # it explicit makes boundary behavior auditable and deterministic under the supplied generator.
-    for row in range(batch):
-        live = torch.nonzero(valid[row], as_tuple=False).flatten()
-        if live.numel() < 2:
-            continue
-        window_start = starts[row, live].min()
-        window_end = ends[row, live].max()
-        duration = window_end - window_start
-        if not bool(duration > 0):
-            continue
-
-        # Try random fractions first, then deterministic interior token boundaries. The fallback
-        # prevents unlucky rounding on short windows from turning an otherwise valid row into a
-        # no-target sample.
-        random_fractions = lo + (hi - lo) * torch.rand(
-            8, generator=generator, device=device,
+    # Draw one unique physical center per horizon and select every resolution that covers it.
+    # The only loops are over the fixed number of horizons and resolutions, never over the batch.
+    for bin_lo, bin_hi in bins:
+        choices = (
+            future_mask & center_horizons.ge(bin_lo) & center_horizons.lt(bin_hi)
         )
-        candidate_boundaries = [window_start + fraction * duration for fraction in random_fractions]
-        interior = torch.unique(torch.cat((starts[row, live], ends[row, live]))).sort().values
-        candidate_boundaries.extend(
-            value for value in interior
-            if bool(value > window_start) and bool(value < window_end)
+        sorted_centers = centers.masked_fill(~choices, inf).sort(dim=1).values
+        unique_center = torch.isfinite(sorted_centers)
+        if patches > 1:
+            unique_center[:, 1:] &= sorted_centers[:, 1:].ne(sorted_centers[:, :-1])
+        unique_count = unique_center.sum(dim=1)
+        # A uniform draw over unique centers prevents denser resolution grids from gaining extra
+        # anchor probability. Rows without choices are masked before they can affect the plan.
+        draw = torch.floor(
+            torch.rand(batch, generator=generator, device=device)
+            * unique_count.clamp_min(1).to(starts.dtype)
+        ).long()
+        unique_rank = unique_center.long().cumsum(dim=1) - 1
+        picked = unique_center & unique_rank.eq(draw[:, None])
+        anchor = torch.where(picked, sorted_centers, torch.zeros_like(sorted_centers)).sum(dim=1)
+        rows = unique_count.gt(0)
+        covered = select_covering(anchor, rows)
+        newly_selected = covered & ~target_mask
+        target_mask |= covered
+        horizon = torch.where(
+            newly_selected, (anchor - boundary)[:, None], horizon,
         )
 
-        chosen_context = chosen_future = None
-        boundary = None
-        for proposed in candidate_boundaries:
-            observed = valid[row] & (ends[row] <= proposed + 1e-7)
-            future = valid[row] & (starts[row] >= proposed - 1e-7)
-            if bool(observed.any()) and bool(future.any()):
-                boundary, chosen_context, chosen_future = proposed, observed, future
-                break
-        if boundary is None:
-            continue
-
-        centers = 0.5 * (starts[row] + ends[row])
-        center_horizons = centers - boundary
-        selected = torch.zeros(patches, dtype=torch.bool, device=device)
-        for bin_lo, bin_hi in bins:
-            choices = torch.nonzero(
-                chosen_future & (center_horizons >= bin_lo)
-                & (center_horizons < bin_hi), as_tuple=False,
-            ).flatten()
-            if choices.numel() == 0:
-                continue
-            # Several resolutions can share a center. Draw from unique physical anchors so a
-            # dense grid does not gain extra sampling probability merely by duplicating a time.
-            anchors = torch.unique(centers[choices])
-            anchor = anchors[torch.randint(
-                anchors.numel(), (), generator=generator, device=device,
-            )]
-            # Include all future resolutions covering the sampled physical anchor. The strict
-            # future predicate remains in force, so no long token can straddle the context edge.
-            # Physical patches are half-open intervals [start, end). With inclusive ends, an
-            # anchor exactly on a fine-grid boundary selected both neighbouring patches and gave
-            # that resolution twice the supervision for one event.
-            covered = nearest_covering_per_resolution(row, anchor, chosen_future)
-            newly_selected = covered & ~selected
-            selected |= covered
-            horizon[row] = torch.where(
-                newly_selected, anchor - boundary, horizon[row],
-            )
-
-        if not bool(selected.any()):
-            # A feasible future outside configured bins is still useful; choose its earliest
-            # physical center and align every available resolution to that anchor.
-            choices = torch.nonzero(chosen_future, as_tuple=False).flatten()
-            anchor = centers[choices[centers[choices].argmin()]]
-            selected = nearest_covering_per_resolution(row, anchor, chosen_future)
-            horizon[row] = torch.where(selected, anchor - boundary, horizon[row])
-
-        context_end[row] = boundary
-        context_mask[row] = chosen_context
-        target_mask[row] = selected
-        eligible[row] = bool(chosen_context.any() and selected.any())
+    # A feasible future outside the configured bins remains useful. Align all available
+    # resolutions to its earliest physical center.
+    fallback_rows = has_boundary & ~target_mask.any(dim=1)
+    fallback_anchor = centers.masked_fill(~future_mask, inf).min(dim=1).values
+    fallback_anchor = torch.where(
+        fallback_rows, fallback_anchor, torch.zeros_like(fallback_anchor),
+    )
+    fallback = select_covering(fallback_anchor, fallback_rows)
+    target_mask |= fallback
+    horizon = torch.where(
+        fallback, (fallback_anchor - boundary)[:, None], horizon,
+    )
+    eligible = has_boundary & context_mask.any(dim=1) & target_mask.any(dim=1)
 
     return FutureTargetPlan(
         context_end=context_end,
