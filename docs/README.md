@@ -1,15 +1,17 @@
 # HALO documentation
 
-Start with [IMWUT_START_HERE.md](IMWUT_START_HERE.md).
+Start with [START_HERE.md](START_HERE.md). It names the active system, source of truth for the
+pretraining corpus, and the exact separation between live and archived work.
 
-The live documentation is deliberately small:
+Live documents:
 
-- `design/DESIGN_OF_RECORD.md`: system architecture and paper scope;
-- `design/RESEARCH_TASKS.md`: Tasks 1-3 and their shared sequence contract;
-- `design/JEPA_PRETRAINING_OBJECTIVE.md`: label-free encoder pretraining;
-- `design/EVALUATION_PROTOCOL.md`: data splits, controls, metrics, and reporting;
-- `data/`: labelled and label-free corpus contracts; and
-- `tasks/`: detailed task-specific training and evaluation specifications.
+- `design/DESIGN_OF_RECORD.md`: current encoder and support-classifier architecture;
+- `design/JEPA_PRETRAINING_OBJECTIVE.md`: optional label-free future-JEPA objective;
+- `design/CONTINUOUS_KERNEL_FRONTEND.md`: continuous multispan encoder arm;
+- `design/EVALUATION_PROTOCOL.md`: support-classification splits, metrics, and reporting rules;
+- `data/PRETRAINING_CORPUS.md`: selected label-free corpus and access status;
+- `baselines/`: retained released-checkpoint roster and comparison policy; and
+- `results/RESULTS.md`: promoted result record.
 
-Use [HISTORY.md](HISTORY.md) to locate a retired experiment by its immutable Git
-reference. Do not restore historical documents into the live design tree.
+Use [HISTORY.md](HISTORY.md) for retired work. Do not restore archived documents into this tree as
+live design material.

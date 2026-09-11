@@ -3,14 +3,13 @@
 HALO keeps source material in two sibling trees under ``data/``:
 
 ``datasets/``
-    Labelled sources. Every activity-recognition corpus used for evaluation probes, the
-    Phase-B evidence bank, and the application tasks. A session here has real activity
-    annotations in ``labels.json``.
+    Labelled sources for current support-classifier training/evaluation and historical
+    reproducibility. A session here has real activity annotations in ``labels.json``.
 
 ``pretraining/``
     Label-free scale sources for representation pretraining ONLY. Every session carries the
     reserved ``__unlabeled__`` marker, so these sources can never contribute to label
-    vocabulary construction, validation probes, or the evidence bank — the existing
+    vocabulary construction, supervised probes, or support episodes — the existing
     ``__unlabeled__`` guards already enforce that, and the directory split makes the
     intent visible on disk instead of only in a roster tuple.
 

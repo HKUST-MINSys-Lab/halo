@@ -1,38 +1,19 @@
-# Training and diagnostics
+# Training
 
-The application-motion-monitoring branch starts from frozen representations. Training is optional
-and is introduced only after non-parametric signal and representation floors are measured.
+Two live training surfaces remain.
 
 ## `tokenizer/`
 
-HALO representation pretraining, checkpoint loading, temporal representation export, and
-representation-health diagnostics. The existing JEPA/VICReg trainer remains useful for controlled
-within-HALO experiments, but the three application tasks do not require another pretraining run to
-begin.
+Optional label-free future-JEPA pretraining for a HALO encoder. The student observes a valid prefix
+of an IMU region, predicts later patch states from an EMA teacher, and decodes physical targets from
+those predictions. See [JEPA_PRETRAINING_OBJECTIVE.md](../docs/design/JEPA_PRETRAINING_OBJECTIVE.md).
 
-See [`tokenizer/README.md`](tokenizer/README.md) for the implemented encoder recipe. Its Phase-A name
-is historical terminology; application code should call the output a representation checkpoint.
+## `support_classifier/`
 
-## `evidence/`
+Support-conditioned HAR training. The same selected encoder embeds query and support recordings;
+the comparator learns only to adjust support-row evidence before the explicit candidate vote. A
+frozen-encoder run isolates representation quality. An end-to-end run updates the HALO encoder,
+recording pool, and comparator through both query and support paths.
 
-Historical candidate-label, memory-bank, and retrieve-mix-vote experiments. They are retained so the
-previous published-result branch remains reproducible, but they are not the active downstream design.
-Do not extend these trainers for the new tasks.
-
-The application path uses sequence matching, aligned difference measurement, and motif discovery in
-a new `applications/motion_monitoring/` package. If frozen representations fail, one small Siamese
-metric projection may be trained and shared by all three tasks.
-
-## `diagnostics/`
-
-Existing representation and provenance probes remain useful. New diagnostics should measure:
-
-- cross-session same-motion versus different-motion separation;
-- remounting and device sensitivity;
-- temporal embedding rank and patch diversity;
-- verification calibration and false-match behavior;
-- target-absent false alarms; and
-- motif recurrence versus duplicate-buffer artifacts.
-
-Activity labels may be used to score hidden-label evaluation but do not enter the core application
-algorithms.
+The old `evidence/` directory is historical reproducibility code, not a live default. Do not add
+new work there.

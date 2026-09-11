@@ -1,23 +1,11 @@
-"""Baseline adapter framework shared by the retained released encoders.
+"""Released-checkpoint adapter framework.
 
-Each baseline is a small adapter that subclasses one of two tiers and is
-registered with :func:`register`:
-
-  * :class:`ConSEAdapter` — a closed-vocabulary classifier. It emits a per-window
-    softmax over the GLOBAL training vocabulary
-    (``data/labels/global_labels.json``); the base bridges that to the target
-    dataset's label strings with ConSE (Norouzi et al., 2014).
-  * :class:`CosineAdapter` — a text-aligned model with its own text tower. It
-    emits per-window sensor embeddings and label embeddings in a shared space;
-    the base scores by cosine similarity (no bridge).
-
-An adapter declares its INPUT CONTRACT (channels / rate / window) so a per-baseline
-resampler (added later) can honour it, implements ``setup`` plus its one tier
-method, and is decorated with ``@register``. The base owns the shared plumbing —
-ground truth, the ConSE/cosine scoring, subject-stratified CIs — via
-:mod:`baselines.scoring` and :mod:`baselines.data`, so there is NO per-baseline dispatch
-code and no per-baseline ground-truth handling. The application tasks consume
-``window_features`` through ``applications.motion_monitoring.baseline_encoder``.
+The retained HARNet, UniMTS, and NormWear adapters declare their published input contract and
+export frozen representations for the common support-conditioned evaluation. The legacy
+``ConSEAdapter`` and ``CosineAdapter`` tiers stay here only because HARNet's released checkpoint
+adapter still uses their feature-loading contract; they are not the active classifier or paper
+protocol. New comparison code should call ``setup_features`` and ``window_features`` rather than
+the historical native-prediction helpers.
 """
 
 from __future__ import annotations

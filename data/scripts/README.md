@@ -23,7 +23,7 @@ Pipeline order: **curate → assemble** (→ grids). `labels/`, `debug/`, and
 |---|---|
 | `canonical_labels.py` | unified **canonical** training vocabulary (merge synonyms) |
 | `label_augmentation.py` | per-dataset label synonyms + templates |
-| `build_global_label_mapping.py` | legacy shared HAR label vocabulary; not used by the application tasks |
+| `build_global_label_mapping.py` | legacy shared HAR label vocabulary; not used by the current support-classifier path |
 
 ## `debug/` — per-session plots
 `visualization_utils.py`, `plot_sessions.py`

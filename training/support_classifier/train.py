@@ -1,7 +1,7 @@
 """Train the retained support-conditioned classification control.
 
-This is a bounded comparison control, not an active movement-monitoring task model. Each episode
-contains a query, compatible support executions, and a candidate roster. The encoder and the sole
+This is the active bounded support-classification model. Each episode contains a query, compatible
+support recordings, and a candidate roster. The encoder and the sole
 sensor-vector support reweighter can be fitted end to end; at initialization, the model is exactly
 the closed-form support vote. Historical Phase-B retrieval and language-voting implementations are
 not part of this module.
@@ -634,7 +634,6 @@ def support_ablation_telemetry(
             temperature=TAU_SUPPORT,
             vote_scale=VOTE_SCALE,
             center=center,
-            enrollment_override=(rows["support_mask"] & text["support_bound"].ge(0)).any(dim=1),
         )
         prediction = output["logits"].masked_fill(
             ~candidate_mask, float("-inf"),

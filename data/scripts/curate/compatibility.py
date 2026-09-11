@@ -7,7 +7,7 @@ The comparison model is handed K labelled recordings alongside each query. Which
 learn: a pocket-phone query is not compared against smartwatch examples. This module is that
 filter, and nothing here is claimed as a research contribution.
 
-WHY IT IS NOT `applications/motion_monitoring/data/compatibility.py`
+WHY IT IS NOT a task-specific compatibility module
 -------------------------------------------------------------------
 That module keys off a live :class:`SensorStream` and normalises ``placement`` by lowercasing and
 collapsing whitespace. The corpus stores ``StreamSpec.placement`` as free-text English, so that

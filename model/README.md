@@ -1,28 +1,30 @@
 # Model components
 
-## `tokenizer/` - movement representation
+## `tokenizer/`
 
-The active model component converts native-rate IMU data into temporal patch embeddings.
+The HALO encoder converts native-rate IMU into contextual physical-time patch vectors and an
+optional recording representation.
 
 | module | role |
 |---|---|
-| `filterbank.py` | fixed physical-Hz filterbank and signed low-frequency/gravity features |
-| `continuous_kernel.py` | learned continuous physical-time convolutional frontend |
-| `preprocess.py` | gravity alignment and per-window preparation |
-| `sensor_tokens.py` | folds xyz channels into sensor-level tokens with validity masks |
-| `transformer.py` | temporal and optional cross-sensor contextualization in physical time |
-| `encoder.py` | representation interface returning tokens, per-patch vectors, and pooled vectors |
-| `channel_text.py` | optional acquisition-description conditioning |
-| `primitives.py` | interpretable physical diagnostics, not task labels |
+| `filterbank.py` | fixed physical-Hz filterbank with signed low-frequency features |
+| `continuous_kernel.py`, `multispan_kernel.py` | continuous temporal frontend and multispan variant |
+| `preprocess.py` | truthful gravity and channel preparation |
+| `sensor_tokens.py` | sensor-level token construction and validity masks |
+| `transformer.py`, `encoder.py` | temporal/cross-sensor context and representation interface |
+| `channel_text.py` | acquisition-configuration conditioning |
+| `future_jepa.py` | pretraining-only EMA teacher, predictor, and physical decoder |
 
-The application design consumes timestamped **per-patch** vectors. Whole-recording pooling is a
-control, not the default, because it removes movement phase and prevents subsequence alignment.
+The encoder preserves patch-level states until a downstream recording pool is explicitly requested.
+The support classifier can train that pool end to end; future-JEPA targets patch states, not pooled
+recording vectors.
 
-## `evidence/` - historical classification experiments
+## `support/`
 
-The evidence modules implement the prior candidate-label retrieval, reranking, and voting research.
-They remain for reproducibility but are not used by the movement-monitoring design. Tasks 1-3 use a
-shared sequence matcher and do not require candidate labels.
+The active support-conditioned classifier starts from cosine similarity between a query recording
+and support recordings. Label bindings turn weighted support rows into candidate scores. The learned
+comparator is intentionally narrow: it set-attends only sensor representations plus query/support
+role and episode-slot embeddings, then emits a scalar correction for each support row.
 
-See [`../docs/design/DESIGN_OF_RECORD.md`](../docs/design/DESIGN_OF_RECORD.md) for the active model
-boundary and [`../training/README.md`](../training/README.md) for training policy.
+The retired evidence-engine modules remain in the repository only for archived checkpoint
+compatibility. They are not imported by the active support-classifier path.

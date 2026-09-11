@@ -11,16 +11,15 @@ Shared, **cross-dataset** logic (unit/gravity canonicalization, the device/chann
 harmonised-vs-raw assembly, augmentations, the setup-all entry point) lives in [`../scripts`](../scripts),
 not here.
 
-The old generic-HAR train/evaluation roster is no longer the application protocol. Dataset roles for
-demonstrated-action detection, movement comparison, and recurrent-motion discovery are defined in
-[`../../docs/data/APPLICATION_DATASETS.md`](../../docs/data/APPLICATION_DATASETS.md). In particular,
-an encoder pretraining source is not automatically an independent application test source.
+The retained datasets feed support-classifier training and held-out evaluation. A dataset used for
+label-free encoder pretraining cannot also support an unseen-dataset generalization claim. Its role
+must be recorded in the run manifest and in the promoted result record.
 
 The gridded training corpus and old held-out HAR roster remain available for representation training
 and historical reproduction. Complete converted sessions, timestamps, gaps, subject identity, and
-execution provenance are the authoritative inputs for the new application tasks; six-second grids
+recording provenance is authoritative for support-classifier episodes; six-second grids
 must not be mistaken for complete recordings.
 
 New data sources still require a locally readable publication or official protocol under
 [`../../references/datasets`](../../references/datasets), verified acquisition metadata, and an
-explicit task role before they enter an application experiment.
+explicit training or evaluation role before they enter a reportable experiment.

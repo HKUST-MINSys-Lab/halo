@@ -4,7 +4,7 @@
 > `training/tokenizer/pretrain.py` implements this multi-horizon future-JEPA objective. The former
 > bidirectional masked JEPA plus VICReg recipe remains available only as the explicitly selected
 > `--jepa-mode masked` control. Literature evidence and the audit that motivated the change remain in
-> [`LABEL_FREE_SCALE_AND_JEPA_AUDIT_20260909.md`](LABEL_FREE_SCALE_AND_JEPA_AUDIT_20260909.md).
+> [`JEPA_LITERATURE_NOTES_20260909.md`](JEPA_LITERATURE_NOTES_20260909.md).
 
 ## 1. Purpose
 

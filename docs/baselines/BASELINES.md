@@ -1,28 +1,18 @@
-# Baseline Encoders
+# Retained baseline encoders
 
-The motion-monitoring study compares timestamped representations, not each model's native HAR
-classifier. Every retained encoder feeds the same Task 1 matcher, Task 2 change model, and Task 3
-recurrent-motion model. Frozen controls use the authors' released checkpoints. HALO may be trained
-end to end with the task head in its own arm.
+The primary comparison is deliberately small and uses only author-released checkpoints.
 
-## Retained released-checkpoint roster
-
-| Encoder | Family | Why retained | Input constraint |
+| encoder | representation family | required input | role in comparison |
 |---|---|---|---|
-| HARNet / ssl-wearables | large-scale wrist accelerometry SSL | low-cost temporal-CNN control | accelerometer, 30 Hz, 5 s receptive field |
-| UniMTS | synthetic motion and body-configuration encoding | configuration-aware recent foundation-model control | accelerometer mapped to its body model |
-| NormWear | channel-independent time-frequency wearable model | closest external time-frequency control | substantially slower inference |
-| HALO | physical-time representation | project model: base fixed, multiresolution fixed, and multispan continuous variants | accepts heterogeneous IMU layouts |
+| HARNet / SSL-Wearables | large-scale wrist accelerometry self-supervision | accelerometer, published resampling and crop contract | low-cost temporal HAR control |
+| UniMTS | synthetic-motion and body-configuration foundation model | accelerometer mapped to its published body configuration | recent heterogeneous-motion control |
+| NormWear | channel-independent wearable time-frequency model | channels and preprocessing required by its checkpoint | time-frequency control |
+| HALO | physical-time IMU representation | heterogeneous masked accelerometer/gyroscope streams | project model |
 
-The application adapter preserves each baseline's published input contract, derives timestamped
-embeddings at a common evaluation stride, and passes no label information to the encoder.
+Every adapter must record its checkpoint source and published preprocessing. It may resample or pad
+only as required by that model's documented contract. It must not use test labels, candidate text,
+or support labels while producing an embedding.
 
-## Excluded models
-
-LiMU-BERT, CrossHAR, ImageBind, and internally trained HALO variants are not active comparison
-arms. Their retained or reproducible history belongs to
-`archive/imwut-comparison-pre-cleanup-20260910`, not this branch. Excluding them keeps the paper
-limited to published checkpoint provenance and a small, interpretable representation roster.
-
-See [BASELINE_FAIRNESS_POLICY.md](BASELINE_FAIRNESS_POLICY.md) for the common application-task
-protocol and source-specific constraints.
+LiMU-BERT and CrossHAR are excluded because locally usable checkpoints were trained in this project.
+ImageBind is retained only for diagnostic work. These exclusions reduce provenance ambiguity; their
+historical results are not part of the live paper comparison.

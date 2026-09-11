@@ -1,16 +1,18 @@
-# IMWUT movement-monitoring results
+# HALO results record
 
-This file is the sole result-of-record for the live movement-monitoring system.
-No completed full, sealed Task 1-3 comparison is recorded on this branch yet.
+This file is the only promoted result record for the current support-conditioned HAR design.
+Historical Phase-B and movement-monitoring results are archived and deliberately not mixed here.
 
-When an experiment is complete, add one dated section containing:
+No sealed result from the cleaned protocol is promoted yet.
 
-- task, cohort and manifest fingerprints;
-- encoder variant and checkpoint hash;
-- frozen versus task-adapted condition;
-- every compared released encoder on the same eligible units;
-- per-dataset metrics, not only pooled averages; and
-- a link to the machine-readable result artifact and figures.
+Every completed run must add a dated section containing:
 
-Do not add pre-cleanup classification or Phase-B tables here. Those results have a
-different recording contract and remain reachable from `HISTORY.md`.
+- code commit, encoder arm, checkpoint hash, and whether the encoder was frozen or end to end;
+- training and development episode-manifest fingerprints;
+- candidate-count and support-count distributions;
+- all retained baseline rows under the same eligible protocol;
+- per-test-dataset metrics and uncertainty, then any aggregate; and
+- machine-readable artifact paths, run time, peak memory, and known exclusions.
+
+Never select a test checkpoint or threshold by the headline table. Development selection and sealed
+test reporting are specified in [EVALUATION_PROTOCOL.md](../design/EVALUATION_PROTOCOL.md).

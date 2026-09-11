@@ -1,94 +1,60 @@
 # HALO
 
-HALO is a research system for **personalized movement monitoring from wearable IMU data**. It uses
-pretrained temporal representations from phones, smartwatches, and compatible consumer wearables to
-support three application tasks:
+HALO is a research codebase for support-conditioned human-activity recognition from heterogeneous
+inertial measurement unit (IMU) recordings. The current question is practical: can a
+physical-time encoder and a simple comparison head recognize a bounded set of activities when it
+is given zero or a small number of labelled support recordings?
 
-1. detect an arbitrary demonstrated movement in a complete later recording;
-2. quantify how independently bounded executions of the same movement differ; and
-3. discover frequently recurring motion directly in an unlabeled continuous recording.
+```text
+native-rate IMU + honest channel metadata
+    -> rate-aware HALO encoder
+    -> one representation per recording
+    -> compare a query with labelled supports
+    -> score the supplied candidate activities
+```
 
-The intended workflow is **demonstrate or discover, detect, compare, and track**. Rehabilitation is
-the primary application. Occupational monitoring is scoped to repetitive-motion exposure and drift;
-the system does not infer intent, fatigue, injury, or clinical improvement without external ground
-truth.
+The project does not claim unconstrained activity recognition from arbitrary label text. The
+support set defines the available evidence: zero-support and enrolled-support conditions are
+separate, explicitly reported evaluation regimes.
 
-The contribution is evaluated as one end-to-end application system. The three tasks are linked
-operations, not separate papers. None depends on a generic pre-segmentation stage: Task 1 localizes
-matches through subsequence alignment, Task 2 receives confirmed executions, and Task 3 searches a
-dense multiscale timeline. A statistical motion-proposal implementation remains only as an optional
-speed baseline.
+## Current scope
 
-Read the active design in this order:
+- **Encoder arms:** a one-second fixed physical filterbank control, a fixed multiresolution
+  filterbank (0.5, 1.0, and 1.5 seconds), and a continuous multispan frontend at the same spans.
+- **Optional pretraining:** label-free future-JEPA trains contextual patch representations before
+  support-classifier training. It is encoder-agnostic at the physical-time token interface.
+- **Classifier:** a fixed similarity-weighted support vote, optionally corrected by a small
+  sensor-only set-attention reweighter. It does not contain the retired admissibility gate or
+  retrieve-mix-vote machinery.
+- **External comparisons:** author-released HARNet, UniMTS, and NormWear checkpoints, adapted
+  faithfully and evaluated under the same support protocol where their input contracts permit it.
 
-1. [`docs/design/MOTIVATION.md`](docs/design/MOTIVATION.md)
-2. [`docs/design/RESEARCH_TASKS.md`](docs/design/RESEARCH_TASKS.md)
-3. [`docs/tasks/TASK1_ARBITRARY_DETECTION.md`](docs/tasks/TASK1_ARBITRARY_DETECTION.md)
-4. [`docs/tasks/TASK2_CHANGE_QUANTIFICATION.md`](docs/tasks/TASK2_CHANGE_QUANTIFICATION.md)
-5. [`docs/tasks/TASK3_RECURRENT_MOTION_DISCOVERY.md`](docs/tasks/TASK3_RECURRENT_MOTION_DISCOVERY.md)
-6. [`docs/data/ANNOTATION_INVENTORY.md`](docs/data/ANNOTATION_INVENTORY.md)
-7. [`docs/design/DESIGN_OF_RECORD.md`](docs/design/DESIGN_OF_RECORD.md)
-8. [`docs/design/ENCODER_HYPOTHESES.md`](docs/design/ENCODER_HYPOTHESES.md)
-9. [`docs/design/EVALUATION_PROTOCOL.md`](docs/design/EVALUATION_PROTOCOL.md)
-10. [`docs/design/IMPLEMENTATION_PLAN.md`](docs/design/IMPLEMENTATION_PLAN.md)
-
-## Current status
-
-The application pivot agreed on 2026-08-27 is now the design of record on `main`. The encoder, data
-converters, released-checkpoint baseline adapters, application source acquisition, and seven
-lossless raw-timeline adapters exist. The temporal annotation inventory is reproducibly measured.
-Task 1 has a tested encoder-agnostic full-timeline subsequence matcher that can return multiple
-physical-time detections without generic motion proposals. The common `MotionSequence` export and
-full task evaluations remain planned. The former Task-0 implementation is retained only as an
-optional proposal-speed baseline.
-
-The previous zero-shot, k-curve, and retrieve-mix-vote research remains recoverable from Git at
-commit `32267b6` and branch `archive/pre-application-main-20260830`. It is not the design of record.
-
-## Technical foundation
-
-- **Data:** converters preserve subjects, sessions, timestamps, sensor units, placement, sampling
-  rate, gravity state, and channel validity. The new tasks must consume whole session timelines rather
-  than treating six-second training grids as independent recordings.
-- **HALO encoder:** physical-time frontend plus temporal patch embeddings and explicit acquisition
-  metadata.
-- **External representations:** a minimal primary roster of author-released HARNet, UniMTS, and
-  NormWear checkpoints, used frozen through faithful adapters; ImageBind remains an optional generic
-  multimodal control.
-- **Initial downstream methods:** raw-signal DTW, physical-feature alignment, latent subsequence
-  alignment, and matrix-profile-style motif discovery. Learned metric heads come later only if the
-  frozen floors identify a representation limitation.
+Read [the documentation entry point](docs/START_HERE.md) before configuring a run.
 
 ## Layout
 
 ```text
-baselines/            # author-released checkpoint adapters and publications
-data/
-  datasets/           # downloads, converters, manifests, and channel descriptions
-  scripts/            # curation, units, assembly, quality checks, and EDA
-model/
-  tokenizer/          # HALO representation encoder and frontends
-  evidence/           # historical classification experiments; not the active application design
-training/
-  tokenizer/          # optional HALO representation pretraining and diagnostics
-  evidence/           # historical Phase-B trainers retained for reproducibility
-  diagnostics/        # representation diagnostics
-eval/                 # prior HAR evaluation plus future shared application protocol code
-docs/                 # active motivation, task, design, data, baseline, and result records
-tests/                # regression tests
+baselines/                    # retained released-checkpoint adapters and publications
+data/                         # labelled data, curation, and label-free pretraining sources
+model/tokenizer/              # HALO frontends and contextual encoder
+model/support/                # current support-conditioned comparison head
+training/tokenizer/           # encoder pretraining
+training/support_classifier/  # support-classifier training and validation
+docs/                         # current design, data, protocol, and results record
+tests/                        # regression tests for the retained surface
 ```
 
-Application code will live under `applications/motion_monitoring/` so it does not inherit candidate-
-label or Phase-B assumptions from the previous evaluation harness.
+The previous language-alignment, explicit-admissibility, Phase-B evidence-engine, and
+movement-monitoring application pivots are archived in Git. They are not live implementation
+guidance. See [docs/HISTORY.md](docs/HISTORY.md).
 
 ## Development
 
-Use the project interpreter for torch, scipy, pandas, and h5py:
+Use the project interpreter for Torch and scientific dependencies:
 
 ```bash
 /home/alex/code/HALO/legacy_code/.venv/bin/python -m pytest tests -q
 ```
 
-Raw datasets, checkpoints, caches, and generated run artifacts remain gitignored. Design decisions
-and promoted result summaries are tracked so switching branches restores the corresponding research
-program without duplicating stale documents.
+Raw downloads, caches, checkpoints, and generated run outputs are ignored by Git. Promoted
+protocols and result summaries are tracked with their code.

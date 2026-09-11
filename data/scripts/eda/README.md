@@ -89,7 +89,7 @@ which remains per-axis and orientation-sensitive.
    acquisition metadata in the manifest.
 5. **Application representation views**: compare frozen encoder sequences, aligned
    demonstrations, per-phase deviations, and recurrent motifs. These views remain
-   to be implemented under `applications/motion_monitoring/`.
+   to be implemented in a dedicated future analysis package rather than the active classifier.
 
 Primary figures use deployment-plausible phone or watch streams. Analyses of
 ankle, chest, ECG, magnetometer, or other pruned inputs must be explicitly

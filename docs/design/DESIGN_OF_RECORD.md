@@ -1,133 +1,87 @@
-# Design of record: detect, compare, and discover
+# Design of record: support-conditioned heterogeneous HAR
 
-> **Design of record, 2026-09-10.** This is the sole live design for the IMWUT
-> movement-monitoring submission. Historical classification and retrieval systems
-> are available only through `docs/HISTORY.md`.
+> Current design, 2026-09-11. This document supersedes the earlier language-alignment,
+> admissibility, evidence-engine, and movement-monitoring designs on `main`.
 
-## 1. System boundary
+## Objective
 
-The system accepts phone, smartwatch, or compatible consumer-wearable IMU recordings and produces a
-timestamped movement representation. It does not require an activity vocabulary for its core tasks.
+Given native-rate IMU recordings from heterogeneous sources, learn a representation in which a
+query recording can be compared with a small collection of labelled support recordings. The task
+has a declared candidate set. At zero support the system has no enrolled example for the target;
+at few support it receives one or more labelled examples. These are different operating
+conditions, not interchangeable scores.
 
-```text
-native-rate IMU + acquisition metadata
-    -> faithful encoder adapter
-    -> timestamped patch embeddings and physical measurements
-    -> task-specific dense matching, alignment, or recurrence discovery
-    -> inspectable physical-time intervals and measurements
-```
+The intended claim is not that language alone identifies any action. It is that a rate-aware,
+physically grounded encoder and an explicit support comparison can provide useful recognition when
+the acquisition configuration and support availability are honestly specified.
 
-No generic segmentation stage is required. Long recordings remain intact until the task-specific
-algorithm localizes the evidence it needs.
+## Input contract
 
-## 2. Common representation contract
+Each recording retains its native samples and metadata:
 
-Every encoder adapter returns a `MotionSequence` with:
+- accelerometer xyz and, when present, gyroscope xyz in canonical units;
+- sampling rate and source rate;
+- per-channel validity masks and gravity state;
+- sensor placement and device description; and
+- recording, subject, and dataset provenance.
 
-- one normalized embedding per temporal patch or sliding analysis frame;
-- physical start, end, and represented duration for every embedding;
-- sensor modality, placement, sampling rate, gravity state, and channel-validity metadata;
-- execution, session, subject, dataset, and source-recording provenance;
-- aligned raw acceleration and gyroscope references; and
-- parameter-free physical summaries required by Task 2.
+Preprocessing never invents a missing modality. Acceleration-only streams are masked rather than
+treated as measured gyroscope signals. All time spans are in seconds, not sample counts.
 
-Adapters may use a model's native temporal features. A model exposing only a pooled embedding is
-applied with a common physical-time sliding window and stride. Duplicate windows never receive extra
-weight merely because one model emits a denser temporal grid.
+## Encoder arms
 
-## 3. Task 1: reference-to-stream detection
+All arms return valid contextual patch vectors and a recording representation produced after
+temporal context. Their interfaces preserve duration, physical time, resolution identity, and
+validity masks.
 
-Task 1 applies constrained cosine-cost subsequence DTW between one or more reference sequences and a
-complete query timeline. The alignment endpoints localize each match. Development-calibrated score
-thresholding and temporal non-maximum suppression turn the dense endpoint scores into zero or more
-non-duplicate physical-time detections.
+| arm | frontend | intended role |
+|---|---|---|
+| fixed control | one-second physical filterbank | small, interpretable baseline |
+| fixed multiresolution | filterbank at 0.5, 1.0, and 1.5 seconds, jointly contextualized | frequency features at multiple physical spans |
+| continuous multispan | learnable continuous kernels at 0.5, 1.0, and 1.5 seconds | temporal as well as frequency-sensitive representation |
 
-The initial method is non-parametric. A diagonal feature weighting, linear projection, or
-differentiable alignment is added only as a measured comparison. Synthetic timelines may train or
-stress the system, but primary evaluation uses natural continuous recordings and real event
-intervals. [`TASK1_ARBITRARY_DETECTION.md`](../tasks/TASK1_ARBITRARY_DETECTION.md) owns the contract.
+Acquisition-description conditioning is auxiliary context. It may explain which channels are
+present and how they were acquired; it must not become a shortcut for dataset or label identity.
 
-## 4. Task 2: aligned difference measurement
+## Optional predictive pretraining
 
-Task 2 receives independently bounded executions from source annotations, user-guided recordings, or
-Task-1 detections. It aligns them once, then keeps several views separate:
+Future-JEPA uses a student encoder that sees only a prefix of an unlabeled region and an EMA
+teacher that supplies later patch targets. A lightweight predictor forecasts future latent states;
+a physical decoder reconstructs standardized future physical measurements from the prediction. The
+student is the only encoder retained after pretraining. Full leakage and masking rules are in
+[JEPA_PRETRAINING_OBJECTIVE.md](JEPA_PRETRAINING_OBJECTIVE.md).
 
-1. latent shape and phase-local embedding cost;
-2. total duration, phase duration, cadence, and time-warp ratio;
-3. acceleration and angular-velocity intensity;
-4. dominant and band-limited physical-frequency energy;
-5. smoothness, stability, and repetition variability; and
-6. sensitivity to session, remounting, rate, and channel availability.
+## Support classifier
 
-Accepted baseline executions define personal variation and measurement noise. A later execution is
-reported as changed only relative to that distribution. Directional claims require external ground
-truth. [`TASK2_CHANGE_QUANTIFICATION.md`](../tasks/TASK2_CHANGE_QUANTIFICATION.md) owns the contract.
+For each episode, the encoder produces query and support recording representations. A fixed,
+temperature-scaled cosine distribution gives each support row a weight. Explicitly enrolled
+supports vote for their bound candidate. Background rows may only contribute through the fixed
+label-semantic bridge used by the declared protocol.
 
-## 5. Task 3: dense multiscale recurrence discovery
+The optional learned comparator receives the query and every support **sensor vector** with role
+and episode-slot embeddings. Its set-attention stack produces one scalar adjustment per support
+row. It cannot read candidate, support-label, or acquisition-description embeddings; this prevents
+the learned path from bypassing sensor evidence through a text shortcut. The resulting adjusted
+support distribution feeds the same vote as the fixed control.
 
-The encoder runs once over a complete recording at a fine physical-time stride. Adjacent base patch
-embeddings are pooled over a declared set of durations to form a temporal pyramid. Every candidate
-retains its start time, end time, duration, scale, and embedding.
+The initial scalar head is zero so the first prediction exactly equals the fixed support vote. Its
+weights receive gradients on the first step; the attention stack receives gradients after the head
+has moved away from zero. Training telemetry must confirm that the residual-head norm and support
+weight change become non-zero.
 
-A learned or fixed same-motion metric connects similar candidates. Temporal consolidation removes
-duplicate overlapping intervals using a declared rule such as Soft-NMS or weighted interval
-selection. A recurrence graph then groups non-overlapping occurrences into motifs. Hidden source
-labels are used only for training targets or evaluation, never as semantic input.
+## Training and evaluation boundary
 
-Raw or engineered-feature variable-length matrix-profile search, pooled cosine, and constrained DTW
-remain controls. The system reports compactness, nearest-negative separation, occurrence count,
-duration spread, boundary stability, and representative examples. A person confirms or names a motif
-before it is called an activity. [`TASK3_RECURRENT_MOTION_DISCOVERY.md`](../tasks/TASK3_RECURRENT_MOTION_DISCOVERY.md)
-owns the contract.
+Encoder pretraining and support-classifier training are independent stages. A classifier experiment
+may freeze a selected encoder or train a dedicated HALO copy end to end. Query and support encodings
+must both receive gradients in the end-to-end arm, including any learned recording pool.
 
-## 6. Optional motion-proposal acceleration
+Evaluation uses subject- and recording-disjoint train/development/test splits. Candidate count and
+support count are episode properties, recorded with every score. Thresholds, checkpoint choice,
+and hyperparameters come from development data only. The test protocol and retained baselines are
+defined in [EVALUATION_PROTOCOL.md](EVALUATION_PROTOCOL.md).
 
-Physical motion evidence, hysteresis, and bounded PELT can screen long still intervals before dense
-matching. This is an optional speed baseline only. Every primary Task-1 and Task-3 result must remain
-available from direct complete-timeline processing so proposal recall cannot cap model quality.
-[`MOTION_PROPOSAL_BASELINE.md`](../methods/MOTION_PROPOSAL_BASELINE.md) records that method.
+## Exclusions
 
-## 7. Learning boundary
-
-Phase A and Phase B are upstream HALO representation-training stages. They are not names for the
-three application tasks. The application comparison starts from released encoder checkpoints and
-uses a separate task-specific model for each task.
-
-Every external encoder remains frozen and receives the same small learned Task-1, Task-2, or Task-3
-module. HALO is reported both frozen under that matched protocol and as an additional end-to-end arm
-in which the task loss may update a task-specific copy of the HALO encoder. This does not require one
-HALO checkpoint to become simultaneously optimal for detection, change measurement, and recurrence
-discovery.
-
-Each task also retains a non-parametric floor. The floor establishes how much information is already
-available and whether the learned module adds value; it is not a claim that a classification-trained
-encoder is already an ideal application metric. End-to-end fine-tuning keeps the same task
-definition, split, decoder, and evaluation.
-
-- positives are independent executions of the same source movement;
-- hard negatives are explicitly different movements from the same source context where possible;
-- ambiguous or incompletely annotated relationships are ignored;
-- augmentations model sensor nuisance but never manufacture the only positive evidence; and
-- test identities, subjects, sessions, and datasets remain held out as declared.
-
-## 8. Role of HALO and external encoders
-
-HALO contributes physical-time features, temporal patch embeddings, explicit missing-information
-masks, and heterogeneous-sensor metadata. These are hypotheses, not assumed advantages. They are
-tested against raw signals, physical features, and released encoders under the same downstream
-pipeline. The system remains publishable as an application result if an external encoder wins a task.
-
-The previous candidate-label interface, zero-shot classifier, memory-label voting, admissibility gate,
-and retrieve-mix-vote mechanism are not part of this design. They remain recoverable from Git commit
-`32267b6`.
-
-## 9. Implementation principles
-
-- Use physical seconds, not sample counts, for every duration and stride.
-- Preserve source timestamps and hard recording/session boundaries.
-- Keep reference and evaluated occurrences execution-disjoint.
-- Preserve complete timelines for Tasks 1 and 3.
-- Separate latent measurements from interpretable physical measurements.
-- Treat synthetic streams as training aids, not primary publication evidence.
-- Keep the first system non-parametric and auditable.
-- Never describe recurrence as intent or difference as clinical improvement without ground truth.
+The retired explicit admissibility table, separate Phase-B memory bank, candidate-token mixer,
+arbitrary-label curriculum, and Task 0-3 movement-monitoring packages are not part of this design.
+They are archived in Git and must not be revived through a default flag or undocumented import.

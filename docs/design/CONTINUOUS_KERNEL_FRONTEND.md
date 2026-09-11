@@ -134,10 +134,9 @@ estimate and the learned reranker but slightly reduced direct 1-NN representatio
 dataset-bootstrap intervals crossed zero for the headline frontend differences. That result is mixed
 and does not promote this frontend universally.
 
-The application comparison is more diagnostic: evaluate fixed and continuous frontends with the
-same Task-1 sequence matcher and Task-2 phase-local score. The continuous arm earns its cost only if
-its ordered sub-second features improve event boundaries, same-motion verification, or localization
-of known execution changes.
+The support-classification comparison is more diagnostic: evaluate fixed and continuous frontends
+under the same support episodes and readouts. The continuous arm earns its cost only if its ordered
+sub-second features improve held-out recognition under the declared candidate and support regimes.
 
 ## Cost
 
