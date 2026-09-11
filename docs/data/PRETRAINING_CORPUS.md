@@ -61,6 +61,34 @@ sees, so its placement coverage now matters more than it did. Nymeria provides r
 body-mounted motion across locations; NHANES and synthetic IMU prevent the representation from
 becoming specific to one acquisition regime.
 
+## Selected corpus for the next full pretraining run
+
+**Decision 2026-09-11.** The target real-data roster for the next full future-JEPA pretraining run
+is:
+
+| source | selected contribution | access | implementation state |
+|---|---|---|---|
+| `nhanes` | 1,000 participants x 12 motion-aware hours; non-dominant-wrist accelerometer | public CDC download | adapter works; only a pilot subset is materialized |
+| `nymeria_xsens` | all available sequences; the 11 retained bilateral head, trunk, arm, and leg placements | user-authorized Nymeria manifest | converter exists; fetcher must accept the current `body_xdata_mvnx` manifest group before materialization |
+| `extrasensory` | phone-in-hand, phone-in-pocket, and wrist-watch streams from the public raw release | public direct download | labelled adapter works; an eight-second label-free build and downstream-overlap guard are still required |
+| `arwise` | raw 10 Hz smartwatch acceleration and angular velocity from the four public CASAS volumes | public Zenodo download, CC BY 4.0 | source verified; bounded fetch and conversion adapters are not yet implemented |
+
+All activity annotations in ExtraSensory and ArWISE are ignored during encoder pretraining. Their
+presence in the releases does not make the JEPA objective supervised. However, a source cannot be
+used both here and as a supposedly unseen downstream evaluation source. ExtraSensory must therefore
+be removed from any conflicting supervised/evaluation roster before it is activated under
+`data/pretraining/`.
+
+Synthetic IMU remains an explicit ablation and contingency source, not part of this target default.
+It may test whether simulated motion adds value after the real-data result exists, but it must not
+replace real participant or device diversity in the primary run.
+
+This table records the selected scientific corpus. It does **not** activate incomplete sources.
+`CORPUS_PLAN` and `LABEL_FREE_PRETRAIN_DATASETS` remain the operational build/training roster until
+all four adapters pass one-source conversion, metadata, quality-cache, and loader smoke checks. The
+target roster must be promoted into those two code locations in one reviewed change; until then, a
+run from the operational roster is a pilot rather than the selected full-corpus experiment.
+
 ## Composition
 
 Generated from [`data/pretraining/corpus_plan.py`](../../data/pretraining/corpus_plan.py),
