@@ -129,8 +129,6 @@ def assert_no_retired_sources(datasets: Sequence[str], *, allow: bool = False) -
 PRETRAIN_SCALE_DATASETS = (
     "nhanes",
     "nymeria_xsens",
-    "nymeria_aria",
-    "ego_exo4d",
     "synthetic_imu",
 )
 

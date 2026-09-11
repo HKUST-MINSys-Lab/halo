@@ -113,31 +113,6 @@ CORPUS_PLAN: Tuple[SourcePlan, ...] = (
              "placements already kept.",
     ),
     SourcePlan(
-        dataset="nymeria_aria",
-        take="head + both wrists, one IMU per device, all sequences",
-        streams=3,
-        wall_hours=300.0,
-        rate_hz=200.0,
-        channels=6,
-        wave=1,
-        access="gated",
-        note="Real glasses and wristband IMUs, hardware-synchronised with the Xsens suit "
-             "above, so the same motion is observed from three device classes at once.",
-    ),
-    SourcePlan(
-        dataset="ego_exo4d",
-        take="head Aria IMU from all takes",
-        streams=1,
-        wall_hours=221.26,
-        rate_hz=200.0,
-        channels=6,
-        wave=1,
-        access="gated",
-        note="The head placement at 740+ subjects. The release has 1,286 camera-hours but "
-             "221 ego-camera hours, which is the relevant one-IMU stream budget. The ~1 TB "
-             "image-free VRS download is the real cost and is streamed then deleted.",
-    ),
-    SourcePlan(
         dataset="synthetic_imu",
         take="AMASS + Motion-X++ (+ 100STYLE), 8 virtual placements",
         streams=8,
@@ -149,6 +124,36 @@ CORPUS_PLAN: Tuple[SourcePlan, ...] = (
         note="Diversity of motion vocabulary, never the base of the corpus: published "
              "evidence (arXiv 2602.11064) is that mocap pretraining alone gives marginal "
              "gains from the sim-to-real gap and helps mainly when mixed with real data.",
+    ),
+)
+
+# Understood adapters deliberately excluded from the first corpus of record. The first JEPA
+# comparison should establish whether Nymeria Xsens plus inexpensive acquisition diversity is
+# sufficient before adding a second gated device family or an AWS-backed source.
+DEFERRED_SOURCES: Tuple[SourcePlan, ...] = (
+    SourcePlan(
+        dataset="nymeria_aria",
+        take="head + both wrists, one IMU per device, all sequences",
+        streams=3,
+        wall_hours=300.0,
+        rate_hz=200.0,
+        channels=6,
+        wave=1,
+        access="gated",
+        note="Deferred: the available release manifest does not expose the compact motion-only "
+             "Aria assets expected by the current converter.",
+    ),
+    SourcePlan(
+        dataset="ego_exo4d",
+        take="head Aria IMU from all takes",
+        streams=1,
+        wall_hours=221.26,
+        rate_hz=200.0,
+        channels=6,
+        wave=1,
+        access="gated",
+        note="Deferred: avoid AWS and large VRS acquisition until the three-source corpus is "
+             "measured as insufficient.",
     ),
 )
 

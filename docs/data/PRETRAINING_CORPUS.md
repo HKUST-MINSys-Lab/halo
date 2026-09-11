@@ -57,8 +57,9 @@ physical duration before constructing a loader and gives the exact rebuild comma
 are found.
 
 One consequence to keep in view: this makes the label-free corpus the *only* thing the encoder
-sees, so its placement coverage now matters more than it did. That is the main reason Nymeria
-and Ego-Exo4D are in the plan at all, rather than NHANES alone at ten times the hours.
+sees, so its placement coverage now matters more than it did. Nymeria provides real
+body-mounted motion across locations; NHANES and synthetic IMU prevent the representation from
+becoming specific to one acquisition regime.
 
 ## Composition
 
@@ -70,12 +71,10 @@ which is the single source of truth for the build, the tests, and this table. Ru
 |---|---|---:|---:|---:|---:|---:|
 | `nhanes` | 3,000 participants x 12 h, motion-aware hours | 1 | 36,000 | 80 Hz | 3 | 124.4 |
 | `nymeria_xsens` | all 1,100 sequences, 8 of 17 body placements | 8 | 2,400 | 240 Hz | 6 | 24.9 |
-| `nymeria_aria` | head + both wrists, one IMU per device | 3 | 900 | 200 Hz | 6 | 7.8 |
-| `ego_exo4d` | head Aria IMU from IMU-bearing ego takes | 1 | 221 | 200 Hz | 6 | 1.9 |
 | `synthetic_imu` | AMASS + Motion-X++ (+ 100STYLE), 8 virtual placements | 8 | 1,800 | 60 Hz | 6 | 4.7 |
-| **total** | | | **41,321** | | | **163.7** |
+| **total** | | | **40,200** | | | **154.0** |
 
-Against a 180 GB budget, leaving 16.3 GB of headroom. Accel-only sources still occupy six
+Against a 180 GB budget, leaving 26.0 GB of headroom. Accel-only sources still occupy six
 grid slots because the common contract zero-pads and masks gyro. For comparison, the labelled Phase-A
 corpus supplies 3,117 stream-hours, so this is roughly a 13.6x increase in label-free signal.
 
@@ -86,6 +85,10 @@ token stream the encoder sees independently.
 `embody3d` (500 h, 439 participants) is wired as a candidate and excluded from the budget:
 its access terms could not be confirmed as of 2026-09-09. The orchestrator refuses to build a
 candidate source until someone confirms the licence and moves it into `CORPUS_PLAN`.
+
+`nymeria_aria` and `ego_exo4d` remain implemented as deferred adapters, but are not part of
+the default experiment. This keeps the first comparison focused on one large real-motion source
+with two inexpensive diversity controls.
 
 ## Two storage decisions
 

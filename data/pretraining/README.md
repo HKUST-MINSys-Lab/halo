@@ -16,7 +16,7 @@ joining a fixed root.
 
 The JEPA objective needs no labels, so the ceiling on pretraining data is not annotation
 cost but download and disk. The current 18-source labelled corpus supplies 3,117 stream-hours,
-of which Capture-24 alone is 82% of the windows. These sources add ~41,300 stream-hours
+of which Capture-24 alone is 82% of the windows. These sources add ~40,200 stream-hours
 across placements the labelled corpus barely covers.
 
 ## The corpus of record
@@ -29,10 +29,8 @@ build and the docs.
 |---|---|---:|---:|---:|---:|
 | `nhanes` | 3,000 participants x 12 h, motion-aware hours | 1 | 36,000 | 80 Hz | 124.4 |
 | `nymeria_xsens` | all 1,100 sequences, 8 of 17 body placements | 8 | 2,400 | 240 Hz | 24.9 |
-| `nymeria_aria` | head + both wrists, one IMU per device | 3 | 900 | 200 Hz | 7.8 |
-| `ego_exo4d` | head Aria IMU from IMU-bearing ego takes | 1 | 221 | 200 Hz | 1.9 |
 | `synthetic_imu` | AMASS + Motion-X++ (+ 100STYLE), 8 virtual placements | 8 | 1,800 | 60 Hz | 4.7 |
-| **total** | | | **41,321** | | **163.7** |
+| **total** | | | **40,200** | | **154.0** |
 
 The `channels` column describes measured channels. The grid stores six physical slots for every
 source, zero-padding and masking unavailable gyro, which is why accel-only NHANES costs 124.4 GB

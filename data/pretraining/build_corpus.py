@@ -27,6 +27,7 @@ from typing import Sequence
 from data.pretraining.corpus_plan import (
     CANDIDATE_SOURCES,
     CORPUS_PLAN,
+    DEFERRED_SOURCES,
     DEFAULT_BUDGET_GB,
     SourcePlan,
     PRETRAIN_WINDOW_SECONDS,
@@ -84,7 +85,10 @@ CONVERT_ARGS = {
 def _selected(datasets: Sequence[str] | None) -> tuple[SourcePlan, ...]:
     if not datasets:
         return CORPUS_PLAN
-    known = {source.dataset: source for source in CORPUS_PLAN + CANDIDATE_SOURCES}
+    known = {
+        source.dataset: source
+        for source in CORPUS_PLAN + DEFERRED_SOURCES + CANDIDATE_SOURCES
+    }
     unknown = [name for name in datasets if name not in known]
     if unknown:
         raise SystemExit(
