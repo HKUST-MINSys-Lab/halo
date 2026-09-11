@@ -22,6 +22,7 @@ from training.tokenizer.future_jepa import (
     recommend_fixed_objective_weights,
 )
 from training.tokenizer.pretrain import (
+    MULTISPAN_MAX_BATCH_TOKENS, MULTISPAN_REFERENCE_BATCH,
     PipelineAModel, PretrainConfig, batch_under_token_budget,
     frontend_rope_min_period, future_tokens_per_window,
     validate_source_window_contract,
@@ -72,13 +73,17 @@ def test_future_jepa_model_is_frontend_agnostic(
 def test_eight_second_future_schedules_fit_the_token_budget():
     fixed = PretrainConfig(source_window_seconds=8.0)
     assert future_tokens_per_window(fixed) == 30
-    assert batch_under_token_budget(future_tokens_per_window(fixed)) == 384
+    assert batch_under_token_budget(future_tokens_per_window(fixed)) == 512
 
     multispan = PretrainConfig(
         frontend="multispan", multiresolution=False, source_window_seconds=8.0,
     )
     assert future_tokens_per_window(multispan) == 118
-    assert batch_under_token_budget(future_tokens_per_window(multispan)) == 96
+    assert batch_under_token_budget(
+        future_tokens_per_window(multispan),
+        reference_batch=MULTISPAN_REFERENCE_BATCH,
+        max_batch_tokens=MULTISPAN_MAX_BATCH_TOKENS,
+    ) == 384
     assert frontend_rope_min_period(multispan) == pytest.approx(0.25)
 
 

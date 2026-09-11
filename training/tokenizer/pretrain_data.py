@@ -69,9 +69,10 @@ VAL_RESOLUTION_PAIR = (0.5, 1.5)
 # windows, and patch_seconds is drawn PER BATCH — so without this, memory is a random variable:
 # measured P swings 12->22 at fixed batch. The current sensor-granularity encoder was profiled at
 # 7.46 GiB for batch 384 and 10.06 GiB for batch 512 with every resolution pair enabled on a 24 GiB
-# RTX 4090. 12,288 therefore admits every draw through batch 512 (worst case 11,264 tokens) without
-# silently changing the augmentation distribution. Set 0 to disable.
-MAX_BATCH_TOKENS = 12_288
+# RTX 4090. The current fixed 0.5/1.0/1.5 s JEPA grid uses 15,360 tokens at batch 512 and was
+# re-profiled at 3.87 GiB on 2026-09-11, so 16,384 admits the measured throughput optimum while
+# retaining ample headroom for validation and allocator variation. Set 0 to disable.
+MAX_BATCH_TOKENS = 16_384
 # Covers the largest declared future-JEPA patch in the label-free corpus: 240 Hz x 1.5 s = 360
 # samples. Keeping one power-of-two capacity across collate, encoder, frozen physical targets and
 # evaluation avoids frontend-specific truncation or a run that succeeds only on low-rate sources.

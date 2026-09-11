@@ -305,7 +305,8 @@ def encode_dataset_detailed(enc, data, texts, device, rate: float, gravity_state
                             neutral_text: bool = False,
                             export_sensor_rows: bool = False,
                             eval_patching: str = "checkpoint",
-                            batch_size: int = 256) -> dict[str, torch.Tensor]:
+                            batch_size: int = 256,
+                            amp_dtype: torch.dtype | None = None) -> dict[str, torch.Tensor]:
     """Encode windows and retain both pooled and valid per-patch representations.
 
     Returns:
@@ -347,7 +348,7 @@ def encode_dataset_detailed(enc, data, texts, device, rate: float, gravity_state
     # The collate capacity is part of a fixed-filterbank checkpoint's architecture. New Phase-A
     # runs use 512 samples for 240 Hz x 1.5 s, while historical and direct-test encoders may use
     # 256. Padding to the mutable current default makes those encoders fail before inference.
-    eval_dft_size = int(getattr(enc.filterbank, "S", DFT_SIZE))
+    eval_dft_size = int(getattr(getattr(enc, "filterbank", None), "S", DFT_SIZE))
     collate = (
         MultiResolutionCollate(
             fixed_patch_seconds=eval_resolutions,
@@ -419,23 +420,28 @@ def encode_dataset_detailed(enc, data, texts, device, rate: float, gravity_state
                 items.append(item)
             batch = collate(items)
             plen = batch["patch_len"]
-            out = enc(
-                batch["patches"].to(device), batch["rates"].to(device),
-                plen.to(device),
-                batch["role_texts"] if factored else batch["texts"],
-                batch["positions"].to(device),
-                patch_durations=(batch["patch_durations"].to(device)
-                                 if "patch_durations" in batch else None),
-                resolution_ids=(batch["resolution_ids"].to(device)
-                                if "resolution_ids" in batch else None),
-                channel_mask=batch["channel_mask"].to(device),
-                patch_padding_mask=batch["patch_padding_mask"].to(device),
-                sensor_texts=(batch["sensor_texts"] if factored else None),
-                sensor_id=(batch["sensor_id"].to(device) if factored else None),
-                source_rate_hz=batch["source_rates"].to(device),
-                sensor_bias=(batch["sensor_bias"].to(device)
-                             if getattr(enc, "token_granularity", "channel") == "sensor" else None),
-            )
+            with torch.amp.autocast(
+                device.type,
+                enabled=device.type == "cuda" and amp_dtype is not None,
+                dtype=amp_dtype if amp_dtype is not None else torch.float16,
+            ):
+                out = enc(
+                    batch["patches"].to(device), batch["rates"].to(device),
+                    plen.to(device),
+                    batch["role_texts"] if factored else batch["texts"],
+                    batch["positions"].to(device),
+                    patch_durations=(batch["patch_durations"].to(device)
+                                     if "patch_durations" in batch else None),
+                    resolution_ids=(batch["resolution_ids"].to(device)
+                                    if "resolution_ids" in batch else None),
+                    channel_mask=batch["channel_mask"].to(device),
+                    patch_padding_mask=batch["patch_padding_mask"].to(device),
+                    sensor_texts=(batch["sensor_texts"] if factored else None),
+                    sensor_id=(batch["sensor_id"].to(device) if factored else None),
+                    source_rate_hz=batch["source_rates"].to(device),
+                    sensor_bias=(batch["sensor_bias"].to(device)
+                                 if getattr(enc, "token_granularity", "channel") == "sensor" else None),
+                )
             embs.append(out["pooled"] if requires_grad else out["pooled"].cpu())
             if "per_patch" not in out:
                 if _require_patches:
@@ -663,6 +669,7 @@ def development_transfer_score(
     *,
     patching: str = "checkpoint",
     max_windows_per_stream: int = SELECTION_MAX_WINDOWS_PER_STREAM,
+    amp_dtype: torch.dtype | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Subject-disjoint kNN on development-only acquisition sources.
 
@@ -706,7 +713,7 @@ def development_transfer_score(
                 enc, ref.load_data()[take], stream_channel_descriptions(dataset, stream), device,
                 ref.rate_hz, _stream_gravity_state(dataset, stream), channel_mask=ref.mask,
                 dataset=dataset, stream=stream, lengths=ref.load_lengths()[take],
-                eval_patching=patching, export_sensor_rows=True,
+                eval_patching=patching, export_sensor_rows=True, amp_dtype=amp_dtype,
             )
             if encoded["sensor_Z"].numel():
                 rows = encoded["sensor_Z"].float()

@@ -106,6 +106,12 @@ from training.tokenizer.pretrain_data import (
 
 GYRO_IDX = [3, 4, 5]
 OUT_DIR = Path(__file__).resolve().parent / "outputs" / "pretrain"
+# Multi-span tokens carry a materially cheaper activation footprint than fixed-filterbank tokens.
+# On the 24 GiB reference RTX 4090, 384 windows / 45,312 tokens used 8.62 GiB and was within 1.3%
+# of batch 512 throughput. A 60 Ki-token ceiling keeps the measured 512-window configuration
+# available explicitly, but the flatter part of the throughput curve makes 384 the safer default.
+MULTISPAN_MAX_BATCH_TOKENS = 60 * 1_024
+MULTISPAN_REFERENCE_BATCH = 384
 
 
 def future_resolution_durations(cfg: "PretrainConfig") -> tuple[float, ...]:
@@ -130,12 +136,16 @@ def future_tokens_per_window(cfg: "PretrainConfig") -> int:
     )
 
 
-def batch_under_token_budget(tokens_per_window: int, reference_batch: int = 512) -> int:
+def batch_under_token_budget(
+    tokens_per_window: int,
+    reference_batch: int = 512,
+    max_batch_tokens: int = MAX_BATCH_TOKENS,
+) -> int:
     """Largest multiple of 32 no larger than the reference or token budget."""
 
     if tokens_per_window <= 0:
         raise ValueError("tokens_per_window must be positive")
-    ceiling = max(MAX_BATCH_TOKENS // tokens_per_window, 1)
+    ceiling = max(max_batch_tokens // tokens_per_window, 1)
     candidate = min(reference_batch, ceiling)
     return max((candidate // 32) * 32, 1) if candidate >= 32 else candidate
 
@@ -323,6 +333,9 @@ class PretrainConfig:
     # specialized on each batch's changing unique-text cardinality and was slower. Transformer-only
     # compilation is checkpoint-neutral; fall back to eager if the backend cannot lower a shape.
     compile_encoder: bool = False
+    # Ada/Ampere and newer: BF16 has FP32's exponent range, needs no loss scaling, and retains the
+    # same Tensor Core/memory footprint as FP16. DSP and covariance calculations remain FP32.
+    amp_dtype: str = "bf16"                # bf16 | fp16
     num_workers: int = 12                 # re-profiled 2026-08-07 on the production two-view loader:
                                           # steady wait 38.8 ms (nw=8) -> 24.1 ms (nw=12), and the
                                           # live GPU loop's exposed wait fell 7.7 ms -> <0.2 ms.
@@ -850,7 +863,10 @@ def write_source_provenance(out: Path, metadata: dict) -> dict:
     return serializable
 
 
-def capture_runtime_provenance(device: torch.device) -> dict[str, object]:
+def capture_runtime_provenance(
+    device: torch.device,
+    amp_dtype: str = "fp16",
+) -> dict[str, object]:
     """Software and accelerator identity needed to reconstruct a reported training run."""
     import scipy
 
@@ -862,8 +878,8 @@ def capture_runtime_provenance(device: torch.device) -> dict[str, object]:
         "cuda_runtime": torch.version.cuda,
         "cudnn": torch.backends.cudnn.version(),
         "device": str(device),
-        "mixed_precision": "fp16" if device.type == "cuda" else "fp32",
-        "dynamic_loss_scaling": device.type == "cuda",
+        "mixed_precision": amp_dtype if device.type == "cuda" else "fp32",
+        "dynamic_loss_scaling": device.type == "cuda" and amp_dtype == "fp16",
     }
     if device.type == "cuda":
         props = torch.cuda.get_device_properties(device)
@@ -1050,7 +1066,8 @@ def conse_probe_predict(train_z, train_y, val_z, val_y, protos,
 
 @torch.no_grad()
 def embed_stratified(model: PipelineAModel, loader: DataLoader, device, per_label: int,
-                     target_labels: set | None = None, label_totals: dict | None = None):
+                     target_labels: set | None = None, label_totals: dict | None = None,
+                     amp_dtype: torch.dtype = torch.float16):
     """Embed EXACTLY ``min(per_label, available)`` windows per label (deterministic — the loader
     must be shuffle=False / pre-shuffled). Guarantees every label is represented so the kNN metric
     covers all classes and best.pt selection is stable.
@@ -1092,7 +1109,7 @@ def embed_stratified(model: PipelineAModel, loader: DataLoader, device, per_labe
             take.append(j)
         if take:
             # Match the training precision policy: spectral analysis remains FP32, while the neural
-            # projection/conditioning/transformer path uses FP16 autocast on CUDA. Probe embeddings
+            # projection/conditioning/transformer path uses the run's autocast dtype on CUDA. Probe embeddings
             # are converted back to FP32 before the CPU kNN/ridge calculations below.
             sensor_granularity = model.encoder.token_granularity == "sensor"
             factored = model.encoder.text_conditioning == "factored" or sensor_granularity
@@ -1104,7 +1121,7 @@ def embed_stratified(model: PipelineAModel, loader: DataLoader, device, per_labe
                 device, non_blocking=True,
             )
             with torch.amp.autocast(
-                device.type, enabled=device.type == "cuda", dtype=torch.float16,
+                device.type, enabled=device.type == "cuda", dtype=amp_dtype,
             ):
                 out = model.encoder(
                     patches, rates, plen, texts,
@@ -1198,6 +1215,9 @@ def _corpus_datasets(name: str) -> tuple[str, ...]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--amp-dtype", choices=("bf16", "fp16"), default=None,
+                        help="CUDA neural-path mixed precision (default: bf16; filterbank DSP and "
+                             "loss statistics remain fp32)")
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--stop-after", type=int, default=None,
                         help="stop and checkpoint at this step while retaining --steps as the full "
@@ -1401,9 +1421,10 @@ def main() -> None:
                         help="MODEL seed (init/augmentation/batch order). Vary this across replicates.")
     parser.add_argument("--compile", dest="compile_encoder", action="store_true", default=None,
                         help="torch.compile only the transformer core (not ragged text conditioning). "
-                             "Enabled by default for CUDA Phase-A runs.")
+                             "Opt-in: dynamic sensor/token shapes are slower than eager on the "
+                             "reference RTX 4090.")
     parser.add_argument("--no-compile", dest="compile_encoder", action="store_false",
-                        help="disable the default CUDA transformer compilation")
+                        help="use eager transformer execution (the default)")
     parser.add_argument("--data-seed", type=int, default=None,
                         help="DATA seed = the subject train/val split. Keep FIXED across all arms and "
                              "replicates so the split (and the metric harness) stays identical (#1).")
@@ -1425,7 +1446,7 @@ def main() -> None:
         objective_calibration_at=500,
         objective_calibration_mode="apply",
         objective_target_jepa_share=(0.70 if args.jepa_mode == "future" else 0.45),
-        compile_encoder=args.device.startswith("cuda") and not args.smoke,
+        compile_encoder=False,
         train_datasets=_corpus_datasets(args.corpus),
         corpus_name=args.corpus,
         source_window_seconds=(PRETRAIN_WINDOW_SECONDS
@@ -1534,6 +1555,8 @@ def main() -> None:
         cfg.batch_size = args.batch
     if args.num_workers is not None:
         cfg.num_workers = args.num_workers
+    if args.amp_dtype is not None:
+        cfg.amp_dtype = args.amp_dtype
     if args.homogeneous_sensor_batches is not None:
         cfg.homogeneous_sensor_batches = args.homogeneous_sensor_batches
     if args.seed is not None:
@@ -1629,8 +1652,12 @@ def main() -> None:
             )
     elif cfg.frontend == "multispan":
         tokens_per_window = future_tokens_per_window(cfg)
-        max_batch = max(MAX_BATCH_TOKENS // tokens_per_window, 1)
-        default_batch = batch_under_token_budget(tokens_per_window)
+        max_batch = max(MULTISPAN_MAX_BATCH_TOKENS // tokens_per_window, 1)
+        default_batch = batch_under_token_budget(
+            tokens_per_window,
+            reference_batch=MULTISPAN_REFERENCE_BATCH,
+            max_batch_tokens=MULTISPAN_MAX_BATCH_TOKENS,
+        )
         if args.batch is None:
             cfg.batch_size = default_batch
         if args.steps is None:
@@ -1651,7 +1678,7 @@ def main() -> None:
             parser.error(
                 f"--frontend multispan with spans {cfg.multispan_durations} emits "
                 f"{tokens_per_window} tokens/window and requires --batch <= {max_batch} "
-                f"under the {MAX_BATCH_TOKENS}-token budget"
+                f"under the {MULTISPAN_MAX_BATCH_TOKENS}-token budget"
             )
     if cfg.jepa_mode == "future":
         if cfg.token_granularity != "sensor":
@@ -1797,17 +1824,20 @@ def main() -> None:
         parser.error("--target-jepa-gradient-share must be in (0,1)")
     device = torch.device(cfg.device)
     if device.type == "cuda":
+        if cfg.amp_dtype == "bf16" and not torch.cuda.is_bf16_supported():
+            parser.error("--amp-dtype bf16 requires a CUDA device with BF16 support; use fp16")
         # TF32 for CUDA matrix products inside the FP32 filterbank/diagnostic islands. The
-        # transformer already runs FP16 under autocast; validation kNN/ridge stays CPU FP32.
+        # transformer already runs mixed precision under autocast; validation kNN/ridge stays CPU FP32.
         torch.backends.cuda.matmul.fp32_precision = "tf32"
         torch.backends.cudnn.conv.fp32_precision = "tf32"
+    amp_torch_dtype = torch.bfloat16 if cfg.amp_dtype == "bf16" else torch.float16
     torch.manual_seed(cfg.seed)
     prepare_output_dir(
         args.out, force=args.force, smoke=args.smoke, resume=args.resume is not None,
     )
     source_provenance = capture_source_provenance(args.out, write=False)
-    runtime_provenance = capture_runtime_provenance(device)
-    precision = "fp16-mixed" if device.type == "cuda" else "fp32"
+    runtime_provenance = capture_runtime_provenance(device, cfg.amp_dtype)
+    precision = f"{cfg.amp_dtype}-mixed" if device.type == "cuda" else "fp32"
     print(f"frontend={cfg.frontend} multiresolution={cfg.multiresolution} "
           f"precision={precision}", flush=True)
     # NB: run_config.json is written AFTER resume validation (below), so a rejected --resume can't
@@ -2079,7 +2109,7 @@ def main() -> None:
     # 2^16 default. Start there to avoid throwing away those first optimizer updates while retaining
     # dynamic growth/backoff for any later change in gradient range.
     scaler = torch.amp.GradScaler(
-        enabled=device.type == "cuda", init_scale=16_384.0,
+        enabled=device.type == "cuda" and cfg.amp_dtype == "fp16", init_scale=16_384.0,
     )
     def ema_decay_at(step: int) -> float:
         """BYOL cosine ramp from cfg.jepa_ema_decay to 1.0, or the fixed value.
@@ -2143,6 +2173,11 @@ def main() -> None:
     if args.resume:
         rk = torch.load(args.resume, map_location=device, weights_only=False)
         saved_cfg = rk.get("config", {})
+        # Checkpoints predating the explicit precision field were unambiguously FP16. Materialize
+        # that historical value so `--amp-dtype fp16` can resume them faithfully; the BF16 default
+        # still fails the strict trajectory comparison instead of silently changing precision.
+        if "amp_dtype" not in saved_cfg:
+            saved_cfg = {**saved_cfg, "amp_dtype": "fp16"}
         saved_step = int(rk["step"])
         # One-time calibration legitimately changes these scalar coefficients after the original
         # command is parsed. They are immutable checkpoint trajectory state on resume; all other
@@ -2270,7 +2305,7 @@ def main() -> None:
     def encode_clean_view_b(batch: dict) -> dict:
         """Encode the SECOND augmentation-positive view (the collate's ``*_b`` keys), clean/no mask.
         Only ['pooled'] is consumed by the VICReg projector. Filterbank analysis runs FP32 like
-        view A; its projection and transformer run under the caller's FP16 autocast. The
+        view A; its projection and transformer run under the caller's mixed-precision autocast. The
         conditioning path MATCHES view A (per_channel vs factored), so the encoder sees the same
         text mode — factored view B carries its OWN independently-augmented role/sensor text."""
         p_b = batch["patches_b"].to(device, non_blocking=True).float()
@@ -2394,6 +2429,12 @@ def main() -> None:
         do_objective_grad_log = step == 1 or step % 500 == 0
         if hasattr(fe, "request_runtime_telemetry"):
             fe.request_runtime_telemetry(do_log)
+        # Keep the planner's tiny, branch-heavy control tensors on CPU. Computing duration after
+        # transfer and copying it back forced one CUDA synchronization per multi-span step.
+        full_recording_duration_cpu = (
+            (batch["patch_len"] * batch["patch_padding_mask"]).sum(dim=1).float()
+            / batch["rates"].clamp_min(1e-6)
+        )
         patches = batch["patches"].to(device, non_blocking=True)   # NOT gravity-aligned (2026-07-19 design)
         rates = batch["rates"].to(device, non_blocking=True)
         patch_len = batch["patch_len"].to(device, non_blocking=True)
@@ -2411,11 +2452,9 @@ def main() -> None:
         raw_patch_durations = patch_durations
         raw_resolution_ids = resolution_ids
         B, _, _, C = patches.shape
-        full_recording_duration = (
-            (raw_patch_len * raw_patch_pad).sum(dim=1).float() / rates.clamp_min(1e-6)
-        )
+        full_recording_duration = full_recording_duration_cpu.to(device, non_blocking=True)
         if cfg.frontend == "multispan":
-            grid_meta = fe.token_metadata(full_recording_duration.detach().cpu())
+            grid_meta = fe.token_metadata(full_recording_duration_cpu)
             positions = grid_meta["positions"].to(device, non_blocking=True)
             patch_durations = grid_meta["durations"].to(device, non_blocking=True)
             resolution_ids = grid_meta["resolution_ids"].to(device, non_blocking=True)
@@ -2516,7 +2555,7 @@ def main() -> None:
                                       valid_patches=patch_pad, channel_mask=channel_mask)
 
         with torch.amp.autocast(
-            device.type, enabled=device.type == "cuda", dtype=torch.float16,
+            device.type, enabled=device.type == "cuda", dtype=amp_torch_dtype,
         ):
             projection_sensor_id = (
                 batch["sensor_id"].to(device, non_blocking=True)
@@ -2525,8 +2564,9 @@ def main() -> None:
             projection_n_sensors = (
                 max(map(len, batch["sensor_texts"])) if sensor_granularity else None
             )
-            # The neural projection/transformer path uses FP16. The filterbank DSP (rDFT +
-            # constant-Q reduction) stays FP32 because FP16 has too little range for raw spectral
+            # The neural projection/transformer path uses the selected mixed precision. The
+            # filterbank DSP (rDFT + constant-Q reduction) stays FP32 because reduced precision has
+            # too little range and mantissa precision for raw spectral
             # energy; this is a narrow numerical island and sensor tokens retain gradients.
             with torch.amp.autocast(device.type, enabled=False):
                 # Split analysis from projection so the EMA teacher can reuse the DSP. On the
@@ -2706,7 +2746,7 @@ def main() -> None:
                         teacher_analysis = None
                     elif shared_analysis is not None:
                         # Fixed arm: reuse the student's parameter-free analysis, then apply the
-                        # TEACHER's own (EMA-lagged) projection under the outer FP16 autocast.
+                        # TEACHER's own (EMA-lagged) projection under the outer mixed-precision autocast.
                         teacher_analysis = shared_analysis.detach()
                     else:
                         with torch.amp.autocast(device.type, enabled=False):
@@ -3200,7 +3240,8 @@ def main() -> None:
                 "perf/examples_per_s": steps_per_second * cfg.batch_size,
                 "perf/eta_minutes": max(run_until_step - step, 0) / steps_per_second / 60.0,
                 "amp/scale": float(scaler.get_scale()),
-                "amp/dtype": "float16" if device.type == "cuda" else "float32",
+                "amp/dtype": str(amp_torch_dtype).removeprefix("torch.")
+                             if device.type == "cuda" else "float32",
                 "amp/skipped_updates_window": int(amp_skipped_since_log),
                 "amp/skipped_updates_total": int(amp_skipped_total),
                 "amp/consecutive_skips": int(amp_consecutive_skips),
@@ -3400,12 +3441,14 @@ def main() -> None:
                     val_z, val_y, val_src, val_stream = embed_stratified(
                         model, val_loader, device, cfg.val_per_label,
                         label_totals=val_label_totals,
+                        amp_dtype=amp_torch_dtype,
                     )
                     # Same support bank at every validation and across comparison arms.
                     train_eval_gen.manual_seed(cfg.data_seed)
                     train_z, train_y, _, _ = embed_stratified(
                         model, train_eval_loader, device, cfg.val_per_label,
                         target_labels=set(val_y.tolist()), label_totals=train_label_totals,
+                        amp_dtype=amp_torch_dtype,
                     )
                 finally:
                     model.encoder._compiled_transformer_forward = compiled_transformer
@@ -3434,6 +3477,7 @@ def main() -> None:
                 try:
                     selection_ba, selection_by_dataset = development_transfer_score(
                         model.encoder, device, tuple(cfg.selection_datasets), patching="checkpoint",
+                        amp_dtype=amp_torch_dtype,
                     )
                 finally:
                     model.encoder._compiled_transformer_forward = compiled_transformer
