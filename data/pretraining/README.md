@@ -74,6 +74,10 @@ The native rate is preserved in the session manifest and travels with each windo
 `source_rate_hz`, so the tokenizer still knows what was actually acquired. Xsens stays at its
 native 240 Hz; resampling it would add an interpolation artefact for no saving worth having.
 
+**Source windows are eight seconds.** Converters truncate only at real session/gap boundaries, and
+the corpus grid stage passes the same duration explicitly. Historical labelled grids remain six
+seconds; the JEPA trainer rejects a label-free grid built under that old contract.
+
 ## Usage
 
 ```bash

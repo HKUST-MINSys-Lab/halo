@@ -23,7 +23,7 @@ them.
 
 Short sequences: DROPPED, not concatenated
 ------------------------------------------
-Anything shorter than ``--min-seconds`` (default 6 s, our window) after edge
+Anything shorter than ``--min-seconds`` (default 8 s, our JEPA source window) after edge
 trimming is discarded.  Concatenating clips would be the other option and we
 reject it deliberately: splicing two unrelated motions creates a position
 discontinuity, and the very next stage is a second derivative, which turns that
@@ -53,6 +53,8 @@ from typing import Iterable, Iterator, Optional, Sequence
 import numpy as np
 import pandas as pd
 
+from data.pretraining.corpus_plan import PRETRAIN_WINDOW_SECONDS
+
 from .synthesis import (
     DEFAULT_PLACEMENTS,
     PLACEMENTS,
@@ -66,7 +68,7 @@ from .synthesis import (
 DS_DIR = Path(__file__).resolve().parent
 DOWNLOADS = DS_DIR / "downloads"
 UNLABELED = "__unlabeled__"
-WINDOW_SECONDS = 6.0
+WINDOW_SECONDS = PRETRAIN_WINDOW_SECONDS
 OUTPUT_COLUMNS = ("acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z")
 SOURCES = ("amass", "motion_x", "100style", "embody3d")
 
@@ -249,7 +251,12 @@ def iter_100style(
     scale_to_metres: float = 0.01,
 ) -> Iterator[SourceSequence]:
     """100STYLE BVH (Zenodo 8127870, CC BY 4.0). Layout: ``<Style>/<Style>_<gait>.bvh``."""
-    files = sorted(root.rglob("*.bvh"))
+    # The official zip also contains an equally large ``__MACOSX`` tree whose
+    # ``._*.bvh`` files are AppleDouble metadata, not motion captures.
+    files = sorted(
+        path for path in root.rglob("*.bvh")
+        if "__MACOSX" not in path.parts and not any(part.startswith(".") for part in path.parts)
+    )
     for count, path in enumerate(files):
         if limit is not None and count >= limit:
             return

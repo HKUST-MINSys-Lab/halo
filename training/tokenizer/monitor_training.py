@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SEVERITY = {"green": 0, "warning": 1, "critical": 2}
 
 
@@ -59,14 +59,19 @@ def _median(records: list[dict], key: str) -> float:
 
 
 def _selection(row: dict) -> float:
-    return float(row.get("val_knn_label_stream_ba", row.get("val_knn_ba", float("nan"))))
+    for key in ("development_transfer_knn_ba", "val_knn_label_stream_ba", "val_knn_ba"):
+        if _finite(row.get(key)):
+            return float(row[key])
+    return float("nan")
 
 
 def assess(run_dir: Path, stale_seconds: float = 120.0) -> dict:
     log_path = run_dir / "log.jsonl"
     rows = load_jsonl(log_path)
     train = [row for row in rows if "total" in row]
-    val = [row for row in rows if "val_knn_ba" in row]
+    val = [row for row in rows if any(key in row for key in (
+        "development_transfer_knn_ba", "val_knn_label_stream_ba", "val_knn_ba",
+    ))]
     events = [row for row in rows if "event" in row]
     try:
         config = json.loads((run_dir / "run_config.json").read_text())
@@ -94,10 +99,11 @@ def assess(run_dir: Path, stale_seconds: float = 120.0) -> dict:
     critical_numeric = (
         "total", "future/loss", "physical/loss", "collapse/total", "jepa", "vicreg",
         "grad/total_preclip", "grad/encoder", "grad/future_predictor",
-        "grad/physical_decoder", "descriptor/loss", "grad/sensor_fold",
+        "grad/physical_decoder", "grad/frontend", "descriptor/loss", "grad/sensor_fold",
         "grad/descriptor_projection", "grad/bias_projection", "grad/descriptor_head",
         "repr_encoder/effective_rank", "repr_retrieval/effective_rank",
-        "repr_projector/effective_rank",
+        "repr_projector/effective_rank", "frontend/observable_fraction",
+        "frontend/dead_kernel_fraction",
     )
     for row in train[-12:]:
         bad = [key for key in critical_numeric if key in row and not _finite(row[key])]
@@ -119,6 +125,11 @@ def assess(run_dir: Path, stale_seconds: float = 120.0) -> dict:
         if horizon_counts and any(int(value) == 0 for value in horizon_counts):
             alert("warning", "empty_future_horizon",
                   "At least one configured future-horizon bin received no target in the latest batch.")
+        resolution_counts = [value for key, value in latest.items()
+                             if key.startswith("future/resolution_") and key.endswith("_count")]
+        if resolution_counts and any(int(value) == 0 for value in resolution_counts):
+            alert("warning", "empty_future_resolution",
+                  "At least one frontend resolution received no target in the latest batch.")
         physical_rows = [row for row in train[-6:]
                          if _finite(row.get("physical/improvement_over_zero"))]
         physical_gain = _median(physical_rows, "physical/improvement_over_zero")
@@ -157,6 +168,25 @@ def assess(run_dir: Path, stale_seconds: float = 120.0) -> dict:
     if latest.get("data/input_finite_fraction", 1.0) < 1.0:
         alert("critical", "nonfinite_input",
               f"Recent input finite fraction is {latest['data/input_finite_fraction']:.6f}.")
+    if config.get("frontend") == "multispan" and latest_step > warmup_steps:
+        frontend_grad = _median(train[-6:], "grad/frontend")
+        if not math.isfinite(frontend_grad):
+            alert("critical", "frontend_gradient_missing",
+                  "Multi-span frontend gradient telemetry is missing after warmup.")
+        elif frontend_grad <= 0.0:
+            alert("critical", "frontend_no_gradient",
+                  "The learnable multi-span frontend has zero recent gradient norm.")
+        dead_fraction = float(latest.get("frontend/dead_kernel_fraction", float("nan")))
+        observable = float(latest.get("frontend/observable_fraction", float("nan")))
+        if not math.isfinite(dead_fraction) or not math.isfinite(observable):
+            alert("critical", "frontend_health_missing",
+                  "Multi-span kernel observability/dead-kernel telemetry is missing after warmup.")
+        elif dead_fraction > 0.0:
+            alert("warning", "dead_frontend_kernels",
+                  f"{dead_fraction:.1%} of multi-span kernels have near-zero response variance.")
+        if math.isfinite(observable) and observable <= 0.0:
+            alert("critical", "frontend_unobservable",
+                  "No multi-span kernel is observable at the sampled acquisition rates.")
     if int(latest.get("amp/consecutive_skips", 0)) >= 3:
         alert("critical", "amp_repeated_skips", "At least three optimizer updates were skipped in a row.")
     elif int(latest.get("amp/skipped_updates_window", 0)) > 0:
@@ -287,6 +317,14 @@ def assess(run_dir: Path, stale_seconds: float = 120.0) -> dict:
             "descriptor_head": latest.get("grad/descriptor_head"),
             "future_predictor": latest.get("grad/future_predictor"),
             "physical_decoder": latest.get("grad/physical_decoder"),
+            "frontend": latest.get("grad/frontend"),
+        },
+        "frontend": {
+            "duration_gate": latest.get("duration/gate"),
+            "observable_fraction": latest.get("frontend/observable_fraction"),
+            "dead_kernel_fraction": latest.get("frontend/dead_kernel_fraction"),
+            "response_std_mean": latest.get("frontend/response_std_mean"),
+            "edge_support_mean": latest.get("frontend/edge_support_mean"),
         },
         "representation": {
             "encoder_effective_rank": latest.get("repr_encoder/effective_rank"),
@@ -321,6 +359,9 @@ def assess(run_dir: Path, stale_seconds: float = 120.0) -> dict:
             "points": len(val),
             "latest_selection": selection_values[-1] if selection_values else None,
             "best_selection": max(selection_values) if selection_values else None,
+            "latest_development_transfer": (
+                val[-1].get("development_transfer_knn_ba") if val else None
+            ),
             "latest_global_knn": val[-1].get("val_knn_ba") if val else None,
             "latest_conse_label_stream": val[-1].get("val_conse_label_stream_ba") if val else None,
         },

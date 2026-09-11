@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -20,7 +21,11 @@ from training.tokenizer.future_jepa import (
     patch_variance_covariance,
     recommend_fixed_objective_weights,
 )
-from training.tokenizer.pretrain import PipelineAModel, PretrainConfig
+from training.tokenizer.pretrain import (
+    PipelineAModel, PretrainConfig, batch_under_token_budget,
+    frontend_rope_min_period, future_tokens_per_window,
+    validate_source_window_contract,
+)
 
 
 def _three_scale_grid(batch: int = 2):
@@ -62,6 +67,27 @@ def test_future_jepa_model_is_frontend_agnostic(
         model.physical_target_analyzer.n_bands
         + int(model.physical_target_analyzer.use_dc)
     )
+
+
+def test_eight_second_future_schedules_fit_the_token_budget():
+    fixed = PretrainConfig(source_window_seconds=8.0)
+    assert future_tokens_per_window(fixed) == 30
+    assert batch_under_token_budget(future_tokens_per_window(fixed)) == 384
+
+    multispan = PretrainConfig(
+        frontend="multispan", multiresolution=False, source_window_seconds=8.0,
+    )
+    assert future_tokens_per_window(multispan) == 118
+    assert batch_under_token_budget(future_tokens_per_window(multispan)) == 96
+    assert frontend_rope_min_period(multispan) == pytest.approx(0.25)
+
+
+def test_label_free_window_contract_rejects_a_stale_grid():
+    index = SimpleNamespace(refs=[SimpleNamespace(
+        rate_hz=80.0, shape=(10, 480, 6), key="nhanes/watch_wrist",
+    )])
+    with pytest.raises(ValueError, match="nhanes/watch_wrist=6s"):
+        validate_source_window_contract(index, 8.0)
 
 
 def test_future_plan_is_deterministic_disjoint_and_span_safe():

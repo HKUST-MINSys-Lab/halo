@@ -7,7 +7,7 @@ Activity labels are used only by development probes; they do not enter the train
 
 ## Default objective
 
-For the default fixed-filterbank arm, every native-rate six-second source window becomes aligned
+For the default fixed-filterbank arm, every native-rate eight-second source window becomes aligned
 0.5, 1.0, and 1.5 second patch grids. The constrained-learnable filterbank uses the same grid; the
 continuous-kernel arm uses its native one-second token grid. A random physical-time boundary leaves
 roughly 40-70% of the window visible to the student. Targets begin strictly after that boundary, so
@@ -103,18 +103,19 @@ global row count into result claims.
 | encoder | d=256, 3 dual-branch transformer layers, 8 heads |
 | frontend | fixed physical filterbank |
 | token unit | one token per sensor modality triad |
-| source context | up to six seconds |
+| source context | up to eight seconds |
 | patch grids | 0.5, 1.0, 1.5 seconds, jointly encoded |
 | predictor | d=128, 2 decoder layers, 4 heads |
 | optimizer | AdamW |
-| LR / warmup / weight decay | 4.24e-4 / 500 steps / 0.0707 |
+| LR / warmup / weight decay | derived from the resolved batch; recorded in `run_config.json` |
 | gradient clip | 1.0 |
 | precision on CUDA | FP16 autocast with dynamic loss scaling; FP32 master weights and reductions |
-| default batch / steps | 512 / 15,000 |
+| default batch / steps | 384 / 20,000 |
 
-Multi-span defaults are derived from the same 12,288 transformer-token budget. With spans 0.5,
-1.0, and 1.5 seconds, this is batch 128 and 60,000 updates, preserving the default arm's number of
-sampled windows. `--multispan-durations` is serialized in the checkpoint.
+Multi-span defaults are derived from the same 12,288 transformer-token budget. With an eight-second
+context and spans 0.5, 1.0, and 1.5 seconds at four frames per span, this is batch 96 and 80,000
+updates, preserving the fixed arm's 7.68 million sampled windows. Durations, frame density, token
+budget, and resolved schedule are serialized in the checkpoint.
 
 Run-specific values in `run_config.json` are authoritative. The trainer rejects incompatible
 future-objective combinations instead of silently falling back to a different experiment.
@@ -126,18 +127,19 @@ Use the project environment for commands that import Torch, SciPy, pandas, or h5
 ```bash
 PY=/home/alex/code/HALO/legacy_code/.venv/bin/python
 
-$PY -m training.tokenizer.pretrain --smoke --steps 2 --device cpu \
+$PY -m training.tokenizer.pretrain --smoke --steps 2 --device cpu --corpus label_free \
   --out /tmp/halo_future_jepa_smoke --force
 
-$PY -m training.tokenizer.pretrain --device cuda \
-  --calibrate-objectives-at 1000 \
+$PY -m training.tokenizer.objective_health --frontend fixed --corpus label_free \
+  --out /tmp/halo_fixed_objective_health.json
+$PY -m training.tokenizer.objective_health --frontend multispan --corpus label_free \
+  --out /tmp/halo_multispan_objective_health.json
+
+$PY -m training.tokenizer.pretrain --device cuda --corpus label_free \
   --objective-calibration-mode apply \
   --out training/tokenizer/outputs/<run>
 
-$PY -m training.tokenizer.pretrain --device cuda --frontend continuous \
-  --out training/tokenizer/outputs/<continuous-run>
-
-$PY -m training.tokenizer.pretrain --device cuda --frontend multispan \
+$PY -m training.tokenizer.pretrain --device cuda --corpus label_free --frontend multispan \
   --multispan-durations 0.5 1.0 1.5 \
   --out training/tokenizer/outputs/<multispan-run>
 ```
@@ -155,7 +157,7 @@ dashboard without touching the training GPU:
 
 ```bash
 $PY -m training.tokenizer.monitor_training \
-  --run-dir training/tokenizer/outputs/<run> --render
+  --run-dir training/tokenizer/outputs/<run> --render --watch 60
 ```
 
 The future-JEPA telemetry includes:
@@ -165,7 +167,8 @@ The future-JEPA telemetry includes:
 - true-target versus shuffled-target similarity margin;
 - physical-decoder improvement over a zero predictor;
 - context, target, ineligible, and leakage rates;
-- encoder, predictor, decoder, and objective-specific gradient norms and cosines;
+- encoder, frontend, predictor, decoder, and objective-specific gradient norms and cosines;
+- multi-span observability, dead-kernel fraction, response spread, and duration-gate state;
 - visible-state and teacher representation spread/effective rank;
 - EMA student-teacher distance and half-life;
 - AMP skips, clipping, throughput, VRAM, source balance, and input validity; and

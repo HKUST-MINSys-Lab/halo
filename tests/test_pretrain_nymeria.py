@@ -630,7 +630,7 @@ def test_convert_writes_the_repo_session_contract(tmp_path, monkeypatch):
             assert stamps[0] == 0.0
             assert np.all(np.diff(stamps) > 0)
             assert np.allclose(np.diff(stamps), 1.0 / rate, atol=1e-9)
-            # Whole six-second windows only, so no grid window can cross a gap.
+            # Whole source windows only, so no grid window can cross a gap.
             assert len(frame) % int(rate * convert.WINDOW_SECONDS) == 0
             assert np.median(np.linalg.norm(
                 frame[["acc_x", "acc_y", "acc_z"]].to_numpy(), axis=1
@@ -681,7 +681,9 @@ def test_max_hours_per_sequence_caps_output(tmp_path):
     labels = json.loads((out / convert.XSENS_DATASET / "labels.json").read_text())
     for session_id in labels:
         frame = pd.read_parquet(out / convert.XSENS_DATASET / "sessions" / session_id / "data.parquet")
-        assert len(frame) == 240 * 12
+        # The 12-second cap is applied before the source contract: retain the largest complete
+        # eight-second JEPA window rather than emitting a partial window across a later grid seam.
+        assert len(frame) == 240 * 8
 
 
 def test_subject_without_verified_identity_is_rejected(tmp_path):

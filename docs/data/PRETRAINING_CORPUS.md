@@ -44,12 +44,17 @@ So the two stages now draw from disjoint trees:
 Every labelled corpus is therefore genuinely out-of-sample for the encoder, which is a stronger
 and more honest transfer claim than the previous arrangement could support.
 
-Select it with `python -m training.tokenizer.pretrain --corpus label_free`. The historical
+This is the default recipe; select it explicitly in recorded launch commands with
+`python -m training.tokenizer.pretrain --corpus label_free`. The historical
 `expanded` (the active labelled roster, 14 sources) and `matched` (the frozen historical 12) recipes keep their names so
-earlier runs stay reproducible; `expanded` remains the CLI default until a label-free run has
-been measured against it. `deployment_policy.assert_pretraining_is_label_free` refuses a
+earlier runs stay reproducible. `deployment_policy.assert_pretraining_is_label_free` refuses a
 labelled corpus in the label-free recipe, checking where a source sits on disk rather than
 trusting a roster tuple, and a test asserts the two rosters never intersect.
+
+Label-free sessions and native grids use eight-second source windows. This is independent of the
+legacy six-second labelled-grid contract. The trainer checks every materialized label-free grid's
+physical duration before constructing a loader and gives the exact rebuild command if stale grids
+are found.
 
 One consequence to keep in view: this makes the label-free corpus the *only* thing the encoder
 sees, so its placement coverage now matters more than it did. That is the main reason Nymeria

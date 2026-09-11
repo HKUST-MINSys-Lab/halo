@@ -63,7 +63,7 @@ GAP POLICY (both modalities)
   A time gap longer than 0.5 s is a hard boundary, never interpolated across.
   The session is split into ``..._p01``, ``..._p02`` parts; the stream token stays
   a matchable substring of the session id.  Each part is then truncated to
-  complete six-second windows, so no downstream grid window can cross a gap.
+  complete eight-second windows, so no downstream grid window can cross a gap.
 """
 
 from __future__ import annotations
@@ -82,6 +82,8 @@ from typing import Iterable, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
+from data.pretraining.corpus_plan import PRETRAIN_WINDOW_SECONDS
+
 DS_DIR = Path(__file__).resolve().parent
 DOWNLOADS = DS_DIR / "downloads"
 #: The label-free corpus root. `corpus_roots.dataset_root(name)` resolves a dataset to
@@ -93,7 +95,7 @@ GRAVITY_MS2 = 9.80665
 XSENS_RATE_HZ = 240.0
 ARIA_RATE_HZ = 200.0
 ARIA_NOMINAL_RATES = (800.0, 1000.0)
-WINDOW_SECONDS = 6.0
+WINDOW_SECONDS = PRETRAIN_WINDOW_SECONDS
 MAX_GAP_SECONDS = 0.5
 UNLABELED = "__unlabeled__"
 

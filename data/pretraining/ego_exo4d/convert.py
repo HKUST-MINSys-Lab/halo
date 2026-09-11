@@ -26,7 +26,7 @@ model never reads, while 200 Hz still leaves an order of magnitude of headroom.
 Gaps. Aria drops IMU packets. Interpolating across a dropout invents motion, so
 any gap longer than 0.5 s SPLITS the session instead. Parts are suffixed
 (``..._aria_head_part02``) and ``aria_head`` stays a matchable substring so the
-deployment-policy stream token still resolves. Parts shorter than one 6 s window
+deployment-policy stream token still resolves. Parts shorter than one 8 s window
 are dropped.
 
 Subjects. HALO splits are subject-disjoint, so a take must resolve to a stable
@@ -65,6 +65,8 @@ import numpy as np
 import pandas as pd
 from scipy.signal import filtfilt, firwin
 
+from data.pretraining.corpus_plan import PRETRAIN_WINDOW_SECONDS
+
 DS_DIR = Path(__file__).resolve().parent
 DOWNLOADS = DS_DIR / "downloads"
 
@@ -75,7 +77,7 @@ UNLABELED = "__unlabeled__"
 SOURCE_URL = "https://docs.ego-exo4d-data.org/"
 
 RATE_HZ = 200.0
-WINDOW_SECONDS = 6.0
+WINDOW_SECONDS = PRETRAIN_WINDOW_SECONDS
 MIN_SESSION_SECONDS = WINDOW_SECONDS
 MAX_GAP_SECONDS = 0.5
 GRAVITY_MS2 = 9.80665

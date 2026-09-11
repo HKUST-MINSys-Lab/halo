@@ -32,14 +32,16 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from data.pretraining.corpus_plan import PRETRAIN_WINDOW_SECONDS
+
 
 DS_DIR = Path(__file__).resolve().parent
 DOWNLOADS = DS_DIR / "downloads"
 RATE_HZ = 80.0
-WINDOW_SECONDS = 6.0
+WINDOW_SECONDS = PRETRAIN_WINDOW_SECONDS
 WINDOW_SAMPLES = int(RATE_HZ * WINDOW_SECONDS)
 UNLABELED = "__unlabeled__"
-#: Max-axis standard deviation, in g, below which a six-second window is indistinguishable
+#: Max-axis standard deviation, in g, below which one JEPA source window is indistinguishable
 #: from a motionless device. Measured as the NHANES noise floor in the 2026-07 corpus audit.
 STILL_G = 0.003
 #: Share of a subject's hour budget deliberately drawn from the low-motion end, so sleep and
@@ -101,7 +103,7 @@ def _evenly_spaced(members: list[tarfile.TarInfo], max_hours: int | None) -> lis
 
 
 def motion_score(xyz: np.ndarray) -> float:
-    """Fraction of six-second windows in ``xyz`` that carry more than sensor noise.
+    """Fraction of JEPA source windows in ``xyz`` that carry more than sensor noise.
 
     A window counts as moving when its largest per-axis standard deviation exceeds
     ``STILL_G``. That threshold is the release's own noise floor, not a tuned constant: the

@@ -45,10 +45,11 @@ from torch.utils.data import DataLoader
 
 from data.scripts.augmentations import AugmentationConfig
 from data.scripts.labels.canonical_labels import NON_SEMANTIC_LABELS
+from data.pretraining.corpus_plan import PRETRAIN_WINDOW_SECONDS
 from model.tokenizer.encoder import SetTokenizerEncoder
 from model.tokenizer.continuous_kernel import ContinuousKernelTokenizer
 from model.tokenizer.filterbank import PhysicalFilterbankTokenizer
-from model.tokenizer.multispan_kernel import multispan_frame_count
+from model.tokenizer.multispan_kernel import MS_FRAMES_PER_SPAN, multispan_frame_count
 from model.tokenizer.sensor_tokens import descriptor_retrieval_loss
 from training.tokenizer.losses_repr import (
     MASK_RATIO_TIME,
@@ -116,6 +117,57 @@ def future_resolution_durations(cfg: "PretrainConfig") -> tuple[float, ...]:
             else (float(cfg.patch_seconds),))
 
 
+def future_tokens_per_window(cfg: "PretrainConfig") -> int:
+    """Conservative token count used to size a future-JEPA batch."""
+
+    if cfg.frontend == "multispan":
+        return multispan_frame_count(
+            cfg.multispan_durations, cfg.source_window_seconds, cfg.frames_per_span,
+        )
+    return sum(
+        max(1, int(math.ceil(cfg.source_window_seconds / duration - 1e-6)))
+        for duration in future_resolution_durations(cfg)
+    )
+
+
+def batch_under_token_budget(tokens_per_window: int, reference_batch: int = 512) -> int:
+    """Largest multiple of 32 no larger than the reference or token budget."""
+
+    if tokens_per_window <= 0:
+        raise ValueError("tokens_per_window must be positive")
+    ceiling = max(MAX_BATCH_TOKENS // tokens_per_window, 1)
+    candidate = min(reference_batch, ceiling)
+    return max((candidate // 32) * 32, 1) if candidate >= 32 else candidate
+
+
+def frontend_rope_min_period(cfg: "PretrainConfig") -> float:
+    """Fastest physical period resolvable by the selected token grid."""
+
+    if cfg.frontend == "multispan":
+        return 2.0 * min(cfg.multispan_durations) / cfg.frames_per_span
+    return 0.4 if cfg.multiresolution else 0.5
+
+
+def validate_source_window_contract(index: CorpusIndex, expected_seconds: float) -> None:
+    """Reject stale label-free grids built with a different physical context."""
+
+    mismatches = []
+    for ref in index.refs:
+        if ref.rate_hz <= 0 or len(ref.shape) < 2:
+            continue
+        actual = ref.shape[1] / ref.rate_hz
+        tolerance = max(1.0 / ref.rate_hz, 1e-6)
+        if abs(actual - expected_seconds) > tolerance:
+            mismatches.append(f"{ref.key}={actual:g}s")
+    if mismatches:
+        shown = ", ".join(mismatches[:8])
+        suffix = " ..." if len(mismatches) > 8 else ""
+        raise ValueError(
+            f"label-free JEPA requires {expected_seconds:g}s source grids, but found "
+            f"{shown}{suffix}. Rebuild with `python -m data.pretraining.build_corpus --stage grids`."
+        )
+
+
 @dataclass
 class PretrainConfig:
     # The depth sweep found that three layers retain activity information better than six while
@@ -126,6 +178,8 @@ class PretrainConfig:
     dim_feedforward: int = 1024
     dropout: float = 0.1
     frontend: str = "fixed"               # fixed | constrained-learnable | continuous kernels
+    corpus_name: str = "label_free"
+    source_window_seconds: float = PRETRAIN_WINDOW_SECONDS
     dft_size: int = DFT_SIZE               # serialized architecture/collate capacity
     trunk: str = "dual"                   # dual (checkpoint-compatible) | temporal (compact engine)
     # Omit the Phase-A-only descriptor head unless its explicit objective is enabled. Serialize this
@@ -159,6 +213,8 @@ class PretrainConfig:
     multiresolution: bool = True
     future_patch_durations: tuple[float, ...] = (0.5, 1.0, 1.5)
     multispan_durations: tuple[float, ...] = (0.5, 1.0, 1.5)
+    frames_per_span: int = MS_FRAMES_PER_SPAN
+    rope_min_period: float = 0.5
     future_context_fraction: tuple[float, float] = (0.4, 0.7)
     future_horizon_bins_seconds: tuple[tuple[float, float], ...] = DEFAULT_HORIZON_BINS_SECONDS
     future_teacher_top_layers: int = 2
@@ -179,8 +235,8 @@ class PretrainConfig:
     long_patch_choices: tuple[float, ...] = LONG_PATCH_SECONDS_CHOICES
     min_resolution_ratio: float = MIN_RESOLUTION_RATIO
     val_resolution_pair: tuple[float, float] = VAL_RESOLUTION_PAIR
-    # Single-resolution starts from the 1024 x 7,500 recipe. The future-JEPA multi-resolution
-    # default is normalized below to batch 512 x 15,000 so it sees the same number of windows.
+    # Single-resolution starts from the 1024 x 7,500 recipe. Future-JEPA schedules are derived
+    # below to preserve the 7.68-million-window reference under the actual token budget.
     steps: int = 7_500                    # ~4.4 aggregate expanded-corpus equivalents
     # Conservative square-root LR scaling from 3e-4 at batch 256. Doubling weight decay preserves
     # approximately the same integrated AdamW shrink over one quarter as many optimizer updates.
@@ -317,6 +373,14 @@ def hydrate_calibrated_objective_weights(
 class PipelineAModel(nn.Module):
     def __init__(self, cfg: PretrainConfig):
         super().__init__()
+        duration_choices = (future_resolution_durations(cfg) if cfg.jepa_mode == "future"
+                            else tuple(cfg.short_patch_choices) + tuple(cfg.long_patch_choices))
+        duration_min = min(duration_choices)
+        duration_max = max(duration_choices)
+        if duration_min == duration_max:
+            # Single-scale controls do not activate duration conditioning, but the shared encoder
+            # still requires a non-degenerate normalization interval for checkpoint compatibility.
+            duration_min, duration_max = 0.5 * duration_min, 1.5 * duration_max
         self.encoder = SetTokenizerEncoder(
             d_model=cfg.d_model, num_layers=cfg.num_layers, num_heads=cfg.num_heads,
             dim_feedforward=cfg.dim_feedforward, dropout=cfg.dropout, dft_size=cfg.dft_size,
@@ -332,20 +396,19 @@ class PipelineAModel(nn.Module):
             # Center time alone cannot distinguish overlapping tokens with different physical
             # support. Duration is therefore explicit at both channel and sensor granularity.
             use_duration_embedding=(cfg.multiresolution or cfg.frontend == "multispan"),
-            duration_min_seconds=min(cfg.future_patch_durations if cfg.jepa_mode == "future"
-                                     else cfg.short_patch_choices),
-            duration_max_seconds=max(cfg.future_patch_durations if cfg.jepa_mode == "future"
-                                     else cfg.long_patch_choices),
+            duration_min_seconds=duration_min,
+            duration_max_seconds=duration_max,
             duration_gate_init=cfg.duration_gate_init,
             num_resolutions=max(2, len(future_resolution_durations(cfg))),
-            rope_min_period=0.4 if cfg.multiresolution else 0.5,
+            rope_min_period=frontend_rope_min_period(cfg),
             center_shift_fraction=cfg.center_shift_fraction,
             bandwidth_factor_max=cfg.bandwidth_factor_max,
             compression_gain_max=cfg.compression_gain_max,
             filter_shape_min=cfg.filter_shape_min,
             filter_shape_max=cfg.filter_shape_max,
             adaptive_gate_init=cfg.adaptive_gate_init,
-            **({"spans": cfg.multispan_durations} if cfg.frontend == "multispan" else {}),
+            **({"spans": cfg.multispan_durations, "frames_per_span": cfg.frames_per_span}
+               if cfg.frontend == "multispan" else {}),
         )
         self.encoder.multiresolution = cfg.multiresolution or cfg.frontend == "multispan"
         self.encoder.eval_resolutions = tuple(
@@ -1140,12 +1203,11 @@ def main() -> None:
                         help="stop and checkpoint at this step while retaining --steps as the full "
                              "LR/EMA schedule (for bounded trajectory monitors)")
     parser.add_argument("--lr", type=float, default=None,
-                        help="optimizer peak learning rate (future-JEPA default "
-                             "4.24e-4 at batch 512)")
+                        help="optimizer peak learning rate (future-JEPA default scales with batch)")
     parser.add_argument("--weight-decay", type=float, default=None,
-                        help="AdamW weight decay (future-JEPA default 0.0707 at batch 512)")
+                        help="AdamW weight decay (future-JEPA default scales with batch)")
     parser.add_argument("--warmup-steps", type=int, default=None,
-                        help="linear LR warmup steps (future-JEPA default 500)")
+                        help="linear LR warmup steps (future-JEPA default preserves warmup examples)")
     parser.add_argument("--grad-clip", type=float, default=None,
                         help="global gradient-norm clipping threshold (default 1.0)")
     parser.add_argument("--smoke", action="store_true",
@@ -1189,6 +1251,8 @@ def main() -> None:
     parser.add_argument("--multispan-durations", type=float, nargs="+", default=None,
                         help="physical spans represented by the multi-span continuous frontend "
                              "(default: 0.5 1.0 1.5 seconds)")
+    parser.add_argument("--frames-per-span", type=int, default=None,
+                        help="multi-span analysis frames per physical span (default: 4)")
     parser.add_argument("--future-context-fraction", type=float, nargs=2, default=None,
                         metavar=("MIN", "MAX"),
                         help="fractional range from which the past-only context boundary is drawn")
@@ -1314,12 +1378,13 @@ def main() -> None:
                         help="train on the tokenizer-ablation 3-rate-core subset (5 datasets, xrf_v2 "
                              "held out) instead of the full corpus. See ablation_subset.py.")
     parser.add_argument("--corpus", choices=("label_free", "expanded", "matched"),
-                        default="expanded",
+                        default="label_free",
                         help="named Phase-A recipe. label_free=the label-free pretraining corpus "
                              "in data/pretraining/, disjoint from the labelled data the "
                              "comparator and classification head train on, so a downstream gain "
-                             "is attributable; expanded=the active labelled roster (14 sources since "
-                             "2026-09-10; the frozen 18 is EXPANDED_18_TRAIN_DATASETS), the default; "
+                             "is attributable and is the default; expanded=the active labelled "
+                             "historical roster (14 sources since 2026-09-10; the frozen 18 is "
+                             "EXPANDED_18_TRAIN_DATASETS); "
                              "matched=the frozen original 12-source corpus for technique-only "
                              "baseline comparisons (contains retired sources: needs --allow-retired)")
     parser.add_argument("--datasets", nargs="+", default=None,
@@ -1362,6 +1427,9 @@ def main() -> None:
         objective_target_jepa_share=(0.70 if args.jepa_mode == "future" else 0.45),
         compile_encoder=args.device.startswith("cuda") and not args.smoke,
         train_datasets=_corpus_datasets(args.corpus),
+        corpus_name=args.corpus,
+        source_window_seconds=(PRETRAIN_WINDOW_SECONDS
+                               if args.corpus == "label_free" else WINDOW_SECONDS),
     )
     if args.neutral_acquisition_text is not None:
         cfg.neutral_acquisition_text = bool(args.neutral_acquisition_text)
@@ -1377,6 +1445,8 @@ def main() -> None:
         cfg.future_patch_durations = tuple(args.future_patch_durations)
     if args.multispan_durations is not None:
         cfg.multispan_durations = tuple(args.multispan_durations)
+    if args.frames_per_span is not None:
+        cfg.frames_per_span = args.frames_per_span
     if args.future_context_fraction is not None:
         cfg.future_context_fraction = tuple(args.future_context_fraction)
     if args.future_teacher_top_layers is not None:
@@ -1476,9 +1546,25 @@ def main() -> None:
         parser.error("--datasets and --subset are mutually exclusive")
     if args.datasets is not None:
         cfg.train_datasets = tuple(args.datasets)
+        from data.scripts.curate.deployment_policy import LABEL_FREE_PRETRAIN_DATASETS
+        requested = set(cfg.train_datasets)
+        label_free = set(LABEL_FREE_PRETRAIN_DATASETS)
+        if requested.issubset(label_free):
+            cfg.corpus_name = "label_free_subset"
+            cfg.source_window_seconds = PRETRAIN_WINDOW_SECONDS
+        elif requested.isdisjoint(label_free):
+            cfg.corpus_name = "custom"
+            cfg.source_window_seconds = WINDOW_SECONDS
+        else:
+            parser.error(
+                "--datasets cannot mix eight-second label-free grids with six-second labelled "
+                "grids; choose one source-window contract per run"
+            )
     elif args.subset:
         from training.tokenizer.ablation_subset import SUBSET_TRAIN_DATASETS, DEFAULT_CAP
         cfg.train_datasets = SUBSET_TRAIN_DATASETS
+        cfg.corpus_name = "subset"
+        cfg.source_window_seconds = WINDOW_SECONDS
         # Apply the SAME per-stream cap the metric harness uses (build_subset_index(cap=DEFAULT_CAP)),
         # so TRAIN and EVAL share one corpus definition (audit 2026-07-23 #3: --subset previously left
         # max_per_stream=None -> trained on ~94k windows while metrics used the 10k cap).
@@ -1499,40 +1585,52 @@ def main() -> None:
         cfg.warmup_steps = args.warmup_steps
     if args.grad_clip is not None:
         cfg.grad_clip = args.grad_clip
-    # The multi-resolution path has up to 22 patches per six-second window, so batch 1024 would
-    # exceed its 12,288-token budget and silently leave only the coarsest resolution pair. Give the
-    # ablation its own sample-matched batch-512 schedule unless the caller explicitly overrides a
-    # field. An explicitly oversized batch is rejected below rather than changing the experiment.
+    if not math.isfinite(cfg.source_window_seconds) or cfg.source_window_seconds <= 0:
+        parser.error("source-window duration must be finite and positive")
+    if cfg.frames_per_span <= 0:
+        parser.error("--frames-per-span must be a positive integer")
     if cfg.frontend == "multispan" and (
         any(not math.isfinite(value) or value <= 0 for value in cfg.multispan_durations)
         or tuple(sorted(set(cfg.multispan_durations))) != cfg.multispan_durations
     ):
         parser.error("multi-span durations must be unique, finite, positive, and increasing")
+
+    # Resolve time position at the fastest frontend stride. For multi-span this is twice the
+    # shortest T/frames_per_span interval (the temporal Nyquist period).
+    cfg.rope_min_period = frontend_rope_min_period(cfg)
+
+    # Derive schedule defaults from the real token count. Both arms see the same 7.68 million
+    # source windows as the audited 512 x 15,000 reference without exceeding the transformer-token
+    # budget. Explicit oversized batches fail rather than silently dropping a resolution.
     if cfg.multiresolution:
-        if args.batch is None:
-            cfg.batch_size = 512
-        if args.steps is None:
-            cfg.steps = 15_000
-        if args.lr is None:
-            cfg.lr = 4.242640687119285e-4
-        if args.weight_decay is None:
-            cfg.weight_decay = 0.07071067811865475
-        if args.warmup_steps is None:
-            cfg.warmup_steps = 500
-        if args.calibrate_objectives_at is None:
-            cfg.objective_calibration_at = 1_000
-        if args.jepa_ema_decay is None:
-            cfg.jepa_ema_decay = 0.992016  # 0.996^2: batch-256 EMA half-life in examples
-        if cfg.batch_size > 512:
-            parser.error("--multiresolution requires --batch <= 512 to retain every resolution pair")
-    elif cfg.frontend == "multispan":
-        # Match the fixed arm's audited transformer-token budget. Multi-span emits a denser grid
-        # than the collate partition, so the generic collate guard cannot enforce this itself.
-        tokens_per_window = multispan_frame_count(cfg.multispan_durations, WINDOW_SECONDS)
+        tokens_per_window = future_tokens_per_window(cfg)
         max_batch = max(MAX_BATCH_TOKENS // tokens_per_window, 1)
-        # Use a power-of-two batch no larger than the budget-derived ceiling. Sample-match the
-        # fixed multi-resolution recipe so frontend comparisons see the same number of windows.
-        default_batch = 1 << (max_batch.bit_length() - 1)
+        default_batch = batch_under_token_budget(tokens_per_window)
+        if args.batch is None:
+            cfg.batch_size = default_batch
+        if args.steps is None:
+            cfg.steps = round(15_000 * 512 / cfg.batch_size)
+        batch_ratio = cfg.batch_size / 512.0
+        if args.lr is None:
+            cfg.lr = 4.242640687119285e-4 * math.sqrt(batch_ratio)
+        if args.weight_decay is None:
+            cfg.weight_decay = 0.07071067811865475 * math.sqrt(batch_ratio)
+        if args.warmup_steps is None:
+            cfg.warmup_steps = round(500 / batch_ratio)
+        if args.calibrate_objectives_at is None:
+            cfg.objective_calibration_at = round(1_000 / batch_ratio)
+        if args.jepa_ema_decay is None:
+            cfg.jepa_ema_decay = 0.992016 ** batch_ratio
+        if cfg.batch_size > max_batch:
+            parser.error(
+                f"multi-resolution durations {future_resolution_durations(cfg)} emit "
+                f"{tokens_per_window} tokens/window and require --batch <= {max_batch} "
+                f"under the {MAX_BATCH_TOKENS}-token budget"
+            )
+    elif cfg.frontend == "multispan":
+        tokens_per_window = future_tokens_per_window(cfg)
+        max_batch = max(MAX_BATCH_TOKENS // tokens_per_window, 1)
+        default_batch = batch_under_token_budget(tokens_per_window)
         if args.batch is None:
             cfg.batch_size = default_batch
         if args.steps is None:
@@ -1720,6 +1818,8 @@ def main() -> None:
     # and reconstructable by the metric harness (#1).
     index = CorpusIndex(max_per_stream=cfg.max_per_stream, seed=cfg.data_seed,
                         datasets=cfg.train_datasets or TRAIN_DATASETS)
+    if cfg.corpus_name in {"label_free", "label_free_subset"}:
+        validate_source_window_contract(index, cfg.source_window_seconds)
     corpus_fp = corpus_fingerprint(index)
     print(f"corpus: {index.summary()}  (datasets={sorted(cfg.train_datasets or TRAIN_DATASETS)})",
           flush=True)

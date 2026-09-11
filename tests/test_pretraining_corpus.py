@@ -337,6 +337,14 @@ def test_the_encoder_and_the_head_never_share_a_corpus():
     assert not overlap, f"encoder and head share corpora: {sorted(overlap)}"
 
 
+def test_every_label_free_source_is_excluded_from_subject_validation():
+    """Unlabelled sources train the encoder; labelled development data selects checkpoints."""
+    from data.scripts.curate.deployment_policy import LABEL_FREE_PRETRAIN_DATASETS
+    from training.tokenizer.pretrain_data import PHASE_A_ONLY_DATASETS
+
+    assert PHASE_A_ONLY_DATASETS == frozenset(LABEL_FREE_PRETRAIN_DATASETS)
+
+
 def test_every_label_free_source_really_is_label_free():
     """Membership of the roster is not evidence; where it sits on disk is."""
     from data.scripts.curate.deployment_policy import LABEL_FREE_PRETRAIN_DATASETS
@@ -406,6 +414,18 @@ def test_orchestrator_uses_each_source_cli_contract(monkeypatch):
     assert any("nymeria.fetch --all-sequences --max-gb 120" in command for command in rendered)
     assert any("synthetic_imu.fetch amass motion_x 100style" in command for command in rendered)
     assert any("synthetic_imu.convert --sources amass motion_x 100style" in command for command in rendered)
+
+
+def test_grid_stage_uses_the_jepa_source_window_contract(monkeypatch):
+    from data.pretraining import build_corpus
+
+    commands: list[list[str]] = []
+    monkeypatch.setattr(build_corpus, "_run", lambda command: commands.append(command) or 0)
+    source = next(item for item in corpus_plan.CORPUS_PLAN if item.dataset == "nhanes")
+    assert build_corpus._stage_grids((source,)) == 0
+    grid_command = next(command for command in commands if "data.scripts.build_grids" in command)
+    index = grid_command.index("--window-seconds")
+    assert float(grid_command[index + 1]) == corpus_plan.PRETRAIN_WINDOW_SECONDS
 
 
 def test_fetching_refuses_without_explicit_approval():

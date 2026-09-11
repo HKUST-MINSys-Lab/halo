@@ -57,6 +57,18 @@ def test_monitor_uses_label_stream_checkpoint_metric(tmp_path):
     assert report["validation"]["latest_selection"] == 0.63
 
 
+def test_monitor_prefers_finite_development_transfer_metric(tmp_path):
+    val = {
+        "step": 100, "val_knn_ba": float("nan"),
+        "val_knn_label_stream_ba": float("nan"), "development_transfer_knn_ba": 0.71,
+    }
+    _write_run(tmp_path, [_healthy()], [val])
+    (tmp_path / "last.pt").touch()
+    report = assess(tmp_path)
+    assert report["validation"]["latest_selection"] == 0.71
+    assert report["validation"]["latest_development_transfer"] == 0.71
+
+
 def test_monitor_flags_invalid_input_and_source_drift(tmp_path):
     row = _healthy()
     row["data/input_finite_fraction"] = 0.999
@@ -137,10 +149,24 @@ def test_monitor_uses_future_jepa_health_fields(tmp_path):
     assert report["representation"]["visible_effective_rank"] == 32.0
 
 
+def test_monitor_rejects_missing_multispan_frontend_health(tmp_path):
+    row = _healthy(step=1_000)
+    row.update({"future/loss": 0.5, "physical/loss": 0.2, "collapse/total": 1.0})
+    _write_run(tmp_path, [row], steps=2_000)
+    config = json.loads((tmp_path / "run_config.json").read_text())
+    config.update({"jepa_mode": "future", "frontend": "multispan"})
+    (tmp_path / "run_config.json").write_text(json.dumps(config))
+    report = assess(tmp_path)
+    assert report["status"] == "critical"
+    assert {item["code"] for item in report["alerts"]} >= {
+        "frontend_gradient_missing", "frontend_health_missing",
+    }
+
+
 def test_monitor_writes_machine_and_human_snapshots_and_plot(tmp_path):
     _write_run(tmp_path, [_healthy()])
     report = write_report(tmp_path, stale_seconds=120, render=True)
     assert report["status"] == "green"
-    assert json.loads((tmp_path / "health.json").read_text())["schema_version"] == 1
+    assert json.loads((tmp_path / "health.json").read_text())["schema_version"] == 2
     assert "STATUS: GREEN" in (tmp_path / "health.txt").read_text()
     assert (tmp_path / "telemetry.png").stat().st_size > 1_000

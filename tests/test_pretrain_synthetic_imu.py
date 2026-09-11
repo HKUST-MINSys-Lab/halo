@@ -705,6 +705,20 @@ def test_100style_loader_end_to_end_from_a_bvh_on_disk(tmp_path):
     assert np.allclose(np.linalg.norm(frame[["acc_x", "acc_y", "acc_z"]].to_numpy(), axis=-1), 1.0, atol=1e-5)
 
 
+def test_100style_loader_ignores_macos_archive_metadata(tmp_path):
+    root = tmp_path / "100style"
+    real = root / "Neutral" / "Neutral_FW.bvh"
+    metadata = root / "__MACOSX" / "Neutral" / "._Neutral_FW.bvh"
+    real.parent.mkdir(parents=True)
+    metadata.parent.mkdir(parents=True)
+    real.write_text(_tiny_bvh(300))
+    metadata.write_bytes(b"not a BVH motion file")
+
+    sequences = list(convert.iter_100style(root, DEFAULT_PLACEMENTS))
+    assert len(sequences) == 1
+    assert sequences[0].name == "neutral_fw"
+
+
 def test_missing_source_directory_is_reported_not_fatal(tmp_path, capsys):
     assert list(convert.iter_sources(["amass", "100style"], tmp_path, DEFAULT_PLACEMENTS, None)) == []
     printed = capsys.readouterr().out

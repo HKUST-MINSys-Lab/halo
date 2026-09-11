@@ -29,6 +29,7 @@ from data.pretraining.corpus_plan import (
     CORPUS_PLAN,
     DEFAULT_BUDGET_GB,
     SourcePlan,
+    PRETRAIN_WINDOW_SECONDS,
     format_plan,
     total_gigabytes,
 )
@@ -176,7 +177,8 @@ def _stage_grids(sources: Sequence[SourcePlan]) -> int:
     failed = bool(
         _run(
             [sys.executable, "-m", "data.scripts.build_grids",
-             "--dataset", *names, "--alignment", "native"]
+             "--dataset", *names, "--alignment", "native",
+             "--window-seconds", str(PRETRAIN_WINDOW_SECONDS)]
         )
     )
     if failed:

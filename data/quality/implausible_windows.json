@@ -1,6 +1,6 @@
 {
   "alignment": "native",
-  "grid_fingerprint": "b3f4b653a9a5575dbbd5a54d3225ba74ad563d0e58ba7642963eca010139d848",
+  "grid_fingerprint": "68a8d10abbd96f804832488fee14f2fbe290c19e350581567079d71a568b5e7d",
   "stream_fingerprints": {
     "capture24/watch_wrist": "e035c8696d0246a5162d3358ffe4febd77855ec1f10501611a92ba557ba22f78",
     "dsads/chest": "4acc820b6178979f4fd55bb6881155c11232323cc8590281cd6940343be08f03",
@@ -41,7 +41,7 @@
     "motionsense/phone_front_pocket": "5428da607fcfd3b2301efb3e9fd4a507a4e99b351fd1d0ce12dd86596d96040e",
     "nfi_fared/back": "a44485d86433b2cfd53a889bdeb449b2d66c1f5e26377b218f82a5309f52bf37",
     "nfi_fared/wrist": "0c2e53fa4ad4ecbfabe84c1fc0770b94dc1a6396b26ff1f74772ad0bf5c86467",
-    "nhanes/watch_wrist": "3cec0eceb76c3fb7893f093940479acefba63e1f9bcb8ca3932a8ff4caefb909",
+    "nhanes/watch_wrist": "2677c1fd573ab7d96d8f766def89a443db83cca9544218146934e846bdc1867d",
     "opportunity/back": "59dc0122959b45fc1a6024283a9381ce309fae67ff86041ca2a7f0bf1ec36f37",
     "opportunity/left_lower_arm": "68777d9d2cb569444b4ecd4bb866a9c25f26e41237881c7b31a20928a5e8cb65",
     "opportunity/left_upper_arm": "f87cc8c94649d741992261b3cfdb0d65939b896c9a93dfc8c571f55ba81fe7ea",
@@ -71,6 +71,14 @@
     "sp_sw_har/watch_wrist": "83c45e1cf1209dd410c1cad7d0d0a65f20daa4b057219435a9fd4cd23f3c1963",
     "spar/watch_left_wrist": "086aced63d89d8a9a08d46794d63de7d4c31fa463207c02f9fe7cb2c2789d01b",
     "spar/watch_right_wrist": "657425b64c24f3b221d017a1b3b4fbe3231c6928a85574020cb5c5a288e6caa2",
+    "synthetic_imu/virt_head": "2dac2f66aa8c92d3760aeffdaf170e681c3d82cbe491cc23838a39706fa53520",
+    "synthetic_imu/virt_lforearm": "842220e0f7002487e9d68cfa563c2fb5f15cc1a528ff3577a1ad2bf6f6ccee1a",
+    "synthetic_imu/virt_pelvis": "5a8719e8f52cbf7342cb33bc191fa0b99efbf04aa6b5031545d0db3d2ba867ee",
+    "synthetic_imu/virt_rforearm": "cae24d13f6ad6a1ebe5f0c1c2a980371246e8e75964c26ee464eb912d29da40e",
+    "synthetic_imu/virt_rshank": "3d5157f87192a2b728fa9c1540522333d091bbb299b9b769d1a9c4325dead9e2",
+    "synthetic_imu/virt_rthigh": "059c8eefde0999ef32950ae1cc305dfc98ddbdb77bd04db8131b2d0c5ef4ada3",
+    "synthetic_imu/virt_rupperarm": "631837b68890185caa6dccaccef56f251668b3493caad92eb06674d43f3ff05f",
+    "synthetic_imu/virt_sternum": "8da972c19fed911e621ada54e0f15e01b9ad61bf4e230f9a2b90957d2c4b3c5f",
     "tnda_har/watch_wrist": "d040a7db78d3ef80ca1f6296e243562ff24ef7bd711a37c6ea5892d6d3bcd3d1",
     "uci_har/phone_waist": "bd92bc1bc2480d9999a10018d3f0565cea7a152ab45be82f67ab6ad807c8e517",
     "unimib_shar/phone_pocket": "464cfd2f36f4c9d3b1b59c91129b5858416f3b01d9b89c96c49a26c00f15bc23",
@@ -195,6 +203,9 @@
     ],
     "phytmo/left_shin": [
       2295
+    ],
+    "synthetic_imu/virt_sternum": [
+      4516
     ]
   },
   "summary": [
@@ -220,6 +231,14 @@
       5130,
       18.417499542236328,
       16.445100784301758,
+      0
+    ],
+    [
+      "synthetic_imu/virt_sternum",
+      1,
+      10358,
+      78.0625,
+      4.06640625,
       0
     ]
   ]

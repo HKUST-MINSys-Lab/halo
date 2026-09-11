@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
 from pathlib import Path
 
@@ -27,7 +28,10 @@ def load(log_path: Path):
             r = json.loads(line)
         except Exception:
             continue
-        (val_recs if "val_knn_ba" in r else step_recs).append(r)
+        is_validation = any(key in r for key in (
+            "development_transfer_knn_ba", "val_knn_label_stream_ba", "val_knn_ba",
+        ))
+        (val_recs if is_validation else step_recs).append(r)
     return step_recs, val_recs
 
 
@@ -56,6 +60,14 @@ def ewma(values, alpha=0.2):
     for value in values:
         out.append(value if not out else alpha * value + (1.0 - alpha) * out[-1])
     return out
+
+
+def selection_value(row):
+    for key in ("development_transfer_knn_ba", "val_knn_label_stream_ba", "val_knn_ba"):
+        value = row.get(key)
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return float(value)
+    return float("nan")
 
 
 def _line(axis, records, key, label=None, *, smooth=False, **kwargs):
@@ -129,6 +141,7 @@ def render(log_path: Path, out_path: Path):
 
     gradient_keys = ((
         ("grad/total_preclip", "total"), ("grad/encoder", "encoder"),
+        ("grad/frontend", "frontend"),
         ("grad/future_predictor", "future predictor"),
         ("grad/physical_decoder", "physical decoder"),
         ("grad/descriptor_projection", "descriptor projection"),
@@ -177,6 +190,7 @@ def render(log_path: Path, out_path: Path):
     ax[2, 0].set_title("representation spread"); _legend(ax[2, 0], fontsize=7)
 
     for key, label, style in (
+        ("development_transfer_knn_ba", "development transfer (selection)", "g-o"),
         ("val_knn_label_stream_ba", "kNN label/stream (selection)", "k-o"),
         ("val_knn_ba", "kNN global", "k--"),
         ("val_conse_label_stream_ba", "ConSE label/stream", "b-s"),
@@ -202,8 +216,22 @@ def render(log_path: Path, out_path: Path):
         ax[2, 2].set_yticks(y, names, fontsize=6)
     ax[2, 2].set_title("rolling dataset share"); _legend(ax[2, 2], fontsize=7)
 
+    frontend_keys = (
+        ("frontend/observable_fraction", "observable kernels"),
+        ("frontend/dead_kernel_fraction", "dead kernels"),
+        ("frontend/response_std_mean", "response std"),
+        ("duration/gate", "duration gate"),
+    )
+    has_frontend = any(
+        series(S, key)[0] for key, _ in frontend_keys if key.startswith("frontend/")
+    )
     aug = latest.get("data/augmentation_rate_window", {})
-    if aug:
+    if has_frontend:
+        for key, label in frontend_keys:
+            _line(ax[3, 0], S, key, label, smooth=True, lw=1.0)
+        ax[3, 0].set_title("frontend health")
+        _legend(ax[3, 0], fontsize=7)
+    elif aug:
         names = sorted(aug)
         ax[3, 0].barh(range(len(names)), [aug[k] for k in names])
         display = {
@@ -216,7 +244,7 @@ def render(log_path: Path, out_path: Path):
         }
         ax[3, 0].set_yticks(range(len(names)), [display.get(name, name) for name in names], fontsize=6)
         ax[3, 0].set_xlim(0, 1)
-    ax[3, 0].set_title("realized augmentation rate")
+        ax[3, 0].set_title("realized augmentation rate")
 
     _line(ax[3, 1], S, "perf/steps_per_s", "steps/s", lw=1.0, color="tab:green")
     ax[3, 1].set_title("throughput"); ax[3, 1].set_ylabel("steps/s")
@@ -228,8 +256,9 @@ def render(log_path: Path, out_path: Path):
     _legend(mem, fontsize=7, loc="upper right")
 
     ax[3, 2].axis("off")
-    best = max((r.get("val_knn_label_stream_ba", r.get("val_knn_ba", float("nan")))
-                for r in V), default=float("nan"))
+    selection_scores = [selection_value(row) for row in V]
+    selection_scores = [value for value in selection_scores if math.isfinite(value)]
+    best = max(selection_scores, default=float("nan"))
     best_c = max((r.get("val_conse_label_stream_ba", r.get("val_conse_ba", float("nan")))
                   for r in V), default=float("nan"))
     clip_values = series(S, "grad/clip_coefficient")[1]

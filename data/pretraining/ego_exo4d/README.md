@@ -107,7 +107,7 @@ slow, smooth head movement that never happened, so **any gap > 0.5 s splits the
 session** instead of being interpolated across. Parts are suffixed
 `..._aria_head_part01`, `..._aria_head_part02`; `aria_head` stays a matchable
 substring so the deployment-policy stream token still resolves. Parts shorter
-than one 6 s window are dropped. Each part's `timestamp_sec` restarts at 0.
+than one 8 s window are dropped. Each part's `timestamp_sec` restarts at 0.
 
 **Subject identity.** HALO splits are subject-disjoint, so a take must resolve to
 a stable person. `takes.json` carries `participant_uid` — a release-wide integer

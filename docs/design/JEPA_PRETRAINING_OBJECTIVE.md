@@ -130,7 +130,7 @@ more tokens.
 ## 3. Training example
 
 Draw one continuous region without crossing a session, subject, stream, acquisition configuration,
-or known recording-gap boundary. The initial experiment may use the existing six-second source
+or known recording-gap boundary. The design-of-record label-free corpus uses an eight-second source
 region. Within that region:
 
 1. Sample a context boundary so the student observes approximately 40-70% of the region.

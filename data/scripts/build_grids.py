@@ -384,6 +384,7 @@ def _write_streaming_grid(
     canonical_labels: bool,
     view: str,
     pre_windowed: bool = False,
+    window_seconds: float = WINDOW_SECONDS,
 ) -> None:
     """Two-pass, constant-signal-memory grid writer.
 
@@ -411,6 +412,7 @@ def _write_streaming_grid(
             view=view,
             include_partial=(alignment == "native"),
             forced_window=forced_window,
+            window_seconds=window_seconds,
         )
         if not len(grid.data):
             continue
@@ -440,6 +442,7 @@ def _write_streaming_grid(
             canonical_labels=canonical_labels,
             view=view,
             pre_windowed=pre_windowed,
+            window_seconds=window_seconds,
         )
         _save(out_root, spec, empty, subjects)
         return
@@ -474,6 +477,7 @@ def _write_streaming_grid(
                 view=view,
                 include_partial=(alignment == "native"),
                 forced_window=forced_window,
+                window_seconds=window_seconds,
             )
             count = len(grid.data)
             if not count:
@@ -531,6 +535,7 @@ def _write_streaming_grid(
                 "event_ids": event_ids,
                 "lengths_file": "lengths.npy",
                 "store_dtype": str(store_dtype),
+                "window_seconds": sample_shape[0] / rate_out,
                 "partial_windows": int(np.count_nonzero(lengths < sample_shape[0])),
             }
         )
@@ -542,7 +547,8 @@ def _write_streaming_grid(
 
 
 def build(out_root: Optional[Path] = None, datasets: Optional[Sequence[str]] = None,
-          alignments: Optional[Sequence[str]] = None) -> None:
+          alignments: Optional[Sequence[str]] = None,
+          window_seconds: float = WINDOW_SECONDS) -> None:
     """Assemble + save the grid regimes for EVERY device stream (phone + watch + body).
 
     We build the full phone+watch+body set once; `harmonised-strict` is the phone-only subset selected
@@ -550,6 +556,8 @@ def build(out_root: Optional[Path] = None, datasets: Optional[Sequence[str]] = N
     Pass `datasets` to build only those (e.g. after a single converter re-run); pass `alignments` to
     build only some regimes (e.g. `["native"]` to add the HALO grids without rebuilding the rest).
     """
+    if not np.isfinite(window_seconds) or window_seconds <= 0:
+        raise ValueError("window_seconds must be finite and positive")
     # ``out_root`` is an explicit override (tests, scratch builds). Left unset, each dataset
     # writes beside its own sessions, which may be either corpus root.
     want = set(datasets) if datasets else None
@@ -583,6 +591,7 @@ def build(out_root: Optional[Path] = None, datasets: Optional[Sequence[str]] = N
                     canonical_labels=canonical,
                     view=view,
                     pre_windowed=pw,
+                    window_seconds=window_seconds,
                 )
             else:
                 sessions = list(sessions_factory())
@@ -595,6 +604,7 @@ def build(out_root: Optional[Path] = None, datasets: Optional[Sequence[str]] = N
                     canonical_labels=canonical,
                     view=view,
                     pre_windowed=pw,
+                    window_seconds=window_seconds,
                 )
                 _save(out_root, spec, grid, subjects)
 
@@ -646,6 +656,10 @@ def _save(out_root: Optional[Path], spec: StreamSpec, grid: Grid, subjects: List
         "event_ids": list(map(str, grid.event_ids or [])),
         "lengths_file": "lengths.npy",
         "store_dtype": str(store_dtype),
+        "window_seconds": (
+            grid.data.shape[1] / grid.rate_hz
+            if grid.data.ndim == 3 and grid.data.shape[1] and grid.rate_hz > 0 else None
+        ),
         "partial_windows": int(np.count_nonzero(lengths < (grid.data.shape[1]
                                                                if grid.data.ndim == 3 else 0))),
     }))
@@ -660,8 +674,11 @@ def main() -> None:
     p.add_argument("--alignment", nargs="*", default=None,
                    choices=[a[0] for a in _ALIGNMENTS],
                    help="Build only these grid regimes (default: all three).")
+    p.add_argument("--window-seconds", type=float, default=WINDOW_SECONDS,
+                   help="physical source-window duration (default: 6; label-free JEPA uses 8)")
     args = p.parse_args()
-    build(datasets=args.dataset, alignments=args.alignment)
+    build(datasets=args.dataset, alignments=args.alignment,
+          window_seconds=args.window_seconds)
 
 
 if __name__ == "__main__":

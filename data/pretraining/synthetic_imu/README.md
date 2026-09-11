@@ -61,7 +61,9 @@ synthetic sessions with one command and no registrations.
 Its file names are resolved from the Zenodo REST API at run time rather than
 hardcoded. Zenodo answered 403/504 to non-browser clients when this module was
 written, so the file list could not be verified offline, and a hardcoded
-`.../files/100STYLE.zip` would have been a guess. One API call cannot be wrong.
+The fetcher resolves the declared `100STYLE.zip` BVH asset against the live
+Zenodo record before downloading it. It deliberately skips the separate
+14.8 GB labelled-data archive because this label-free converter does not use it.
 
 ### Embody 3D
 
@@ -273,7 +275,7 @@ is load-bearing**: no downstream policy, grid or eval should ever confuse a
 simulated stream for a measured one, and `grep -r virt_` finds every one of them.
 
 **Short sequences are dropped, not concatenated.** Anything under
-`--min-seconds` (default 6 s, our window) after edge trimming is discarded.
+`--min-seconds` (default 8 s, our JEPA source window) after edge trimming is discarded.
 Concatenation was the other option and is rejected on purpose: splicing two
 unrelated clips creates a position discontinuity, and the very next stage is a
 second derivative, which turns that into a multi-hundred-g impulse. Those
@@ -315,18 +317,14 @@ python -m data.pretraining.synthetic_imu.convert --sources 100style --realism
 python -m pytest tests/test_pretrain_synthetic_imu.py -q
 ```
 
-> **Housekeeping gap (not fixed here — `.gitignore` is outside this module).**
-> `.gitignore` covers `data/datasets/*/downloads/` and `data/datasets/*/sessions/`
-> but nothing under `data/pretraining/`, so `downloads/` and `sessions/` in this
-> directory are currently *not* ignored. Add the matching
-> `data/pretraining/*/downloads/` and `data/pretraining/*/sessions/` rules before
-> committing anything generated here. (The same gap now affects
-> `data/pretraining/nhanes/`.)
-
-This module is **not** registered in `data/scripts/curate/deployment_policy.py`
-and its streams are not built by `data/scripts/build_grids.py`. Wiring it into
-the corpus is a separate, deliberate decision — see the sim-to-real caveat above
-before making it.
+Generated downloads, sessions, grids, and manifests under `data/pretraining/`
+are ignored by the repository. The eight declared virtual placements are wired
+as `phase_a_scale` streams in `deployment_policy.py`; build them explicitly with
+`python -m data.scripts.build_grids --dataset synthetic_imu --alignment native
+--window-seconds 8`. A source skeleton may expose only a subset of placements.
+For example, the open 100STYLE BVH release resolves head, sternum, and pelvis;
+the other declared streams remain empty until a source with those joints is
+converted. Empty streams do not satisfy corpus materialization checks.
 
 ---
 

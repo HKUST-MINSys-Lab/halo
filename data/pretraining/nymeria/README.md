@@ -258,7 +258,7 @@ w_device   = R(sensorOrientation)ᵀ · angularVelocity
 
 A gap longer than **0.5 s** is a hard boundary and is **never interpolated across**. The
 recording is split into `_p01`, `_p02`, … parts, the stream token stays a matchable substring,
-and each part is then truncated to a whole number of six-second windows — so no downstream grid
+and each part is then truncated to a whole number of eight-second windows — so no downstream grid
 window can straddle a gap. A backwards clock step is treated as a gap too, not silently sorted.
 For Xsens the clock is the MVNX **frame index** divided by `frameRate`, so a dropped-frame run
 shows up as a real gap that the nominal `time` attribute would have hidden.

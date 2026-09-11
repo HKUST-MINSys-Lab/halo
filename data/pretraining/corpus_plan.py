@@ -39,6 +39,12 @@ BYTES_PER_SAMPLE = 2
 #: additional transient space.
 DEFAULT_BUDGET_GB = 180.0
 
+# The representation learner needs enough past context to predict all three future-horizon bins.
+# Keep this separate from data.scripts.build_grids.WINDOW_SECONDS: six-second labelled grids remain
+# a reproducibility contract for historical classification experiments, while the label-free JEPA
+# corpus is rebuilt at the eight-second context selected for the current experiment.
+PRETRAIN_WINDOW_SECONDS = 8.0
+
 
 @dataclass(frozen=True)
 class SourcePlan:

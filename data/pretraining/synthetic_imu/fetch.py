@@ -8,11 +8,9 @@ account, accept a licence, and receive per-user download links.  Those are
 and where to drop them, and does nothing else.
 
 100STYLE is CC BY 4.0 on Zenodo and **is** downloaded automatically.  Its file
-names are resolved from the Zenodo REST API at run time rather than hardcoded:
-the record could not be reached to verify the file list when this module was
-written (Zenodo answered 403/504 to non-browser clients from that network), so
-guessing ``.../files/100STYLE.zip`` would have been an invented URL.  Asking the
-API costs one request and cannot be wrong.
+metadata and URL are resolved from the Zenodo REST API at run time.  Only the
+``100STYLE.zip`` BVH release is fetched: the converter does not consume the
+separate 14.8 GB labelled-data archive on the same record.
 
 The SMPL / SMPL-H **body models** are a separate gate again (a different
 account, on a different site, per model) and are needed only for the AMASS and
@@ -57,6 +55,7 @@ class Source:
     homepage: str
     note: str
     record: Optional[str] = None
+    files: tuple[str, ...] = ()  # empty means every file on the record
 
 
 SOURCES: dict[str, Source] = {
@@ -68,6 +67,7 @@ SOURCES: dict[str, Source] = {
         licence="CC BY 4.0",
         homepage="https://www.ianxmason.com/100style/",
         record=ZENODO_RECORD_100STYLE,
+        files=("100STYLE.zip",),
         note=(
             "100STYLE (Mason et al.): 100 locomotion styles, XSens capture at 60 fps, >4M frames "
             "(~19 h), BVH named <Style>/<Style>_<MovementType>.bvh plus Dataset_List.csv and "
@@ -217,15 +217,27 @@ def fetch_zenodo(source: Source, raw_dir: Path = DOWNLOADS) -> list[dict]:
     with urllib.request.urlopen(_request(url, {"Accept": "application/json"})) as response:
         record = json.loads(response.read().decode("utf-8"))
 
-    files = record.get("files") or []
-    if not files:
+    record_files = record.get("files") or []
+    if not record_files:
         raise RuntimeError(
             f"Zenodo record {source.record} listed no files. Open "
             f"https://zenodo.org/records/{source.record} in a browser and download manually into "
             f"{target}."
         )
+    available = {(entry.get("key") or entry.get("filename")): entry for entry in record_files}
+    if source.files:
+        missing = sorted(set(source.files) - set(available))
+        if missing:
+            raise RuntimeError(
+                f"Zenodo record {source.record} does not contain required file(s) {missing}; "
+                f"available files are {sorted(available)}"
+            )
+        selected = [available[name] for name in source.files]
+    else:
+        selected = record_files
+
     results = []
-    for entry in files:
+    for entry in selected:
         name = entry.get("key") or entry.get("filename")
         link = (entry.get("links") or {}).get("self") or entry.get("links", {}).get("download")
         size = entry.get("size")

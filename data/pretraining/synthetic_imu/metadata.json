@@ -27,14 +27,9 @@
     "gyro_z": "gyro_z"
   },
   "placement": [
-    "virt_head",
-    "virt_sternum",
-    "virt_pelvis",
-    "virt_lforearm",
-    "virt_rforearm",
-    "virt_rupperarm",
-    "virt_rthigh",
-    "virt_rshank"
+    "head",
+    "pelvis",
+    "sternum"
   ],
-  "note": "Virtual IMU synthesised from motion capture (AMASS / Motion-X++ / 100STYLE), NOT measured. Stream tokens are prefixed 'virt_' so a simulated stream is never mistaken for a real one. Diversity source only: mocap pretraining alone gives marginal gains from the sim-to-real gap (arXiv 2602.11064). Phase-A only; unlabeled. The converter rewrites this file with the placements actually built."
+  "note": "Virtual IMU synthesised from motion capture (AMASS / Motion-X++ / 100STYLE). Stream tokens are prefixed 'virt_' so simulated streams are never mistaken for measured ones. Phase-A only; unlabeled."
 }

@@ -1,8 +1,8 @@
 """Pipeline A Phase-1 data pipeline (pretraining corpus + sampler + collate).
 
 Design decisions carried in from the gates:
-  * Corpus = the expanded 18-dataset TRAIN recipe's **native** grids by default (eval sets never
-    touched); the original 12-dataset matched recipe remains an explicit comparison arm. Native sampling
+  * Corpus = the dedicated label-free recipe's **native** grids by default (labelled evaluation sets
+    are never touched); labelled expanded/matched recipes remain historical controls. Native sampling
     RATE (no 60 Hz resample) + canonical labels + 6-ch pad+mask. The filterbank tokenizer is
     rate-invariant, so HALO trains on the corpus's REAL native rates (20/50/100 Hz) instead of a
     homogenized 60 Hz base. Corpus-matched layout-locked baseline adapters now begin from the same
@@ -34,6 +34,7 @@ from data.scripts.augmentations import AugmentationConfig, IMUAugmenter, IMUSamp
 from data.scripts.curate.deployment_policy import (
     CORPUS_MATCHED_TRAIN_DATASETS,
     EXPANDED_PHASE_A_TRAIN_DATASETS,
+    LABEL_FREE_PRETRAIN_DATASETS,
 )
 from data.scripts.eda.grid_io import GridRef, discover_grids
 from data.scripts.labels.canonical_labels import canonicalize
@@ -44,13 +45,13 @@ from data.scripts.labels.canonical_labels import canonicalize
 # hapt DROPPED: the sweep confirmed it is the UCI-HAR re-release — same 30 subjects /
 # recordings (per-window NCC 0.98 vs uci_har), so keeping both leaks near-duplicate val
 # windows into train across the pair. uci_har is the canonical windowed release; keep it.
-# Expanded is the design-of-record default. CORPUS_MATCHED_TRAIN_DATASETS remains a named launch
-# recipe for technique-only comparisons against baselines trained on the original twelve sources.
+# This module-level roster is the historical labelled recipe used by explicit controls. The CLI's
+# design-of-record default is the disjoint label-free roster resolved in pretrain.py.
 TRAIN_DATASETS = EXPANDED_PHASE_A_TRAIN_DATASETS
-# Fully wired scale sources, opt-in through pretrain.py --datasets. NHANES is intentionally absent
-# from label probes and Phase B because it has no activity annotations.
+# Historical optional sources for the labelled recipe. Label-free scale sources are resolved from
+# deployment_policy so additions cannot silently fall into the validation partition.
 OPTIONAL_PHASE_A_DATASETS = ("extrasensory", "nhanes", "hmog", "kneepad")
-PHASE_A_ONLY_DATASETS = frozenset({"nhanes"})
+PHASE_A_ONLY_DATASETS = frozenset(LABEL_FREE_PRETRAIN_DATASETS)
 UNLABELED_LABEL = "__unlabeled__"
 WINDOW_SECONDS = 6.0
 PATCH_SECONDS = 1.0

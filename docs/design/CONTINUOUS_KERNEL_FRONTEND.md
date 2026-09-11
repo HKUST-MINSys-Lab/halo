@@ -170,8 +170,8 @@ contract (exact sample offsets, integral scaling, re-zero-mean, energy-retained 
 is unchanged and tested per group (cross-rate correlation > 0.97 at 20/25/50 vs 100 Hz).
 
 **Frames per group.** Stride `T / frames_per_span` (`--frames-per-span`, default 4, an initial
-temporal-resolution choice rather than an exact bandwidth guarantee). A 6 s window yields
-48 + 24 + 16 = 88 tokens per
+temporal-resolution choice rather than an exact bandwidth guarantee). The eight-second JEPA window
+yields 64 + 32 + 22 = 118 tokens per
 sensor. The grid follows the longest recording in the batch; shorter recordings are masked beyond
 their own duration and get exactly the tokens they get alone (tested).
 
@@ -215,10 +215,12 @@ corpus, four loader workers): 43 ms per step against 17 ms for the fixed filterb
 so a 35k-step run is about 25 minutes. Per-token export for the evaluation adapter follows the
 frontend's grid (`out["token_grid"]`).
 
-**Not done.** JEPA masking is refused on the grid (Phase-A pretraining does not support this
-frontend); only short smoke runs have been launched; the per-group projection is linear, a small per-group
-temporal mixer before attention is an obvious ablation if the trunk proves too shallow for 180
-tokens.
+**Future JEPA.** The past-only future objective supports this frontend directly. Student kernels see
+only the raw prefix; the EMA teacher sees the complete window. The trainer derives RoPE's fastest
+period from the shortest span and frame density, audits targets per span, logs frontend gradient,
+observability and dead-kernel telemetry, and sizes the batch from the actual emitted token count.
+The historical bidirectional masked objective remains unsupported because it cannot provide honest
+raw-signal masking for kernels whose support overlaps a masked interval.
 
 Smoke and tests: `tests/test_multispan_kernel.py` plus the encoder/export suites, including
 normalization, checkpoint revision checks and refusal of duplicated input grids.

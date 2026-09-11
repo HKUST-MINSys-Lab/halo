@@ -124,7 +124,8 @@ def assert_no_retired_sources(datasets: Sequence[str], *, allow: bool = False) -
 # `data/pretraining/corpus_plan.py` and `docs/data/PRETRAINING_CORPUS.md`. Every session in
 # these carries `__unlabeled__`, so they can only ever feed representation pretraining: they
 # are structurally incapable of reaching a label vocabulary, a validation probe, or the
-# Phase-B bank. Never a named recipe's default; request them explicitly.
+# supervised application heads. Grid construction remains explicit so fetching a source cannot
+# silently enlarge an existing run; the encoder trainer's named ``label_free`` recipe selects them.
 PRETRAIN_SCALE_DATASETS = (
     "nhanes",
     "nymeria_xsens",
