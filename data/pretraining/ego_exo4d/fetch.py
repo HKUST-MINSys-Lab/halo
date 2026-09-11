@@ -93,8 +93,20 @@ def _aws_help(profile: str | None) -> str:
     )
 
 
-def require_cli(which=shutil.which) -> str:
+def require_cli(which=shutil.which, executable: str | None = None) -> str:
+    """Find the official downloader, including beside the active Python executable.
+
+    Production commands invoke the project interpreter by absolute path. Its ``bin`` directory
+    need not be on ``PATH``, even though ``ego4d`` installs the matching entry point there.
+    Keep injected ``which`` functions deterministic for tests and callers.
+    """
     path = which(CLI_NAME)
+    if not path and (which is shutil.which or executable is not None):
+        # Do not resolve the venv's ``python`` symlink: resolving would land in the system
+        # interpreter directory and lose the sibling console-script location.
+        sibling = Path(executable or sys.executable).parent / CLI_NAME
+        if sibling.is_file() and os.access(sibling, os.X_OK):
+            path = str(sibling)
     if not path:
         raise MissingPrerequisite(_cli_help())
     return path
@@ -121,7 +133,10 @@ def aws_configured(profile: str | None = None, env: Mapping[str, str] | None = N
     if not texts:
         return False
     if profile is None:
-        return True
+        # Named profiles alone do not make the implicit default profile usable. Letting such a
+        # config through starts `egoexo`, which then fails after a metadata request with a less
+        # actionable botocore traceback.
+        return any("[default]" in text or "[profile default]" in text for text in texts)
     return any(f"[{profile}]" in text or f"[profile {profile}]" in text for text in texts)
 
 
@@ -252,8 +267,9 @@ def build_command(
     splits: Sequence[str] = (),
     s3_profile: str | None = None,
     num_workers: int | None = None,
+    cli_path: str = CLI_NAME,
 ) -> list[str]:
-    command = [CLI_NAME, "-o", str(out_dir), "--parts", *parts, "-y"]
+    command = [cli_path, "-o", str(out_dir), "--parts", *parts, "-y"]
     if uids:
         command += ["--uids", *uids]
     if universities:
@@ -310,12 +326,13 @@ def fetch(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    require_cli()
+    cli_path = require_cli()
     require_aws(s3_profile)
 
     if not skip_metadata:
         _run(
-            build_command(out_dir, [METADATA_PART], s3_profile=s3_profile, num_workers=num_workers),
+            build_command(out_dir, [METADATA_PART], s3_profile=s3_profile,
+                          num_workers=num_workers, cli_path=cli_path),
             runner=runner,
         )
 
@@ -381,6 +398,7 @@ def fetch(
             splits=splits,
             s3_profile=s3_profile,
             num_workers=num_workers,
+            cli_path=cli_path,
         ),
         runner=runner,
     )

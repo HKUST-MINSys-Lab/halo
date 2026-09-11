@@ -125,6 +125,40 @@ def test_duplicate_cache_allows_absent_optional_cached_streams(tmp_path, monkeyp
     assert sd.load("native", require=True) == {}
 
 
+def test_incremental_duplicate_refresh_preserves_only_fingerprinted_streams(tmp_path, monkeypatch):
+    """Incremental quality refresh is fail-closed for untouched grids."""
+    from types import SimpleNamespace
+    from data.scripts import scan_duplicates as sd
+    from data.scripts.eda import grid_io
+
+    repeated = np.zeros((2, 4, 6), dtype=np.float32)
+    changed = SimpleNamespace(
+        key="changed/watch", dataset="changed", n_windows=2, labels=("x", "x"),
+        load_data=lambda: repeated, load_lengths=lambda: np.array([4, 4], dtype=np.int32),
+    )
+    stable = SimpleNamespace(key="stable/watch", dataset="stable", n_windows=0)
+    cache = tmp_path / "duplicate_windows.json"
+    cache.write_text(json.dumps({
+        "alignment": "native", "stream_fingerprints": {"stable/watch": "stable-fp"},
+        "windows": {"stable/watch": [9]}, "summary": [],
+    }))
+    monkeypatch.setattr(sd, "OUT", cache)
+    monkeypatch.setattr(grid_io, "discover_grids", lambda alignment: [changed, stable])
+    monkeypatch.setattr(
+        grid_io, "grid_corpus_fingerprint",
+        lambda alignment, refs=None: "all-fp" if refs is None else f"{refs[0].dataset}-fp",
+    )
+    blob = sd.scan("native", ["changed"])
+    assert blob["windows"] == {"stable/watch": [9], "changed/watch": [1]}
+
+    cache.write_text(json.dumps({
+        "alignment": "native", "stream_fingerprints": {"stable/watch": "outdated"},
+        "windows": {}, "summary": [],
+    }))
+    with pytest.raises(ValueError, match="unselected streams have changed"):
+        sd.scan("native", ["changed"])
+
+
 def test_orphan_session_directories_are_not_ingested(tmp_path, monkeypatch):
     """A converter re-run that drops sessions leaves the old directories behind, and the grid
     builder's glob would happily ingest them — defeating the very fix that dropped them. MM-Fit's

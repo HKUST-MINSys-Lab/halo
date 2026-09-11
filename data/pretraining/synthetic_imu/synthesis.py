@@ -203,7 +203,10 @@ PLACEMENTS: dict[str, Placement] = {
         token="virt_lforearm",
         smpl_vertex=1961,
         smpl_joint=18,
-        bvh_joint_candidates=("LeftForeArm", "LeftHand", "lradius"),
+        # 100STYLE's MotionBuilder BVH calls the joint at the proximal end of
+        # this segment ``LeftElbow``.  In a BVH hierarchy its local rotation
+        # drives the forearm; omitting that spelling silently removed the site.
+        bvh_joint_candidates=("LeftForeArm", "LeftElbow", "LeftHand", "lradius"),
         description="left wrist / forearm (watch position)",
         provenance="VERIFIED: TransPose preprocess.py L34-35, vi_mask[0]=1961 / ji_mask[0]=18 (SMPL joint 18 = left elbow, drives the left forearm)",
     ),
@@ -212,7 +215,8 @@ PLACEMENTS: dict[str, Placement] = {
         token="virt_rforearm",
         smpl_vertex=5424,
         smpl_joint=19,
-        bvh_joint_candidates=("RightForeArm", "RightHand", "rradius"),
+        # See ``lforearm``: 100STYLE names the proximal forearm joint Elbow.
+        bvh_joint_candidates=("RightForeArm", "RightElbow", "RightHand", "rradius"),
         description="right wrist / forearm (watch position)",
         provenance="VERIFIED: TransPose preprocess.py L34-35, vi_mask[1]=5424 / ji_mask[1]=19 (SMPL joint 19 = right elbow, drives the right forearm)",
     ),
@@ -221,7 +225,8 @@ PLACEMENTS: dict[str, Placement] = {
         token="virt_rupperarm",
         smpl_vertex=None,
         smpl_joint=17,
-        bvh_joint_candidates=("RightArm", "rhumerus"),
+        # MotionBuilder's ``RightShoulder`` rotation drives the upper-arm bone.
+        bvh_joint_candidates=("RightArm", "RightShoulder", "rhumerus"),
         description="right upper arm band",
         provenance="UNVERIFIED: no published virtual-IMU mask places a sensor on the upper arm. No vertex index is asserted; falls back to the SMPL joint 17 (right shoulder, which drives the right humerus) origin — a documented approximation.",
     ),
@@ -230,7 +235,8 @@ PLACEMENTS: dict[str, Placement] = {
         token="virt_rthigh",
         smpl_vertex=4362,
         smpl_joint=2,
-        bvh_joint_candidates=("RightUpLeg", "rfemur"),
+        # MotionBuilder's ``RightHip`` rotation drives the femur.
+        bvh_joint_candidates=("RightUpLeg", "RightHip", "rfemur"),
         description="right thigh (pocket / thigh-worn)",
         provenance="VERIFIED: IMUPoser preprocess_all.py L33-34, vi_mask[3]=4362 / ji_mask[3]=2 (SMPL joint 2 = right hip, drives the right femur). NOT from TransPose, whose leg sensors sit at the knee.",
     ),
@@ -239,7 +245,8 @@ PLACEMENTS: dict[str, Placement] = {
         token="virt_rshank",
         smpl_vertex=4662,
         smpl_joint=5,
-        bvh_joint_candidates=("RightLeg", "rtibia"),
+        # MotionBuilder's ``RightKnee`` rotation drives the lower-leg bone.
+        bvh_joint_candidates=("RightLeg", "RightKnee", "rtibia"),
         description="right shank / lower leg",
         provenance="VERIFIED: TransPose preprocess.py L34-35, vi_mask[3]=4662 / ji_mask[3]=5 (SMPL joint 5 = right knee, drives the right shank)",
     ),

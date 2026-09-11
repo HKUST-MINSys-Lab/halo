@@ -559,6 +559,18 @@ def test_missing_cli_message_is_actionable():
     assert "2 days" in text
 
 
+def test_require_cli_finds_entrypoint_next_to_project_interpreter(tmp_path):
+    runtime = tmp_path / "bin" / "python"
+    cli = runtime.with_name("egoexo")
+    runtime.parent.mkdir(parents=True)
+    runtime.write_text("")
+    cli.write_text("#!/bin/sh\n")
+    cli.chmod(0o755)
+    assert fetch_mod.require_cli(
+        which=lambda _name: None, executable=str(runtime)
+    ) == str(cli)
+
+
 def test_missing_aws_message_is_actionable(tmp_path):
     env = {"HOME": str(tmp_path)}
     assert not fetch_mod.aws_configured(None, env)
@@ -577,6 +589,10 @@ def test_aws_profile_detected_in_shared_credentials(tmp_path):
     env = {"HOME": str(tmp_path)}
     assert fetch_mod.aws_configured("egoexo", env)
     assert not fetch_mod.aws_configured("other", env)
+    assert not fetch_mod.aws_configured(None, env)
+
+    (aws / "credentials").write_text("[default]\naws_access_key_id = AKIA\n")
+    assert fetch_mod.aws_configured(None, env)
 
 
 def test_dry_run_plans_without_downloading(tmp_path, monkeypatch):

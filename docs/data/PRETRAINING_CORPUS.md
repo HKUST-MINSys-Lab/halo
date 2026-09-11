@@ -140,6 +140,20 @@ Licence-gated fetchers (`nymeria`, `ego_exo4d`, `synthetic_imu`) print the exact
 and refuse to run until the credentials or URL manifest exist. Nothing in this tree bypasses
 a licence.
 
+### Tooling isolation
+
+The training runtime is `/home/alex/code/HALO/legacy_code/.venv/bin/python`. Do not install
+`projectaria-tools` into it: current releases can replace its pinned NumPy stack, which would
+invalidate model dependencies. VRS conversion is prepared in the isolated Python 3.12 runtime
+`/home/alex/.venvs/halo-nymeria-download/bin/python`, with `projectaria-tools==1.7.1`, NumPy,
+SciPy, pandas and PyArrow. Use that interpreter only for `nymeria.convert` and
+`ego_exo4d.convert`; training and grid building continue to use the project runtime.
+
+The Nymeria fetcher has a resumable standard-library fallback, so its official downloader does
+not need to be installed. The Ego-Exo4D `egoexo` entry point is installed beside the project
+interpreter and the fetcher resolves that location even when the interpreter is invoked by
+absolute path.
+
 Only the `native` grid regime is built for these sources. The `harmonised` and
 `non_harmonised` regimes exist for the layout-locked baselines and the evaluation path,
 neither of which may touch a label-free source.

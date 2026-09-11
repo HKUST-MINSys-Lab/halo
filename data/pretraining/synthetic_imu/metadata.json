@@ -28,7 +28,12 @@
   },
   "placement": [
     "head",
+    "lforearm",
     "pelvis",
+    "rforearm",
+    "rshank",
+    "rthigh",
+    "rupperarm",
     "sternum"
   ],
   "note": "Virtual IMU synthesised from motion capture (AMASS / Motion-X++ / 100STYLE). Stream tokens are prefixed 'virt_' so simulated streams are never mistaken for measured ones. Phase-A only; unlabeled."

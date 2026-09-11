@@ -452,6 +452,20 @@ def test_bvh_trajectory_resolves_placements_by_joint_name():
     assert np.allclose(np.linalg.norm(imu.acc_g, axis=-1), 1.0, atol=1e-6)
 
 
+def test_motionbuilder_bvh_joint_aliases_cover_all_virtual_sites():
+    """100STYLE uses MotionBuilder names at the proximal end of each limb bone."""
+    names = {
+        "Hips", "Chest", "Head", "LeftElbow", "RightElbow", "RightShoulder",
+        "RightHip", "RightKnee",
+    }
+    resolved = {
+        placement
+        for placement, spec in PLACEMENTS.items()
+        if names.intersection(spec.bvh_joint_candidates)
+    }
+    assert resolved == set(DEFAULT_PLACEMENTS)
+
+
 def test_bvh_rotation_channel_order_is_applied_intrinsically():
     """Zrotation then Xrotation must compose as Rz @ Rx, not Rx @ Rz."""
     text = _bvh([" ".join(["0.0"] * 3 + ["90.0", "45.0", "0.0"] + ["0.0"] * 6)] * 3)

@@ -187,7 +187,8 @@ def _stage_grids(sources: Sequence[SourcePlan]) -> int:
     # stage operational rather than leaving the next training invocation to fail on stale caches.
     failures = 0
     for module in ("data.scripts.scan_implausible", "data.scripts.scan_duplicates"):
-        failures += bool(_run([sys.executable, "-m", module, "--alignment", "native"]))
+        failures += bool(_run([sys.executable, "-m", module, "--alignment", "native",
+                               "--datasets", *names]))
     return failures
 
 

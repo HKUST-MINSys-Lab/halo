@@ -65,3 +65,36 @@ def test_implausible_scan_excludes_nonfinite_windows(tmp_path, monkeypatch):
     blob = si.scan("native")
     assert blob["windows"] == {"example/watch": [1]}
     assert blob["summary"][0][-1] == 1
+
+
+def test_incremental_implausible_refresh_preserves_only_fingerprinted_streams(tmp_path, monkeypatch):
+    """A rebuilt source need not reread the corpus, but stale other sources must refuse."""
+    from types import SimpleNamespace
+    from data.scripts import scan_implausible as si
+    from data.scripts.eda import grid_io
+
+    changed = SimpleNamespace(
+        key="changed/watch", dataset="changed", n_windows=1, mask=(True,) * 6,
+        load_data=lambda: np.full((1, 8, 6), 17.0, dtype=np.float32),
+    )
+    stable = SimpleNamespace(key="stable/watch", dataset="stable", n_windows=0)
+    cache = tmp_path / "implausible_windows.json"
+    cache.write_text(json.dumps({
+        "alignment": "native", "stream_fingerprints": {"stable/watch": "stable-fp"},
+        "windows": {"stable/watch": [3]}, "summary": [],
+    }))
+    monkeypatch.setattr(si, "OUT", cache)
+    monkeypatch.setattr(grid_io, "discover_grids", lambda alignment: [changed, stable])
+    monkeypatch.setattr(
+        grid_io, "grid_corpus_fingerprint",
+        lambda alignment, refs=None: "all-fp" if refs is None else f"{refs[0].dataset}-fp",
+    )
+    blob = si.scan("native", ["changed"])
+    assert blob["windows"] == {"stable/watch": [3], "changed/watch": [0]}
+
+    cache.write_text(json.dumps({
+        "alignment": "native", "stream_fingerprints": {"stable/watch": "outdated"},
+        "windows": {}, "summary": [],
+    }))
+    with pytest.raises(ValueError, match="unselected streams have changed"):
+        si.scan("native", ["changed"])

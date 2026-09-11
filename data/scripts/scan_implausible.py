@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 
@@ -41,12 +42,51 @@ def cache_path(alignment: str) -> Path:
     return OUT.with_name(f"{OUT.stem}_{alignment}{OUT.suffix}")
 
 
-def scan(alignment: str = "native") -> dict:
+def scan(alignment: str = "native", datasets: Sequence[str] | None = None) -> dict:
+    """Scan all grids, or safely refresh only named datasets in an existing cache.
+
+    A full corpus can be hundreds of GB.  After rebuilding one source, re-reading every
+    unrelated grid is needless I/O, but accepting its old exclusion entries without a
+    fingerprint check would be unsafe.  Incremental refresh therefore requires a current
+    cache and rejects it if any unselected stream changed.
+    """
     from data.scripts.eda.grid_io import discover_grids, grid_corpus_fingerprint
     refs = discover_grids(alignment)
+    requested = set(datasets or ())
+    selected_refs = refs
     bad: dict[str, list[int]] = {}
-    stats = []
-    for ref in sorted(refs, key=lambda r: r.key):
+    stats: list[tuple] = []
+    if requested:
+        available = {ref.dataset for ref in refs}
+        missing = sorted(requested - available)
+        if missing:
+            raise ValueError(f"no {alignment} grids for requested dataset(s): {missing}")
+        path = cache_path(alignment)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"{path} is required for an incremental refresh; run a full scan first"
+            )
+        prior = json.loads(path.read_text())
+        fingerprints = prior.get("stream_fingerprints", {})
+        stale = [
+            ref.key for ref in refs if ref.dataset not in requested
+            and fingerprints.get(ref.key) != grid_corpus_fingerprint(alignment, [ref])
+        ]
+        if stale:
+            raise ValueError(
+                "cannot incrementally refresh while unselected streams have changed; "
+                f"run a full scan (stale/missing: {stale[:5]})"
+            )
+        selected_refs = [ref for ref in refs if ref.dataset in requested]
+        bad = {
+            key: value for key, value in prior.get("windows", {}).items()
+            if key not in {ref.key for ref in selected_refs}
+        }
+        stats = [
+            tuple(row) for row in prior.get("summary", [])
+            if row[0] not in {ref.key for ref in selected_refs}
+        ]
+    for ref in sorted(selected_refs, key=lambda r: r.key):
         if ref.n_windows == 0:
             continue
         mask = np.asarray(ref.mask, dtype=bool)
@@ -129,8 +169,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--alignment", default="native",
                         choices=("native", "harmonised", "non_harmonised"))
+    parser.add_argument("--datasets", nargs="+", default=None,
+                        help="incrementally refresh only these datasets; requires current unchanged cache")
     args = parser.parse_args()
-    blob = scan(args.alignment)
+    blob = scan(args.alignment, args.datasets)
     path = cache_path(args.alignment)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(blob, indent=2) + "\n")
