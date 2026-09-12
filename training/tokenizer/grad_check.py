@@ -26,6 +26,7 @@ from training.tokenizer.future_jepa import (
     gather_token_rows,
     make_future_target_plan,
     normalized_teacher_target,
+    past_context_references,
     patch_variance_covariance,
 )
 from training.tokenizer.losses_repr import fold_analysis_to_sensors
@@ -154,20 +155,60 @@ def main() -> None:
             return_retrieval_tokens=False,
             return_layer_states=True,
         )
+        teacher_context_output = teacher.encode(
+            teacher_tokens, None, None, positions,
+            patch_durations=durations,
+            resolution_ids=resolutions,
+            channel_mask=channel_mask,
+            patch_padding_mask=plan.context_mask,
+            sensor_descriptors=descriptors,
+            sensor_id=sensor_id,
+            sensor_text_ids=descriptor_ids,
+            return_retrieval_tokens=False,
+            return_layer_states=True,
+        )
     teacher_grid = normalized_teacher_target(
         teacher_output["layer_states"], top_k=cfg.future_teacher_top_layers,
     )
+    context_grid = normalized_teacher_target(
+        teacher_context_output["layer_states"], top_k=cfg.future_teacher_top_layers,
+    )
     context_valid = plan.context_mask.unsqueeze(2) & student["sensor_present"].unsqueeze(1)
+    reference_by_sensor_resolution, _, reference_available = past_context_references(
+        context_grid, context_valid, positions, resolutions, len(cfg.future_patch_durations),
+    )
     prediction, target_indices, query_valid = model.future_predictor(
         student["tokens"], context_valid, plan.target_mask,
         positions, durations, resolutions, plan.horizon_seconds,
-        student["descriptor"], student["sensor_present"],
+        plan.context_end, student["descriptor"], student["sensor_present"],
     )
     teacher_targets = gather_token_rows(teacher_grid, target_indices)
     query_resolutions = resolutions.gather(1, target_indices[..., 0])
+    query_sensor = target_indices[..., 1]
+    query_batch = torch.arange(patches.shape[0]).unsqueeze(1)
+    query_resolution = query_resolutions.clamp(0, len(cfg.future_patch_durations) - 1)
+    reference = reference_by_sensor_resolution[query_batch, query_sensor, query_resolution]
+    all_context_weight = context_valid.to(context_grid.dtype)
+    fallback_reference = (
+        (context_grid * all_context_weight.unsqueeze(-1)).sum(dim=1)
+        / all_context_weight.sum(dim=1).unsqueeze(-1).clamp_min(1.0)
+    )[query_batch, query_sensor]
+    reference = torch.where(
+        reference_available[query_batch, query_sensor, query_resolution].unsqueeze(-1),
+        reference, fallback_reference,
+    )
+    target_residual = teacher_targets - reference
+    motion = target_residual.float().square().mean(dim=-1).sqrt()
+    live = query_valid.to(motion.dtype)
+    motion_mean = (motion * live).sum() / live.sum().clamp_min(1)
+    motion_weights = (1 + cfg.future_motion_weight * (motion / motion_mean.clamp_min(1e-4) - 1)).clamp(
+        min=1.0, max=cfg.future_motion_max_weight,
+    )
     future_loss = balanced_future_latent_loss(
-        prediction, teacher_targets, query_valid, query_resolutions,
+        prediction, target_residual, query_valid, query_resolutions,
         num_resolutions=len(cfg.future_patch_durations),
+        query_weights=motion_weights,
+        normalize_rows=False,
     )
 
     target_analysis = target_frontend.analyze(
@@ -190,7 +231,7 @@ def main() -> None:
     )
     physical_targets = gather_token_rows(physical_grid, target_indices)
     physical_valid = gather_token_rows(physical_valid_grid, target_indices)
-    physical_prediction = model.physical_decoder(prediction)
+    physical_prediction = model.physical_decoder(prediction + reference)
     physical_loss = balanced_physical_loss(
         physical_prediction, physical_targets, query_valid, query_resolutions,
         physical_valid, num_resolutions=len(cfg.future_patch_durations),
@@ -236,6 +277,7 @@ def main() -> None:
             "sensor_tokens": rms(sensor_tokens),
             "visible_student_states": rms(student["tokens"][context_valid]),
             "teacher_targets": rms(teacher_targets[query_valid]),
+            "future_target_residual": rms(target_residual[query_valid]),
             "future_predictions": rms(prediction[query_valid]),
             "physical_predictions": rms(physical_prediction[query_valid]),
         },

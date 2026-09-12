@@ -8,9 +8,11 @@ default recipe.
 
 The student receives only a physical-time prefix of an eight-second source window. An EMA teacher
 encodes the clean window. Target-query tokens request later intervals without exposing their signal.
-The predictor forecasts normalized teacher patch states, then a small decoder reconstructs frozen,
-standardized physical measurements from the predicted state. The predictor and decoder are removed
-after pretraining.
+The predictor forecasts the change from a past-only, same-sensor/same-resolution EMA reference to
+the normalized teacher state of a later patch. It receives relative time-to-boundary metadata on
+every observed context token, but no target absolute position. Adding the predicted residual back to
+that reference yields the future state passed to a small decoder for frozen, standardized physical
+measurements. The predictor and decoder are removed after pretraining.
 
 The implementation accepts any frontend that returns the common token-grid contract: token values,
 physical start/center/end times, durations or resolution IDs, sensor metadata, and validity masks.

@@ -80,6 +80,7 @@ from training.tokenizer.future_jepa import (
     gather_token_rows,
     make_future_target_plan,
     normalized_teacher_target,
+    past_context_references,
     patch_variance_covariance,
     recommend_fixed_objective_weights,
     truncate_patch_lengths_at_time,
@@ -264,18 +265,21 @@ class PretrainConfig:
     # attenuates its encoder gradient. The post-warmup calibration measures and freezes exact values.
     physical_weight: float = 5.0
     collapse_weight: float = 0.01
+    future_motion_weight: float = 0.5
+    future_motion_max_weight: float = 3.0
     vicreg_weight: float = 1.0
     # 0.996^4 preserves the EMA half-life in examples when batch 256 -> 1024 and updates divide by 4.
     jepa_ema_decay: float = 0.984095744256
-    # BYOL RAMPS the teacher decay rather than fixing it (cosine to exactly 1.0):
-    #     tau_k = 1 - (1 - tau_base) * (cos(pi*k/K) + 1) / 2,  tau_base -> 1.0
+    # BYOL ramps the teacher decay. Keep a finite late-run update rate so the EMA remains
+    # responsive after the post-warmup objective calibration changes the student trajectory.
     # data2vec also anneals but is NOT the source of this shape: it uses a LINEAR ramp for speech
     # and NLP, and a constant 0.9998 for vision. The 'cosine' arm here is BYOL's.
     # The trade-off is real -- early training wants a teacher that moves (the student has
     # nothing to learn from a frozen random target), late training wants one that is stable.
     # The reference batch-256 momentum was 0.996. The batch-1024 value above is its exact
     # example-time equivalent, not a claim that a lower-momentum teacher is intrinsically better.
-    jepa_ema_schedule: str = "cosine"     # fixed | cosine (BYOL ramp to 1.0)
+    jepa_ema_schedule: str = "cosine"     # fixed | cosine
+    jepa_ema_final_decay: float = 0.999
     # Realised mask fraction is (L + patch)/W, so nominal 0.5 currently masks ~0.56 of short
     # tokens and ~0.63 of long ones. Comparable methods sit HIGHER: BEiT 40%, MAE 75%
     # (its ablation shows linear-probe accuracy climbing steadily to 75%, a ~20-point gap over
@@ -314,7 +318,7 @@ class PretrainConfig:
     # apply mode installs it after the calibration step, freezes it, and continues the same run.
     objective_calibration_at: int = 0       # 0 disables; recommended full pilot: 2_000
     objective_calibration_batches: int = 50
-    objective_target_jepa_share: float = 0.70
+    objective_target_jepa_share: float = 0.75
     objective_target_physical_share: float = 0.20
     objective_calibration_mode: str = "report"  # report (stop) | apply (freeze and continue)
     # Label-free hierarchical corpus sampler. Dataset mass is tempered and capped, then distributed
@@ -375,7 +379,10 @@ def hydrate_calibrated_objective_weights(
         "jepa_weight": float,
         "physical_weight": float,
         "collapse_weight": float,
+        "future_motion_weight": float,
+        "future_motion_max_weight": float,
         "vicreg_weight": float,
+        "jepa_ema_final_decay": float,
     }
     applied = False
     for key, cast in fields.items():
@@ -1341,19 +1348,25 @@ def main() -> None:
                         help="future-latent physical-decoder objective weight")
     parser.add_argument("--collapse-weight", type=float, default=None,
                         help="patch-level variance/covariance objective weight")
+    parser.add_argument("--future-motion-weight", type=float, default=None,
+                        help="extra relative weight for changing future targets; 0 disables it")
+    parser.add_argument("--future-motion-max-weight", type=float, default=None,
+                        help="maximum per-query future-target weight after motion balancing")
     parser.add_argument("--num-heads", type=int, default=None,
                         help="Attention heads (default 8 -> head dim d_model/heads = 32). The "
                              "literature range for head dim is 64-128; 4 heads gives 64 at "
                              "IDENTICAL parameter count.")
     parser.add_argument("--jepa-ema-schedule", choices=("fixed", "cosine"), default=None,
-                        help="Teacher decay schedule. 'cosine' is the BYOL ramp from "
-                             "jepa_ema_decay to 1.0 and is the default; 'fixed' is the control.")
+                        help="Teacher decay schedule. 'cosine' ramps from jepa_ema_decay to "
+                             "jepa_ema_final_decay; 'fixed' holds the initial value.")
     parser.add_argument("--mask-ratio-time", type=float, default=None,
                         help="Nominal JEPA temporal mask fraction (default 0.5 -> ~0.6 realised). "
                              "MAE/data2vec use 0.75-0.8.")
     parser.add_argument("--jepa-ema-decay", type=float, default=None,
                         help="EMA teacher momentum (default 0.984095744256 at batch 1024; "
                              "example-time equivalent to 0.996 at batch 256).")
+    parser.add_argument("--jepa-ema-final-decay", type=float, default=None,
+                        help="finite final momentum for the cosine EMA schedule (default 0.999).")
     parser.add_argument("--vicreg-proj-dim", type=int, default=None,
                         help="VICReg expander OUTPUT width (default 128); also the width of the "
                              "DxD covariance matrices, so memory grows quadratically. "
@@ -1448,7 +1461,7 @@ def main() -> None:
                                        # (The dataclass default stays per_channel for direct/test ctors.)
         objective_calibration_at=500,
         objective_calibration_mode="apply",
-        objective_target_jepa_share=(0.70 if args.jepa_mode == "future" else 0.45),
+        objective_target_jepa_share=(0.75 if args.jepa_mode == "future" else 0.45),
         compile_encoder=False,
         train_datasets=_corpus_datasets(args.corpus),
         corpus_name=args.corpus,
@@ -1526,6 +1539,10 @@ def main() -> None:
         cfg.physical_weight = args.physical_weight
     if args.collapse_weight is not None:
         cfg.collapse_weight = args.collapse_weight
+    if args.future_motion_weight is not None:
+        cfg.future_motion_weight = args.future_motion_weight
+    if args.future_motion_max_weight is not None:
+        cfg.future_motion_max_weight = args.future_motion_max_weight
     if args.num_heads is not None:
         cfg.num_heads = args.num_heads
     if args.jepa_ema_schedule is not None:
@@ -1534,6 +1551,8 @@ def main() -> None:
         cfg.mask_ratio_time = args.mask_ratio_time
     if args.jepa_ema_decay is not None:
         cfg.jepa_ema_decay = args.jepa_ema_decay
+    if args.jepa_ema_final_decay is not None:
+        cfg.jepa_ema_final_decay = args.jepa_ema_final_decay
     if args.vicreg_proj_dim is not None:
         cfg.vicreg_proj_dim = args.vicreg_proj_dim
     if args.vicreg_proj_hidden is not None:
@@ -1731,6 +1750,8 @@ def main() -> None:
             parser.error("future predictor width must be positive and divisible by its head count")
         if cfg.jepa_weight <= 0 or cfg.collapse_weight <= 0 or cfg.physical_weight < 0:
             parser.error("future/collapse weights must be positive and physical weight nonnegative")
+        if cfg.future_motion_weight < 0 or cfg.future_motion_max_weight < 1:
+            parser.error("future motion weighting requires nonnegative strength and max weight >= 1")
         if not 0 < cfg.objective_target_physical_share < 1:
             parser.error("target physical gradient share must be in (0,1)")
         if cfg.objective_target_jepa_share + cfg.objective_target_physical_share >= 1:
@@ -1820,6 +1841,8 @@ def main() -> None:
         parser.error("--max-per-stream must be positive when provided")
     if not 0 <= cfg.jepa_ema_decay < 1:
         parser.error("--jepa-ema-decay must be in [0,1)")
+    if not cfg.jepa_ema_decay <= cfg.jepa_ema_final_decay < 1:
+        parser.error("--jepa-ema-final-decay must be in [jepa-ema-decay,1)")
     if cfg.lr <= 0 or cfg.grad_clip <= 0:
         parser.error("learning rate and gradient clipping threshold must be positive")
     if cfg.weight_decay < 0:
@@ -2130,14 +2153,12 @@ def main() -> None:
         enabled=device.type == "cuda" and cfg.amp_dtype == "fp16", init_scale=16_384.0,
     )
     def ema_decay_at(step: int) -> float:
-        """BYOL cosine ramp from cfg.jepa_ema_decay to 1.0, or the fixed value.
-
-        Reaches exactly 1.0 at ``step == cfg.steps``; ``update_ema_encoder`` accepts that.
-        """
+        """Cosine ramp from the example-scaled initial EMA to a finite final momentum."""
         if cfg.jepa_ema_schedule != "cosine":
             return cfg.jepa_ema_decay
         progress = min(max(step / max(cfg.steps, 1), 0.0), 1.0)
-        return 1.0 - (1.0 - cfg.jepa_ema_decay) * (math.cos(math.pi * progress) + 1.0) / 2.0
+        blend = (1.0 - math.cos(math.pi * progress)) / 2.0
+        return cfg.jepa_ema_decay + (cfg.jepa_ema_final_decay - cfg.jepa_ema_decay) * blend
 
     log_path = args.out / "log.jsonl"
     best_ba = -1.0
@@ -2213,7 +2234,10 @@ def main() -> None:
                 "jepa_weight": args.jepa_weight,
                 "physical_weight": args.physical_weight,
                 "collapse_weight": args.collapse_weight,
+                "future_motion_weight": args.future_motion_weight,
+                "future_motion_max_weight": args.future_motion_max_weight,
                 "vicreg_weight": args.vicreg_weight,
+                "jepa_ema_final_decay": args.jepa_ema_final_decay,
             }.items() if value is not None
         }
         hydrate_calibrated_objective_weights(
@@ -2755,6 +2779,8 @@ def main() -> None:
             jepa_loss = clean["pooled"].new_zeros(())
             jepa_parts: dict[str, float] = {}
             teacher_clean = None
+            context_reference = latest_context_reference = None
+            future_target_residual = future_motion_weights = None
             if jepa_teacher is not None:
                 # The teacher sees the clean view and never receives gradients. Reuse frozen text-LM
                 # outputs, but run the teacher's own frontend/fusion/transformer weights.
@@ -2813,19 +2839,89 @@ def main() -> None:
                     )
                     context_valid = (future_context_mask.unsqueeze(2)
                                      & clean["sensor_present"].unsqueeze(1))
+                    # The full teacher supplies the future target. A second EMA pass sees only
+                    # the observed prefix and supplies the detached reference state. Reusing its
+                    # token grid avoids a second filterbank analysis while keeping the reference
+                    # causally valid through every temporal-attention layer.
+                    teacher_context = jepa_teacher.encode(
+                        teacher_sensor_tokens, text_embs, text_masks, positions,
+                        patch_durations=patch_durations,
+                        resolution_ids=resolution_ids,
+                        channel_mask=enc_channel_mask,
+                        patch_padding_mask=future_context_mask,
+                        sensor_text_embs=sensor_text_embs,
+                        sensor_text_masks=sensor_text_masks,
+                        sensor_descriptors=sensor_descriptors,
+                        sensor_id=enc_sensor_id,
+                        role_text_ids=role_text_ids,
+                        sensor_text_ids=sensor_text_ids,
+                        return_retrieval_tokens=False,
+                        return_layer_states=True,
+                    )
+                    context_target_grid = normalized_teacher_target(
+                        teacher_context["layer_states"], top_k=cfg.future_teacher_top_layers,
+                    )
+                    (reference_by_sensor_resolution,
+                     latest_by_sensor_resolution,
+                     same_resolution_reference) = past_context_references(
+                        context_target_grid, context_valid, positions, resolution_ids,
+                        len(future_resolution_durations(cfg)),
+                    )
                     jepa_prediction, future_indices, future_query_valid = model.future_predictor(
                         clean["tokens"], context_valid, future_target_mask,
                         positions, patch_durations, resolution_ids, future_horizon,
-                        clean["descriptor"], clean["sensor_present"],
+                        future_context_end, clean["descriptor"], clean["sensor_present"],
                     )
                     teacher_targets = gather_token_rows(teacher_target_grid, future_indices)
                     future_query_resolutions = resolution_ids.gather(
                         1, future_indices[..., 0]
                     )
+                    query_sensor = future_indices[..., 1]
+                    query_resolution = future_query_resolutions.clamp(
+                        min=0, max=len(future_resolution_durations(cfg)) - 1,
+                    )
+                    query_batch = torch.arange(B, device=device).unsqueeze(1)
+                    context_reference = reference_by_sensor_resolution[
+                        query_batch, query_sensor, query_resolution,
+                    ]
+                    latest_context_reference = latest_by_sensor_resolution[
+                        query_batch, query_sensor, query_resolution,
+                    ]
+                    has_same_resolution = same_resolution_reference[
+                        query_batch, query_sensor, query_resolution,
+                    ]
+                    all_context_weight = context_valid.to(context_target_grid.dtype)
+                    all_context_reference = (
+                        (context_target_grid * all_context_weight.unsqueeze(-1)).sum(dim=1)
+                        / all_context_weight.sum(dim=1).unsqueeze(-1).clamp_min(1.0)
+                    )
+                    fallback_reference = all_context_reference[
+                        query_batch, query_sensor,
+                    ]
+                    context_reference = torch.where(
+                        has_same_resolution.unsqueeze(-1), context_reference, fallback_reference,
+                    )
+                    latest_context_reference = torch.where(
+                        has_same_resolution.unsqueeze(-1), latest_context_reference,
+                        fallback_reference,
+                    )
+                    future_target_residual = teacher_targets - context_reference
+                    motion = future_target_residual.float().square().mean(dim=-1).sqrt()
+                    valid_motion = future_query_valid.to(motion.dtype)
+                    motion_mean = (motion * valid_motion).sum() / valid_motion.sum().clamp_min(1)
+                    motion_mean = torch.where(
+                        future_query_valid.any(), motion_mean, motion.new_ones(()),
+                    ).detach()
+                    relative_motion = motion / motion_mean.clamp_min(1e-4)
+                    future_motion_weights = (
+                        1.0 + cfg.future_motion_weight * (relative_motion - 1.0)
+                    ).clamp(min=1.0, max=cfg.future_motion_max_weight)
                     jepa_loss = balanced_future_latent_loss(
-                        jepa_prediction, teacher_targets, future_query_valid,
+                        jepa_prediction, future_target_residual, future_query_valid,
                         future_query_resolutions,
                         num_resolutions=len(future_resolution_durations(cfg)),
+                        query_weights=future_motion_weights,
+                        normalize_rows=False,
                     )
                 else:
                     jepa_prediction = model.jepa_predictor(masked["tokens"])
@@ -2840,7 +2936,7 @@ def main() -> None:
                 if do_log and bool(jepa_mask.any()):
                     if cfg.jepa_mode == "future":
                         valid_prediction = jepa_prediction[future_query_valid]
-                        valid_target = teacher_targets[future_query_valid]
+                        valid_target = future_target_residual[future_query_valid]
                     else:
                         valid_prediction = jepa_prediction[jepa_mask].flatten(1)
                         valid_target = teacher_clean["tokens"][jepa_mask].flatten(1)
@@ -2941,7 +3037,9 @@ def main() -> None:
                     physical_feature_valid = gather_token_rows(
                         physical_valid_grid, physical_target_indices,
                     )
-                    physical_prediction = model.physical_decoder(jepa_prediction)
+                    # The predictor learns a residual. Reconstruct the future latent state before
+                    # decoding fixed physical measurements, retaining absolute-motion supervision.
+                    physical_prediction = model.physical_decoder(jepa_prediction + context_reference)
                     physical_loss = balanced_physical_loss(
                         physical_prediction, physical_targets, future_query_valid,
                         future_query_resolutions, physical_feature_valid,
@@ -2983,14 +3081,86 @@ def main() -> None:
                     selected_horizons = future_horizon.gather(1, future_indices[..., 0])
                     with torch.no_grad():
                         per_query_error = torch.nn.functional.smooth_l1_loss(
-                            torch.nn.functional.layer_norm(
-                                jepa_prediction.float(), (jepa_prediction.shape[-1],)
-                            ),
-                            torch.nn.functional.layer_norm(
-                                teacher_targets.float(), (teacher_targets.shape[-1],)
-                            ),
+                            jepa_prediction.float(), future_target_residual.float(),
                             reduction="none",
                         ).mean(dim=-1)
+                        persistence_residual = latest_context_reference - context_reference
+                        persistence_loss = balanced_future_latent_loss(
+                            persistence_residual, future_target_residual, future_query_valid,
+                            future_query_resolutions,
+                            num_resolutions=len(future_resolution_durations(cfg)),
+                            query_weights=future_motion_weights,
+                            normalize_rows=False,
+                        )
+                        # This is a control, not a second training path. It exposes how much the
+                        # predictor can infer from query metadata alone after its context state is
+                        # removed, and runs only at the ordinary telemetry cadence.
+                        no_context_prediction, _, _ = model.future_predictor(
+                            torch.zeros_like(clean["tokens"]),
+                            torch.zeros_like(context_valid),
+                            future_target_mask, positions, patch_durations, resolution_ids,
+                            future_horizon, future_context_end, clean["descriptor"],
+                            clean["sensor_present"],
+                        )
+                        own_similarity = torch.nn.functional.cosine_similarity(
+                            jepa_prediction.float(), future_target_residual.float(), dim=-1,
+                        )
+                        no_context_similarity = torch.nn.functional.cosine_similarity(
+                            no_context_prediction.float(), future_target_residual.float(), dim=-1,
+                        )
+                        target_unit = torch.nn.functional.normalize(
+                            future_target_residual.float(), dim=-1,
+                        )
+                        no_context_unit = torch.nn.functional.normalize(
+                            no_context_prediction.float(), dim=-1,
+                        )
+                        target_similarity = torch.matmul(target_unit, target_unit.transpose(1, 2))
+                        no_context_to_target = torch.matmul(
+                            no_context_unit, target_unit.transpose(1, 2),
+                        )
+                        same_resolution = future_query_resolutions.unsqueeze(2).eq(
+                            future_query_resolutions.unsqueeze(1)
+                        )
+                        other_valid = (future_query_valid.unsqueeze(2)
+                                       & future_query_valid.unsqueeze(1)
+                                       & same_resolution)
+                        other_valid.diagonal(dim1=1, dim2=2).fill_(False)
+                        other_count = other_valid.sum(dim=-1)
+                        other_similarity = (
+                            (target_similarity * other_valid.to(target_similarity.dtype)).sum(dim=-1)
+                            / other_count.clamp_min(1).to(target_similarity.dtype)
+                        )
+                        live_motion = motion[future_query_valid]
+                        live_weights = future_motion_weights[future_query_valid]
+                        candidate_target = future_query_valid.unsqueeze(1) & same_resolution
+                        no_context_choice = no_context_to_target.masked_fill(
+                            ~candidate_target, float("-inf"),
+                        ).argmax(dim=-1)
+                        own_index = torch.arange(
+                            future_query_valid.shape[1], device=device,
+                        ).unsqueeze(0)
+                        no_context_top1 = (
+                            no_context_choice.eq(own_index) & future_query_valid
+                        ).float().sum() / future_query_valid.sum().clamp_min(1)
+                        parts.update({
+                            "future/persistence_loss": float(persistence_loss),
+                            "future/beats_persistence": float(jepa_loss < persistence_loss),
+                            "future/no_context_similarity": float(
+                                no_context_similarity[future_query_valid].mean()
+                                if bool(future_query_valid.any()) else 0.0),
+                            "future/no_context_same_window_top1": float(no_context_top1),
+                            "future/own_similarity": float(
+                                own_similarity[future_query_valid].mean()
+                                if bool(future_query_valid.any()) else 0.0),
+                            "future/other_target_same_window_similarity": float(
+                                other_similarity[other_count.gt(0)].mean()
+                                if bool(other_count.gt(0).any()) else 0.0),
+                            "future/motion_rms": float(live_motion.mean() if live_motion.numel() else 0.0),
+                            "future/motion_weight_mean": float(
+                                live_weights.mean() if live_weights.numel() else 0.0),
+                            "future/motion_weight_max": float(
+                                live_weights.max() if live_weights.numel() else 0.0),
+                        })
                         for horizon_i, (horizon_lo, horizon_hi) in enumerate(
                             cfg.future_horizon_bins_seconds
                         ):
@@ -3001,6 +3171,10 @@ def main() -> None:
                             parts[f"future/horizon_{horizon_i}_loss"] = float(
                                 per_query_error[selected].mean() if bool(selected.any())
                                 else per_query_error.new_zeros(())
+                            )
+                            parts[f"future/horizon_{horizon_i}_own_similarity"] = float(
+                                own_similarity[selected].mean() if bool(selected.any())
+                                else own_similarity.new_zeros(())
                             )
                         for resolution_i, duration in enumerate(future_resolution_durations(cfg)):
                             selected = future_query_valid & future_query_resolutions.eq(resolution_i)

@@ -46,9 +46,10 @@ present and how they were acquired; it must not become a shortcut for dataset or
 ## Optional predictive pretraining
 
 Future-JEPA uses a student encoder that sees only a prefix of an unlabeled region and an EMA
-teacher that supplies later patch targets. A lightweight predictor forecasts future latent states;
-a physical decoder reconstructs standardized future physical measurements from the prediction. The
-student is the only encoder retained after pretraining. Full leakage and masking rules are in
+teacher that supplies later patch targets. A lightweight predictor forecasts each later latent's
+residual from a past-only EMA context reference; the reconstructed future latent is decoded to
+standardized physical measurements. The student is the only encoder retained after pretraining.
+Full leakage and masking rules are in
 [JEPA_PRETRAINING_OBJECTIVE.md](JEPA_PRETRAINING_OBJECTIVE.md).
 
 ## Support classifier

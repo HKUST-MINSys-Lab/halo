@@ -135,6 +135,15 @@ def test_resume_leaves_explicit_calibration_override_for_validation_to_reject():
     assert cfg.objective_calibration_at == 7
 
 
+def test_resume_leaves_explicit_future_objective_override_for_validation_to_reject():
+    cfg = PretrainConfig(future_motion_weight=0.2)
+    hydrate_calibrated_objective_weights(
+        cfg, {"future_motion_weight": 0.5}, saved_step=100,
+        explicit_fields={"future_motion_weight"},
+    )
+    assert cfg.future_motion_weight == 0.2
+
+
 def test_force_removes_all_known_run_artifacts_but_preserves_unknown_files(tmp_path):
     for name in (
         "last.pt", "log.jsonl", "run_config.json", "objective_calibration.json",

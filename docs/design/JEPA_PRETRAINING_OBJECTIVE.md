@@ -182,10 +182,11 @@ The exact layer set is a recorded hyperparameter and must remain fixed within a 
 
 ### Future predictor
 
-A lightweight, narrower predictor receives the student's context states plus target-query tokens.
-Each target query contains only information available before observing the target: requested future
-time, horizon, duration/resolution, sensor role, and acquisition configuration. It emits one
-predicted latent vector per target.
+A lightweight, narrower predictor receives the student's ordered context states plus target-query
+tokens. Every context token carries relative time-to-prefix-boundary, duration/resolution, sensor
+role, and acquisition configuration. Each target query carries only horizon, duration/resolution,
+sensor role, and acquisition configuration: it never carries its absolute position in the source
+window. It emits one predicted residual per target.
 
 The predictor is intentionally smaller than the encoder. Its role is to model temporal transition,
 not to duplicate the encoder or hide poor representations behind a high-capacity head.
@@ -194,25 +195,32 @@ not to duplicate the encoder or hide poor representations behind a high-capacity
 
 ### 5.1 Future latent prediction
 
-The primary loss compares each predicted future latent against its normalized EMA-teacher target.
-Use Smooth-L1 or L1 initially because these are less sensitive than squared error to occasional
-large residuals. The primary loss is:
+The primary loss compares each predicted change against the normalized EMA-teacher target after
+subtracting a detached, past-only reference. The reference is the EMA mean of observed context
+tokens with the same sensor and resolution; sparse grids fall back to that sensor's all-resolution
+context mean. Use Smooth-L1 because it is less sensitive than squared error to occasional large
+changes. The primary loss is:
 
 ```text
-L_future = mean_over_valid_targets(
-    smooth_l1(normalize(predicted_future), teacher_target)
+reference = mean(EMA_teacher(context tokens before boundary))
+target_residual = teacher_target - reference
+L_future = motion_weighted_mean_over_valid_targets(
+    smooth_l1(predicted_residual, target_residual)
 )
 ```
 
-The live trainer reports the loss separately by prediction horizon and patch duration, plus target
-counts by source dataset. Per-sensor and per-acquisition-configuration breakdowns are offline
+Per-query motion weights are bounded relative weights based on the detached target-residual RMS.
+They prevent static windows from monopolizing the latent loss without removing stationary examples
+from the encoder distribution. The live trainer reports the loss separately by prediction horizon
+and patch duration, plus target counts by source dataset. Per-sensor and per-acquisition-configuration breakdowns are offline
 acceptance analyses so they do not add synchronization or aggregation overhead to every update. A
 shuffled-target control must remain measurably worse than the true target; otherwise the task is not
 learning temporal correspondence.
 
 ### 5.2 Decode predicted latents to physical measurements
 
-A small decoder receives the **predicted future latent**, not the observed teacher latent. It
+A small decoder receives the **reconstructed predicted future latent** (`reference + predicted
+residual`), not the observed teacher latent. It
 reconstructs a frozen, standardized target derived from an independent parameter-free physical
 measurement analyzer. That analyzer is calibrated once, checkpointed, excluded from optimization,
 and is not the selected student frontend. Consequently, fixed, constrained-learnable, and
@@ -276,9 +284,9 @@ L_total = L_future
 `L_future` is the main objective. Initial gradient-share targets, used only to choose fixed scalar
 weights after a short warmup, are:
 
-- future latent prediction: 70%;
+- future latent prediction: 75%;
 - physical reconstruction: 20%; and
-- collapse control: 10%.
+- collapse control: 5%.
 
 The numerically stable launch coefficients before that measurement are `1.0`, `5.0`, and `0.01`,
 respectively. They are initialization values, not an assertion that the three raw losses are equally
@@ -296,7 +304,8 @@ The teacher receives no optimizer update. After every successful student optimiz
 teacher = momentum * teacher + (1 - momentum) * student
 ```
 
-Use an example-count-adjusted base momentum and increase it smoothly toward 1 over training. Do not
+Use an example-count-adjusted base momentum and increase it smoothly toward a finite final value
+(default `0.999`) over training. Do not
 update the teacher after an overflowed or skipped optimizer step. Teacher parameters, normalization
 statistics, and any learnable frontend state used to form targets must all follow the same declared
 EMA policy.
@@ -326,6 +335,10 @@ The live trainer records:
 - latent standard deviation, covariance, and effective rank;
 - true-target loss versus shuffled-target loss and their margin;
 - physical reconstruction error versus a zero predictor;
+- future loss versus a last-context persistence prediction, a no-context prediction, and
+  same-window other-target similarity; the no-context same-resolution top-1 control and
+  own-target similarity are also split by horizon;
+- target-residual motion scale and the realized bounded motion weights;
 - valid target count and target coverage by horizon, resolution, and source dataset;
 - mask-overlap leakage count, which must remain zero; and
 - offline representation diagnostics on non-sealed data; these are reported diagnostics, not a

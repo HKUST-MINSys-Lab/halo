@@ -17,6 +17,7 @@ from training.tokenizer.future_jepa import (
     gather_token_rows,
     make_future_target_plan,
     normalized_teacher_target,
+    past_context_references,
     pack_selected_interval_patches,
     patch_variance_covariance,
     recommend_fixed_objective_weights,
@@ -285,7 +286,7 @@ def test_predictor_has_gradients_without_future_signal_input():
     descriptions = torch.randn(2, 2, 384)
     prediction, indices, query_valid = model(
         context, context_valid, target_mask, positions, durations, groups,
-        horizons, descriptions, torch.ones(2, 2, dtype=torch.bool),
+        horizons, torch.full((2,), 2.0), descriptions, torch.ones(2, 2, dtype=torch.bool),
     )
     target = torch.randn_like(prediction)
     query_groups = groups.gather(1, indices[..., 0])
@@ -312,10 +313,57 @@ def test_future_prediction_cannot_read_invalid_context_rows():
     present = torch.ones(1, 1, dtype=torch.bool)
     with torch.no_grad():
         a = model(context, context_valid, target_mask, positions, durations, groups,
-                  horizons, descriptions, present)[0]
+                  horizons, torch.tensor([2.0]), descriptions, present)[0]
         b = model(changed, context_valid, target_mask, positions, durations, groups,
-                  horizons, descriptions, present)[0]
+                  horizons, torch.tensor([2.0]), descriptions, present)[0]
     assert torch.allclose(a, b, atol=1e-6)
+
+
+def test_predictor_uses_context_time_order_and_is_translation_invariant():
+    torch.manual_seed(13)
+    model = FuturePredictor(8, predictor_dim=8, num_layers=1, num_heads=2, dropout=0.0).eval()
+    context = torch.randn(1, 5, 1, 8)
+    context_valid = torch.tensor([[[True], [True], [True], [False], [False]]])
+    target_mask = torch.tensor([[False, False, False, True, True]])
+    positions = torch.arange(5).float().view(1, 5)
+    durations = torch.ones(1, 5)
+    groups = torch.zeros(1, 5, dtype=torch.long)
+    horizons = torch.tensor([[0.0, 0.0, 0.0, 1.0, 2.0]])
+    descriptors = torch.randn(1, 1, 384)
+    present = torch.ones(1, 1, dtype=torch.bool)
+    shuffled = context.clone()
+    shuffled[:, :3] = shuffled[:, torch.tensor([2, 0, 1])]
+    with torch.no_grad():
+        baseline = model(
+            context, context_valid, target_mask, positions, durations, groups, horizons,
+            torch.tensor([2.0]), descriptors, present,
+        )[0]
+        reordered = model(
+            shuffled, context_valid, target_mask, positions, durations, groups, horizons,
+            torch.tensor([2.0]), descriptors, present,
+        )[0]
+        shifted = model(
+            context, context_valid, target_mask, positions + 17.0, durations, groups, horizons,
+            torch.tensor([19.0]), descriptors, present,
+        )[0]
+    assert (baseline - reordered).abs().max() > 1e-5
+    assert torch.allclose(baseline, shifted, atol=1e-6)
+
+
+def test_past_context_references_are_resolution_specific_and_detached():
+    targets = torch.tensor([[
+        [[1.0, 2.0], [10.0, 20.0]],
+        [[3.0, 4.0], [30.0, 40.0]],
+        [[9.0, 9.0], [90.0, 90.0]],
+    ]], requires_grad=True)
+    valid = torch.tensor([[[True, True], [True, True], [False, False]]])
+    positions = torch.tensor([[1.0, 2.0, 3.0]])
+    groups = torch.tensor([[0, 0, 1]])
+    mean, latest, available = past_context_references(targets, valid, positions, groups, 2)
+    assert available.tolist() == [[[True, False], [True, False]]]
+    assert torch.allclose(mean[0, :, 0], torch.tensor([[2.0, 3.0], [20.0, 30.0]]))
+    assert torch.allclose(latest[0, :, 0], torch.tensor([[3.0, 4.0], [30.0, 40.0]]))
+    assert not mean.requires_grad and not latest.requires_grad
 
 
 def test_predictor_handles_ineligible_rows_without_nan_or_loss_leakage():
@@ -332,7 +380,7 @@ def test_predictor_handles_ineligible_rows_without_nan_or_loss_leakage():
     horizons = torch.tensor([[0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 0.0]])
     prediction, indices, valid = model(
         context, context_valid, target_mask, positions, durations, groups, horizons,
-        torch.randn(2, 1, 384), torch.ones(2, 1, dtype=torch.bool),
+        torch.full((2,), 1.0), torch.randn(2, 1, 384), torch.ones(2, 1, dtype=torch.bool),
     )
     target = torch.randn_like(prediction)
     loss = balanced_future_latent_loss(

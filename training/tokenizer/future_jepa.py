@@ -342,7 +342,7 @@ class FuturePredictor(nn.Module):
         self.context_proj = nn.Linear(d_model, predictor_dim)
         self.descriptor_proj = nn.Linear(descriptor_dim, predictor_dim, bias=False)
         self.numeric_proj = nn.Sequential(
-            nn.Linear(4, predictor_dim), nn.GELU(), nn.Linear(predictor_dim, predictor_dim),
+            nn.Linear(3, predictor_dim), nn.GELU(), nn.Linear(predictor_dim, predictor_dim),
         )
         self.resolution_embedding = nn.Embedding(max_resolutions, predictor_dim)
         self.query_role = nn.Parameter(torch.randn(predictor_dim) * 0.02)
@@ -368,6 +368,7 @@ class FuturePredictor(nn.Module):
         durations: torch.Tensor,
         resolution_ids: torch.Tensor,
         horizon_seconds: torch.Tensor,
+        context_end: torch.Tensor,
         sensor_descriptors: torch.Tensor,
         sensor_present: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -395,6 +396,8 @@ class FuturePredictor(nn.Module):
         }.items():
             if tensor.shape != (batch, patches):
                 raise ValueError(f"{name} must have shape (B,P)")
+        if context_end.reshape(-1).shape[0] != batch:
+            raise ValueError("context_end must contain one value per recording")
         if sensor_descriptors.shape[:2] != (batch, sensors):
             raise ValueError("sensor_descriptors must have shape (B,S,descriptor_dim)")
         if sensor_present.shape != (batch, sensors):
@@ -412,7 +415,6 @@ class FuturePredictor(nn.Module):
 
         patch_index = indices[..., 0]
         sensor_index = indices[..., 1]
-        target_position = positions.gather(1, patch_index)
         target_duration = durations.gather(1, patch_index)
         target_horizon = horizon_seconds.gather(1, patch_index)
         target_resolution = resolution_ids.gather(1, patch_index).clamp(
@@ -422,27 +424,16 @@ class FuturePredictor(nn.Module):
             1, sensor_index.unsqueeze(-1).expand(-1, -1, sensor_descriptors.shape[-1]),
         )
 
-        # Normalize by the complete metadata grid for this recording, not by whichever target was
-        # randomly selected. Signal values remain hidden, while identical physical times retain
-        # identical conditioning across target draws. All four values are bounded to [0,1].
-        metadata_valid = resolution_ids.ge(0) & durations.gt(0)
-        recording_start = torch.where(
-            metadata_valid, positions - 0.5 * durations,
-            torch.full_like(positions, float("inf")),
-        ).amin(dim=1)
-        recording_start = torch.where(
-            torch.isfinite(recording_start), recording_start, positions.new_zeros(()),
-        )
-        recording_end = torch.where(
-            metadata_valid, positions + 0.5 * durations, torch.zeros_like(positions),
-        ).amax(dim=1)
-        span = (recording_end - recording_start).clamp(min=1e-3)
+        # Queries ask "what follows this observed prefix?" rather than "what belongs at this
+        # absolute place in the recording?"  Bounded log-time features preserve physical units
+        # across recordings with different lengths without exposing target absolute position.
+        log_scale = math.log1p(8.0)
+        target_horizon_feature = torch.tanh(torch.log1p(target_horizon.clamp_min(0)) / log_scale)
+        target_duration_feature = torch.tanh(torch.log1p(target_duration.clamp_min(0)) / log_scale)
         numeric = torch.stack((
-            ((target_position - recording_start.unsqueeze(1)) / span.unsqueeze(1)).clamp(0, 1),
-            (target_horizon / span.unsqueeze(1)).clamp(0, 1),
-            (target_duration / span.unsqueeze(1)).clamp(0, 1),
-            (torch.log1p(target_duration.clamp(min=0))
-             / torch.log1p(span.unsqueeze(1))).clamp(0, 1),
+            target_horizon_feature,
+            target_duration_feature,
+            target_duration / (target_duration + target_horizon + 1.0),
         ), dim=-1)
         query = (
             self.query_role.view(1, 1, -1)
@@ -452,7 +443,29 @@ class FuturePredictor(nn.Module):
         )
         query = query * query_valid.unsqueeze(-1).to(query.dtype)
 
-        memory = self.context_proj(context_states.flatten(1, 2))
+        context_positions = positions.repeat_interleave(sensors, dim=1)
+        context_durations = durations.repeat_interleave(sensors, dim=1)
+        context_resolutions = resolution_ids.repeat_interleave(sensors, dim=1).clamp(
+            min=0, max=self.resolution_embedding.num_embeddings - 1,
+        )
+        context_sensor_index = torch.arange(sensors, device=context_states.device).repeat(patches)
+        context_descriptor = sensor_descriptors.gather(
+            1, context_sensor_index.view(1, -1, 1).expand(
+                batch, -1, sensor_descriptors.shape[-1],
+            ),
+        )
+        time_to_boundary = (context_end.reshape(batch, 1) - context_positions).clamp_min(0)
+        context_numeric = torch.stack((
+            torch.tanh(torch.log1p(time_to_boundary) / log_scale),
+            torch.tanh(torch.log1p(context_durations.clamp_min(0)) / log_scale),
+            context_durations / (context_durations + time_to_boundary + 1.0),
+        ), dim=-1)
+        memory = (
+            self.context_proj(context_states.flatten(1, 2))
+            + self.numeric_proj(context_numeric.to(context_states.dtype))
+            + self.descriptor_proj(context_descriptor.to(context_states.dtype))
+            + self.resolution_embedding(context_resolutions)
+        )
         memory_valid = context_valid.flatten(1, 2)
         # Every eligible row has context. For ineligible rows, expose one zero memory element to
         # avoid an all-masked attention softmax; query_valid keeps it out of every objective.
@@ -484,27 +497,80 @@ def gather_token_rows(values: torch.Tensor, indices: torch.Tensor) -> torch.Tens
     return values[batch, indices[..., 0], indices[..., 1]]
 
 
+def past_context_references(
+    context_targets: torch.Tensor,
+    context_valid: torch.Tensor,
+    positions: torch.Tensor,
+    resolution_ids: torch.Tensor,
+    num_resolutions: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return detached mean and latest past targets for each ``(sensor, resolution)``.
+
+    ``context_targets`` must come from an encoder invocation whose temporal keys are restricted to
+    the observed prefix.  The final boolean records whether a same-resolution reference exists;
+    callers may fall back to the all-resolution mean when a sparse grid lacks one.
+    """
+
+    if context_targets.ndim != 4 or context_valid.shape != context_targets.shape[:3]:
+        raise ValueError("context targets and validity must have shapes (B,P,S,D) and (B,P,S)")
+    batch, patches, sensors, width = context_targets.shape
+    if positions.shape != (batch, patches) or resolution_ids.shape != (batch, patches):
+        raise ValueError("context metadata must match the patch grid")
+    if num_resolutions <= 0:
+        raise ValueError("num_resolutions must be positive")
+    groups = resolution_ids.clamp(0, num_resolutions - 1)
+    group_mask = torch.nn.functional.one_hot(groups, num_classes=num_resolutions).bool()
+    valid = context_valid.unsqueeze(-1) & group_mask.unsqueeze(2)
+    count = valid.sum(dim=1).unsqueeze(-1)
+    summed = torch.einsum("bpsd,bpsr->bsrd", context_targets.float(), valid.to(torch.float32))
+    mean = summed / count.clamp_min(1).to(summed.dtype)
+
+    # Choose the latest real context patch per sensor/resolution. ``argmax`` has a stable first
+    # tie-break; overlapping resolutions may share a center without ambiguity for this control.
+    time = positions.unsqueeze(2).unsqueeze(-1).expand(-1, -1, sensors, num_resolutions)
+    latest_index = time.masked_fill(~valid, float("-inf")).argmax(dim=1)
+    gather = latest_index.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, 1, width)
+    rows = context_targets.permute(0, 2, 1, 3).unsqueeze(2).expand(
+        -1, -1, num_resolutions, -1, -1,
+    )
+    latest = rows.gather(3, gather).squeeze(3)
+    return mean.detach(), latest.detach(), count.squeeze(-1).gt(0)
+
+
 def balanced_future_latent_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
     query_valid: torch.Tensor,
     query_resolution_ids: torch.Tensor,
     num_resolutions: int | None = None,
+    query_weights: torch.Tensor | None = None,
+    normalize_rows: bool = True,
 ) -> torch.Tensor:
     """Smooth-L1 normalized latent loss, averaged equally over active resolutions."""
 
     if prediction.shape != target.shape or query_valid.shape != prediction.shape[:2]:
         raise ValueError("future latent prediction, target, and validity shapes disagree")
-    pred = F.layer_norm(prediction.float(), (prediction.shape[-1],))
-    tgt = F.layer_norm(target.detach().float(), (target.shape[-1],))
+    pred = F.layer_norm(prediction.float(), (prediction.shape[-1],)) if normalize_rows else prediction.float()
+    tgt = F.layer_norm(target.detach().float(), (target.shape[-1],)) if normalize_rows else target.detach().float()
     per_query = F.smooth_l1_loss(pred, tgt, reduction="none").mean(dim=-1)
     live = query_valid & query_resolution_ids.ge(0)
+    if query_weights is None:
+        weights = torch.ones_like(per_query)
+    elif query_weights.shape != per_query.shape:
+        raise ValueError("query_weights must be finite and match (B,Q)")
+    else:
+        # Do not use a host-side ``Tensor.all()`` here: this loss runs every accelerator step.
+        weights = torch.nan_to_num(
+            query_weights.detach().to(per_query.dtype), nan=0.0, posinf=0.0, neginf=0.0,
+        ).clamp_min(0)
     if num_resolutions is None:
         num_resolutions = max(int(query_resolution_ids.detach().max().item()) + 1, 1)
     groups = query_resolution_ids.clamp(0, num_resolutions - 1)
-    sums = per_query.new_zeros(num_resolutions).scatter_add_(0, groups[live], per_query[live])
+    sums = per_query.new_zeros(num_resolutions).scatter_add_(
+        0, groups[live], per_query[live] * weights[live],
+    )
     counts = per_query.new_zeros(num_resolutions).scatter_add_(
-        0, groups[live], torch.ones_like(per_query[live]),
+        0, groups[live], weights[live],
     )
     means = sums / counts.clamp_min(1)
     active = counts.gt(0).to(means.dtype)
