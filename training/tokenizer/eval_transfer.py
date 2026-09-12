@@ -1,19 +1,12 @@
-"""Held-out-config transfer probe for a frozen Phase-1 encoder.
+"""Offline frozen-encoder representation probe and encoder reconstruction helpers.
 
-The internal pretraining val-kNN is subject-disjoint but WITHIN the training datasets.
-This measures the thing we actually care about: does the frozen representation cluster
-activities on **held-out eval datasets** (unseen placements/devices/subjects)? For each
-eval dataset we encode its windows with the frozen encoder and run a subject-disjoint
-kNN balanced accuracy over that dataset's OWN labels — pure representation transfer, no
-ConSE/text head involved (that's Pipeline B).
+The live protocol has no development-source roster, so current encoder training never invokes a
+held-out transfer score and selects the fixed final JEPA checkpoint. The reusable encoding helpers
+remain because support-classifier and diagnostic code reconstruct the same encoder contract.
 
-NOT the baseline-table number (which is ConSE macro-F1) — it's a fast, honest transfer
-signal to decide whether Pipeline A cleared the bar before building Pipeline B.
-
-Run:  /home/alex/code/HALO/legacy_code/.venv/bin/python -m training.tokenizer.eval_transfer \
-        --checkpoint training/tokenizer/outputs/pretrain_native/best.pt
-      # NB: pretrain_native/best.pt is the real trained model (val_ba 0.659). The default
-      # outputs/pretrain/ dir holds only smoke/debug runs — do NOT evaluate that one.
+Running this module on an explicitly supplied labelled source is an offline diagnostic only. A
+sealed source must not be passed here before the final protocol is frozen, and this module's kNN
+score is not the publication support-classifier result.
 """
 
 from __future__ import annotations
@@ -48,7 +41,7 @@ PATCH_SECONDS = 1.0
 KNN_K = 5
 SEED = 20260718
 
-# Phase-A CHECKPOINT SELECTION roster — named explicitly as (dataset, stream) pairs rather than
+# Historical checkpoint-selection roster, named explicitly as (dataset, stream) pairs rather than
 # derived from EVAL_STREAMS, because the selection sources are deliberately NOT the "primary"
 # deployment streams and must not drift when that policy changes.
 #
@@ -58,8 +51,9 @@ SEED = 20260718
 # from phone pockets is close to blind to the exact failure it exists to catch. ExtraSensory
 # contributes free-living wrist and in-hand cells at a 25 Hz acquisition clock stored at 50 Hz.
 #
-# EXCLUSIVITY. Every dataset here is development-only: never in a Phase-A training corpus, never in
-# the Phase-B test roster, never in the sealed confirmation roster. ExtraSensory is listed in
+# EXCLUSIVITY. Every dataset here was development-only: never in an encoder-pretraining corpus,
+# never in the support-classifier test roster, and never in the sealed confirmation roster.
+# ExtraSensory is listed in
 # `OPTIONAL_PHASE_A_DATASETS` as a scale source; selecting on it forfeits that use, and
 # `assert_selection_roster_is_untrained` enforces the separation at run start rather than trusting
 # a comment.
@@ -72,13 +66,15 @@ SEED = 20260718
 # checkpoints, which is a worse defect than the phone-only blindness it was added to fix. Its
 # free-living self-reported labels are the likely cause. It is retained because its WRIST posture
 # canary is the orientation instrument this roster exists for, and that canary is read directly.
-PHASE_A_SELECTION_STREAMS = (
-    ("motionsense", "phone_front_pocket", True),
-    ("realworld", "phone_waist", True),
-    ("shoaib", "phone_right_pocket", True),
-    ("extrasensory", "watch_wrist", False),
-    ("extrasensory", "phone_hand", False),
-)
+# EMPTY since 2026-09-11 (three disjoint source roles, no development-source roster).
+# motionsense/realworld/shoaib are
+# sealed test sets and may not be read during training; ExtraSensory pretrains the encoder. With
+# no selection signal the trainer keeps the FINAL checkpoint as `best.pt`, an a-priori choice
+# recorded in the run config. The 2026-08-17 lesson (an internal probe rose while held-out
+# transfer fell) is accepted as a risk the untrained-floor row in the results table must expose,
+# not one an extra development source is allowed to hide. The implementation remains only to
+# reproduce historical checkpoints; current training never calls it.
+PHASE_A_SELECTION_STREAMS: tuple[tuple[str, str, bool], ...] = ()
 PHASE_A_SELECTION_DATASETS = tuple(dict.fromkeys(d for d, _, _ in PHASE_A_SELECTION_STREAMS))
 PHASE_A_SCORED_SELECTION_DATASETS = tuple(
     dict.fromkeys(d for d, _, scored in PHASE_A_SELECTION_STREAMS if scored)
@@ -119,7 +115,13 @@ def subject_holdout(subjects: np.ndarray, dataset: str) -> set:
     return set(unique[:max(1, len(unique) // 2)])
 
 
-def build_encoder(ckpt: dict, device, *, training: bool = False) -> torch.nn.Module:
+def build_encoder(
+    ckpt: dict,
+    device,
+    *,
+    training: bool = False,
+    learnable_recording_pool: bool | None = None,
+) -> torch.nn.Module:
     c = ckpt["config"]
     backbone = c.get("encoder_backbone")
     if backbone in {"harnet", "unimts"}:
@@ -191,6 +193,8 @@ def build_encoder(ckpt: dict, device, *, training: bool = False) -> torch.nn.Mod
         use_sensor_bias_conditioning=bool(use_sensor_bias_conditioning),
         use_sensor_isolated_retrieval=bool(c.get("use_sensor_isolated_retrieval", False)),
         gate_bias_init=c.get("gate_bias_init", -2.0),
+        learnable_recording_pool=bool(c.get("learnable_recording_pool", False))
+        if learnable_recording_pool is None else bool(learnable_recording_pool),
     )
     kw.update(                                              # fixed / learnable filterbank hyperparams
         center_shift_fraction=c.get("center_shift_fraction", 0.45),
@@ -212,7 +216,19 @@ def build_encoder(ckpt: dict, device, *, training: bool = False) -> torch.nn.Mod
         ))
         kw["frames_per_span"] = int(c.get("frames_per_span", MS_FRAMES_PER_SPAN))
     enc = SetTokenizerEncoder(**kw)
-    enc.load_state_dict(ckpt["encoder"])
+    loaded = enc.load_state_dict(
+        ckpt["encoder"],
+        strict=not (bool(kw["learnable_recording_pool"])
+                    and not bool(c.get("learnable_recording_pool", False))),
+    )
+    if bool(kw["learnable_recording_pool"]) and not bool(c.get("learnable_recording_pool", False)):
+        unexpected = [key for key in loaded.unexpected_keys]
+        missing = [key for key in loaded.missing_keys if not key.startswith("recording_pool.")]
+        if unexpected or missing:
+            raise RuntimeError(
+                "Phase-A checkpoint could not be upgraded with a fresh recording pool: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
     enc.eval_resolutions = tuple(
         c.get("eval_resolutions", future_durations
               or c.get("val_resolution_pair", VAL_RESOLUTION_PAIR))
@@ -568,7 +584,8 @@ def encode_dataset(enc, data, texts, device, rate: float, gravity_state=None,
                    source_rate: float | None = None,
                    lengths=None,
                    neutral_text: bool = False,
-                   eval_patching: str = "checkpoint") -> torch.Tensor:
+                   eval_patching: str = "checkpoint",
+                   amp_dtype: torch.dtype | None = None) -> torch.Tensor:
     """Compatibility API: raw windows at native rate -> pooled embeddings only."""
     return encode_dataset_detailed(
         enc, data, texts, device, rate, gravity_state=gravity_state,
@@ -576,6 +593,7 @@ def encode_dataset(enc, data, texts, device, rate: float, gravity_state=None,
         source_rate=source_rate, lengths=lengths,
         neutral_text=neutral_text,
         eval_patching=eval_patching,
+        amp_dtype=amp_dtype,
         _require_patches=False,
     )["pooled"]
 
@@ -671,9 +689,9 @@ def development_transfer_score(
     max_windows_per_stream: int = SELECTION_MAX_WINDOWS_PER_STREAM,
     amp_dtype: torch.dtype | None = None,
 ) -> tuple[float, dict[str, float]]:
-    """Subject-disjoint kNN on development-only acquisition sources.
+    """Subject-disjoint kNN for the historical development-source protocol.
 
-    Phase A uses this to select checkpoints. Datasets are averaged equally, so a source with more
+    Historical pretraining used this to select checkpoints. Datasets are averaged equally, so a source with more
     windows cannot dominate. Scored on the SENSOR ROWS Phase B actually stores, not on a pooled
     embedding no downstream stage ever sees.
 

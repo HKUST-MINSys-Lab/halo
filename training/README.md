@@ -10,10 +10,11 @@ those predictions. See [JEPA_PRETRAINING_OBJECTIVE.md](../docs/design/JEPA_PRETR
 
 ## `support_classifier/`
 
-Support-conditioned HAR training. The same selected encoder embeds query and support recordings;
-the comparator learns only to adjust support-row evidence before the explicit candidate vote. A
-frozen-encoder run isolates representation quality. An end-to-end run updates the HALO encoder,
-recording pool, and comparator through both query and support paths.
+Support-conditioned HAR training. The same selected encoder embeds query and support recordings.
+The semantic token mixer attends jointly over query, support, paired support-label, and candidate
+tokens before a soft candidate vote; a separate but mechanically identical head handles `k=0`.
+The `neighbors` control removes the mixer and isolates encoder quality. An end-to-end run updates
+the HALO encoder, recording pool, and active head through both query and support paths.
 
 The old `evidence/` directory is historical reproducibility code, not a live default. Do not add
 new work there.

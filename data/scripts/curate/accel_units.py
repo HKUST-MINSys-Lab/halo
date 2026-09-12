@@ -38,6 +38,8 @@ ACC_UNIT_G = frozenset({
     "xrf_v2",     # 5-pos IMU acc in g (verified still |acc|~0.9-1.0); AirPods total acc=grav+userAccel (g).
     "extrasensory",  # converter normalizes Android m/s^2, iPhone g (author split), and watch milli-g.
     "nhanes",        # CDC PAX80_G release is calibrated triaxial acceleration in g.
+    "capture24_pretrain",  # Raw Capture-24 Axivity AX3 acceleration is already in g.
+    "extrasensory_pretrain",  # label-free adapter normalizes all device families to g.
     # Label-free pretraining sources. Every one of these converters emits g at the session
     # contract boundary, so nothing is rescaled here. They are listed anyway because the
     # policy test requires a documented unit decision per dataset, and "the converter already

@@ -19,6 +19,7 @@ from typing import Sequence
 import numpy as np
 
 from data.scripts.curate.compatibility import AcquisitionKey, is_near_miss, stream_key
+from data.scripts.labels.canonical_labels import NON_SEMANTIC_LABELS
 from training.support_classifier.sampling import (
     MIN_RECORDING_SECONDS,
     Recording,
@@ -34,7 +35,7 @@ def support_corpus_from_index(
     index: CorpusIndex,
     *,
     split: str = "train",
-    exclude_labels: Sequence[str] = ("unlabeled",),
+    exclude_labels: Sequence[str] = tuple(NON_SEMANTIC_LABELS),
     min_duration_seconds: float = MIN_RECORDING_SECONDS,
 ) -> SupportCorpus:
     """A :class:`SupportCorpus` addressing positions in ``index.<split>``.

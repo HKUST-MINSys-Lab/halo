@@ -21,10 +21,9 @@ recording vectors.
 
 ## `support/`
 
-The active support-conditioned classifier starts from cosine similarity between a query recording
-and support recordings. Label bindings turn weighted support rows into candidate scores. The learned
-comparator is intentionally narrow: it set-attends only sensor representations plus query/support
-role and episode-slot embeddings, then emits a scalar correction for each support row.
-
-The retired evidence-engine modules remain in the repository only for archived checkpoint
-compatibility. They are not imported by the active support-classifier path.
+The active support-conditioned classifier pools each recording to one motion vector. Its semantic
+token mixer jointly attends to the query vector, every support vector, each paired support-label
+token, and candidate-label tokens. Role embeddings distinguish token type; pair and candidate tags
+preserve the support-label-candidate bindings. It then scores query/support cosine similarity and
+softly votes support evidence to the candidate roster. A separate head handles the `k=0` query plus
+candidate-label condition.

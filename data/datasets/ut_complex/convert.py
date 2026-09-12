@@ -5,7 +5,9 @@ Sensors" (Sensors 16(4):426). 10 participants, 13 activities (incl. hand-gesture
 typing, writing, drinking coffee, giving a talk, smoking, eating). Two Samsung Galaxy S2 phones
 were carried in the RIGHT POCKET and on the RIGHT WRIST (emulating a smartwatch).
 
-We keep the WRIST stream only (ut_complex/watch_wrist) -> hand-gesture activities need the wrist.
+We keep the wrist-mounted-phone stream only (ut_complex/watch_wrist) because hand-gesture
+activities need a wrist placement.  It is a phone proxy, not a genuine smartwatch stream; that
+distinction lives in the deployment policy's ``watch_proxy`` device family.
 Accelerometer is the raw (gravity-present) accelerometer, in m/s^2 (|acc| ~ 9.8); gyro in rad/s.
 
 Source: https://www.utwente.nl/en/eemcs/ps/research/dataset/  (ut-data-complex.rar)

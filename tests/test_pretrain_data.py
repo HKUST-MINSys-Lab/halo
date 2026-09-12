@@ -45,16 +45,41 @@ def test_corpus_index_is_subject_disjoint(index):
     assert index.train and index.val
 
 
-def test_mmfit_validation_uses_published_cross_subject_partition(index):
-    train_subjects = set()
-    val_subjects = set()
-    for keys, target in ((index.train, train_subjects), (index.val, val_subjects)):
-        for key in keys:
-            ref = index.refs[key.stream_i]
-            if ref.dataset == "mmfit":
-                target.add(ref.subjects[key.window_i])
-    assert val_subjects == {"w00", "w05", "w12", "w13", "w20"}
-    assert train_subjects.isdisjoint(val_subjects)
+def test_validation_never_removes_a_label_from_training(index):
+    from training.tokenizer.pretrain_data import validation_subjects_for_refs
+
+    val_subjects = validation_subjects_for_refs(index.refs, seed=index.seed)
+    train_labels = {
+        canonicalize(label)
+        for ref in index.refs
+        for subject, label in zip(ref.subjects, ref.labels)
+        if (ref.dataset, subject) not in val_subjects
+    }
+    val_labels = {
+        canonicalize(label)
+        for ref in index.refs
+        for subject, label in zip(ref.subjects, ref.labels)
+        if (ref.dataset, subject) in val_subjects
+    }
+    assert val_labels <= train_labels
+
+
+def test_retired_mmfit_partition_remains_reproducible():
+    """Retirement must not silently break reproduction of the historical MM-Fit split."""
+    from data.scripts.eda.grid_io import discover_grids
+    from training.tokenizer.pretrain_data import validation_subjects_for_refs
+
+    refs = [ref for ref in discover_grids("native") if ref.dataset == "mmfit"]
+    if not refs:
+        pytest.skip("historical MM-Fit grids are not materialized")
+    selected = validation_subjects_for_refs(
+        refs,
+        seed=7,
+        phase_a_only_datasets=frozenset(),
+    )
+    assert {subject for dataset, subject in selected if dataset == "mmfit"} == {
+        "w00", "w05", "w12", "w13", "w20",
+    }
 
 
 def test_corpus_index_uses_canonical_labels(index):
@@ -74,9 +99,10 @@ def test_checked_in_global_vocabulary_matches_expanded_grids():
 
 
 def test_corpus_excludes_eval_datasets(index):
+    from data.scripts.curate.deployment_policy import SEALED_TEST_EVAL_DATASETS
+
     datasets = {r.dataset for r in index.refs}
-    for banned in ("motionsense", "realworld", "shoaib", "inclusivehar",
-                   "tnda_har", "ut_complex", "monipar", "spar", "upper_limb_use"):
+    for banned in SEALED_TEST_EVAL_DATASETS:
         assert banned not in datasets, f"eval dataset {banned} leaked into pretraining"
 
 
@@ -217,8 +243,9 @@ def test_collate_shapes_and_positions(index, ps):
     assert out["patch_ends"].shape == (8, P)
     assert out["resolution_ids"].shape == (8, P)
     assert out["resolution_count"] == 1
-    # positions are patch CENTERS in seconds
-    assert torch.allclose(out["positions"][0, 0], torch.tensor(ps / 2))
+    # Positions are centers of the *realized* sample boundaries.  A final or source-native
+    # partial window need not begin with an exact ``ps``-second patch, so asserting ``ps / 2``
+    # here would reject the intended physical-time partitioning for otherwise valid sources.
     assert torch.allclose(
         out["positions"], 0.5 * (out["patch_starts"] + out["patch_ends"]),
     )
@@ -426,7 +453,10 @@ def test_no_hapt_uci_leak(index):
     datasets = {r.dataset for r in index.refs}
     assert "hapt" not in datasets
     assert datasets.isdisjoint(RETIRED_TRAIN_DATASETS), sorted(datasets & set(RETIRED_TRAIN_DATASETS))
-    assert len(datasets) == 14
+    # The active supervised roster is intentionally curated over time.  Keep this guard tied to
+    # the policy authority rather than an obsolete literal count.
+    from training.tokenizer.pretrain_data import TRAIN_DATASETS
+    assert datasets == set(TRAIN_DATASETS)
 
 
 def test_patch_padding_mask_flags_phantom_patches(index):

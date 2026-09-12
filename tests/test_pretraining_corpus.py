@@ -246,7 +246,7 @@ def test_the_plan_fits_the_stated_budget():
 
 
 def test_source_sizing_is_the_documented_arithmetic():
-    source = next(s for s in corpus_plan.CORPUS_PLAN if s.dataset == "nhanes")
+    source = next(s for s in corpus_plan.CORPUS_PLAN if s.dataset == "capture24_pretrain")
     expected = (
         source.streams * source.wall_hours * 3600.0
         * source.rate_hz * source.stored_channels * corpus_plan.BYTES_PER_SAMPLE / 1e9
@@ -312,9 +312,9 @@ def test_every_planned_source_has_streams_declared_in_the_policy():
 
 def test_synthetic_data_is_never_the_base_of_the_corpus():
     """Mocap-derived signal is a wave-2 diversity source; arXiv 2602.11064 is why."""
-    synthetic = next(s for s in corpus_plan.CORPUS_PLAN if s.dataset == "synthetic_imu")
+    synthetic = next(s for s in corpus_plan.DEFERRED_SOURCES if s.dataset == "synthetic_imu")
     assert synthetic.wave == 2
-    assert synthetic.gigabytes < 0.15 * corpus_plan.total_gigabytes()
+    assert synthetic.dataset not in {source.dataset for source in corpus_plan.CORPUS_PLAN}
 
 
 # ---------------------------------------------------------------------------------------
@@ -324,7 +324,7 @@ def test_synthetic_data_is_never_the_base_of_the_corpus():
 def test_the_encoder_and_the_head_never_share_a_corpus():
     """The whole point of the split: a downstream gain must be attributable.
 
-    If the encoder pretrains on the same corpora the comparator and classification head are
+    If the encoder pretrains on the same corpora the support classifier is
     trained and selected on, an improvement can always be read as the encoder having already
     met those subjects, devices and activities rather than as a better representation.
     """
@@ -338,7 +338,7 @@ def test_the_encoder_and_the_head_never_share_a_corpus():
 
 
 def test_every_label_free_source_is_excluded_from_subject_validation():
-    """Unlabelled sources train the encoder; labelled development data selects checkpoints."""
+    """Unlabelled sources train the encoder; labelled sources never enter its validation split."""
     from data.scripts.curate.deployment_policy import LABEL_FREE_PRETRAIN_DATASETS
     from training.tokenizer.pretrain_data import PHASE_A_ONLY_DATASETS
 
@@ -396,7 +396,7 @@ def _orchestrate(*args: str) -> subprocess.CompletedProcess:
 def test_plan_flag_reports_without_touching_anything():
     result = _orchestrate("--plan")
     assert result.returncode == 0
-    assert "TOTAL" in result.stdout and "nhanes" in result.stdout
+    assert "TOTAL" in result.stdout and "capture24_pretrain" in result.stdout
 
 
 def test_orchestrator_uses_each_source_cli_contract(monkeypatch):
@@ -410,10 +410,11 @@ def test_orchestrator_uses_each_source_cli_contract(monkeypatch):
     assert build_corpus._stage_fetch(sources, approved=True) == 0
     assert build_corpus._stage_convert(sources) == 0
     rendered = [" ".join(command) for command in commands]
-    assert any("nhanes.fetch --subjects 3000" in command for command in rendered)
-    assert any("nymeria.fetch --all-sequences --max-gb 120" in command for command in rendered)
-    assert any("synthetic_imu.fetch amass motion_x 100style" in command for command in rendered)
-    assert any("synthetic_imu.convert --sources amass motion_x 100style" in command for command in rendered)
+    assert any("capture24_pretrain.fetch" in command for command in rendered)
+    assert any("nymeria.fetch --sequences 40 --max-gb 120 --workers 8" in command for command in rendered)
+    assert any("extrasensory_pretrain.fetch" in command for command in rendered)
+    assert any("nymeria.convert --streams xsens" in command for command in rendered)
+    assert any("extrasensory_pretrain.convert" in command for command in rendered)
 
 
 def test_grid_stage_uses_the_jepa_source_window_contract(monkeypatch):
@@ -421,7 +422,7 @@ def test_grid_stage_uses_the_jepa_source_window_contract(monkeypatch):
 
     commands: list[list[str]] = []
     monkeypatch.setattr(build_corpus, "_run", lambda command: commands.append(command) or 0)
-    source = next(item for item in corpus_plan.CORPUS_PLAN if item.dataset == "nhanes")
+    source = next(item for item in corpus_plan.CORPUS_PLAN if item.dataset == "capture24_pretrain")
     assert build_corpus._stage_grids((source,)) == 0
     grid_command = next(command for command in commands if "data.scripts.build_grids" in command)
     index = grid_command.index("--window-seconds")
@@ -430,7 +431,7 @@ def test_grid_stage_uses_the_jepa_source_window_contract(monkeypatch):
 
 def test_fetching_refuses_without_explicit_approval():
     """Hundreds of gigabytes must never move as a side effect of inspecting the plan."""
-    result = _orchestrate("--stage", "fetch", "--datasets", "nhanes")
+    result = _orchestrate("--stage", "fetch", "--datasets", "capture24_pretrain")
     assert result.returncode != 0
     assert "--yes" in result.stdout
 

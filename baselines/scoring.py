@@ -1,4 +1,4 @@
-"""Model-agnostic scoring core for the ZS-XD evaluation protocol (v2).
+"""Model-agnostic scoring utilities for sealed HAR evaluation.
 
 Ported from the legacy ``eval_v2.py`` scoring functions, minus the legacy data
 IO (that lives in :mod:`baselines.data`, wired to the grid format). Everything
@@ -6,7 +6,7 @@ here operates on plain arrays / label strings, so HALO and every baseline are
 scored by the SAME code path.
 
 Protocol summary (see docs):
-  * **ZS-XD**: zero-shot vs the TARGET dataset's own pre-registered label
+  * **Zero support**: prediction vs the target dataset's own pre-registered label
     strings. Canonical grid labels are translated back to the unique native target string before
     exact-match scoring; target classes are never merged during scoring.
   * **Primary metric: macro-F1** over classes present in ground truth UNION
@@ -64,7 +64,7 @@ def align_ground_truth_labels(
 ) -> List[Optional[str]]:
     """Align canonical grid labels to a dataset's frozen native candidate strings.
 
-    Grid construction canonicalizes genuine synonyms even for held-out datasets, while the ZS-XD
+    Grid construction canonicalizes genuine synonyms even for held-out datasets, while the sealed
     candidate vocabulary intentionally preserves each dataset's published label wording. Translate a
     grid label to the unique candidate with the same canonical meaning, retaining ``None`` for concepts
     outside the candidate set. Two candidates that collapse to one canonical concept are not a valid
@@ -421,22 +421,38 @@ def subject_bootstrap_ci(
     f1_classes = macro_f1_classes(gt.tolist(), pred.tolist())
     recall_classes = sorted(set(gt.tolist()))
 
-    def score(g, p) -> float:
-        if metric == "f1_macro":
-            return f1_score(g, p, labels=f1_classes, average="macro", zero_division=0) * 100
-        if metric == "balanced_accuracy":
-            return recall_score(g, p, labels=recall_classes, average="macro", zero_division=0) * 100
-        if metric == "accuracy":
-            return accuracy_score(g, p) * 100
+    # Accumulate one frozen-label confusion matrix per subject, then resample and sum those
+    # matrices. This is algebraically identical to concatenating each sampled subject's windows
+    # and calling sklearn B times, but avoids thousands of estimator setup calls per k/method.
+    classes = f1_classes if metric == "f1_macro" else recall_classes
+    if metric not in {"f1_macro", "balanced_accuracy", "accuracy"}:
         raise ValueError(f"unsupported bootstrap metric: {metric}")
-
-    subj_windows = {s: np.nonzero(subjects == s)[0] for s in uniq}
+    class_to_slot = {label: slot for slot, label in enumerate(classes)}
+    truth = np.asarray([class_to_slot[label] for label in gt], dtype=np.int64)
+    prediction = np.asarray([class_to_slot.get(label, -1) for label in pred], dtype=np.int64)
+    subject_slot = np.searchsorted(uniq, subjects)
+    confusion = np.zeros((len(uniq), len(classes), len(classes)), dtype=np.int64)
+    valid_prediction = prediction >= 0
+    np.add.at(confusion, (subject_slot[valid_prediction], truth[valid_prediction],
+                          prediction[valid_prediction]), 1)
+    # A predicted class outside the frozen F1 class set is impossible because that set is GT union
+    # prediction. The explicit guard keeps a future caller from silently changing the estimand.
+    if not bool(valid_prediction.all()):
+        raise RuntimeError("prediction fell outside the frozen bootstrap class set")
     rng = np.random.RandomState(seed)
-    stats = []
-    for _ in range(B):
-        sample_subj = rng.choice(uniq, size=len(uniq), replace=True)
-        idx = np.concatenate([subj_windows[s] for s in sample_subj])
-        stats.append(score(gt[idx].tolist(), pred[idx].tolist()))
+    draws = rng.randint(0, len(uniq), size=(B, len(uniq)))
+    multiplicity = np.zeros((B, len(uniq)), dtype=np.int64)
+    np.add.at(multiplicity, (np.arange(B)[:, None], draws), 1)
+    sampled = np.einsum("bs,sij->bij", multiplicity, confusion, optimize=True)
+    true_count = sampled.sum(axis=2)
+    predicted_count = sampled.sum(axis=1)
+    true_positive = np.diagonal(sampled, axis1=1, axis2=2)
+    if metric == "f1_macro":
+        stats = (2.0 * true_positive / np.maximum(true_count + predicted_count, 1)).mean(axis=1) * 100
+    elif metric == "balanced_accuracy":
+        stats = (true_positive / np.maximum(true_count, 1)).mean(axis=1) * 100
+    else:
+        stats = true_positive.sum(axis=1) / np.maximum(sampled.sum(axis=(1, 2)), 1) * 100
     lo, hi = np.percentile(stats, [2.5, 97.5])
     return {
         f"{metric}_ci_lo": float(lo),

@@ -1,0 +1,15 @@
+{
+  "name": "limubert_x",
+  "category": "baselines",
+  "paper_title": "Experience Paper: Adopting Activity Recognition in On-demand Food Delivery Business",
+  "authors": "Huatao Xu, Yan Zhang, Wei Gao, Guobin Shen, Mo Li",
+  "year": 2025,
+  "venue": "The 31st Annual International Conference on Mobile Computing and Networking (ACM MobiCom '25)",
+  "pages": "1015-1028",
+  "doi": "10.1145/3680207.3765261",
+  "paper_url": "https://wands.hk/papers/limu-experience.pdf",
+  "data_or_code_url": "https://github.com/WANDS-HKUST/LIMU-BERT_Experience",
+  "license": "MIT (code repository); paper copyright ACM",
+  "bibtex": "@inproceedings{xu2025experience,\n  title={Experience Paper: Adopting Activity Recognition in On-demand Food Delivery Business},\n  author={Xu, Huatao and Zhang, Yan and Gao, Wei and Shen, Guobin and Li, Mo},\n  booktitle={Proceedings of the 31st Annual International Conference on Mobile Computing and Networking},\n  pages={1015--1028},\n  year={2025},\n  doi={10.1145/3680207.3765261}\n}",
+  "notes": "The official repository releases the base_v4 20-sample, six-axis checkpoint pretrained on 1.43 million hours of delivery-courier IMU data."
+}

@@ -1,0 +1,7 @@
+Paper: https://wands.hk/papers/limu-experience.pdf
+DOI: https://doi.org/10.1145/3680207.3765261
+Official code and checkpoint: https://github.com/WANDS-HKUST/LIMU-BERT_Experience
+
+The local paper.pdf was downloaded from the authors' WANDS-HKUST publication site.
+The local adapter checkpoint is the repository's weights/limu_bert_x.pt with SHA-256
+65697e7017020f36429a221382253f1fc370fdfd493cfb71667f95846c18516c.

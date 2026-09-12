@@ -30,7 +30,7 @@ and `xrf_v2`.
 
 Baseline entries retained for representation comparison and historical reproduction:
 
-`crosshar`, `deepconvlstm`, `lanhar`, `limubert`, `llasa`, `moment`, `normwear`, `ssl-wearables`,
+`crosshar`, `deepconvlstm`, `lanhar`, `limubert`, `limubert_x`, `llasa`, `moment`, `normwear`, `ssl-wearables`,
 `unimts`.
 
 ## Application use

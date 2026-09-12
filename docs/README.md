@@ -7,9 +7,11 @@ Live documents:
 
 - `design/DESIGN_OF_RECORD.md`: current encoder and support-classifier architecture;
 - `design/JEPA_PRETRAINING_OBJECTIVE.md`: optional label-free future-JEPA objective;
+- `design/JEPA_REPRESENTATION_EVALUATION.md`: frozen and encoder-only JEPA comparison harness;
 - `design/CONTINUOUS_KERNEL_FRONTEND.md`: continuous multispan encoder arm;
+- `design/EXPERIMENT_ROADMAP.md`: active experiment sequence and result-promotion rules;
 - `design/EVALUATION_PROTOCOL.md`: support-classification splits, metrics, and reporting rules;
-- `data/PRETRAINING_CORPUS.md`: selected label-free corpus and access status;
+- `data/PRETRAINING_CORPUS.md`: selected label-free corpus, exposure budget, and measured runtime;
 - `baselines/`: retained released-checkpoint roster and comparison policy; and
 - `results/RESULTS.md`: promoted result record.
 

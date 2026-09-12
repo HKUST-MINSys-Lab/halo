@@ -1,0 +1,956 @@
+{
+  "motionsense/phone_front_pocket/k=0": {
+    "fingerprint": "b311777ced84648896add7b49b76d7db898c03d993bb41a218b57f8e2a51026a",
+    "n_queries": 4500,
+    "k": 0,
+    "candidates": [
+      "jogging",
+      "sitting",
+      "standing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "motionsense/phone_front_pocket/k=1": {
+    "fingerprint": "f8e33a33a24cb41aae9007179f0b883f25f15cc76ed377a2a2fbf45f992f36d4",
+    "n_queries": 4500,
+    "k": 1,
+    "candidates": [
+      "jogging",
+      "sitting",
+      "standing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "motionsense/phone_front_pocket/k=2": {
+    "fingerprint": "6aea555d3b7754a4c26ff9de19199a26d7aa58703882b1b471cb291232dae32e",
+    "n_queries": 4500,
+    "k": 2,
+    "candidates": [
+      "jogging",
+      "sitting",
+      "standing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "motionsense/phone_front_pocket/k=4": {
+    "fingerprint": "780b1bdb623e5357ea24ee10eef460b9620d5e5faa55462f45019159e06f99d2",
+    "n_queries": 4500,
+    "k": 4,
+    "candidates": [
+      "jogging",
+      "sitting",
+      "standing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "motionsense/phone_front_pocket/k=8": {
+    "fingerprint": "2f113597c79df8662230e54a5a19c67bebbc7b234a0fa7e2e0e06e42c58e8d79",
+    "n_queries": 4500,
+    "k": 8,
+    "candidates": [
+      "jogging",
+      "sitting",
+      "standing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "motionsense/phone_front_pocket/k=16": {
+    "fingerprint": "eca319948f7f7fc6dcbfa22aa7862b13da3e1d3807734ae87435eea4b9646f99",
+    "n_queries": 4500,
+    "k": 16,
+    "candidates": [
+      "jogging",
+      "sitting",
+      "standing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "motionsense/phone_front_pocket/k=32": {
+    "fingerprint": "4008aad4a639c1269a947a04f80c5d00e22026379142832e4acb101f15be3e28",
+    "n_queries": 4500,
+    "k": 32,
+    "candidates": [
+      "jogging",
+      "sitting",
+      "standing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "motionsense/phone_front_pocket/k=64": {
+    "fingerprint": "c2291f8dad0b366d8d18bc6dac9e9ae76b7f92c12730ff25bf5ce8cd17bd5320",
+    "n_queries": 4500,
+    "k": 64,
+    "candidates": [
+      "jogging",
+      "sitting",
+      "standing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "motionsense/phone_front_pocket/k=128": {
+    "fingerprint": "f9ffddd8492e9deb24f9a76057be9b003ea033cac9a9965e4f165ea253439471",
+    "n_queries": 4500,
+    "k": 128,
+    "candidates": [
+      "jogging",
+      "sitting",
+      "standing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "realworld/phone_waist/k=0": {
+    "fingerprint": "49fea55615f7e248d6293c40c50cfbd98143bd5e583d688bc76848b0aeb4d3b1",
+    "n_queries": 11237,
+    "k": 0,
+    "candidates": [
+      "jumping",
+      "lying",
+      "running",
+      "sitting",
+      "climbingdown",
+      "climbingup",
+      "standing",
+      "walking"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "realworld/phone_waist/k=1": {
+    "fingerprint": "48d282580aaada7361731e3df54cee0d72ff1593cbf3f4711069bd17fc558f30",
+    "n_queries": 11237,
+    "k": 1,
+    "candidates": [
+      "jumping",
+      "lying",
+      "running",
+      "sitting",
+      "climbingdown",
+      "climbingup",
+      "standing",
+      "walking"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "realworld/phone_waist/k=2": {
+    "fingerprint": "985de8b21f8829bec0bcee17f76fd238417dbc4c1b7078621b3cd36e8164cd4a",
+    "n_queries": 11237,
+    "k": 2,
+    "candidates": [
+      "jumping",
+      "lying",
+      "running",
+      "sitting",
+      "climbingdown",
+      "climbingup",
+      "standing",
+      "walking"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "realworld/phone_waist/k=4": {
+    "fingerprint": "fdf544e6a78437c346c9c9dfb3976a486d8defc922ab07416f3cc3e31bfb406c",
+    "n_queries": 11237,
+    "k": 4,
+    "candidates": [
+      "jumping",
+      "lying",
+      "running",
+      "sitting",
+      "climbingdown",
+      "climbingup",
+      "standing",
+      "walking"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "realworld/phone_waist/k=8": {
+    "fingerprint": "36355f0e2175b3b4f0f8e25aae60c253348d2f917fc66f4fbada199a630269ea",
+    "n_queries": 11237,
+    "k": 8,
+    "candidates": [
+      "jumping",
+      "lying",
+      "running",
+      "sitting",
+      "climbingdown",
+      "climbingup",
+      "standing",
+      "walking"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "realworld/phone_waist/k=16": {
+    "fingerprint": "e71615fda89097287973613fbf4e2a5d17f90c81c0f1e41de0ac3c5ae9930fdd",
+    "n_queries": 11237,
+    "k": 16,
+    "candidates": [
+      "jumping",
+      "lying",
+      "running",
+      "sitting",
+      "climbingdown",
+      "climbingup",
+      "standing",
+      "walking"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "realworld/phone_waist/k=32": {
+    "fingerprint": "d4c82c3ba4e90510eef94ac2a91e3c540b95ff5409853a08cfa95da81bb34369",
+    "n_queries": 11237,
+    "k": 32,
+    "candidates": [
+      "jumping",
+      "lying",
+      "running",
+      "sitting",
+      "climbingdown",
+      "climbingup",
+      "standing",
+      "walking"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "realworld/phone_waist/k=64": {
+    "fingerprint": "6c6d920b367425ca6685b8de84235af2cb369a7ce1c3f71c2fd78c2af679192c",
+    "n_queries": 11237,
+    "k": 64,
+    "candidates": [
+      "jumping",
+      "lying",
+      "running",
+      "sitting",
+      "climbingdown",
+      "climbingup",
+      "standing",
+      "walking"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "realworld/phone_waist/k=128": {
+    "fingerprint": "f4741d284d93ce28848d453927d558423bbc1eab170cdfc59b63ffaca058020d",
+    "n_queries": 11237,
+    "k": 128,
+    "candidates": [
+      "jumping",
+      "lying",
+      "running",
+      "sitting",
+      "climbingdown",
+      "climbingup",
+      "standing",
+      "walking"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "shoaib/phone_right_pocket/k=0": {
+    "fingerprint": "1f54e11ef34ae2462b2cbca50cc7857515ebc3e50002695ebb9234e75068e07c",
+    "n_queries": 2100,
+    "k": 0,
+    "candidates": [
+      "cycling",
+      "jogging",
+      "sitting",
+      "standing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "shoaib/phone_right_pocket/k=1": {
+    "fingerprint": "bce5bebc0532c3b326c710ddab2d8f607ba2e44a8425d22931f695e54aa483b1",
+    "n_queries": 2100,
+    "k": 1,
+    "candidates": [
+      "cycling",
+      "jogging",
+      "sitting",
+      "standing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "shoaib/phone_right_pocket/k=2": {
+    "fingerprint": "35bc0901602edf04b797cf5a643cdd51f9e2f4edce4cb8e1d27cfb1dea9c6ead",
+    "n_queries": 2100,
+    "k": 2,
+    "candidates": [
+      "cycling",
+      "jogging",
+      "sitting",
+      "standing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "shoaib/phone_right_pocket/k=4": {
+    "fingerprint": "890344032bdb2ed185ffe1e0367960a5a507f3831bc33623a3c9350464e4c5fe",
+    "n_queries": 2100,
+    "k": 4,
+    "candidates": [
+      "cycling",
+      "jogging",
+      "sitting",
+      "standing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "shoaib/phone_right_pocket/k=8": {
+    "fingerprint": "34e1f34903c518d0b467a9200f044366c73ec2ed5e6200fcb20584d04a9d9954",
+    "n_queries": 2100,
+    "k": 8,
+    "candidates": [
+      "cycling",
+      "jogging",
+      "sitting",
+      "standing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "shoaib/phone_right_pocket/k=16": {
+    "fingerprint": "89b20742e9604ef6cf7f73f69b018e49fadb7922918581791fd5d23a2a8798ae",
+    "n_queries": 2100,
+    "k": 16,
+    "candidates": [
+      "cycling",
+      "jogging",
+      "sitting",
+      "standing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "shoaib/phone_right_pocket/k=32": {
+    "fingerprint": "f7979cdd39e5f4fb9501532bba5b74fb01dc111189d1c8ecde8c16fcc49af550",
+    "n_queries": 2100,
+    "k": 32,
+    "candidates": [
+      "cycling",
+      "jogging",
+      "sitting",
+      "standing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "shoaib/phone_right_pocket/k=64": {
+    "fingerprint": "32ae8a0db693b2b44225a18e1a7b0841776b12a0344ba1784fabe105f8075d91",
+    "n_queries": 2100,
+    "k": 64,
+    "candidates": [
+      "cycling",
+      "jogging",
+      "sitting",
+      "standing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "shoaib/phone_right_pocket/k=128": {
+    "fingerprint": "0802192dc8f6fa94c6bdec18a1a39a85f7d97e7c6012ac2160fbecaef68f428b",
+    "n_queries": 2100,
+    "k": 128,
+    "candidates": [
+      "cycling",
+      "jogging",
+      "sitting",
+      "standing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "inclusivehar/phone_waist/k=0": {
+    "fingerprint": "027d4f0342854efca8f5707bcf5e7eab96a220c56af2b782226c56c27c8ad52a",
+    "n_queries": 1260,
+    "k": 0,
+    "candidates": [
+      "jogging",
+      "ramp_ascent",
+      "ramp_descent",
+      "sitting",
+      "standing",
+      "walking"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "inclusivehar/phone_waist/k=1": {
+    "fingerprint": "f6ed05617919280a04dcda9e5b7846de09a6be88bfe9790a269b9031ca7ee608",
+    "n_queries": 1260,
+    "k": 1,
+    "candidates": [
+      "jogging",
+      "ramp_ascent",
+      "ramp_descent",
+      "sitting",
+      "standing",
+      "walking"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "inclusivehar/phone_waist/k=2": {
+    "fingerprint": "5922664242fc62400a9553cf885297426be7fbafea2e6d2404798e170065f16d",
+    "n_queries": 1260,
+    "k": 2,
+    "candidates": [
+      "jogging",
+      "ramp_ascent",
+      "ramp_descent",
+      "sitting",
+      "standing",
+      "walking"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "inclusivehar/phone_waist/k=4": {
+    "fingerprint": "d838c394d1767bc9004bd85b202a6a63b719b667432fc2f76ee9d8246263e16e",
+    "n_queries": 1260,
+    "k": 4,
+    "candidates": [
+      "jogging",
+      "ramp_ascent",
+      "ramp_descent",
+      "sitting",
+      "standing",
+      "walking"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "inclusivehar/phone_waist/k=8": {
+    "fingerprint": "8e15d272197a1a0e9f387dba10cb43de3e7418337916cad6bc9f297b7923555d",
+    "n_queries": 1260,
+    "k": 8,
+    "candidates": [
+      "jogging",
+      "ramp_ascent",
+      "ramp_descent",
+      "sitting",
+      "standing",
+      "walking"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "inclusivehar/phone_waist/k=16": {
+    "fingerprint": "346208bda6e0411ec1a8a387498db930f619a4e481174250239ce237786fc5a9",
+    "n_queries": 1260,
+    "k": 16,
+    "candidates": [
+      "jogging",
+      "ramp_ascent",
+      "ramp_descent",
+      "sitting",
+      "standing",
+      "walking"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "inclusivehar/phone_waist/k=32": {
+    "fingerprint": "1d7e55b6018f9745cccbffb127ee966c00ec8d02d5a1e3c5d31db70e81219f35",
+    "n_queries": 1260,
+    "k": 32,
+    "candidates": [
+      "jogging",
+      "ramp_ascent",
+      "ramp_descent",
+      "sitting",
+      "standing",
+      "walking"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "inclusivehar/phone_waist/k=64": {
+    "fingerprint": "f599e87a4b4aad7777a2092f1265f4f5bde0d0ff800a4c57a5c9f84ad6fbd50f",
+    "n_queries": 1260,
+    "k": 64,
+    "candidates": [
+      "jogging",
+      "ramp_ascent",
+      "ramp_descent",
+      "sitting",
+      "standing",
+      "walking"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "inclusivehar/phone_waist/k=128": {
+    "fingerprint": "1b3f89c87de79889072a0bc7604984f41c4a20859f429a4c922f6ca1bc17a6d2",
+    "n_queries": 1260,
+    "k": 128,
+    "candidates": [
+      "jogging",
+      "ramp_ascent",
+      "ramp_descent",
+      "sitting",
+      "standing",
+      "walking"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "usc_had/phone_hip/k=0": {
+    "fingerprint": "6a2106f07f7140f12072d2d1038519244693481ae3c4bac85df8ae6db13c52cd",
+    "n_queries": 4350,
+    "k": 0,
+    "candidates": [
+      "elevator_down",
+      "elevator_up",
+      "jumping_up",
+      "running_forward",
+      "sitting",
+      "sleeping",
+      "standing",
+      "walking_downstairs",
+      "walking_forward",
+      "walking_left",
+      "walking_right",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "usc_had/phone_hip/k=1": {
+    "fingerprint": "09e183a96bfb6f2fa26360e6daebc4ad0d8469e5ac947445af0da0cd66326c78",
+    "n_queries": 4350,
+    "k": 1,
+    "candidates": [
+      "elevator_down",
+      "elevator_up",
+      "jumping_up",
+      "running_forward",
+      "sitting",
+      "sleeping",
+      "standing",
+      "walking_downstairs",
+      "walking_forward",
+      "walking_left",
+      "walking_right",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "usc_had/phone_hip/k=2": {
+    "fingerprint": "7e57beaab55c3854e7eaf4ad226d75bf11528750c4c52a116496d74753c290f2",
+    "n_queries": 4350,
+    "k": 2,
+    "candidates": [
+      "elevator_down",
+      "elevator_up",
+      "jumping_up",
+      "running_forward",
+      "sitting",
+      "sleeping",
+      "standing",
+      "walking_downstairs",
+      "walking_forward",
+      "walking_left",
+      "walking_right",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "usc_had/phone_hip/k=4": {
+    "fingerprint": "d8dfa3ae3640e8112ffa3061ebb88c6ee054d2fbf646613cdeb8541e97a6ccbe",
+    "n_queries": 4350,
+    "k": 4,
+    "candidates": [
+      "elevator_down",
+      "elevator_up",
+      "jumping_up",
+      "running_forward",
+      "sitting",
+      "sleeping",
+      "standing",
+      "walking_downstairs",
+      "walking_forward",
+      "walking_left",
+      "walking_right",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "usc_had/phone_hip/k=8": {
+    "fingerprint": "2b6d81739bf7ab7625f18dbdb4c94d0a930330124fdce2fcde19d1156b567409",
+    "n_queries": 4350,
+    "k": 8,
+    "candidates": [
+      "elevator_down",
+      "elevator_up",
+      "jumping_up",
+      "running_forward",
+      "sitting",
+      "sleeping",
+      "standing",
+      "walking_downstairs",
+      "walking_forward",
+      "walking_left",
+      "walking_right",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "usc_had/phone_hip/k=16": {
+    "fingerprint": "fc2c7d62abe0f3966aad44d4fa96712e3eca797b13c485c5bef60bf6bcc2b630",
+    "n_queries": 4350,
+    "k": 16,
+    "candidates": [
+      "elevator_down",
+      "elevator_up",
+      "jumping_up",
+      "running_forward",
+      "sitting",
+      "sleeping",
+      "standing",
+      "walking_downstairs",
+      "walking_forward",
+      "walking_left",
+      "walking_right",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "usc_had/phone_hip/k=32": {
+    "fingerprint": "5d0496acf5e298a888748a0ce9e443aa86e79275600dbb85ddeb544d560259d5",
+    "n_queries": 4350,
+    "k": 32,
+    "candidates": [
+      "elevator_down",
+      "elevator_up",
+      "jumping_up",
+      "running_forward",
+      "sitting",
+      "sleeping",
+      "standing",
+      "walking_downstairs",
+      "walking_forward",
+      "walking_left",
+      "walking_right",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "usc_had/phone_hip/k=64": {
+    "fingerprint": "a5a134be2ab5544463b10dc7c9fa005ec891381edc11f24cb49624b67d7154e5",
+    "n_queries": 4350,
+    "k": 64,
+    "candidates": [
+      "elevator_down",
+      "elevator_up",
+      "jumping_up",
+      "running_forward",
+      "sitting",
+      "sleeping",
+      "standing",
+      "walking_downstairs",
+      "walking_forward",
+      "walking_left",
+      "walking_right",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "usc_had/phone_hip/k=128": {
+    "fingerprint": "5a828cf4021e72f4d7332d5e02beb1f81f8009b3cc1a9f8efbcd2fcb0ec3c480",
+    "n_queries": 4350,
+    "k": 128,
+    "candidates": [
+      "elevator_down",
+      "elevator_up",
+      "jumping_up",
+      "running_forward",
+      "sitting",
+      "sleeping",
+      "standing",
+      "walking_downstairs",
+      "walking_forward",
+      "walking_left",
+      "walking_right",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "ut_complex/watch_wrist/k=0": {
+    "fingerprint": "d25b4e953ab7b7284e9f06612225f82153ddae740c0a83a5c894cbe41994b522",
+    "n_queries": 3900,
+    "k": 0,
+    "candidates": [
+      "biking",
+      "drinking_coffee",
+      "eating",
+      "jogging",
+      "sitting",
+      "smoking",
+      "standing",
+      "talking",
+      "typing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs",
+      "writing"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "ut_complex/watch_wrist/k=1": {
+    "fingerprint": "7a06bc684a7c827e7357c0d3d991acf28253eb8df178cad51133f4e7637d0ee8",
+    "n_queries": 3900,
+    "k": 1,
+    "candidates": [
+      "biking",
+      "drinking_coffee",
+      "eating",
+      "jogging",
+      "sitting",
+      "smoking",
+      "standing",
+      "talking",
+      "typing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs",
+      "writing"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "ut_complex/watch_wrist/k=2": {
+    "fingerprint": "0031273322ddba3ab6a3e05361855db51bb1e16eaf7cf3f2e7fe1296cd65e213",
+    "n_queries": 3900,
+    "k": 2,
+    "candidates": [
+      "biking",
+      "drinking_coffee",
+      "eating",
+      "jogging",
+      "sitting",
+      "smoking",
+      "standing",
+      "talking",
+      "typing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs",
+      "writing"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "ut_complex/watch_wrist/k=4": {
+    "fingerprint": "8fbc69d7e1d6ed791896d45aa54eaceab43e022689266b0bd71d45463d8c4686",
+    "n_queries": 3900,
+    "k": 4,
+    "candidates": [
+      "biking",
+      "drinking_coffee",
+      "eating",
+      "jogging",
+      "sitting",
+      "smoking",
+      "standing",
+      "talking",
+      "typing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs",
+      "writing"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "ut_complex/watch_wrist/k=8": {
+    "fingerprint": "012cc24069432948aea7404ba72090d549adb05dd04aa3017fe88a001c248946",
+    "n_queries": 3900,
+    "k": 8,
+    "candidates": [
+      "biking",
+      "drinking_coffee",
+      "eating",
+      "jogging",
+      "sitting",
+      "smoking",
+      "standing",
+      "talking",
+      "typing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs",
+      "writing"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "ut_complex/watch_wrist/k=16": {
+    "fingerprint": "971ad7e58024606ee188c73d641cf54179cfd9bed5ef6ae6ddaa5eb00a02fd52",
+    "n_queries": 3900,
+    "k": 16,
+    "candidates": [
+      "biking",
+      "drinking_coffee",
+      "eating",
+      "jogging",
+      "sitting",
+      "smoking",
+      "standing",
+      "talking",
+      "typing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs",
+      "writing"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "ut_complex/watch_wrist/k=32": {
+    "fingerprint": "db4c34a2547620a20f060f3fbaff79465fd4e7c9f722b9261b40cd9a9ec0e808",
+    "n_queries": 3900,
+    "k": 32,
+    "candidates": [
+      "biking",
+      "drinking_coffee",
+      "eating",
+      "jogging",
+      "sitting",
+      "smoking",
+      "standing",
+      "talking",
+      "typing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs",
+      "writing"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "ut_complex/watch_wrist/k=64": {
+    "fingerprint": "7065de08e618171bb613520b407d6b068e25dd61ae647a5b80cb26b2a81ae417",
+    "n_queries": 3900,
+    "k": 64,
+    "candidates": [
+      "biking",
+      "drinking_coffee",
+      "eating",
+      "jogging",
+      "sitting",
+      "smoking",
+      "standing",
+      "talking",
+      "typing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs",
+      "writing"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "ut_complex/watch_wrist/k=128": {
+    "fingerprint": "1aae44f151a114cc8b506d7e740b92e5b25d89fb221d287e28ca126d8e503812",
+    "n_queries": 3900,
+    "k": 128,
+    "candidates": [
+      "biking",
+      "drinking_coffee",
+      "eating",
+      "jogging",
+      "sitting",
+      "smoking",
+      "standing",
+      "talking",
+      "typing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs",
+      "writing"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  }
+}

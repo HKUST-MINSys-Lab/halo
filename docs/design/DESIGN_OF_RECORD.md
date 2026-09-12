@@ -1,6 +1,6 @@
 # Design of record: support-conditioned heterogeneous HAR
 
-> Current design, 2026-09-11. This document supersedes the earlier language-alignment,
+> Current design, 2026-09-12. This document supersedes the earlier language-alignment,
 > admissibility, evidence-engine, and movement-monitoring designs on `main`.
 
 ## Objective
@@ -53,35 +53,53 @@ student is the only encoder retained after pretraining. Full leakage and masking
 
 ## Support classifier
 
-For each episode, the encoder produces query and support recording representations. A fixed,
-temperature-scaled cosine distribution gives each support row a weight. Explicitly enrolled
-supports vote for their bound candidate. Background rows may only contribute through the fixed
-label-semantic bridge used by the declared protocol.
+For each episode, the encoder produces one learnable pooled vector for the query recording and for
+each enrolled support recording. The active classifier is a small set transformer with **separate
+parameters** for the two information conditions:
 
-The optional learned comparator receives the query and every support **sensor vector** with role
-and episode-slot embeddings. Its set-attention stack produces one scalar adjustment per support
-row. It cannot read candidate, support-label, or acquisition-description embeddings; this prevents
-the learned path from bypassing sensor evidence through a text shortcut. The resulting adjusted
-support distribution feeds the same vote as the fixed control.
+* With enrollment (`k > 0`), the token set is the query vector, every support vector, each
+  support's paired label token, and every candidate-label token. Role embeddings distinguish the
+  four token types. Pair tags bind a support vector to its own label token; candidate tags bind
+  that label token to its candidate. The head refines the set jointly, scores the refined query
+  against every refined support vector by cosine similarity, and softly votes the scores to the
+  bound candidate labels.
+* With no enrollment (`k = 0`), the token set is only the query vector and candidate-label tokens.
+  The zero-shot head refines them jointly, then scores the refined query against each refined
+  candidate label by cosine similarity.
 
-The initial scalar head is zero so the first prediction exactly equals the fixed support vote. Its
-weights receive gradients on the first step; the attention stack receives gradients after the head
-has moved away from zero. Training telemetry must confirm that the residual-head norm and support
-weight change become non-zero.
+There is no top-k retrieval or hidden background bank. Every supplied support row participates in
+attention and receives a differentiable score. The `neighbors` control removes the token mixer and
+uses the same encoder with a temperature-scaled soft support vote; it is the fast diagnostic of
+encoder quality without classifier reasoning.
 
 ## Training and evaluation boundary
 
 Encoder pretraining and support-classifier training are independent stages. A classifier experiment
 may freeze a selected encoder or train a dedicated HALO copy end to end. Query and support encodings
-must both receive gradients in the end-to-end arm, including any learned recording pool.
+must both receive gradients in the end-to-end arm, including the learned recording pool. The
+zero-shot and enrolled losses are averaged by regime when both appear in a batch, so the shared
+encoder is not dominated by whichever condition happened to supply more queries.
 
-Evaluation uses subject- and recording-disjoint train/development/test splits. Candidate count and
-support count are episode properties, recorded with every score. Thresholds, checkpoint choice,
-and hyperparameters come from development data only. The test protocol and retained baselines are
-defined in [EVALUATION_PROTOCOL.md](EVALUATION_PROTOCOL.md).
+The current paper roster has three pairwise-disjoint source roles. This table is explanatory; the
+executable authority is `data/scripts/curate/deployment_policy.py`.
+
+| role | count | datasets |
+|---|---:|---|
+| label-free JEPA pretraining | 3 | `capture24_pretrain`, `nymeria_xsens`, `extrasensory_pretrain` |
+| support-classifier training | 8 | `hhar`, `wisdm`, `kuhar`, `harmes`, `xrf_v2`, `dsads`, `forth_trace`, `realdisp` |
+| sealed test | 6 | `motionsense`, `realworld`, `shoaib`, `inclusivehar`, `usc_had`, `ut_complex` |
+
+The eight supervised sources are split by subject into optimizer data and an internal validation
+fold. That fold selects support-classifier checkpoints, but it is not a separate development-source
+roster. Candidate count and support count are episode properties recorded with every score. JEPA
+uses a fixed training schedule and takes its final checkpoint because its three label-free sources
+provide no meaningful label probe. The sealed sources never select a checkpoint or hyperparameter
+and are touched only after the protocol is frozen. See
+[EVALUATION_PROTOCOL.md](EVALUATION_PROTOCOL.md).
 
 ## Exclusions
 
-The retired explicit admissibility table, separate Phase-B memory bank, candidate-token mixer,
-arbitrary-label curriculum, and Task 0-3 movement-monitoring packages are not part of this design.
-They are archived in Git and must not be revived through a default flag or undocumented import.
+The retired explicit admissibility table, separate Phase-B memory bank, memory-wide retrieval and
+candidate-scoring path, arbitrary-label curriculum, and Task 0-3 movement-monitoring packages are
+not part of this design. The active bounded-set token mixer described above is distinct from that
+retired path. Archived components must not be revived through a default flag or undocumented import.

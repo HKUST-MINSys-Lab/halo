@@ -1,0 +1,12 @@
+{
+  "n_embeddings": 4350,
+  "dimension": 256,
+  "n_labels": 12,
+  "sampled_embeddings": 1976,
+  "effective_rank": 109.28313865912529,
+  "leave_one_out_neighbor_purity": 0.8851214574898786,
+  "same_label_cosine_mean": 0.829576068487617,
+  "different_label_cosine_mean": 0.45888387156268456,
+  "centroid_margin_mean": 0.025604731858716364,
+  "centroid_margin_p10": -0.029154787963538487
+}

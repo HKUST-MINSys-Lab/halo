@@ -1,4 +1,4 @@
-# Nymeria — label-free Phase-A pretraining source
+# Nymeria — label-free JEPA encoder-pretraining source
 
 Meta Project Aria **Nymeria** (ECCV 2024, arXiv 2406.09905) and **NymeriaPlus**
 (arXiv 2603.18496): ~1,200 sequences, 300 hours, 264 participants, 50 locations of
@@ -12,10 +12,10 @@ everyday activity. Each ~15-minute sequence simultaneously records
 | observer headset | a **second person** following the participant | — (excluded) |
 
 It is the only source in reach with real IMU on the head, both wrists and every limb
-**at the same instant**, which is exactly the cross-configuration structure Phase-A
+**at the same instant**, which is exactly the cross-configuration structure JEPA pretraining
 needs. There are no activity annotations, so every session here carries the reserved
-`__unlabeled__` marker: Phase-A self-supervision may use it, label-vocabulary
-construction and the Phase-B evidence bank must not.
+`__unlabeled__` marker: JEPA self-supervision may use it, while label-vocabulary construction and
+support-classifier episodes must not.
 
 Licence: **CC BY-NC 4.0** (non-commercial), email-gated.
 
@@ -29,15 +29,14 @@ Nothing in this module tries to bypass the licence.
    Registration turnaround is typically ~48 h.
 2. In the Aria Dataset Explorer, pick sequences (filter by location / date /
    scenario) — or select everything; `fetch.py` filters locally before downloading.
-3. When choosing **download groups, tick exactly these two and nothing else**:
+3. When choosing download groups, tick exactly this one and nothing else:
 
    | group | files per sequence |
    | --- | --- |
-   | `body_raw` | `body/xdata.healthcheck`, `body/xdata.mvnx`, `body/xdata.npz` |
-   | `timesync_and_imu` | `recording_{head,lwrist,rwrist,observer}/data/motion.vrs` |
+   | `body_xdata_mvnx` | Xsens MVN Link suit recording (`*.mvnx`) |
 
-   `timesync_and_imu` is **IMU-only VRS — no image streams**. That is what keeps this
-   a tens-of-GB pull instead of the ~80 TB full release. Do not tick any video group.
+   Do not tick any video or VRS group. The Xsens assets alone are about 1.96 TB for
+   the 1,064 sequences that expose them, so HALO takes a deterministic bounded subset.
 4. Save the emailed manifest to `data/pretraining/nymeria/downloads/url.json`
    (or pass `--url-json PATH`). It is credential-like and time-limited; the local
    `.gitignore` keeps it out of the repo.
@@ -47,7 +46,7 @@ it is on `PATH`):
 
 ```bash
 pip install git+https://github.com/facebookresearch/nymeria_dataset   # nymeriaplus-download
-pip install projectaria-tools                                        # required for the VRS path
+pip install projectaria-tools                                        # only for optional Aria conversion
 ```
 
 ## 2. Commands
@@ -56,20 +55,19 @@ pip install projectaria-tools                                        # required 
 # See exactly what would be pulled, byte counts included. Downloads nothing.
 python -m data.pretraining.nymeria.fetch --sequences 40 --dry-run
 
-# Fetch a deterministic 40-sequence subset, both groups, hard 120 GB ceiling.
+# Fetch a deterministic 40-sequence Xsens subset, hard 120 GB ceiling.
 python -m data.pretraining.nymeria.fetch --sequences 40 --max-gb 120 --workers 8
 
 # No arguments = the bounded default of 40 sequences (this is how
 # data.pretraining.build_corpus --stage fetch invokes it). Everything in your
-# manifest instead, still under --max-gb:
+# manifest instead, still under --max-gb (the supplied full manifest will refuse):
 python -m data.pretraining.nymeria.fetch --all-sequences --max-gb 400
 
 # Named sequences instead of a seeded draw.
 python -m data.pretraining.nymeria.fetch --sequence-ids 20230607_s0_... 20230608_s1_...
 
-# Convert everything downloaded into HALO sessions. With no arguments this writes
-# data/pretraining/nymeria_xsens/ and data/pretraining/nymeria_aria/.
-python -m data.pretraining.nymeria.convert
+# Convert the corpus-of-record Xsens stream into HALO sessions.
+python -m data.pretraining.nymeria.convert --streams xsens
 
 # Xsens only (no projectaria_tools needed), capped at 10 minutes per sequence.
 python -m data.pretraining.nymeria.convert --streams xsens --max-hours-per-sequence 0.1667
@@ -285,11 +283,12 @@ module. These are the assumptions that a first real conversion must confirm:
    full dump of the real keys, shapes and dtypes when none match, rather than guessing; `auto`
    then falls through to the MVNX path. Run `--inspect-npz <path>` on the first downloaded
    sequence, paste the output, and correct `NPZ_CANDIDATES`.
-5. **`<seq>/metadata.json` participant field.** `SUBJECT_KEYS` lists candidate names checked at
-   any nesting depth, followed by the MVNX `<subject label=...>`. A sequence without either is
-   rejected and counted as `sequences_without_verified_subject`; its sequence uid is never used
-   as a pseudo-subject. Nymeria has 264 participants across ~1,200 sequences, so treating UIDs
-   as people would invalidate subject-balanced sampling and subject-disjoint analyses.
+5. **Participant identity.** An explicit participant field in `<seq>/metadata.json` takes
+   precedence. Otherwise, the official release UID format
+   `date_setup_first_last_activity_recording` supplies the stable participant pseudonym. This
+   extracts 236 recurring identities from the issued 1,100-sequence manifest. Generic MVNX labels
+   such as `MVN System` are rejected; a nonstandard sequence without another verified identity is
+   also rejected. Treating each recording UID as a person would invalidate subject balancing.
 6. **url.json schema.** The manifest is issued per user and its key spelling is not public. The
    parser is tolerant (several accepted spellings for url / size / filename / sha1, and it
    accepts a record, a list of records, or a name→record mapping) and raises

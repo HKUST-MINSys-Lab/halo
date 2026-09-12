@@ -1,9 +1,11 @@
-"""Baseline adapters for the ZS-XD evaluation protocol.
+"""External encoder adapters for the current support-conditioned HAR comparison.
 
 Each baseline lives in its own subfolder ``baselines/<name>/`` with an ``adapter.py``
 that subclasses a tier in :mod:`baselines.base` and is decorated with ``@register``.
 Dropping such a subfolder in **auto-registers** it here — no edit to this file needed.
-See ``docs/baselines/BASELINES.md`` for the roster + verified input contracts.
+Historical native/ConSE scoring methods remain available in the adapter modules for reproduction,
+but they are not the primary comparison. See ``docs/baselines/BASELINES.md`` for the live roster and
+verified input contracts.
 """
 
 from __future__ import annotations

@@ -10,18 +10,13 @@ Access is licence-gated (CC BY-NC 4.0) and this module deliberately does not try
 to work around that.  The user must:
 
   1. accept the licence at https://www.projectaria.com/datasets/nymeria/
-  2. tick the download groups ``body_raw`` and ``timesync_and_imu`` (only those)
+  2. tick the download group ``body_xdata_mvnx``
   3. receive the URL manifest by email and save it as ``downloads/url.json``
 
-Only two of the release's download groups are ever requested here (group->file
-layout verified against ``nymeriaplus/layout.py`` in
-github.com/facebookresearch/nymeria_dataset):
-
-  ``body_raw``          ``body/xdata.healthcheck``, ``body/xdata.mvnx``, ``body/xdata.npz``
-                        -- the Xsens MVN Link 17-tracker suit stream at 240 Hz.
-  ``timesync_and_imu``  ``recording_{head,lwrist,rwrist,observer}/data/motion.vrs``
-                        -- IMU-only VRS containers.  **No image streams**, which is
-                        what keeps this a ~tens-of-GB pull instead of 80 TB.
+Only ``body_xdata_mvnx`` is requested.  It is the Xsens MVN Link suit stream at
+240 Hz and is the only Nymeria device family in the corpus of record.  The
+manifest supplied in September 2026 exposes each MVNX recording as a separate
+group; older ``body_raw`` / ``timesync_and_imu`` names are not present.
 
 Two download paths, both resumable and byte-identical in their result:
 
@@ -44,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -69,26 +65,15 @@ LICENCE_URL = "https://www.projectaria.com/datasets/nymeria/"
 DOWNLOADER_CLI = "nymeriaplus-download"
 LOG_DIR_NAME = ".download_logs"
 
-#: The only two groups this module ever requests.
-BODY_GROUP = "body_raw"
-IMU_GROUP = "timesync_and_imu"
-DEFAULT_GROUPS = (BODY_GROUP, IMU_GROUP)
+#: The sole group requested by the current Xsens-only corpus contract.
+BODY_GROUP = "body_xdata_mvnx"
+DEFAULT_GROUPS = (BODY_GROUP,)
 
 #: Per-group file layout, verified against ``nymeriaplus/layout.py``.  Used by the
 #: stdlib fallback to place a downloaded file at the same relative path the official
 #: CLI would use, when the url.json record carries only a bare basename.
 GROUP_LAYOUT: Mapping[str, tuple[str, ...]] = {
-    BODY_GROUP: (
-        "body/xdata.healthcheck",
-        "body/xdata.mvnx",
-        "body/xdata.npz",
-    ),
-    IMU_GROUP: (
-        "recording_head/data/motion.vrs",
-        "recording_lwrist/data/motion.vrs",
-        "recording_rwrist/data/motion.vrs",
-        "recording_observer/data/motion.vrs",
-    ),
+    BODY_GROUP: ("body/xdata.mvnx",),
 }
 
 # url.json record field names.  The manifest is issued per-user by Meta and its exact
@@ -111,8 +96,7 @@ Do this once:
   2. In the Aria Dataset Explorer, select the sequences you want (or all of
      them -- this fetcher filters them down locally before downloading).
   3. When choosing download groups, tick EXACTLY these two and nothing else:
-         {BODY_GROUP}          (Xsens 17-IMU suit: body/xdata.{{healthcheck,mvnx,npz}})
-         {IMU_GROUP}   (IMU-only VRS: recording_*/data/motion.vrs)
+         {BODY_GROUP}   (Xsens 17-IMU suit: body/xdata.mvnx)
      Do NOT tick any group containing image/video streams; the full release is
      ~80 TB and the video groups are essentially all of it.
   4. Save the emailed manifest to {{path}} (or pass --url-json PATH).
@@ -151,7 +135,10 @@ class FileRecord:
         name = self.filename.replace("\\", "/").lstrip("/")
         if "/" in name:
             return f"{self.sequence}/{name}"
-        for candidate in GROUP_LAYOUT.get(self.group, ()):
+        candidates = GROUP_LAYOUT.get(self.group, ())
+        if len(candidates) == 1:
+            return f"{self.sequence}/{candidates[0]}"
+        for candidate in candidates:
             if candidate.rsplit("/", 1)[-1] == name:
                 return f"{self.sequence}/{candidate}"
         # Unknown basename for this group: keep it, namespaced, rather than guessing
@@ -280,19 +267,22 @@ def locate_container(raw: Any, groups: Iterable[str] = DEFAULT_GROUPS) -> dict:
         "could not find a {sequence: {group: ...}} mapping containing any of "
         f"{sorted(wanted)} in url.json. Top-level keys: {sorted(map(str, raw.keys()))[:20]}. "
         "Either the manifest was issued without those download groups (re-request it "
-        f"with {BODY_GROUP} and {IMU_GROUP} ticked), or the manifest schema changed."
+        f"with {BODY_GROUP} ticked), or the manifest schema changed."
     )
 
 
 def parse_catalog(raw: Any, groups: Iterable[str] = DEFAULT_GROUPS) -> dict[str, dict[str, list[FileRecord]]]:
     """Normalise a url.json document into ``{sequence: {group: [FileRecord, ...]}}``."""
-    container = locate_container(raw, groups)
+    wanted = set(groups)
+    container = locate_container(raw, wanted)
     catalog: dict[str, dict[str, list[FileRecord]]] = {}
     for sequence, payload in container.items():
         if not isinstance(payload, Mapping):
             continue
         per_group: dict[str, list[FileRecord]] = {}
         for group, node in payload.items():
+            if str(group) not in wanted:
+                continue
             records = _records_from_node(str(sequence), str(group), node)
             if records:
                 per_group[str(group)] = records
@@ -473,25 +463,39 @@ def download_record(out_dir: Path, record: FileRecord) -> int:
         _write_marker(out_dir, record, size)
         return size
     tmp = destination.with_name(destination.name + ".part")
-    request = urllib.request.Request(record.url, headers={"User-Agent": _USER_AGENT})
-    digest = hashlib.sha1()
-    size = 0
-    with urllib.request.urlopen(request) as response, tmp.open("wb") as handle:
-        while True:
-            chunk = response.read(8 * 1024 * 1024)
-            if not chunk:
-                break
-            handle.write(chunk)
-            digest.update(chunk)
-            size += len(chunk)
+    existing = tmp.stat().st_size if tmp.exists() else 0
+    headers = {"User-Agent": _USER_AGENT}
+    if existing:
+        headers["Range"] = f"bytes={existing}-"
+    request = urllib.request.Request(record.url, headers=headers)
+    with urllib.request.urlopen(request) as response:
+        partial = getattr(response, "status", None) == 206
+        if existing and not partial:
+            existing = 0
+        mode = "ab" if existing else "wb"
+        with tmp.open(mode) as handle:
+            while True:
+                chunk = response.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                handle.write(chunk)
+    size = tmp.stat().st_size
     if record.size_bytes is not None and size != record.size_bytes:
-        tmp.unlink(missing_ok=True)
+        # Keep a short partial response for a future byte-range resume. A file that
+        # exceeds the declared size cannot be a valid prefix and is discarded.
+        if size > record.size_bytes:
+            tmp.unlink(missing_ok=True)
         raise RuntimeError(
             f"{record.relative_path}: incomplete download, expected {record.size_bytes} got {size}"
         )
-    if record.sha1 and digest.hexdigest() != record.sha1.lower():
-        tmp.unlink(missing_ok=True)
-        raise RuntimeError(f"{record.relative_path}: sha1 mismatch")
+    if record.sha1:
+        digest = hashlib.sha1()
+        with tmp.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != record.sha1.lower():
+            tmp.unlink(missing_ok=True)
+            raise RuntimeError(f"{record.relative_path}: sha1 mismatch")
     os.replace(tmp, destination)
     if zipfile.is_zipfile(destination):
         # The official downloader expands group archives. The fallback must leave the same layout
@@ -589,8 +593,10 @@ def fetch(
                 "(pip install git+https://github.com/facebookresearch/nymeria_dataset); "
                 "using the stdlib fallback"
             )
-        for record in plan.records:
-            fetched += download_record(out_dir, record)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            futures = [pool.submit(download_record, out_dir, record) for record in plan.records]
+            for future in concurrent.futures.as_completed(futures):
+                fetched += future.result()
 
     manifest = _manifest(plan, seed_used, url_json, out_dir, path=path, fetched=fetched)
     (out_dir / "fetch_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")

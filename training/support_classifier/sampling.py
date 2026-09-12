@@ -2,7 +2,7 @@
 
 WHAT AN EPISODE IS
 ------------------
-One query recording, a candidate label roster, and K labelled *support executions* the comparator
+One query recording, a candidate label roster, and K labelled *support executions* the classifier
 may compare the query against. Everything the model learns about "how to compare" comes from how
 these are drawn, so this module is the method rather than plumbing around it.
 
@@ -18,9 +18,8 @@ THE FOUR RULES
    merging, no deduplication. Two candidates may carry near-identical text; the readout handles
    that by giving them near-identical votes, which is the right answer.
 4. **Ground-truth support present with probability p.** The answer is always in the candidate
-   roster. In a few-shot episode every candidate has enrolled support. In a zero-shot episode none
-   of the candidate labels has support; compatible rows with other labels are unbound background,
-   exactly like deployed k=0 evaluation.
+   roster. In a few-shot episode every candidate has enrolled support. In a zero-shot episode the
+   classifier receives only the query and declared candidate labels; there is no background bank.
 
 SUPPORT-SET DRAWING
 -------------------
@@ -42,7 +41,7 @@ from typing import Iterable, Literal, Sequence
 
 import numpy as np
 
-from data.scripts.labels.canonical_labels import canonicalize
+from data.scripts.labels.canonical_labels import NON_SEMANTIC_LABELS, canonicalize
 from data.scripts.curate.compatibility import (
     AcquisitionKey,
     is_near_miss,
@@ -57,11 +56,14 @@ SamplingMode = Literal["compatible", "near_miss", "unfiltered"]
 SubjectRelation = Literal["same_subject", "cross_subject"]
 SupportUnit = tuple[str, str, str]  # dataset, subject, physical execution
 
-#: A-priori constants (design doc §3). They may be varied deliberately as an experiment; they are
-#: never tuned against evaluation data, because there is no development split.
+#: Protocol defaults (design doc §3). They may be varied deliberately using only the supervised
+#: training sources and their internal subject-held-out fold; sealed sources never tune them.
 DEFAULT_SUPPORT = 32
 DEFAULT_P_GT_PRESENT = 0.5
-DEFAULT_LABEL_SUBSET = (2, 14)
+# Candidate rosters should be large enough that the support task cannot devolve into a binary
+# decision.  Small configurations still use every feasible label rather than being excluded.
+DEFAULT_LABEL_SUBSET = (2, 32)
+LARGE_C_MIN = 16
 DEFAULT_SAME_SUBJECT_PROBABILITY = 0.5
 DEFAULT_ENROLLMENT_K = (1, 2, 4, 8)
 DEFAULT_QUERIES_PER_SUPPORT_SET = 4
@@ -197,18 +199,24 @@ def build_support_corpus(
     alignment: str = "native",
     max_per_stream: int | None = None,
     seed: int = 0,
-    exclude_labels: Iterable[str] = ("unlabeled",),
+    exclude_labels: Iterable[str] = NON_SEMANTIC_LABELS,
     min_duration_seconds: float = MIN_RECORDING_SECONDS,
 ) -> SupportCorpus:
     """Index the training grids into the structure the sampler draws from.
 
     Reads grid metadata only — never ``data.npy`` — so building the index is cheap and the encoder
-    stays responsible for loading signal.
+    stays responsible for loading signal. The same fingerprinted implausible/duplicate-window
+    exclusions used by :class:`CorpusIndex` are mandatory here; an offline evaluator must not
+    silently score rows that training rejects as invalid observations.
     """
 
     rng = np.random.default_rng(seed)
     banned = {str(label).lower() for label in exclude_labels}
     wanted = set(datasets)
+    from data.scripts.scan_implausible import load as load_implausible
+    from data.scripts.scan_duplicates import load as load_duplicates
+    implausible = load_implausible(alignment, require=True)
+    duplicates = load_duplicates(alignment, require=True)
 
     recordings: list[Recording] = []
     keys: list[AcquisitionKey] = []
@@ -230,10 +238,13 @@ def build_support_corpus(
 
         executions = _execution_ids(ref.dataset, ref.event_ids)
         lengths = ref.load_lengths()
+        excluded = implausible.get(ref.key, set()) | duplicates.get(ref.key, set())
         chosen = np.arange(ref.n_windows)
         if max_per_stream is not None and ref.n_windows > max_per_stream:
             chosen = np.sort(rng.choice(ref.n_windows, size=max_per_stream, replace=False))
         for window in chosen:
+            if int(window) in excluded:
+                continue
             if float(lengths[int(window)]) / ref.rate_hz < min_duration_seconds:
                 continue
             label = canonicalize(ref.labels[int(window)])
@@ -269,7 +280,7 @@ class Episode:
 
     query: int
     support: tuple[int, ...]             # one sampled window from each distinct execution
-    support_candidate: tuple[int, ...]   # candidate slot, or -1 for zero-shot background
+    support_candidate: tuple[int, ...]   # candidate slot; empty for zero-shot
     candidates: tuple[str, ...]          # verbatim label strings
     gt_slot: int                         # the answer is always in the candidate roster
     mode: SamplingMode
@@ -534,6 +545,26 @@ def _draw_feasible_candidate_roster(
     return tuple(str(label) for label in selected), support, slots, groups
 
 
+def _large_candidate_count(
+    rng: np.random.Generator,
+    *,
+    available: int,
+    label_subset: tuple[int, int],
+) -> int:
+    """Draw from the upper half of the feasible candidate range.
+
+    A small acquisition-specific vocabulary cannot honestly provide a large-C episode, so use all
+    it can provide.  Larger vocabularies are trained on broadly sized rosters without requiring a
+    second, contradictory candidate-count knob.
+    """
+    low, high = label_subset
+    capacity = min(int(high), int(available))
+    if capacity < low:
+        return capacity
+    floor = max(low, min(LARGE_C_MIN, capacity))
+    return int(rng.integers(floor, capacity + 1))
+
+
 def _can_draw_candidate_count(
     units_by_label: dict[str, dict[SupportUnit, list[int]]],
     *,
@@ -633,7 +664,7 @@ def draw_episode(
     mode: SamplingMode = "compatible",
     query_index: int | None = None,
     same_subject_probability: float = DEFAULT_SAME_SUBJECT_PROBABILITY,
-    semantic_zero_shot: bool = False,
+    semantic_zero_shot: bool = True,
 ) -> Episode | None:
     """Draw one episode, or ``None`` when the query admits no usable support at all.
 
@@ -658,7 +689,7 @@ def draw_episode(
         return None
 
     want_gt = bool(rng.random() < p_gt_present)
-    if not want_gt and semantic_zero_shot:
+    if not want_gt:
         # A direct semantic head needs no background bank. Draw only plausible candidates;
         # do not inherit the old bridge's requirement for a third, non-candidate activity.
         available = sorted({label for candidate_key in keys for label in corpus.all_labels
@@ -677,61 +708,38 @@ def draw_episode(
                        requested_candidates=requested_labels)
     cross = _available_units(corpus, keys, query, "cross_subject")
     same = _available_units(corpus, keys, query, "same_subject")
-    if want_gt:
-        feasible: list[tuple[SubjectRelation, dict[str, dict[SupportUnit, list[int]]]]] = []
-        if query.label in cross and len(cross) >= 2:
-            feasible.append(("cross_subject", cross))
-        if query.label in same and len(same) >= 2:
-            feasible.append(("same_subject", same))
-        if not feasible:
-            return None
-        if len(feasible) == 2:
-            selected = 1 if rng.random() < same_subject_probability else 0
-            relation, available_units = feasible[selected]
-        else:
-            relation, available_units = feasible[0]
+    feasible: list[tuple[SubjectRelation, dict[str, dict[SupportUnit, list[int]]]]] = []
+    if query.label in cross and len(cross) >= 2:
+        feasible.append(("cross_subject", cross))
+    if query.label in same and len(same) >= 2:
+        feasible.append(("same_subject", same))
+    if not feasible:
+        return None
+    if len(feasible) == 2:
+        selected = 1 if rng.random() < same_subject_probability else 0
+        relation, available_units = feasible[selected]
     else:
-        # Deployed k=0 draws from the training corpus and therefore has no same-user enrollment.
-        relation, available_units = "cross_subject", cross
-        if not available_units:
-            return None
+        relation, available_units = feasible[0]
 
     available = sorted(available_units)
     n_labels = int(rng.integers(low, high + 1))
     n_labels = min(n_labels, len(corpus.all_labels))
-    if want_gt:
-        n_labels = min(n_labels, support_size)
+    n_labels = min(n_labels, support_size)
     if n_labels < 2:
         return None
 
-    if want_gt:
-        others = [label for label in available if label != query.label]
-        take = min(n_labels - 1, len(others))
-        if take < 1:
-            return None
-        picked = list(rng.choice(others, size=take, replace=False))
-        picked.append(query.label)
-    else:
-        # All candidates must be plausible under the same support availability
-        # rule. Otherwise the answer alone reveals the configuration's vocabulary.
-        # Keep at least one other label for non-candidate background support.
-        if query.label not in available_units or len(available) < 3:
-            return None
-        n_labels = min(n_labels, len(available) - 1)
-        others = [label for label in available if label != query.label]
-        picked = [query.label, *rng.choice(others, size=n_labels - 1, replace=False)]
+    others = [label for label in available if label != query.label]
+    take = min(n_labels - 1, len(others))
+    if take < 1:
+        return None
+    picked = list(rng.choice(others, size=take, replace=False))
+    picked.append(query.label)
     rng.shuffle(picked)
     candidates = tuple(str(label) for label in picked)
     gt_slot = candidates.index(query.label)
 
-    if want_gt:
-        support_labels = [label for label in candidates if label in available_units]
-        candidate_slots = {label: candidates.index(label) for label in support_labels}
-    else:
-        support_labels = [label for label in available if label not in candidates]
-        if len(support_labels) > high:
-            support_labels = list(rng.choice(support_labels, size=high, replace=False))
-        candidate_slots = None
+    support_labels = [label for label in candidates if label in available_units]
+    candidate_slots = {label: candidates.index(label) for label in support_labels}
     if not support_labels:
         return None
     support, support_candidate = _draw_support(
@@ -749,7 +757,7 @@ def draw_episode(
         mode=mode,
         requested_support=int(support_size),
         shrunk=len(support) < support_size,
-        zero_shot=not want_gt,
+        zero_shot=False,
         subject_relation=relation,
     )
 
@@ -777,28 +785,40 @@ def _draw_deployment_support_set(
         return None
     low, high = label_subset
     want_support = bool(rng.random() < p_gt_present)
+    cross = _available_units(corpus, keys, query, "cross_subject")
+    same = _available_units(corpus, keys, query, "same_subject")
 
     if not want_support:
-        if not semantic_zero_shot:
-            return None
-        base = draw_episode(
-            corpus, rng, support_size=1, p_gt_present=0.0, label_subset=label_subset,
-            mode=mode, query_index=query_index,
-            same_subject_probability=same_subject_probability, semantic_zero_shot=True,
+        # The zero-shot head is a genuine query/candidate-label model.  Do not manufacture the
+        # retired semantic background bank: its row count and acquisition mix are unrelated to
+        # the deployment condition and would give the two heads different input semantics.
+        available_labels = sorted(
+            label for label, units in cross.items() if units
         )
-        if base is None or len(base.candidates) < low:
+        if len(available_labels) < low:
+            return None
+        requested_candidates = _large_candidate_count(
+            rng, available=len(available_labels), label_subset=label_subset,
+        )
+        base = draw_episode(
+            corpus, rng,
+            p_gt_present=0.0,
+            label_subset=(requested_candidates, requested_candidates),
+            mode=mode,
+            query_index=query_index,
+            same_subject_probability=same_subject_probability,
+            semantic_zero_shot=True,
+        )
+        if base is None or len(base.candidates) < low or base.support:
             return None
         query_rows = _additional_queries(
             corpus, rng, base_query=query_index, keys=keys, candidates=base.candidates,
-            support=(), relation="cross_subject", count=queries_per_support_set,
+            support=base.support, relation="cross_subject", count=queries_per_support_set,
         )
         return [replace(
             base, query=row, gt_slot=base.candidates.index(corpus.recordings[row].label),
-            support_set_id=support_set_id,
+            requested_support=0, shrunk=False, support_set_id=support_set_id,
         ) for row in query_rows]
-
-    cross = _available_units(corpus, keys, query, "cross_subject")
-    same = _available_units(corpus, keys, query, "same_subject")
 
     feasible_by_k: dict[int, list[tuple[SubjectRelation, dict, list[str]]]] = {}
     for value in dict.fromkeys(int(item) for item in enrollment_k):
@@ -824,7 +844,9 @@ def _draw_deployment_support_set(
     relation_fallback = requested_relation not in by_relation
     relation, available_units, available = by_relation.get(requested_relation, options[0])
 
-    requested_labels = int(rng.integers(low, high + 1))
+    requested_labels = _large_candidate_count(
+        rng, available=len(available), label_subset=label_subset,
+    )
     candidates, support, slots, groups = _draw_feasible_candidate_roster(
         available_units, query_label=query.label, available_labels=available,
         requested_labels=requested_labels, rng=rng, k=k,
@@ -940,6 +962,17 @@ def draw_batch(
     """Draw ``batch_size`` episodes plus the telemetry that makes the draw auditable."""
 
     if deployment_matched:
+        # Keep the deployment episode contract self-contained.  The trainer passes these values
+        # explicitly for provenance, but profiling, tests and downstream callers must not be able
+        # to reach a half-specified path that fails only after corpus loading has finished.
+        kwargs = {
+            "p_gt_present": DEFAULT_P_GT_PRESENT,
+            "label_subset": DEFAULT_LABEL_SUBSET,
+            "mode": "compatible",
+            "same_subject_probability": DEFAULT_SAME_SUBJECT_PROBABILITY,
+            "semantic_zero_shot": True,
+            **kwargs,
+        }
         if queries_per_support_set < 1 or windows_per_execution < 1:
             raise ValueError("query and execution-window counts must be positive")
         if not enrollment_k or any(int(k) < 1 for k in enrollment_k):

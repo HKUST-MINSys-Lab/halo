@@ -1,0 +1,108 @@
+{
+  "motionsense/phone_front_pocket/k=0": {
+    "fingerprint": "b311777ced84648896add7b49b76d7db898c03d993bb41a218b57f8e2a51026a",
+    "n_queries": 4500,
+    "k": 0,
+    "candidates": [
+      "jogging",
+      "sitting",
+      "standing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "realworld/phone_waist/k=0": {
+    "fingerprint": "49fea55615f7e248d6293c40c50cfbd98143bd5e583d688bc76848b0aeb4d3b1",
+    "n_queries": 11237,
+    "k": 0,
+    "candidates": [
+      "jumping",
+      "lying",
+      "running",
+      "sitting",
+      "climbingdown",
+      "climbingup",
+      "standing",
+      "walking"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "shoaib/phone_right_pocket/k=0": {
+    "fingerprint": "1f54e11ef34ae2462b2cbca50cc7857515ebc3e50002695ebb9234e75068e07c",
+    "n_queries": 2100,
+    "k": 0,
+    "candidates": [
+      "cycling",
+      "jogging",
+      "sitting",
+      "standing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "inclusivehar/phone_waist/k=0": {
+    "fingerprint": "027d4f0342854efca8f5707bcf5e7eab96a220c56af2b782226c56c27c8ad52a",
+    "n_queries": 1260,
+    "k": 0,
+    "candidates": [
+      "jogging",
+      "ramp_ascent",
+      "ramp_descent",
+      "sitting",
+      "standing",
+      "walking"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "usc_had/phone_hip/k=0": {
+    "fingerprint": "6a2106f07f7140f12072d2d1038519244693481ae3c4bac85df8ae6db13c52cd",
+    "n_queries": 4350,
+    "k": 0,
+    "candidates": [
+      "elevator_down",
+      "elevator_up",
+      "jumping_up",
+      "running_forward",
+      "sitting",
+      "sleeping",
+      "standing",
+      "walking_downstairs",
+      "walking_forward",
+      "walking_left",
+      "walking_right",
+      "walking_upstairs"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  },
+  "ut_complex/watch_wrist/k=0": {
+    "fingerprint": "d25b4e953ab7b7284e9f06612225f82153ddae740c0a83a5c894cbe41994b522",
+    "n_queries": 3900,
+    "k": 0,
+    "candidates": [
+      "biking",
+      "drinking_coffee",
+      "eating",
+      "jogging",
+      "sitting",
+      "smoking",
+      "standing",
+      "talking",
+      "typing",
+      "walking",
+      "walking_downstairs",
+      "walking_upstairs",
+      "writing"
+    ],
+    "seed": 20260912,
+    "construction": "execution_disjoint_stable_choice_v1"
+  }
+}

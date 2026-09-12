@@ -11,9 +11,11 @@ For an eligible query/support episode:
 3. Apply the same support/candidate episode manifest to every exported representation.
 4. Report 1-NN, prototype, and ridge as separate readouts where `k >= 1`; label fitted methods as
    adaptation rather than zero shot.
-5. Report HALO's learned support-vote result separately from its 1-NN control.
+5. Report HALO's learned retrieve-mix-vote result separately from its matched `neighbors` and 1-NN
+   controls.
 6. Mark unsupported source/model combinations instead of inventing a replacement input path.
 
-All model-selection decisions use development data. Test results are per dataset with subject-level
-uncertainty, checkpoint provenance, upstream data-overlap disclosure, runtime, and memory. See the
-full [evaluation protocol](../design/EVALUATION_PROTOCOL.md).
+All model-selection decisions are fixed a priori or use the internal subject-held-out fold of the
+supervised training sources; there is no separate development-source roster. Test results are per
+dataset with subject-level uncertainty, checkpoint provenance, upstream data-overlap disclosure,
+runtime, and memory. See the full [evaluation protocol](../design/EVALUATION_PROTOCOL.md).

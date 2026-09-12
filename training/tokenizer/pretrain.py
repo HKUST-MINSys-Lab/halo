@@ -191,7 +191,9 @@ class PretrainConfig:
     corpus_name: str = "label_free"
     source_window_seconds: float = PRETRAIN_WINDOW_SECONDS
     dft_size: int = DFT_SIZE               # serialized architecture/collate capacity
-    trunk: str = "dual"                   # dual (checkpoint-compatible) | temporal (compact engine)
+    # The support-conditioned classifier consumes temporal sensor tokens.  Keep the historical
+    # dual trunk available only when it is requested explicitly by an old checkpoint/ablation.
+    trunk: str = "temporal"
     # Omit the Phase-A-only descriptor head unless its explicit objective is enabled. Serialize this
     # shape decision so strict reconstruction never has to infer it from state-dict prefixes.
     descriptor_prediction: bool = False
@@ -1193,7 +1195,7 @@ def _corpus_datasets(name: str) -> tuple[str, ...]:
     ``label_free`` is the 2026-09-09 split: the encoder pretrains only on sources that carry no
     activity annotation at all, leaving every labelled corpus genuinely out-of-sample for it.
     The historical ``expanded`` and ``matched`` recipes train the encoder on the same labelled
-    data the comparator and classification head later use, which makes a downstream gain
+    data the support classifier later uses, which makes a downstream gain
     ambiguous — it can always be read as the encoder having already met those subjects, devices
     and activities. They remain available so earlier runs stay reproducible.
     """
@@ -1325,8 +1327,8 @@ def main() -> None:
     parser.add_argument("--val-every", type=int, default=None,
                         help="steps between validation passes (selection can only fire on one)")
     parser.add_argument("--selection-every", type=int, default=None,
-                        help="steps between held-out development-transfer selection scores; must be "
-                             "a multiple of --val-every to fire on schedule")
+                        help="steps between optional historical transfer-probe scores; the current "
+                             "label-free recipe has no selection roster")
     parser.add_argument("--retrieval-vicreg-fraction", type=float, default=None,
                         help="fraction of VICReg assigned directly to the sensor rows stored in "
                              "the evidence bank (default 0.5)")
@@ -1401,9 +1403,10 @@ def main() -> None:
                         default="label_free",
                         help="named Phase-A recipe. label_free=the label-free pretraining corpus "
                              "in data/pretraining/, disjoint from the labelled data the "
-                             "comparator and classification head train on, so a downstream gain "
+                             "support classifier trains on, so a downstream gain "
                              "is attributable and is the default; expanded=the active labelled "
-                             "historical roster (14 sources since 2026-09-10; the frozen 18 is "
+                             "historical active labelled roster (8 sources since 2026-09-11; "
+                             "the frozen 18 is "
                              "EXPANDED_18_TRAIN_DATASETS); "
                              "matched=the frozen original 12-source corpus for technique-only "
                              "baseline comparisons (contains retired sources: needs --allow-retired)")
@@ -1569,7 +1572,10 @@ def main() -> None:
         parser.error("--datasets and --subset are mutually exclusive")
     if args.datasets is not None:
         cfg.train_datasets = tuple(args.datasets)
-        from data.scripts.curate.deployment_policy import LABEL_FREE_PRETRAIN_DATASETS
+        from data.scripts.curate.deployment_policy import (
+            LABEL_FREE_PRETRAIN_DATASETS,
+            assert_pretraining_is_label_free,
+        )
         requested = set(cfg.train_datasets)
         label_free = set(LABEL_FREE_PRETRAIN_DATASETS)
         if requested.issubset(label_free):
@@ -1583,6 +1589,12 @@ def main() -> None:
                 "--datasets cannot mix eight-second label-free grids with six-second labelled "
                 "grids; choose one source-window contract per run"
             )
+        # A custom list is still a Phase-A pretraining request.  Never let it become an
+        # undocumented route around the label-free corpus boundary.
+        try:
+            assert_pretraining_is_label_free(cfg.train_datasets)
+        except ValueError as exc:
+            parser.error(str(exc))
     elif args.subset:
         from training.tokenizer.ablation_subset import SUBSET_TRAIN_DATASETS, DEFAULT_CAP
         cfg.train_datasets = SUBSET_TRAIN_DATASETS
@@ -1598,6 +1610,12 @@ def main() -> None:
     # The single gate between every roster path (--corpus, --datasets, --subset) and training.
     from data.scripts.curate.deployment_policy import assert_no_retired_sources
     assert_no_retired_sources(cfg.train_datasets or TRAIN_DATASETS, allow=args.allow_retired)
+    if cfg.corpus_name in {"label_free", "label_free_subset"}:
+        from data.scripts.curate.deployment_policy import assert_pretraining_is_label_free
+        try:
+            assert_pretraining_is_label_free(cfg.train_datasets or TRAIN_DATASETS)
+        except ValueError as exc:
+            parser.error(str(exc))
     if args.steps is not None:
         cfg.steps = args.steps
     if args.lr is not None:
@@ -2145,8 +2163,11 @@ def main() -> None:
             "jepa_teacher": (jepa_teacher.state_dict() if jepa_teacher is not None else None),
             "label_ids": index.label_ids,
             "step": step, "val_ba": val_ba,
-            "selection_metric": ("development_transfer_knn_ba"
-                                 if cfg.selection_datasets else "val_knn_label_stream_ba"),
+            "selection_metric": (
+                "historical_transfer_knn_ba" if cfg.selection_datasets
+                else "val_knn_label_stream_ba" if has_internal_classification_probe
+                else "fixed_final_step"
+            ),
             "selection_value": latest_selection_ba,
             "selection_step": latest_selection_step,
             "selection_datasets": list(cfg.selection_datasets),
@@ -3475,8 +3496,8 @@ def main() -> None:
                 conse_hetero_ba = label_group_balanced_acc(conse_pred, val_y, val_stream)
             else:
                 # A single `__unlabeled__` class gives every representation 100% kNN/ConSE. Keep
-                # those metrics explicitly absent; checkpoint selection uses the held-out labelled
-                # development roster below.
+                # those metrics explicitly absent. The current label-free recipe has no online
+                # selection dataset; its final scheduled checkpoint is the a-priori choice.
                 val_y = torch.empty(0, dtype=torch.long)
                 val_src, val_stream = [], []
                 knn_pred = conse_pred = torch.empty(0, dtype=torch.long)
@@ -3545,9 +3566,18 @@ def main() -> None:
         if run_until_step < cfg.steps:
             print(f"bounded monitor stopped at step {run_until_step}; full schedule remains "
                   f"{cfg.steps} steps and this checkpoint can be resumed", flush=True)
-        metric = ("development transfer kNN" if cfg.selection_datasets
-                  else "val label/stream-macro kNN")
-        print(f"done: best {metric} {best_ba:.3f} · checkpoints in {args.out}", flush=True)
+        if not cfg.selection_datasets and best_ba < 0:
+            # Three-role rule (2026-09-11): no labelled selection data exists in the label-free
+            # pretraining role, so no checkpoint was ever
+            # "selected". The final checkpoint is the a-priori choice; write it as best.pt so
+            # downstream loaders keep one path, and say so in the run record.
+            checkpoint("best.pt", step, float("nan"))
+            print(f"done: no selection signal (fixed JEPA schedule); final step {step} checkpoint "
+                  f"written as best.pt a priori · checkpoints in {args.out}", flush=True)
+        else:
+            metric = ("development transfer kNN" if cfg.selection_datasets
+                      else "val label/stream-macro kNN")
+            print(f"done: best {metric} {best_ba:.3f} · checkpoints in {args.out}", flush=True)
 
 
 if __name__ == "__main__":

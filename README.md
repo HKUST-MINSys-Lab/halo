@@ -23,9 +23,10 @@ separate, explicitly reported evaluation regimes.
   filterbank (0.5, 1.0, and 1.5 seconds), and a continuous multispan frontend at the same spans.
 - **Optional pretraining:** label-free future-JEPA trains contextual patch representations before
   support-classifier training. It is encoder-agnostic at the physical-time token interface.
-- **Classifier:** a fixed similarity-weighted support vote, optionally corrected by a small
-  sensor-only set-attention reweighter. It does not contain the retired admissibility gate or
-  retrieve-mix-vote machinery.
+- **Classifier:** a semantic token mixer with separate zero-support and enrolled-support weights.
+  With enrollment it jointly contextualises query, support, paired support-label, and candidate-label
+  tokens before a soft support vote. The parameter-free `neighbors` path is the encoder control.
+  Neither path contains the retired admissibility gate or hidden memory-bank retrieval machinery.
 - **External comparisons:** author-released HARNet, UniMTS, and NormWear checkpoints, adapted
   faithfully and evaluated under the same support protocol where their input contracts permit it.
 
@@ -44,7 +45,7 @@ docs/                         # current design, data, protocol, and results reco
 tests/                        # regression tests for the retained surface
 ```
 
-The previous language-alignment, explicit-admissibility, Phase-B evidence-engine, and
+The previous language-alignment, explicit-admissibility, Phase-B memory-bank evidence engine, and
 movement-monitoring application pivots are archived in Git. They are not live implementation
 guidance. See [docs/HISTORY.md](docs/HISTORY.md).
 

@@ -27,7 +27,7 @@ def test_primary_train_datasets_matches_trainer_roster():
     assert union == set(TRAIN_DATASETS), (
         f"roster drift: policy declares {sorted(union - set(TRAIN_DATASETS))} extra, "
         f"missing {sorted(set(TRAIN_DATASETS) - union)}")
-    assert len(_ptd) + len(_direct) == len(TRAIN_DATASETS) == 14
+    assert len(_ptd) + len(_direct) == len(TRAIN_DATASETS) == 8
     # The matched recipe is FROZEN history (12 sources incl. the retired ones); the active primary
     # roster is that list minus the retirements. They must never be the same object again.
     assert set(_ptd) == set(_matched) - set(RETIRED_TRAIN_DATASETS)
@@ -171,18 +171,61 @@ def test_non_deployment_datasets_are_not_primary():
     assert {"dsads", "harth"}.issubset(EXCLUDED_PRIMARY_DATASETS)
 
 
-def test_new_heldout_datasets_are_default_eval_only():
-    heldout = {"monipar", "spar", "upper_limb_use"}
-    assert heldout <= set(PRIMARY_EVAL_DATASETS)
-    assert heldout.isdisjoint(TRAIN_DATASETS)
-    assert all(stream_specs(dataset, "primary") for dataset in heldout)
+def test_clinical_pivot_datasets_left_every_live_roster():
+    """The movement-monitoring pivot is archived; its clinical corpora are not general HAR."""
+    from data.scripts.curate.deployment_policy import (
+        PHASE_A_TRANSFER_DATASETS,
+        RETIRED_EVAL_DATASETS,
+        SEALED_TEST_EVAL_DATASETS,
+    )
+
+    clinical = {"monipar", "spar", "upper_limb_use"}
+    assert clinical <= set(RETIRED_EVAL_DATASETS)   # tnda_har joined it for a non-clinical reason
+    for roster in (PRIMARY_EVAL_DATASETS, SEALED_TEST_EVAL_DATASETS, TRAIN_DATASETS,
+                   PHASE_A_TRANSFER_DATASETS):
+        assert clinical.isdisjoint(roster)
+    # Converters and StreamSpecs stay so an archived protocol still reproduces.
+    assert all(stream_specs(dataset, "primary") for dataset in clinical)
+
+
+def test_no_separate_development_source_roster():
+    """Every evaluation source is sealed; internal validation comes only from training sources."""
+    from data.scripts.curate import deployment_policy as policy
+
+    assert set(policy.PRIMARY_EVAL_DATASETS) == set(policy.SEALED_TEST_EVAL_DATASETS)
+    assert policy.PHASE_A_TRANSFER_DATASETS == ()
+    assert not hasattr(policy, "DEVELOPMENT_EVAL_DATASETS")
+    assert set(policy.SEALED_TEST_EVAL_DATASETS).isdisjoint(TRAIN_DATASETS)
+    assert set(policy.SEALED_TEST_EVAL_DATASETS).isdisjoint(policy.LABEL_FREE_PRETRAIN_DATASETS)
+
+
+def test_live_data_rosters_are_exact_and_pairwise_disjoint():
+    """The paper protocol is exactly 3 pretraining, 8 head-training, and 6 sealed sources."""
+    from data.scripts.curate import deployment_policy as policy
+
+    assert policy.LABEL_FREE_PRETRAIN_DATASETS == (
+        "capture24_pretrain", "nymeria_xsens", "extrasensory_pretrain",
+    )
+    assert policy.SUPERVISED_HEAD_TRAIN_DATASETS == (
+        "hhar", "wisdm", "kuhar", "harmes", "xrf_v2", "dsads", "forth_trace", "realdisp",
+    )
+    assert policy.SEALED_TEST_EVAL_DATASETS == (
+        "motionsense", "realworld", "shoaib", "inclusivehar", "usc_had", "ut_complex",
+    )
+    rosters = [
+        set(policy.LABEL_FREE_PRETRAIN_DATASETS),
+        set(policy.SUPERVISED_HEAD_TRAIN_DATASETS),
+        set(policy.SEALED_TEST_EVAL_DATASETS),
+    ]
+    assert all(rosters[i].isdisjoint(rosters[j])
+               for i in range(len(rosters)) for j in range(i + 1, len(rosters)))
 
 
 def test_default_grid_build_covers_expanded_training_roster():
     from data.scripts.build_grids import build_stream_specs
     built = {spec.dataset for spec in build_stream_specs()}
     assert built == set(TRAIN_DATASETS) | set(PRIMARY_EVAL_DATASETS)
-    assert {"dsads", "mmfit"} <= built
+    assert {"dsads", "forth_trace", "realdisp"} <= built
     assert "opportunity" not in built, "retired 2026-09-10; must leave the default build"
     assert {"extrasensory", "nhanes", "hmog", "kneepad"}.isdisjoint(built)
 

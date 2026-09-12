@@ -1,0 +1,26 @@
+{
+  "dataset": "extrasensory_pretrain",
+  "display_name": "ExtraSensory (label-free pretraining view)",
+  "sampling_rate_hz": 50,
+  "channels": [
+    "acc_x",
+    "acc_y",
+    "acc_z"
+  ],
+  "core_channels": {
+    "acc_x": "acc_x",
+    "acc_y": "acc_y",
+    "acc_z": "acc_z"
+  },
+  "extra_channels": [],
+  "placement": "wrist watch or explicitly annotated phone hand/pocket placement",
+  "num_subjects": 60,
+  "activities": [],
+  "role": "pretrain_scale",
+  "phase_a_only": true,
+  "streaming_grid": true,
+  "full_windows_only": true,
+  "pre_windowed": false,
+  "grid_dtype": "float16",
+  "note": "Source-isolated, label-free view of public ExtraSensory raw accelerometer captures. Storage uses one Parquet per participant and stream; an integer segment_id preserves every raw capture or clock-split part as an independent windowing boundary. Activity labels are never read or filtered. The label table is read only for the two deployment-valid phone placements (hand and pocket); the published split is read only for Android/iPhone unit normalization. Android m/s^2, iPhone g, and Pebble watch milli-g are normalized to g with gravity present, then each uninterrupted capture is resampled independently to 50 Hz. Raw archives are fetched once into and reused from data/datasets/extrasensory/downloads. Every emitted session carries only __unlabeled__ and is restricted to JEPA pretraining."
+}

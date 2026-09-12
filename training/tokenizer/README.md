@@ -30,6 +30,10 @@ Before a full run, use `objective_health` on the chosen corpus/frontend to confi
 valid future horizons, teacher/student separation, loss scales, and gradient reach. During a run,
 `monitor_training` reads the lightweight JSON telemetry without touching the GPU.
 
+The current full-corpus batches, step counts, measured RTX 4090 throughput, and wall-time planning
+budget are maintained in [PRETRAINING_CORPUS.md](../../docs/data/PRETRAINING_CORPUS.md). Do not use
+historical support-classifier timings to estimate JEPA pretraining.
+
 ## Retained utilities
 
 - `pretrain.py`: configuration, training, validation, checkpointing, and telemetry;

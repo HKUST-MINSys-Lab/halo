@@ -57,6 +57,23 @@ def test_checkpoint_without_dft_metadata_uses_historical_capacity():
     assert restored.filterbank.S == 256
 
 
+def test_phase_a_checkpoint_can_add_a_fresh_learnable_recording_pool_for_head_training():
+    """A label-free checkpoint has no classifier pool, but head training may add one explicitly."""
+    from training.tokenizer.eval_transfer import build_encoder
+
+    cfg = PretrainConfig(
+        d_model=32, num_layers=1, num_heads=4, dim_feedforward=64,
+        token_granularity="sensor", multiresolution=False,
+    )
+    original = PipelineAModel(cfg).encoder
+    restored = build_encoder(
+        {"config": vars(cfg).copy(), "encoder": original.state_dict()}, "cpu",
+        training=True, learnable_recording_pool=True,
+    )
+    assert restored.recording_pool is not None
+    assert restored.recording_pool.query.requires_grad
+
+
 def test_eval_subset_covers_streams_before_refilling_large_source():
     keys = (
         [WindowKey(0, i, 7) for i in range(100)]

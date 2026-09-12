@@ -47,6 +47,45 @@ ROPE_MIN_PERIOD_S = 0.5
 ROPE_MAX_PERIOD_S = 600.0
 
 
+class RecordingAttentionPool(nn.Module):
+    """One learned query that pools a masked set of contextual sensor tokens.
+
+    This is deliberately downstream of temporal context: it learns which already-contextualised
+    moments, sensors and resolutions matter to a recording decision without introducing a
+    positional shortcut.  It is optional because Future-JEPA trains patch representations, not
+    recording representations.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, dropout: float):
+        super().__init__()
+        self.query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.norm = nn.LayerNorm(d_model)
+        self.attention = nn.MultiheadAttention(
+            d_model, n_heads, dropout=dropout, batch_first=True,
+        )
+        self.ffn_norm = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, 2 * d_model), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(2 * d_model, d_model),
+        )
+        self.out_norm = nn.LayerNorm(d_model)
+
+    def forward(self, tokens: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        """Pool ``(B, T, D)`` tokens where ``valid`` is ``(B, T)``."""
+        if tokens.ndim != 3 or valid.shape != tokens.shape[:2]:
+            raise ValueError("recording pool expects tokens (B,T,D) and matching validity mask")
+        if bool((~valid.any(dim=1)).any()):
+            raise ValueError("recording pool received an all-padding recording")
+        query = self.query.expand(tokens.shape[0], -1, -1)
+        attended, _ = self.attention(
+            self.norm(query), self.norm(tokens), self.norm(tokens),
+            key_padding_mask=~valid, need_weights=False,
+        )
+        value = query + attended
+        value = value + self.ffn(self.ffn_norm(value))
+        return self.out_norm(value).squeeze(1)
+
+
 class SetTokenizerEncoder(nn.Module):
     """signal patches + channel TEXT + physical time -> representation.
 
@@ -78,6 +117,7 @@ class SetTokenizerEncoder(nn.Module):
         duration_gate_init: float = 0.1,
         num_resolutions: int = 2,
         rope_min_period: float = ROPE_MIN_PERIOD_S,
+        learnable_recording_pool: bool = False,
         **filterbank_kwargs,
     ):
         super().__init__()
@@ -96,6 +136,7 @@ class SetTokenizerEncoder(nn.Module):
         if token_granularity not in ("channel", "sensor"):
             raise ValueError("token_granularity must be 'channel' or 'sensor'")
         self.token_granularity = token_granularity
+        self.learnable_recording_pool_enabled = bool(learnable_recording_pool)
         self.sensor_bias_dim = int(sensor_bias_dim)
         self.use_sensor_bias_conditioning = bool(use_sensor_bias_conditioning)
         if trunk not in ("dual", "temporal"):
@@ -215,9 +256,18 @@ class SetTokenizerEncoder(nn.Module):
                 rope_min_period=rope_min_period,
                 rope_max_period=ROPE_MAX_PERIOD_S,
             )
+        self.recording_pool = (
+            RecordingAttentionPool(d_model, num_heads, dropout)
+            if self.learnable_recording_pool_enabled else None
+        )
         # Runtime-only acceleration hook. The trainer may install a compiled bound ``forward`` here;
         # keeping the actual module untouched preserves ordinary state_dict keys and eager eval loads.
         self._compiled_transformer_forward = None
+
+    def _learned_recording_pool(self, h: torch.Tensor, valid: torch.Tensor) -> torch.Tensor | None:
+        if self.recording_pool is None:
+            return None
+        return self.recording_pool(h.flatten(1, 2), valid.flatten(1, 2))
 
     def _add_duration_embedding(
         self,
@@ -564,6 +614,9 @@ class SetTokenizerEncoder(nn.Module):
             pooled = (summaries * active.unsqueeze(-1)).sum(dim=1) \
                 / active.sum(dim=1, keepdim=True).clamp(min=1.0)
 
+        learned_pool = self._learned_recording_pool(h, weights.gt(0))
+        if learned_pool is not None:
+            pooled = learned_pool
         output = {"tokens": h, "per_patch": per_patch, "pooled": pooled}
         if return_layer_states:
             output["layer_states"] = layer_states
@@ -724,6 +777,10 @@ class SetTokenizerEncoder(nn.Module):
             present = (denom_r > 0).to(per_patch.dtype)
             pooled = (means * present.unsqueeze(-1)).sum(dim=1) \
                 / present.sum(dim=1, keepdim=True).clamp(min=1.0)
+
+        learned_pool = self._learned_recording_pool(h, weights.gt(0))
+        if learned_pool is not None:
+            pooled = learned_pool
 
         # Per-sensor context for descriptor prediction. Match session pooling: physical-duration
         # weighting within each grid and equal weight across active grids. Otherwise the denser short

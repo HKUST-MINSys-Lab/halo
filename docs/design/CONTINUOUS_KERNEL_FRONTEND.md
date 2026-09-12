@@ -1,9 +1,10 @@
 # Continuous physical-time frontend
 
 > **Implemented encoder arm, 2026-08-24; audited and corrected 2026-09-09** (see "Corrections"
-> below). Retained because temporal resolution may matter directly for sequence matching and
-> phase-local movement comparison. Both the single-span and multi-span arms are implemented.
-> The multi-span arm is ready for short end-to-end experiments; it has no trained result yet.
+> below). Retained because temporal resolution may matter directly for motion representation.
+> The multi-span arm is the current experiment; the implemented single-span path is a diagnostic
+> control, not a separate planned paper arm. Neither has a promoted result under the current sealed
+> protocol yet.
 
 ## Purpose
 
@@ -138,11 +139,13 @@ The support-classification comparison is more diagnostic: evaluate fixed and con
 under the same support episodes and readouts. The continuous arm earns its cost only if its ordered
 sub-second features improve held-out recognition under the declared candidate and support regimes.
 
-## Cost
+## Historical support-classifier cost
 
-The last measured RTX 4090 end-to-end profile used about 129 ms per historical episodic training step
-and 3.89 GiB allocated VRAM. In an isolated mixed-rate batch of 512 windows, continuous analysis was
-the dominant frontend cost; triad packing, dense CNN, and projection were comparatively small.
+The last measured RTX 4090 end-to-end profile of the retired episodic support-classifier workload
+used about 129 ms per step and 3.89 GiB allocated VRAM. It is retained only as implementation
+history and is not a JEPA runtime estimate. In an isolated mixed-rate batch of 512 windows,
+continuous analysis was the dominant frontend cost; triad packing, dense CNN, and projection were
+comparatively small.
 
 Application inference must re-profile complete continuous sessions. Reusing overlapping analysis
 frames is likely more important than optimizing the ordinary dense CNN.
@@ -209,10 +212,12 @@ the retained support-classification control keeps support vectors attached, so g
 kernels from both sides; `frontend/*` telemetry and `--frontend-lr-scale` /
 `--frontend-reg-weight` apply.
 
-**Cost, measured on the RTX 4090** (40 steps, `neighbors` readout, four episodes per step, capped
-corpus, four loader workers): 43 ms per step against 17 ms for the fixed filterbank, i.e. 2.6x,
-so a 35k-step run is about 25 minutes. Per-token export for the evaluation adapter follows the
-frontend's grid (`out["token_grid"]`).
+**Historical classifier cost, measured on the RTX 4090** (40 steps, `neighbors` readout, four
+episodes per step, capped corpus, four loader workers): 43 ms per step against 17 ms for the fixed
+filterbank, i.e. 2.6x, so that earlier 35k-step classifier run was about 25 minutes. This is not the
+current JEPA workload. The current JEPA measurement and planning budget live only in
+[PRETRAINING_CORPUS.md](../data/PRETRAINING_CORPUS.md). Per-token export for the evaluation adapter
+follows the frontend's grid (`out["token_grid"]`).
 
 **Future JEPA.** The past-only future objective supports this frontend directly. Student kernels see
 only the raw prefix; the EMA teacher sees the complete window. The trainer derives RoPE's fastest

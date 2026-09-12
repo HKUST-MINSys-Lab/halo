@@ -1,0 +1,22 @@
+{
+  "name": "limubert_x",
+  "title": "Experience Paper: Adopting Activity Recognition in On-demand Food Delivery Business",
+  "authors": ["Huatao Xu", "Yan Zhang", "Wei Gao", "Guobin Shen", "Mo Li"],
+  "year": 2025,
+  "venue": "ACM MobiCom 2025",
+  "doi": "10.1145/3680207.3765261",
+  "paper_url": "https://wands.hk/papers/limu-experience.pdf",
+  "code_url": "https://github.com/WANDS-HKUST/LIMU-BERT_Experience",
+  "checkpoint_url": "https://github.com/WANDS-HKUST/LIMU-BERT_Experience/raw/main/weights/limu_bert_x.pt",
+  "checkpoint_sha256": "65697e7017020f36429a221382253f1fc370fdfd493cfb71667f95846c18516c",
+  "checkpoint_parameters": 55446,
+  "license": "MIT (source repository); paper copyright ACM",
+  "input_contract": {
+    "channels": ["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"],
+    "rate_hz": 20,
+    "window_samples": 20,
+    "window_sec": 1,
+    "acceleration_units": "g after the authors' divide-by-9.8 normalization",
+    "gyroscope_units": "rad/s"
+  }
+}

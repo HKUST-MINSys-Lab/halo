@@ -48,8 +48,8 @@ STILL_G = 0.003
 #: sedentary posture stay represented instead of being selected away.
 STILL_FRACTION = 1.0 / 3.0
 #: Default hours per participant. Twelve spans a day and a night while keeping breadth of
-#: SUBJECTS the dominant axis: under the sampler's per-subject n^0.5 tempering, 3,000 people
-#: at 12 h is worth far more than 500 people at a full week.
+#: Subjects are the dominant axis: under the sampler's per-subject n^0.5 tempering, 128 people
+#: at 12 h is worth far more than a small cohort recorded for a full week.
 DEFAULT_MAX_HOURS = 12
 OUTPUT_COLUMNS = ("acc_x", "acc_y", "acc_z")
 _STAMP = re.compile(r"\.(2000-\d{2}-\d{2}-\d{2}-\d{2}-\d{2})-000-P0000\.sensor\.csv$")

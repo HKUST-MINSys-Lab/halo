@@ -1,4 +1,4 @@
-"""Loader for the new-repo grid format, feeding the ZS-XD evaluation.
+"""Grid loader shared by external encoder adapters and historical zero-support scoring.
 
 Each dataset stores windowed grids under::
 
@@ -9,7 +9,7 @@ Each dataset stores windowed grids under::
                     labels[per-window list], subjects[per-window list]}
 
 and a pre-registered candidate label vocabulary at
-``data/datasets/<ds>/eval_labels.json`` (the ZS-XD target strings for that
+``data/datasets/<ds>/eval_labels.json`` (the sealed dataset's declared candidate strings for that
 dataset). Harmonized grid construction may store a genuine synonym under its training-corpus
 canonical name; :func:`baselines.scoring.align_ground_truth_labels` maps that internal representation
 back to the unique frozen target string before scoring. The global ConSE training vocabulary lives at
@@ -56,7 +56,7 @@ class EvalStream:
         channels:    the C channel names of `windows`, in grid order.
         rate_hz:     sampling rate of `windows`.
         mask:        (C,) bool per-channel validity (False = zero-padded absence).
-        eval_labels: the dataset's pre-registered ZS-XD candidate label vocabulary.
+        eval_labels: the dataset's pre-registered candidate label vocabulary.
         event_ids:   converter-provided window event ids when available.
         execution_ids: the leakage unit — one continuous physical capture. Derived by removing the
                      window ordinal from ``event_ids`` and then, where the converter provides a
@@ -136,7 +136,7 @@ def load_eval_labels(dataset: str, stream: Optional[str] = None) -> List[str]:
     if not path.exists():
         raise FileNotFoundError(
             f"No eval_labels.json for '{dataset}' at {path}. This dataset is not "
-            "set up as a ZS-XD evaluation target."
+            "set up as a sealed evaluation target."
         )
     blob = json.loads(path.read_text())
     labels = list(blob["labels"])
@@ -216,9 +216,9 @@ def _quality_excluded(dataset: str, stream: str, alignment: str) -> tuple[np.nda
 
     ``scan_duplicates`` (byte-identical stale-buffer windows) and ``scan_implausible`` (windows
     outside any consumer sensor's full-scale range) cache their verdicts per stream. Phase-A
-    training and the memory-bank build have always applied them; **evaluation did not**, so a
+    training and historical support-bank builds applied them; **evaluation did not**, so a
     window that is too corrupt to train on was still scored. That is live, not hypothetical:
-    `motionsense/phone_front_pocket` is a Phase-B development stream and carries 34 flagged
+    `motionsense/phone_front_pocket` is a sealed test stream and carries 34 flagged
     duplicates, and Opportunity's 70 fabricated hole-windows were excluded from training while
     remaining available to the evaluator.
 
@@ -240,6 +240,7 @@ def load_eval_stream(
     alignment: str = "non_harmonised",
     *,
     apply_quality_screen: bool = True,
+    candidate_labels: Optional[List[str]] = None,
 ) -> EvalStream:
     """Load one dataset/stream grid as an :class:`EvalStream`.
 
@@ -252,6 +253,11 @@ def load_eval_stream(
                    ``scan_implausible`` (see :func:`_quality_excluded`). Pass ``False`` only to
                    inspect the raw grid; scoring on an unscreened stream reports windows the
                    trainer itself refused.
+        candidate_labels: explicit candidate vocabulary for a training-only stream. Sealed
+                   evaluation callers must omit this and use the dataset's registered
+                   ``eval_labels.json``; the zero-shot reference-bank builder supplies the frozen
+                   global training vocabulary because training datasets intentionally have no
+                   sealed-evaluation candidate file.
 
     The returned `gt` / `subjects` are 1:1 with `windows` (length N) and verbatim
     from the grid — align and restrict `gt` to `eval_labels` at scoring time via
@@ -343,7 +349,8 @@ def load_eval_stream(
         channels=channels,
         rate_hz=float(meta["rate_hz"]),
         mask=mask.astype(bool),
-        eval_labels=load_eval_labels(dataset, stream),
+        eval_labels=(list(candidate_labels) if candidate_labels is not None
+                     else load_eval_labels(dataset, stream)),
         event_ids=event_ids,
         execution_ids=execution_ids,
         block_ids=block_ids,

@@ -9,11 +9,13 @@ for a seed and does not favor unusually small/short recordings.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import os
 import re
 import shutil
+import socket
 import urllib.request
 from html.parser import HTMLParser
 from pathlib import Path
@@ -24,6 +26,9 @@ DS_DIR = Path(__file__).resolve().parent
 DOWNLOADS = DS_DIR / "downloads"
 INDEX_URL = "https://ftp.cdc.gov/pub/pax_g/"
 DEFAULT_SEED = 20260726
+CHUNK_BYTES = 1024 * 1024
+READ_TIMEOUT_SECONDS = 60
+MAX_ATTEMPTS = 5
 
 
 class _ArchiveLinkParser(HTMLParser):
@@ -82,10 +87,24 @@ def _download(seqn: str) -> dict:
     if destination.exists() and destination.stat().st_size == expected:
         print(f"[nhanes] present {seqn}: {expected / 1e6:.1f} MB")
         return {"seqn": seqn, "url": url, "bytes": expected}
-    tmp = destination.with_suffix(".tar.bz2.part")
-    request = urllib.request.Request(url, headers={"User-Agent": "HALO-dataset-fetch/1.0"})
-    with urllib.request.urlopen(request) as response, tmp.open("wb") as output:
-        shutil.copyfileobj(response, output, length=8 * 1024 * 1024)
+    tmp = destination.with_name(destination.name + ".part")
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        existing = tmp.stat().st_size if tmp.exists() else 0
+        headers = {"User-Agent": "HALO-dataset-fetch/1.0"}
+        if existing:
+            headers["Range"] = f"bytes={existing}-"
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=READ_TIMEOUT_SECONDS) as response:
+                resumed = existing > 0 and getattr(response, "status", None) == 206
+                if existing and not resumed:
+                    existing = 0
+                with tmp.open("ab" if existing else "wb") as output:
+                    shutil.copyfileobj(response, output, length=CHUNK_BYTES)
+            break
+        except (TimeoutError, socket.timeout, OSError):
+            if attempt == MAX_ATTEMPTS:
+                raise
     if tmp.stat().st_size != expected:
         raise RuntimeError(
             f"{seqn}: incomplete download: expected {expected}, got {tmp.stat().st_size}"
@@ -101,6 +120,8 @@ def main() -> None:
     group.add_argument("--subjects", type=int, help="deterministic number of participants")
     group.add_argument("--ids", nargs="+", help="explicit NHANES SEQN identifiers")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--workers", type=int, default=16,
+                        help="parallel resumable archive transfers (default: 16)")
     args = parser.parse_args()
 
     available = available_subjects()
@@ -113,7 +134,8 @@ def main() -> None:
         selected = select_subjects(available, args.subjects, args.seed)
 
     DOWNLOADS.mkdir(parents=True, exist_ok=True)
-    records = [_download(seqn) for seqn in selected]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        records = list(pool.map(_download, selected))
     (DOWNLOADS / "subset_manifest.json").write_text(
         json.dumps(
             {

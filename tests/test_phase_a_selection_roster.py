@@ -21,40 +21,42 @@ from training.tokenizer.eval_transfer import (
 
 
 def test_selection_roster_is_disjoint_from_training_corpus():
-    """The roster must never intersect either named Phase-A training recipe."""
+    """The roster must never intersect a LIVE training roster: the active head roster or the
+    label-free pretraining roster. The frozen historical `CORPUS_MATCHED_TRAIN_DATASETS` is not
+    checked here since 2026-09-11: pamap2 was retired from training and reused as the unscored
+    wrist posture canary, and a static pin against a retired recipe would forbid exactly that
+    reuse. Historical reproductions (`--corpus matched --allow-retired`) are still refused at
+    launch by `assert_selection_roster_is_untrained`, which reads the run's actual roster."""
     from data.scripts.curate.deployment_policy import (
         EXPANDED_PHASE_A_TRAIN_DATASETS,
-        CORPUS_MATCHED_TRAIN_DATASETS,
+        LABEL_FREE_PRETRAIN_DATASETS,
     )
 
-    for corpus in (EXPANDED_PHASE_A_TRAIN_DATASETS, CORPUS_MATCHED_TRAIN_DATASETS):
+    for corpus in (EXPANDED_PHASE_A_TRAIN_DATASETS, LABEL_FREE_PRETRAIN_DATASETS):
         assert not set(PHASE_A_SELECTION_DATASETS) & set(corpus)
 
 
-def test_selection_roster_is_disjoint_from_the_phase_b_test_roster():
-    """Selecting on a Phase-B test dataset would silently burn the readout."""
-    from data.scripts.curate.deployment_policy import (
-        ESTABLISHED_EVAL_DATASETS,
-        NEW_HELDOUT_EVAL_DATASETS,
-    )
+def test_selection_roster_is_disjoint_from_the_sealed_test_roster():
+    """Selecting on a sealed test dataset would silently burn the readout."""
+    from data.scripts.curate.deployment_policy import SEALED_TEST_EVAL_DATASETS
 
-    test_roster = set(ESTABLISHED_EVAL_DATASETS + NEW_HELDOUT_EVAL_DATASETS) - {
-        "motionsense", "realworld", "shoaib",      # the declared development cohorts
-    }
-    assert not set(PHASE_A_SELECTION_DATASETS) & test_roster
+    assert not set(PHASE_A_SELECTION_DATASETS) & set(SEALED_TEST_EVAL_DATASETS)
 
 
-def test_guard_rejects_a_trained_selection_source():
-    overlap = [PHASE_A_SELECTION_DATASETS[0], "capture24"]
-    with pytest.raises(ValueError, match="must be held out"):
-        assert_selection_roster_is_untrained(overlap)
+def test_selection_roster_is_empty_under_the_three_role_rule():
+    """No labelled selection source: the fixed-schedule final checkpoint is the a-priori choice."""
+    assert PHASE_A_SELECTION_STREAMS == ()
+    assert PHASE_A_SELECTION_DATASETS == ()
+    # An explicit offline call may still not name a source the encoder trained on.
+    assert_selection_roster_is_untrained(("capture24_pretrain",))  # empty roster: no overlap
     assert_selection_roster_is_untrained(["capture24", "wisdm"])       # no overlap -> silent
 
 
 def test_roster_covers_more_than_phone_placements():
-    """A phone-only roster is close to blind to the wrist damage it exists to catch."""
+    """Retired guard: with no selection roster there is nothing to be blind with. Kept so a future
+    roster that is reintroduced must again include a wrist stream."""
     placements = {stream for _, stream, _ in PHASE_A_SELECTION_STREAMS}
-    assert any("wrist" in placement for placement in placements)
+    assert not placements or any("wrist" in placement for placement in placements)
 
 
 def test_subsample_returns_every_row_when_under_cap():

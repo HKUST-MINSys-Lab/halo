@@ -55,16 +55,18 @@ ACTIVITIES = {
     "Sit": "sitting",
     "Talk-sit": "talking_sitting",
     "Talk-stand": "talking_standing",
-    "Stand-sit": "standing_up_from_sitting",
+    # The release describes these as repeated bidirectional sequences, not one-way
+    # transitions. Keeping them distinct avoids contaminating transition classes.
+    "Stand-sit": "repeated_standing_and_sitting",
     "Lay": "lying",
-    "Lay-stand": "standing_up_from_laying",
+    "Lay-stand": "repeated_standing_and_lying",
     "Pick": "picking_up",
     "Jump": "jumping",
     "Push-up": "push_up",
     "Sit-up": "sit_up",
     "Walk": "walking",
     "Walk-backwards": "walking_backwards",
-    "Walk-circle": "walking",  # Map to walking
+    "Walk-circle": "walking_in_circles",
     "Run": "running",
     "Stair-up": "walking_upstairs",
     "Stair-down": "walking_downstairs",
@@ -78,6 +80,42 @@ OUTPUT_DIR = DS_DIR
 
 # Dataset parameters
 SAMPLE_RATE = 100.0  # Hz
+CLOCK_GAP_INTERVALS = 5
+
+
+def split_clock_runs(frame: pd.DataFrame) -> list[pd.DataFrame]:
+    """Split a KU-HAR file at genuine clock resets and material timing gaps.
+
+    The release contains millisecond-scale backwards timestamp jitter, which must remain in the
+    same physical recording, as well as rare 18--41 second resets and missing stretches.  Estimate
+    the normal cadence from positive intervals, then use a cadence-relative threshold so this does
+    not encode a source-specific magic number.
+    """
+    if frame.empty:
+        return []
+    clock = pd.to_numeric(frame["timestamp_sec"], errors="coerce").to_numpy(np.float64)
+    positive = np.diff(clock)
+    positive = positive[np.isfinite(positive) & (positive > 0) & (positive < 1.0)]
+    observed_dt = float(np.median(positive)) if positive.size >= 5 else 1.0 / SAMPLE_RATE
+    # A small subset of releases records bursts at 1--2 ms followed by ~20 ms idle periods.  The
+    # median positive delta then describes the serializer, not the physical 100 Hz acquisition;
+    # using it alone would turn each ordinary burst into a fake gap.  A true gap must exceed both
+    # the observed cadence and the documented sensor cadence by this many intervals.
+    threshold = CLOCK_GAP_INTERVALS * max(observed_dt, 1.0 / SAMPLE_RATE)
+    delta = np.diff(clock)
+    cuts = np.flatnonzero(
+        ~np.isfinite(delta) | (delta < -threshold) | (delta > threshold)
+    ) + 1
+    bounds = np.r_[0, cuts, len(frame)]
+    runs: list[pd.DataFrame] = []
+    for start, stop in zip(bounds[:-1], bounds[1:]):
+        run = frame.iloc[int(start):int(stop)].copy().reset_index(drop=True)
+        # Preserve even a short terminal run. Grid construction later applies the experiment's
+        # minimum-window rule; dropping it here would silently turn a clock repair into data loss.
+        if len(run) >= 2:
+            # Each run receives its own uniform local clock after any anti-aliased resampling.
+            runs.append(run)
+    return runs
 
 
 def parse_folder_name(folder_name: str) -> Optional[str]:
@@ -241,36 +279,38 @@ def convert_kuhar():
             skipped_count += 1
             continue
 
-        # Estimate this file's true rate from its timestamps (subject 1016 ≈ 111 Hz).
-        # Windowing counts samples, so a wrong rate mis-sizes windows in seconds.
-        file_rate = _estimate_rate(df["timestamp_sec"].values, SAMPLE_RATE)
-        if abs(file_rate - SAMPLE_RATE) / SAMPLE_RATE > 0.05 and subject not in rate_warned:
-            print(f"  ⚠ subject {subject}: est. rate {file_rate:.1f} Hz (nominal {SAMPLE_RATE}) — windowing at true rate")
-            rate_warned.add(subject)
+        runs = split_clock_runs(df)
+        if not runs:
+            skipped_count += 1
+            continue
+        if len(runs) > 1:
+            print(f"  split {filepath.name} into {len(runs)} clock-contiguous runs")
+        for part, run in enumerate(runs):
+            # Estimate each run's true rate (subject 1016 is about 111 Hz). Windowing counts
+            # samples, so a wrong rate mis-sizes physical windows.
+            file_rate = _estimate_rate(run["timestamp_sec"].values, SAMPLE_RATE)
+            if abs(file_rate - SAMPLE_RATE) / SAMPLE_RATE > 0.05 and subject not in rate_warned:
+                print(f"  ⚠ subject {subject}: est. rate {file_rate:.1f} Hz (nominal {SAMPLE_RATE}) — resampling")
+                rate_warned.add(subject)
 
-        # Normalize this file to the nominal 100 Hz so build_grids (which resamples once at the
-        # dataset rate from metadata.json) sees a single true rate. KU-HAR is 100 Hz except a few
-        # files (e.g. subject 1016 ≈ 111 Hz); anti-alias resample those to 100 Hz here.
-        chans = ["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"]
-        if abs(file_rate - SAMPLE_RATE) / SAMPLE_RATE > 0.02:
-            s, d = int(round(file_rate)), int(round(SAMPLE_RATE))
-            g = gcd(s, d)
-            arr = resample_poly(df[chans].to_numpy(np.float64), up=d // g, down=s // g, axis=0)
-            df = pd.DataFrame(arr, columns=chans)
-            df["timestamp_sec"] = np.arange(len(df)) / SAMPLE_RATE
+            # Normalize each contiguous run to 100 Hz.  Never interpolate across a clock seam.
+            chans = ["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"]
+            if abs(file_rate - SAMPLE_RATE) / SAMPLE_RATE > 0.02:
+                s, d = int(round(file_rate)), int(round(SAMPLE_RATE))
+                g = gcd(s, d)
+                arr = resample_poly(run[chans].to_numpy(np.float64), up=d // g, down=s // g, axis=0)
+                run = pd.DataFrame(arr, columns=chans)
+            run["timestamp_sec"] = np.arange(len(run), dtype=np.float64) / SAMPLE_RATE
+            run["subject"] = f"s{subject:04d}"
+            session_id = f"s{subject:04d}_{activity}_{i:04d}_p{part:02d}"
+            session_dir = sessions_dir / session_id
+            session_dir.mkdir(exist_ok=True)
+            run.to_parquet(session_dir / "data.parquet", index=False)
 
-        # Save the whole continuous single-activity recording as ONE session (build_grids does the
-        # fixed 6 s windowing). Subject id for subject-disjoint splits (read by iter_sessions).
-        df["subject"] = f"s{subject:04d}"
-        session_id = f"s{subject:04d}_{activity}_{i:04d}"
-        session_dir = sessions_dir / session_id
-        session_dir.mkdir(exist_ok=True)
-        df.to_parquet(session_dir / "data.parquet", index=False)
-
-        all_labels[session_id] = [activity]
-        subject_window_counts[subject] = subject_window_counts.get(subject, 0) + 1
-        session_count += 1
-        activity_counts[activity] = activity_counts.get(activity, 0) + 1
+            all_labels[session_id] = [activity]
+            subject_window_counts[subject] = subject_window_counts.get(subject, 0) + 1
+            session_count += 1
+            activity_counts[activity] = activity_counts.get(activity, 0) + 1
 
         if (i + 1) % 500 == 0:
             print(f"  Processed {i + 1}/{len(data_files)} files, {session_count} sessions...")
@@ -319,8 +359,9 @@ def create_manifest():
 
     Kept in sync with the committed ``data/kuhar/manifest.json`` so re-running the
     converter does not silently degrade the manifest. Notes captured here:
-      - 17 unique standardized activities (18 source folders; Walk and Walk-circle
-        both map to ``walking``).
+      - 18 unique activities. In particular, the repeated stand/sit and stand/lie
+        protocols remain bidirectional classes, and circular walking is not folded
+        into straight walking.
       - Accelerometer is GRAVITY-REMOVED (linear acceleration): |acc| over static
         activities (standing/sitting/lying) is ~0.06, not ~9.8/1.0. Verified
         empirically. The gravity-canonicalization augmentation must treat these
@@ -330,7 +371,7 @@ def create_manifest():
     """
     manifest = {
         "dataset_name": "KU-HAR",
-        "description": "KU-HAR (Khulna University Human Activity Recognition) dataset. 89 subjects performing 17 activities including walking, running, jumping, stairs, sitting, standing, lying, and exercises (push-ups, sit-ups). Smartphone IMU with triaxial accelerometer (gravity removed / linear acceleration) and gyroscope.",
+        "description": "KU-HAR (Khulna University Human Activity Recognition) dataset. 89 subjects performing 18 activities including walking, running, jumping, stairs, sitting, standing, lying, repeated posture transitions, and exercises. Smartphone IMU with triaxial accelerometer (gravity removed / linear acceleration) and gyroscope.",
         "source": "https://www.kaggle.com/datasets/niloy333/kuhar",
         "num_subjects": 89,
         "channels": [

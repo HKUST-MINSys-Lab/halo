@@ -328,7 +328,8 @@ The live trainer records:
 - physical reconstruction error versus a zero predictor;
 - valid target count and target coverage by horizon, resolution, and source dataset;
 - mask-overlap leakage count, which must remain zero; and
-- fixed downstream development probes evaluated without fitting on sealed test data.
+- offline representation diagnostics on non-sealed data; these are reported diagnostics, not a
+  checkpoint-selection signal for the current fixed-schedule JEPA recipe.
 
 The offline acceptance audit additionally checks duplicate-vector rate, sensor/configuration target
 coverage, and physical prediction against training-mean, previous-context, and temporal-interpolation
@@ -341,8 +342,8 @@ large source dominates solely through token count, or resume changes the teacher
 
 ## 9. Controlled experiment
 
-Run three sample-matched arms with the same encoder, corpus, optimizer budget, and development
-selection protocol:
+Run three sample-matched arms with the same encoder, corpus, optimizer budget, and fixed final-step
+checkpoint rule:
 
 | arm | objective | purpose |
 |---|---|---|
@@ -357,6 +358,10 @@ Use `--physical-weight 0` for arm B. Arm C is the default. Both use the same fut
 student/teacher encoders, corpus sampler, and downstream selection probes.
 
 ## 10. Implementation map
+
+The operational corpus, exposure budget, and current measured runtime live in
+[PRETRAINING_CORPUS.md](../data/PRETRAINING_CORPUS.md); this design document does not duplicate
+hardware-dependent estimates.
 
 - `training/tokenizer/future_jepa.py`: physical-time target planner, metadata-only future predictor,
   normalized teacher targets, balanced losses, and fixed objective calibration.

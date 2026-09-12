@@ -1,8 +1,8 @@
-"""harnet / ssl-wearables adapter (ConSE tier).
+"""HARNet / SSL-Wearables adapter, with a historical ConSE readout.
 
 A FROZEN OxWearables ``harnet5`` ResNet trunk (30 Hz, 3-ch accelerometer, g-units
-WITH gravity, no other normalization) + the shared 2-layer probe fit on OUR 93-way
-global training vocabulary (``data/labels/global_labels.json``). The base bridges
+WITH gravity, no other normalization) + an optional shared 2-layer probe fit on the
+canonical training vocabulary (``data/labels/global_labels.json``). The base bridges
 that softmax to the target dataset's labels with ConSE, so harnet — which has no
 text tower — is scored zero-shot exactly like the other closed-vocab baselines.
 
@@ -26,7 +26,7 @@ Two things are carried over verbatim, one is fixed:
     subject appears in both the head-train and the head-selection fold, so the
     early-stopping signal cannot be inflated by within-subject correlation. The
     eval targets are a separate held-out cohort, so there is no target leakage at
-    all (that guarantee is structural in ZS-XD).
+    all (that guarantee is structural in the dataset-held-out protocol).
 
 Gravity guard: harnet's contract requires gravity RETAINED. Training datasets
 whose accelerometer has gravity removed (detected as a near-zero DC magnitude,
@@ -76,7 +76,7 @@ SSL_HUB_TAG = "v1.0.0"
 #             OFF-THE-SHELF / deployment row: what a practitioner gets by downloading harnet
 #             today. Leaving it untouched keeps the previously published number valid.
 #   "matched" — HALO's exact 12-dataset / 20-stream training corpus with HALO's same per-stream
-#             cap. This is the SCIENTIFIC CONTROL: it removes the confound that HALO's memory bank
+#             cap. This is the historical scientific control: it removes the confound that HALO's support corpus
 #             saw wrist streams (sp_sw_har, nfi_fared, harmes, xrf_v2) that harnet's head-fit never
 #             did — and the wrist cells are exactly where HALO beat harnet.
 # Note the corpora can never be byte-identical: harnet REQUIRES gravity, so the gravity-removed

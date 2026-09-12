@@ -1,9 +1,9 @@
 """One repeatable command to fetch, convert, and grid the label-free pretraining corpus.
 
     python -m data.pretraining.build_corpus --plan
-    python -m data.pretraining.build_corpus --stage fetch   --datasets nhanes --yes
-    python -m data.pretraining.build_corpus --stage convert --datasets nhanes
-    python -m data.pretraining.build_corpus --stage grids   --datasets nhanes
+    python -m data.pretraining.build_corpus --stage fetch   --datasets capture24_pretrain --yes
+    python -m data.pretraining.build_corpus --stage convert --datasets capture24_pretrain
+    python -m data.pretraining.build_corpus --stage grids   --datasets capture24_pretrain
 
 Each stage is independently resumable, because each is idempotent on its own outputs: a
 fetcher skips archives it already has, a converter rewrites ``sessions/`` from whatever is
@@ -41,9 +41,11 @@ PRETRAIN_ROOT = Path(__file__).resolve().parent
 #: Grid datasets a source produces. Most sources are one dataset; Nymeria records two
 #: device families at different rates, so it converts into two dataset directories.
 GRID_DATASETS = {
+    "capture24_pretrain": ("capture24_pretrain",),
     "nhanes": ("nhanes",),
     "nymeria_xsens": ("nymeria_xsens",),
     "nymeria_aria": ("nymeria_aria",),
+    "extrasensory_pretrain": ("extrasensory_pretrain",),
     "ego_exo4d": ("ego_exo4d",),
     "synthetic_imu": ("synthetic_imu",),
 }
@@ -51,9 +53,11 @@ GRID_DATASETS = {
 #: Where each planned source's fetch/convert modules live. Nymeria's two dataset
 #: directories share one fetcher and one converter, because they come from one download.
 MODULE_ROOT = {
+    "capture24_pretrain": "data.pretraining.capture24_pretrain",
     "nhanes": "data.pretraining.nhanes",
     "nymeria_xsens": "data.pretraining.nymeria",
     "nymeria_aria": "data.pretraining.nymeria",
+    "extrasensory_pretrain": "data.pretraining.extrasensory_pretrain",
     "ego_exo4d": "data.pretraining.ego_exo4d",
     "synthetic_imu": "data.pretraining.synthetic_imu",
 }
@@ -62,9 +66,11 @@ MODULE_ROOT = {
 # Fetchers have different interfaces, so invoking them bare either fails (NHANES/Ego-Exo4D)
 # or quietly selects a development-sized default (Nymeria/synthetic IMU).
 FETCH_ARGS = {
-    "nhanes": ("--subjects", "3000"),
-    "nymeria_xsens": ("--all-sequences", "--max-gb", "120"),
+    "capture24_pretrain": (),
+    "nhanes": ("--subjects", "128", "--workers", "16"),
+    "nymeria_xsens": ("--sequences", "40", "--max-gb", "120", "--workers", "8"),
     "nymeria_aria": ("--all-sequences", "--max-gb", "120"),
+    "extrasensory_pretrain": (),
     # Ego-Exo4D must be fetched in bounded batches and converted with --keep-existing because
     # its VRS input is intentionally discarded after each batch. See its README for the loop.
     "ego_exo4d": None,
@@ -74,9 +80,11 @@ FETCH_ARGS = {
 }
 
 CONVERT_ARGS = {
+    "capture24_pretrain": (),
     "nhanes": (),
-    "nymeria_xsens": (),
+    "nymeria_xsens": ("--streams", "xsens"),
     "nymeria_aria": (),
+    "extrasensory_pretrain": (),
     "ego_exo4d": None,
     "synthetic_imu": ("--sources", "amass", "motion_x", "100style"),
 }

@@ -48,6 +48,7 @@ from data.scripts.curate.deployment_policy import (
     StreamSpec,
     deployment_streams,
     session_stream_specs,
+    stream_specs,
 )
 from data.scripts.labels.canonical_labels import canonicalize
 
@@ -76,7 +77,8 @@ Session = Tuple[pd.DataFrame, float, object]
 def stream_grid(dataset: str, spec: StreamSpec, sessions: Iterable[Session], *,
                 alignment: str, resample_to: Optional[float], canonical_labels: bool,
                 view: str, pre_windowed: bool = False,
-                window_seconds: float = WINDOW_SECONDS) -> Tuple[Grid, List]:
+                window_seconds: float = WINDOW_SECONDS,
+                include_partial: Optional[bool] = None) -> Tuple[Grid, List]:
     """Assemble every session of ONE device stream into a single stacked `Grid`.
 
     The three build concerns are decoupled (a stream can mix them — see ``_ALIGNMENTS``):
@@ -93,6 +95,8 @@ def stream_grid(dataset: str, spec: StreamSpec, sessions: Iterable[Session], *,
     Returns ``(grid, subjects)`` where ``subjects`` is one entry per window (for subject-disjoint splits).
     """
     sessions = list(sessions)
+    if include_partial is None:
+        include_partial = alignment == "native"
     datas: List[np.ndarray] = []
     labels: List = []
     subjects: List = []
@@ -115,7 +119,7 @@ def stream_grid(dataset: str, spec: StreamSpec, sessions: Iterable[Session], *,
         window = forced_window if forced_window is not None else max(1, round(window_seconds * out_rate))
         g = assemble(frame, dataset, spec, alignment=view, window=window,
                      rate_hz=native_rate, resample_to=resample_to,
-                     include_partial=(alignment == "native"))
+                     include_partial=include_partial)
         if len(g.data) == 0:
             continue
         datas.append(g.data)
@@ -150,6 +154,48 @@ def stream_grid(dataset: str, spec: StreamSpec, sessions: Iterable[Session], *,
 # --------------------------------------------------------------------------------------------------
 # Disk I/O — reads what the converters produce. Thin by design; the logic above is what's tested.
 # --------------------------------------------------------------------------------------------------
+
+
+def iter_logical_segments(frame: pd.DataFrame) -> Iterable[pd.DataFrame]:
+    """Yield independent logical sessions encoded inside one physical Parquet.
+
+    Most converters store one logical session per file and therefore have no
+    ``segment_id`` column. Large snippet corpora may aggregate many captures into one
+    participant/stream file to avoid hundreds of thousands of tiny files. For those,
+    this is the sole expansion point: grid assembly sees each segment independently,
+    so resampling, fixed-window slicing, and final partial padding can never cross a
+    source capture or clock-gap boundary.
+    """
+    if "segment_id" not in frame.columns:
+        yield frame
+        return
+    raw_ids = frame["segment_id"].to_numpy()
+    if not len(raw_ids):
+        return
+    try:
+        numeric_ids = np.asarray(raw_ids, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("segment_id must contain finite integers") from exc
+    if not np.isfinite(numeric_ids).all() or not np.equal(numeric_ids, np.floor(numeric_ids)).all():
+        raise ValueError("segment_id must contain finite integers")
+    segment_ids = numeric_ids.astype(np.int64)
+    starts = np.r_[0, np.flatnonzero(segment_ids[1:] != segment_ids[:-1]) + 1]
+    stops = np.r_[starts[1:], len(frame)]
+    ordered_ids = segment_ids[starts]
+    if len(np.unique(ordered_ids)) != len(ordered_ids):
+        raise ValueError("each segment_id must occupy one contiguous run")
+    source_attrs = dict(frame.attrs)
+    base_session = source_attrs.get("halo_session_id")
+    base_event = source_attrs.get("halo_event_id") or base_session
+    for start, stop, segment_id in zip(starts, stops, ordered_ids):
+        segment = frame.iloc[int(start):int(stop)].drop(columns="segment_id")
+        segment.attrs.update(source_attrs)
+        if base_session is not None:
+            segment.attrs["halo_session_id"] = f"{base_session}:segment:{int(segment_id)}"
+        if base_event is not None:
+            segment.attrs["halo_event_id"] = f"{base_event}:segment:{int(segment_id)}"
+        yield segment
+
 
 def iter_sessions(dataset: str, spec: StreamSpec,
                   keep_ids: Optional[set] = None) -> Iterable[Session]:
@@ -203,7 +249,10 @@ def iter_sessions(dataset: str, spec: StreamSpec,
         # Subject for subject-disjoint splits: a `subject` column if present, else the session-id
         # prefix (converters encode the subject in the id, e.g. "sub01_..." / "subject3_...").
         subject = frame["subject"].iloc[0] if "subject" in frame.columns else sid.split("_")[0]
-        yield frame, native_rate, subject
+        yield from (
+            (segment, native_rate, subject)
+            for segment in iter_logical_segments(frame)
+        )
 
     if orphans:
         print(f"  [{dataset}/{spec.stream_id}] skipped {orphans} session directories absent from "
@@ -279,6 +328,16 @@ def _streaming_grid_enabled(dataset: str) -> bool:
     """
     meta = dataset_root(dataset) / "metadata.json"
     return bool(meta.exists() and json.loads(meta.read_text()).get("streaming_grid", False))
+
+
+def _full_windows_only(dataset: str) -> bool:
+    """Whether native grids omit incomplete source contexts.
+
+    Future-prediction corpora made from independent snippets can otherwise be dominated by
+    padded examples that cannot supply all configured prediction horizons.
+    """
+    meta = dataset_root(dataset) / "metadata.json"
+    return bool(meta.exists() and json.loads(meta.read_text()).get("full_windows_only", False))
 
 
 def _greedy_class_cap(per_class: dict, max_hours: float) -> set:
@@ -385,6 +444,7 @@ def _write_streaming_grid(
     view: str,
     pre_windowed: bool = False,
     window_seconds: float = WINDOW_SECONDS,
+    include_partial: bool = False,
 ) -> None:
     """Two-pass, constant-signal-memory grid writer.
 
@@ -410,7 +470,7 @@ def _write_streaming_grid(
             native_rate,
             resample_to=resample_to,
             view=view,
-            include_partial=(alignment == "native"),
+            include_partial=include_partial,
             forced_window=forced_window,
             window_seconds=window_seconds,
         )
@@ -475,7 +535,7 @@ def _write_streaming_grid(
                 native_rate,
                 resample_to=resample_to,
                 view=view,
-                include_partial=(alignment == "native"),
+                include_partial=include_partial,
                 forced_window=forced_window,
                 window_seconds=window_seconds,
             )
@@ -572,6 +632,7 @@ def build(out_root: Optional[Path] = None, datasets: Optional[Sequence[str]] = N
         if want and spec.dataset not in want:
             continue
         pw = _pre_windowed(spec.dataset)
+        full_windows_only = _full_windows_only(spec.dataset)
         cap = _max_hours_per_class(spec.dataset)
         keep_ids = _capped_session_ids(spec.dataset, spec, cap) if cap else None
         if keep_ids is not None:
@@ -580,6 +641,7 @@ def build(out_root: Optional[Path] = None, datasets: Optional[Sequence[str]] = N
             s.dataset, s, keep_ids=ids
         )
         for name, resample_to, canonical, view in regimes:
+            include_partial = name == "native" and not full_windows_only
             if _streaming_grid_enabled(spec.dataset):
                 _write_streaming_grid(
                     out_root,
@@ -592,6 +654,7 @@ def build(out_root: Optional[Path] = None, datasets: Optional[Sequence[str]] = N
                     view=view,
                     pre_windowed=pw,
                     window_seconds=window_seconds,
+                    include_partial=include_partial,
                 )
             else:
                 sessions = list(sessions_factory())
@@ -605,6 +668,7 @@ def build(out_root: Optional[Path] = None, datasets: Optional[Sequence[str]] = N
                     view=view,
                     pre_windowed=pw,
                     window_seconds=window_seconds,
+                    include_partial=include_partial,
                 )
                 _save(out_root, spec, grid, subjects)
 
@@ -622,9 +686,13 @@ def build_stream_specs(datasets: Optional[Sequence[str]] = None) -> Tuple[Stream
             if spec.dataset in want
         )
     default_datasets = set(EXPANDED_PHASE_A_TRAIN_DATASETS) | set(PRIMARY_EVAL_DATASETS)
+    # The sealed roster may include an explicitly disclosed placement proxy (currently
+    # UT-Complex's wrist-mounted phone).  It is not eligible for phone/watch compatibility
+    # pooling, but it must still be materialised when the declared sealed roster is rebuilt.
+    # Resolve primary specs directly rather than through ``deployment_streams``, which correctly
+    # excludes proxies from the deployment-compatible training view.
     primary = tuple(
-        spec for spec in deployment_streams(placement_strict=False, role="primary")
-        if spec.dataset in default_datasets
+        spec for dataset in default_datasets for spec in stream_specs(dataset, "primary")
     )
     direct = tuple(
         spec for spec in deployment_streams(placement_strict=False, role=None)

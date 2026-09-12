@@ -28,7 +28,11 @@ import numpy as np
 
 # Train datasets for the subset. wisdm contributes both its streams (20 Hz pocket + wrist); the
 # rest one each. CorpusIndex splits subjects disjointly within each dataset.
-SUBSET_TRAIN_DATASETS = ("wisdm", "hhar", "unimib_shar", "pamap2", "kuhar")
+# Rebuilt 2026-09-11: unimib_shar and pamap2 were retired from the head roster, so the old tuple
+# was refused at launch by `assert_no_retired_sources`. The replacements keep the property the
+# subset exists for - a wide native-rate spread across few sources - at 20 / 25 / 50 / 51.2 /
+# 100 Hz, with xrf_v2 still held out as the unseen configuration.
+SUBSET_TRAIN_DATASETS = ("wisdm", "dsads", "hhar", "forth_trace", "kuhar")
 
 # Held-out for cross-config transfer (unseen dataset -> every window is an unseen config).
 SUBSET_HELDOUT_DATASETS = ("xrf_v2",)
@@ -40,8 +44,14 @@ PLACEMENT = {
     ("wisdm", "phone_pocket"): "pocket", ("wisdm", "watch_wrist"): "wrist",
     ("hhar", "phone_waist"): "waist",
     ("hhar", "phone_waist_accel_only"): "waist",
-    ("unimib_shar", "phone_pocket"): "pocket",
-    ("pamap2", "watch_wrist"): "wrist", ("kuhar", "phone_waist"): "waist",
+    ("dsads", "left_wrist"): "wrist", ("dsads", "right_wrist"): "wrist",
+    ("dsads", "chest"): "chest", ("dsads", "left_knee"): "knee",
+    ("dsads", "right_knee"): "knee",
+    ("forth_trace", "left_wrist"): "wrist", ("forth_trace", "right_wrist"): "wrist",
+    ("forth_trace", "chest"): "chest", ("forth_trace", "torso"): "torso",
+    ("forth_trace", "left_ankle"): "ankle",
+    ("forth_trace", "right_thigh"): "thigh",
+    ("kuhar", "phone_waist"): "waist",
     ("xrf_v2", "left_wrist"): "wrist", ("xrf_v2", "right_wrist"): "wrist",
     ("xrf_v2", "left_pocket"): "pocket", ("xrf_v2", "right_pocket"): "pocket",
     ("xrf_v2", "glasses"): "glasses", ("xrf_v2", "airpods_ear"): "ear",

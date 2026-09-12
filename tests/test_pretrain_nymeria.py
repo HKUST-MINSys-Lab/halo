@@ -221,24 +221,10 @@ def _fake_url_json(sequence_count=6, *, group_bytes=10_000_000_000, sizes=True):
     for i in range(sequence_count):
         uid = f"20230607_s{i}_indoor_ace{i:03d}"
         sequences[uid] = {
-            "body_raw": {
-                "xdata.mvnx": {
-                    "download_url": f"https://example.invalid/{uid}/xdata.mvnx",
-                    "filename": "xdata.mvnx",
-                    **({"file_size_bytes": group_bytes} if sizes else {}),
-                },
-                "xdata.npz": {
-                    "download_url": f"https://example.invalid/{uid}/xdata.npz",
-                    "filename": "xdata.npz",
-                    **({"file_size_bytes": group_bytes} if sizes else {}),
-                },
-            },
-            "timesync_and_imu": {
-                "motion_head.vrs": {
-                    "download_url": f"https://example.invalid/{uid}/head/motion.vrs",
-                    "filename": "recording_head/data/motion.vrs",
-                    **({"file_size_bytes": group_bytes} if sizes else {}),
-                }
+            "body_xdata_mvnx": {
+                "download_url": f"https://example.invalid/{uid}/xdata.mvnx",
+                "filename": f"Nymeria_v0.0_{uid}_body_xdata.mvnx",
+                **({"file_size_bytes": group_bytes} if sizes else {}),
             },
             # A group we must never request, sized so that including it would blow
             # any sane budget.
@@ -260,8 +246,8 @@ def test_catalog_parse_and_group_filter():
     plan = fetch.build_plan(catalog, sorted(catalog)[:2], fetch.DEFAULT_GROUPS)
     assert {r.group for r in plan.records} == set(fetch.DEFAULT_GROUPS)
     assert "recording_head_rgb" not in {r.group for r in plan.records}
-    assert len(plan.records) == 2 * 3
-    assert plan.known_bytes == 6 * 10_000_000_000
+    assert len(plan.records) == 2
+    assert plan.known_bytes == 2 * 10_000_000_000
 
 
 def test_sequence_selection_is_deterministic_and_bounded():
@@ -279,9 +265,9 @@ def test_sequence_selection_is_deterministic_and_bounded():
 def test_max_gb_refusal():
     catalog = fetch.parse_catalog(_fake_url_json())
     plan = fetch.build_plan(catalog, sorted(catalog), fetch.DEFAULT_GROUPS)
-    assert plan.known_bytes / 1e9 == pytest.approx(180.0)
+    assert plan.known_bytes / 1e9 == pytest.approx(60.0)
     with pytest.raises(fetch.BudgetExceeded, match="over the --max-gb budget"):
-        fetch.check_budget(plan, max_gb=120.0)
+        fetch.check_budget(plan, max_gb=50.0)
     fetch.check_budget(plan, max_gb=200.0)  # under budget: no raise
 
 
@@ -313,7 +299,7 @@ def test_missing_url_json_raises_an_actionable_licence_error(tmp_path):
         fetch.load_url_json(tmp_path / "url.json")
     message = str(excinfo.value)
     assert "projectaria.com/datasets/nymeria" in message
-    assert "body_raw" in message and "timesync_and_imu" in message
+    assert "body_xdata_mvnx" in message
 
 
 def test_unrecognised_url_json_shape_is_reported_not_guessed():
@@ -322,22 +308,20 @@ def test_unrecognised_url_json_shape_is_reported_not_guessed():
 
 
 def test_record_relative_path_uses_the_verified_group_layout():
-    record = fetch.FileRecord("seq1", "body_raw", "https://x/y", "xdata.mvnx", 1, None)
-    assert record.relative_path == "seq1/body/xdata.mvnx"
-    nested = fetch.FileRecord(
-        "seq1", "timesync_and_imu", "https://x/y", "recording_lwrist/data/motion.vrs", 1, None
-    )
-    assert nested.relative_path == "seq1/recording_lwrist/data/motion.vrs"
-
-
-def test_completed_zip_is_extracted_before_it_is_reported_present(tmp_path):
-    """A resumed fallback download must give convert.py the official CLI's layout."""
-    destination = tmp_path / "seq1" / "body_raw" / "body.zip"
-    destination.parent.mkdir(parents=True)
-    with zipfile.ZipFile(destination, "w") as archive:
-        archive.writestr("seq1/body/xdata.mvnx", "mvnx payload")
     record = fetch.FileRecord(
-        "seq1", "body_raw", "https://unused.invalid/body.zip", "body.zip",
+        "seq1", "body_xdata_mvnx", "https://x/y", "release_body_xdata.mvnx", 1, None
+    )
+    assert record.relative_path == "seq1/body/xdata.mvnx"
+
+
+def test_completed_release_named_mvnx_is_reported_present(tmp_path):
+    """The fallback maps the release filename to the converter's stable layout."""
+    destination = tmp_path / "seq1" / "body" / "xdata.mvnx"
+    destination.parent.mkdir(parents=True)
+    destination.write_text("mvnx payload")
+    record = fetch.FileRecord(
+        "seq1", "body_xdata_mvnx", "https://unused.invalid/release_body_xdata.mvnx",
+        "release_body_xdata.mvnx",
         destination.stat().st_size, None,
     )
     assert fetch.download_record(tmp_path, record) == destination.stat().st_size
@@ -696,6 +680,16 @@ def test_subject_without_verified_identity_is_rejected(tmp_path):
         convert.resolve_subject(sequence, mvnx_subject=None)
     (sequence / "metadata.json").write_text(json.dumps({"session": {"participant": "P7"}}))
     assert convert.resolve_subject(sequence) == ("P7", "metadata.json:participant")
+
+
+def test_official_sequence_uid_supplies_recurring_subject_not_generic_mvn_label(tmp_path):
+    first = tmp_path / "20231222_s0_denise_carter_act2_d8mdi5"
+    second = tmp_path / "20231222_s0_denise_carter_act3_3itytl"
+    first.mkdir()
+    second.mkdir()
+    expected = ("denise_carter", "official_sequence_uid:pseudonym")
+    assert convert.resolve_subject(first, mvnx_subject="MVN System") == expected
+    assert convert.resolve_subject(second, mvnx_subject="MVN System") == expected
 
 
 # ======================================================================================

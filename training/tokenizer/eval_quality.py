@@ -1,9 +1,10 @@
 """Comprehensive quality battery for a frozen Phase-1 encoder.
 
 Characterizes the representation along the axes that matter for feeding an evidence
-engine — NOT a baseline-beating claim (that needs the M6 ConSE zero-shot protocol).
+engine.  It uses supervised-training sources only; sealed evaluation belongs exclusively to the
+support-protocol runner.
 
-Probes (all on HELD-OUT eval datasets, subject-disjoint unless noted):
+Probes (all on supervised-training sources, subject-disjoint unless noted):
   1. DISCRIMINABILITY   kNN-BA + linear-probe macro-F1 per dataset; per-class + confusion
   2. INVARIANCE         embedding drift (cosine / rel-L2) under rotation / gain / rate, and
                         kNN-BA when the QUERY is transformed vs a clean bank — the thesis test
@@ -166,21 +167,33 @@ def main():
     report["discriminability_per_stream"] = disc_stream
 
     # ---------- 2. invariance (drift + kNN-under-transform) ----------
+    # Keep this diagnostic entirely inside the supervised roster.  A quality probe must never
+    # casually consume a sealed test stream just because it has a convenient phone placement.
     inv = {}
-    ref = refs[("motionsense", "phone_front_pocket")]
+    from data.scripts.curate.deployment_policy import SUPERVISED_HEAD_TRAIN_DATASETS, stream_specs
+    candidates = [
+        (dataset, spec.stream_id)
+        for dataset in SUPERVISED_HEAD_TRAIN_DATASETS
+        for spec in stream_specs(dataset, "primary")
+        if (dataset, spec.stream_id) in refs
+    ]
+    if not candidates:
+        raise RuntimeError("no supervised stream is available for the invariance diagnostic")
+    dataset, stream = candidates[0]
+    ref = refs[(dataset, stream)]
     full = np.asarray(ref.load_lengths()) == ref.shape[1]
     data = ref.load_data()[full]
     labels = np.asarray(ref.labels)[full]
     subj = np.asarray(ref.subjects)[full]
-    texts = stream_channel_descriptions("motionsense", "phone_front_pocket")
+    texts = stream_channel_descriptions(dataset, stream)
     z0 = encode(enc, data, texts, device, rate=ref.rate_hz,
-                channel_mask=ref.mask, dataset="motionsense", stream="phone_front_pocket")
+                channel_mask=ref.mask, dataset=dataset, stream=stream)
     tr, te = subj_split(subj, rng)
     base_knn = knn_balanced_acc(z0[tr], labels[tr].tolist(), z0[te], labels[te].tolist())
     for kind in ("rotation", "gain", "rate"):
         xt, rt = transform_windows(data, kind, np.random.default_rng(SEED), ref.rate_hz)
         zt = encode(enc, xt, texts, device, rate=rt,
-                    channel_mask=ref.mask, dataset="motionsense", stream="phone_front_pocket")
+                    channel_mask=ref.mask, dataset=dataset, stream=stream)
         cos = torch.nn.functional.cosine_similarity(z0, zt, dim=1).mean().item()
         rel = ((z0 - zt).norm(dim=1) / (z0.norm(dim=1) + 1e-9)).mean().item()
         # classify TRANSFORMED query against CLEAN bank

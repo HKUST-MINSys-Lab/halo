@@ -70,6 +70,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import sys
 import xml.etree.ElementTree as ET
@@ -151,6 +152,14 @@ SUBJECT_KEYS = (
     "actor",
     "user_id",
 )
+
+# Official release UIDs encode the stable participant pseudonym between the
+# setup marker and activity marker. Across the issued 1,100-sequence manifest,
+# this yields 236 recurring identities rather than 1,100 recording identities.
+SEQUENCE_SUBJECT_RE = re.compile(
+    r"^\d{8}_s\d+_(?P<subject>.+)_act\d+_[^_]+$"
+)
+GENERIC_MVNX_SUBJECTS = {"mvn system", "mvn animate"}
 
 _ARIA_TOOLS_HINT = (
     "projectaria_tools is required to read Nymeria's motion.vrs files.\n"
@@ -856,7 +865,11 @@ def resolve_subject(sequence_dir: Path, mvnx_subject: str | None = None) -> tupl
             found = None
         if found:
             return found[0], f"metadata.json:{found[1]}"
-    if mvnx_subject and mvnx_subject.strip():
+    match = SEQUENCE_SUBJECT_RE.fullmatch(sequence_dir.name)
+    if match:
+        return match.group("subject"), "official_sequence_uid:pseudonym"
+    if (mvnx_subject and mvnx_subject.strip()
+            and mvnx_subject.strip().lower() not in GENERIC_MVNX_SUBJECTS):
         return mvnx_subject.strip(), "mvnx:subject@label"
     raise ValueError(
         f"{sequence_dir.name}: no verified participant identifier in metadata.json or MVNX; "
@@ -915,6 +928,16 @@ def _load_body(
 ) -> MvnxRecording | None:
     npz = sequence_dir / "body" / "xdata.npz"
     mvnx = sequence_dir / "body" / "xdata.mvnx"
+    if not mvnx.exists():
+        # The official downloader can retain the release filename instead of the
+        # stable body/xdata.mvnx path used by our fallback downloader.
+        matches = sorted(sequence_dir.glob("*_body_xdata.mvnx"))
+        if not matches:
+            matches = sorted(sequence_dir.rglob("*_body_xdata.mvnx"))
+        if len(matches) > 1:
+            raise ValueError(f"{sequence_dir.name}: multiple Xsens MVNX files: {matches[:3]}")
+        if matches:
+            mvnx = matches[0]
     if body_source in ("auto", "npz") and npz.exists():
         try:
             return load_npz_recording(npz, angular_unit=angular_unit)

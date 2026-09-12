@@ -1,6 +1,6 @@
 {
   "display_name": "KU-HAR",
-  "num_sessions": 17374,
+  "num_sessions": 2452,
   "sampling_rate_hz": 100,
   "channels": [
     "acc_x",
@@ -27,16 +27,17 @@
     "picking_up",
     "push_up",
     "running",
+    "repeated_standing_and_lying",
+    "repeated_standing_and_sitting",
     "sit_up",
     "sitting",
     "standing",
-    "standing_up_from_laying",
-    "standing_up_from_sitting",
     "table_tennis",
     "talking_sitting",
     "talking_standing",
     "walking",
     "walking_backwards",
+    "walking_in_circles",
     "walking_downstairs",
     "walking_upstairs"
   ],

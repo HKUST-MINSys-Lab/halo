@@ -408,11 +408,13 @@ def validation_subjects_for_refs(
     phase_a_only_datasets: frozenset[str] = PHASE_A_ONLY_DATASETS,
     rng: np.random.Generator | None = None,
 ) -> set[tuple[str, str]]:
-    """Return the exact subject-disjoint validation split used by Phase A.
+    """Return the exact subject-disjoint validation split used by encoder training.
 
     This is shared with offline artifacts derived from the training corpus. Keeping the split in one
     function prevents filterbank/bias calibration from silently seeing validation subjects while the
-    optimizer does not.
+    optimizer does not. A subject is eligible for validation only when every label they carry remains
+    represented by at least one training subject. This makes a smaller validation fold preferable to
+    creating a validation-only class that the optimizer can never learn.
     """
     rng = rng if rng is not None else np.random.default_rng(seed)
     selected: set[tuple[str, str]] = set()
@@ -439,23 +441,43 @@ def validation_subjects_for_refs(
                 raise ValueError(f"MM-Fit is missing published cross-subject workouts: {sorted(missing)}")
             selected.update((dataset, subject) for subject in sorted(guaranteed))
             continue
-        need = set().union(*(subj_labels.get((dataset, s), set()) for s in ordered))
+        remaining_label_subjects: dict[str, int] = {}
+        for subject in ordered:
+            for label in subj_labels.get((dataset, subject), set()):
+                remaining_label_subjects[label] = remaining_label_subjects.get(label, 0) + 1
+
+        # Only labels occurring in at least two subjects can be represented on both sides of a
+        # subject-disjoint split. Singleton-subject labels remain optimizer-only and are measured
+        # later on the sealed datasets rather than becoming impossible validation targets.
+        need = {label for label, count in remaining_label_subjects.items() if count >= 2}
         picked: list[str] = []
+
+        def can_hold_out(subject: str) -> bool:
+            return all(
+                remaining_label_subjects[label] > 1
+                for label in subj_labels.get((dataset, subject), set())
+            )
+
+        def hold_out(subject: str) -> None:
+            picked.append(subject)
+            for label in subj_labels.get((dataset, subject), set()):
+                remaining_label_subjects[label] -= 1
+
         while len(picked) < n_val and need:
             best = max(
-                (s for s in ordered if s not in picked),
+                (s for s in ordered if s not in picked and can_hold_out(s)),
                 key=lambda s: (len(subj_labels.get((dataset, s), set()) & need), s),
                 default=None,
             )
             if best is None or not (subj_labels.get((dataset, best), set()) & need):
                 break
-            picked.append(best)
+            hold_out(best)
             need -= subj_labels.get((dataset, best), set())
         for subject in ordered:
             if len(picked) >= n_val:
                 break
-            if subject not in picked:
-                picked.append(subject)
+            if subject not in picked and can_hold_out(subject):
+                hold_out(subject)
         selected.update((dataset, subject) for subject in picked)
     return selected
 
@@ -506,11 +528,13 @@ class CorpusIndex:
             for key in set(self.implausible) | set(self.duplicates)
         }
 
-        # Subject-disjoint split per dataset, chosen to COVER AS MANY LABELS as the budget allows.
+        # Subject-disjoint split per dataset, chosen to COVER AS MANY LABELS as the budget allows
+        # while retaining at least one training subject for every label.
         # A purely random 10% draw left whole labels with zero val windows (e.g. `sleeping`: 15,100
         # train / 0 val; `table_tennis`: 216/0), so val_knn_ba / val_conse_ba / best.pt selection
         # silently omitted whole labels while the code claimed all of them. Greedy set-cover over
-        # subjects fixes that without touching disjointness (a subject is still wholly train or val).
+        # subjects fixes that without touching disjointness (a subject is still wholly train or val)
+        # or creating validation-only labels.
         val_subjects = validation_subjects_for_refs(self.refs, seed=seed, rng=rng)
 
         # balanced selection + label map (train labels only)

@@ -74,6 +74,55 @@ RETIRED_TRAIN_DATASETS = {
     "opportunity": "4 subjects, 4 labels, 37% full windows. Four people cannot carry a cross-"
                    "subject comparison signal, yet uniform dataset sampling gave it 5.6% of "
                    "queries.",
+    "capture24": "Promoted wholesale to the source-isolated, label-free Capture-24 JEPA corpus "
+                 "on 2026-09-11. Keeping it in the supervised roster would reuse the same 151 "
+                 "people and recordings across pretraining and support-conditioned fitting.",
+    # Retired 2026-09-11 after a verified cost/benefit review of the head-training roster. The
+    # corpus-shape finding behind it: only 11 of 937 (acquisition key, label) cells are reachable
+    # from two or more datasets, so under the default `compatible` sampling mode 98.8% of episodes
+    # draw every support from the query's own dataset. A source earns its place by covering an
+    # evaluation configuration (phone pocket/waist/hip, watch right wrist) or by adding subjects at
+    # a key another source shares; a source that adds a private key, a private vocabulary and a
+    # structural defect adds maintenance surface and nothing the claim needs.
+    #
+    # NOT retired, and why (each re-measured on the grids on disk, 2026-09-11):
+    #   hhar   - the only compatible training source for the phone-waist evaluation streams
+    #            (realworld, inclusivehar); the 2026-09-10 converter rewrite kept the Galaxy S+ as an
+    #            honest accel-only stream and anti-aliases to 50 Hz on the real clock.
+    #   wisdm  - the only compatible source for shoaib's right pocket and the only near-miss watch
+    #            source for tnda_har/ut_complex; both 2026-09-10 sweep defects are gone: 100% of
+    #            sessions now run at 20 Hz and gyro exact-repeat fraction is 0.002 (was >30% for
+    #            17/51 subjects).
+    #   kuhar  - 89 subjects, the largest cross-subject pool in the corpus, at a phone-waist key
+    #            with 8/8 of realworld's labels. Gravity-removed at source (median |acc| 0.09 g),
+    #            so it can never be `compatible` with a gravity-present evaluation stream; it is
+    #            a near-miss source for all three waist/hip streams. Its repeated stand/sit and
+    #            stand/lie protocols and circular walking retain their own semantic labels.
+    "pamap2": "3.3k windows, 0.9% of the corpus, yet dataset-first query sampling gave it 1/13 of "
+              "all queries (an 8.6x up-weight); 9 subjects; body-IMU wrist that is neither "
+              "compatible nor near-miss with any evaluation stream; only 2 labels no other source "
+              "has. No defect, no coverage, a sampler distortion.",
+    "unimib_shar": "Pre-windowed 3 s clips (median 3.02 s; 0% of windows fill the 6 s context), "
+                   "the same structural mismatch that retired uci_har and sp_sw_har: half of "
+                   "every comparison is padding. Accelerometer-only, and at most a near-miss to "
+                   "any evaluation stream. The overlap-leak and lost-source reasons given on "
+                   "2026-09-10 are withdrawn: the source CSVs are on disk and recordings.json maps "
+                   "11,771 windows to 1,910 trials, which the execution unit already honours.",
+    # Retired 2026-09-11 (second pass) to reach the eight-source head roster. Measured against the
+    # six-source general-HAR evaluation roster: every one of the 11 cross-source (key, label)
+    # cells in the corpus survives without these three, every evaluation stream keeps its
+    # compatible or near-miss training partner, and the 20/25/50/51.2/100 Hz rate spread is kept.
+    "mmfit": "Its compatible coverage of shoaib's right pocket and the watch right wrist is "
+             "already supplied by wisdm and harmes; 8.5k windows, 21 subjects, gym exercises "
+             "sharing no label with any evaluation set and no cross-source cell.",
+    "phytmo": "Physical-therapy exercise protocol (Sci. Data 2022): rehabilitation content the "
+              "programme has moved away from. Its six acquisition keys shared with realdisp carry "
+              "zero shared labels, so the pooling they appeared to offer never produced a "
+              "cross-source cell.",
+    "nfi_fared": "Two dataset-private keys (lower back, forearm_unspecified) that pool with "
+                 "nothing and match no evaluation stream; 14 subjects. Its 100 Hz and eval-label "
+                 "coverage are supplied by kuhar and dsads. Swapping it for dsads keeps all 11 "
+                 "cross-source cells and restores the 25 Hz anchor.",
 }
 
 # ACTIVE. The datasets whose raw source frames are curated to the 6-slot acc/gyro layout by
@@ -87,14 +136,15 @@ PRIMARY_TRAIN_DATASETS = tuple(
 # ACTIVE. 2026-08-12: training datasets built by their OWN converters straight to native grids, not
 # through the deployment channel-policy curation. They carry StreamSpecs (placement/device text) but
 # no `curate_frame` source frame, so they are training-but-not-primary. Together with
-# PRIMARY_TRAIN_DATASETS these are exactly TRAIN_DATASETS (F11 guard). monipar, spar and
-# upper_limb_use are the three held-out for eval and are intentionally absent.
+# PRIMARY_TRAIN_DATASETS these are exactly TRAIN_DATASETS (F11 guard). The evaluation roster is
+# intentionally absent; see SEALED_TEST_EVAL_DATASETS below.
 DIRECT_CONVERTED_TRAIN_DATASETS = tuple(
     dataset for dataset in ("dsads", "forth_trace", "opportunity", "realdisp", "mmfit", "phytmo")
     if dataset not in RETIRED_TRAIN_DATASETS
 )
 
-# ACTIVE design-of-record training corpus (14 sources since 2026-09-10). Adding or removing a
+# ACTIVE design-of-record support-classifier training corpus (8 sources since 2026-09-11).
+# Adding or removing a
 # dataset here is an experimental-protocol change: it needs a StreamSpec, converter, grids, quality
 # caches, a regenerated data/labels/global_labels.json, and a corpus-matched baseline disclosure.
 EXPANDED_PHASE_A_TRAIN_DATASETS = (
@@ -127,9 +177,9 @@ def assert_no_retired_sources(datasets: Sequence[str], *, allow: bool = False) -
 # supervised application heads. Grid construction remains explicit so fetching a source cannot
 # silently enlarge an existing run; the encoder trainer's named ``label_free`` recipe selects them.
 PRETRAIN_SCALE_DATASETS = (
-    "nhanes",
+    "capture24_pretrain",
     "nymeria_xsens",
-    "synthetic_imu",
+    "extrasensory_pretrain",
 )
 
 # ---------------------------------------------------------------------------------------------
@@ -210,23 +260,50 @@ ESTABLISHED_EVAL_DATASETS = (
     "ut_complex",
 )
 
-NEW_HELDOUT_EVAL_DATASETS = (
-    "monipar",
-    "spar",
-    "upper_limb_use",
-)
+# Withdrawn from evaluation on 2026-09-11. These three arrived with the movement-monitoring
+# clinical pivot, which is archived (tag `archive-pre-classifier-cleanup-20260911`). The live
+# question is general human activity recognition, and a clinical-population symptom or
+# rehabilitation-exercise corpus does not measure it. Their converters, StreamSpecs and grids are
+# left intact so an archived protocol still reproduces; they are simply no longer a live roster.
+RETIRED_EVAL_DATASETS = {
+    "monipar": "Parkinson's disease motor-symptom monitoring via weekly smartwatch visits "
+               "(Frontiers in Neurology 2023). Clinical symptom measurement, not general HAR.",
+    "spar": "Shoulder physiotherapy exercise recognition (Physiol. Meas. 2018). Rehabilitation "
+            "exercise protocol, not general HAR.",
+    "upper_limb_use": "Relative arm use in patients with hemiparesis (J. Rehab. Assist. Technol. "
+                      "Eng. 2021). Clinical population and a clinical readout. Separately, only "
+                      "72% of its cells can form a k=8 episode (10th percentile k=3), so its "
+                      "support curve bent for a sampling reason rather than a modelling one.",
+    "tnda_har": "General HAR and wanted, but the UniMTS bundle we convert from ships no "
+                "per-sample subject id: all 3,353 windows carry subject=\"unknown\", so no "
+                "cross-subject support can ever be drawn and it can only produce k=0 rows. Restore "
+                "it by fetching the original release (IEEE DataPort 10.21227/4epb-pg26, sign-in) "
+                "and converting with participants.",
+}
 
-PRIMARY_EVAL_DATASETS = ESTABLISHED_EVAL_DATASETS + NEW_HELDOUT_EVAL_DATASETS
-
-# Subject-disjoint kNN transfer needs at least three usable subject identities. TNDA-HAR and
-# UT-Complex deliberately remain in the model-agnostic/Phase-B protocol but are unsuitable for this
-# particular probe. USC-HAD remains in the external test set rather than the frequently-run probe.
-PHASE_A_TRANSFER_DATASETS = (
+#: Sealed test roster: every evaluation dataset. Three disjoint source roles (decision reaffirmed
+#: 2026-09-11): label-free encoder pretraining, supervised head training, and sealed test. There is
+#: no separate development-source roster. No checkpoint, temperature, threshold, or roster choice may read these;
+#: they are touched once. Three phone placements (front pocket, waist x2, right pocket, hip) and
+#: one watch wrist, 50 and 100 Hz, all gravity-present; inclusivehar includes participants with
+#: physical disabilities.
+SEALED_TEST_EVAL_DATASETS = (
     "motionsense",
     "realworld",
     "shoaib",
     "inclusivehar",
-) + NEW_HELDOUT_EVAL_DATASETS
+    "usc_had",
+    "ut_complex",
+)
+
+PRIMARY_EVAL_DATASETS = SEALED_TEST_EVAL_DATASETS
+
+# The held-out-configuration transfer probe is EMPTY under the three-role rule: every labelled
+# source is either a head-training source or sealed, and a probe run during training may read
+# neither (sealed data would be spent; head-training data is the same role the encoder is
+# being prepared for, so it is not "transfer"). Offline diagnostics may pass explicit datasets to
+# `training.tokenizer.eval_transfer`; nothing runs on a sealed source before the final test.
+PHASE_A_TRANSFER_DATASETS: Tuple[str, ...] = ()
 
 EXCLUDED_PRIMARY_DATASETS = {
     "dsads": "torso/limb IMUs do not match the phone-pocket/waist or watch-wrist deployment",
@@ -385,10 +462,9 @@ STREAM_SPECS: Tuple[StreamSpec, ...] = (
     StreamSpec("capture24", "watch_wrist", "watch", "dominant wrist",
                _GENERIC_ACC, {}, "present"),
 
-    # Optional Phase-A scale sources. ExtraSensory has per-example phone placement
-    # labels; the converter prunes unknown/bag/table examples before assigning one
-    # of these streams. NHANES has no activity labels and is never a Phase-B bank
-    # source.
+    # Historical optional encoder-pretraining sources. ExtraSensory has per-example phone placement
+    # labels; the converter prunes unknown/bag/table examples before assigning one of these
+    # streams. The active source-isolated label-free views are declared immediately below.
     StreamSpec("extrasensory", "phone_pocket", "phone", "a trouser pocket",
                _GENERIC_ACC, {}, "present", role="phase_a_scale",
                session_contains=("_phone_pocket_",),
@@ -407,11 +483,32 @@ STREAM_SPECS: Tuple[StreamSpec, ...] = (
     StreamSpec("nhanes", "watch_wrist", "watch", "the non-dominant wrist",
                _GENERIC_ACC, {}, "present", role="phase_a_scale",
                session_contains=("_watch_wrist",),
-               note="NHANES PAX80_G ActiGraph acceleration at 80 Hz; unlabeled Phase-A-only "
+               note="NHANES PAX80_G ActiGraph acceleration at 80 Hz; unlabeled pretraining-only "
                     "bounded subset with released QC intervals applied."),
+    StreamSpec("capture24_pretrain", "watch_wrist", "watch", "the dominant wrist",
+               _GENERIC_ACC, {}, "present", role="phase_a_scale",
+               session_contains=("_watch_wrist",),
+               note="Label-free continuous view of Capture-24 Axivity AX3 acceleration at 100 Hz "
+                    "in g. Activity annotations are not read; only real timestamp gaps split a "
+                    "participant recording."),
+    StreamSpec("extrasensory_pretrain", "phone_pocket", "phone", "a trouser pocket",
+               _GENERIC_ACC, {}, "present", role="phase_a_scale",
+               session_contains=("_phone_pocket",),
+               note="Label-free view of ExtraSensory raw phone captures. Android m/s^2 and "
+                    "iPhone g are normalized to g; placement annotations are metadata only."),
+    StreamSpec("extrasensory_pretrain", "phone_hand", "phone", "the hand",
+               _GENERIC_ACC, {}, "present", role="phase_a_scale",
+               session_contains=("_phone_hand",),
+               note="Label-free view of ExtraSensory raw phone captures with an explicit "
+                    "in-hand placement annotation."),
+    StreamSpec("extrasensory_pretrain", "watch_wrist", "watch", "the wrist",
+               _GENERIC_ACC, {}, "present", role="phase_a_scale",
+               session_contains=("_watch_wrist",),
+               note="Label-free Pebble watch acceleration, acquired at approximately 25 Hz "
+                    "and stored at 50 Hz in g."),
     # Label-free pretraining scale sources (data/pretraining/). Every session carries
     # __unlabeled__, so these never reach a label vocabulary, a validation probe, or the
-    # Phase-B bank; role="phase_a_scale" keeps them out of every default build as well.
+    # support-classifier episodes; role="phase_a_scale" keeps them out of every default build.
     #
     # Nymeria records one motion with three device families at once, hardware-synchronised.
     # That simultaneity is the point: it is the only public source where the same movement is
@@ -506,9 +603,12 @@ STREAM_SPECS: Tuple[StreamSpec, ...] = (
     StreamSpec("tnda_har", "watch_wrist", "watch", "right wrist",
                _GENERIC_ACC, _GENERIC_GYRO, "present",
                note="Right-wrist IMU from the UniMTS TNDA-HAR bundle (cols 12:18); accel m/s^2 (gravity present), gyro rad/s."),
-    StreamSpec("ut_complex", "watch_wrist", "watch", "the right wrist",
+    # UT-Complex is a phone strapped to the wrist, not a smartwatch.  Keep the historical stream
+    # slug so existing converted artifacts remain addressable, but keep it out of genuine-watch
+    # compatibility pools.
+    StreamSpec("ut_complex", "watch_wrist", "watch_proxy", "the right wrist",
                _GENERIC_ACC, _GENERIC_GYRO, "present",
-               note="Wrist-worn phone (smartwatch emulation); complex hand-gesture activities. Accel m/s^2 (gravity present)."),
+               note="Wrist-mounted phone, retained as a smartwatch-placement proxy only; complex hand-gesture activities. Accel m/s^2 (gravity present)."),
 
     # SPAR — consumer Apple Watch, 7 shoulder physiotherapy exercises, 20 subjects x both
     # shoulders. A rehabilitation-framing EVALUATION source: its concepts are absent from the
@@ -716,7 +816,9 @@ def deployment_streams(
       ``device`` IMUs (e.g. nfi_fared back/wrist). A session recorded on multiple devices contributes
       one separate single-device sample each.
 
-    ``watch_proxy`` / ``non_deployment`` streams are excluded — they are diagnostic/stress, not primary.
+    ``watch_proxy`` / ``non_deployment`` streams are excluded from compatibility pooling. A proxy
+    can still be named in the sealed roster and materialized explicitly for its disclosed
+    placement-proxy evaluation cell.
     """
     keep = {"phone"} if placement_strict else {"phone", "watch", "device"}
     return tuple(

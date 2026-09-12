@@ -1,6 +1,6 @@
 """Released-checkpoint adapter framework.
 
-The retained HARNet, UniMTS, and NormWear adapters declare their published input contract and
+The retained HARNet, LiMU-BERT-X, UniMTS, and NormWear adapters declare their published input contract and
 export frozen representations for the common support-conditioned evaluation. The legacy
 ``ConSEAdapter`` and ``CosineAdapter`` tiers stay here only because HARNet's released checkpoint
 adapter still uses their feature-loading contract; they are not the active classifier or paper

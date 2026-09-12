@@ -7,7 +7,7 @@ alignments without needing converted parquet on disk.
 import numpy as np
 import pandas as pd
 
-from data.scripts.build_grids import _greedy_class_cap, stream_grid
+from data.scripts.build_grids import _greedy_class_cap, iter_logical_segments, stream_grid
 from data.scripts.curate.accel_units import GRAVITY_MS2
 from data.scripts.curate.deployment_policy import all_source_channels, get_stream_spec
 
@@ -50,6 +50,40 @@ def test_stream_grid_persists_session_event_identity():
     ]
 
 
+def test_aggregated_segments_never_form_a_cross_boundary_window():
+    spec = get_stream_spec("hhar", "phone_waist")
+    first = _session_frame("hhar", spec, 200, "walking", acc=GRAVITY_MS2)
+    second = _session_frame("hhar", spec, 200, "walking", acc=2 * GRAVITY_MS2)
+    frame = pd.concat([first, second], ignore_index=True)
+    frame["segment_id"] = np.repeat([10, 11], 200)
+    frame.attrs["halo_session_id"] = "subject1_aggregate"
+    logical = [(part, 50.0, "s1") for part in iter_logical_segments(frame)]
+
+    grid, subjects = stream_grid(
+        "hhar", spec, logical, alignment="native", resample_to=None,
+        canonical_labels=True, view="harmonised",
+    )
+
+    # Each 4-second capture becomes one honest partial window. Without segment-aware
+    # assembly, the 400 concatenated rows would create a 6-second window mixing captures.
+    assert grid.lengths.tolist() == [200, 200]
+    assert grid.data.shape == (2, 300, 6)
+    assert np.allclose(grid.data[0, :200, :3], 1.0)
+    assert np.allclose(grid.data[1, :200, :3], 2.0)
+    assert np.count_nonzero(grid.data[:, 200:, :]) == 0
+    assert subjects == ["s1", "s1"]
+    assert grid.event_ids == [
+        "hhar:subject1_aggregate:segment:10:0",
+        "hhar:subject1_aggregate:segment:11:0",
+    ]
+
+
+def test_aggregated_segment_id_cannot_reappear_later():
+    frame = pd.DataFrame({"acc_x": [0.0, 1.0, 2.0], "segment_id": [0, 1, 0]})
+    with np.testing.assert_raises_regex(ValueError, "contiguous run"):
+        list(iter_logical_segments(frame))
+
+
 def test_native_grid_retains_final_partial_context_with_honest_length():
     spec = get_stream_spec("hhar", "phone_waist")
     frame = _session_frame("hhar", spec, 425, "walking")  # 8.5 seconds at 50 Hz
@@ -62,6 +96,19 @@ def test_native_grid_retains_final_partial_context_with_honest_length():
     assert np.count_nonzero(grid.data[1, 125:]) == 0
     assert grid.labels == ["walking", "walking"]
     assert subjects == ["s1", "s1"]
+
+
+def test_stream_grid_can_drop_partial_context_for_predictive_sources():
+    spec = get_stream_spec("hhar", "phone_waist")
+    frame = _session_frame("hhar", spec, 425, "walking")
+    grid, subjects = stream_grid(
+        "hhar", spec, [(frame, 50.0, "s1")], alignment="native",
+        resample_to=None, canonical_labels=True, view="harmonised",
+        include_partial=False,
+    )
+    assert grid.data.shape == (1, 300, 6)
+    assert grid.lengths.tolist() == [300]
+    assert subjects == ["s1"]
 
 
 def test_baseline_grids_still_drop_partial_contexts():

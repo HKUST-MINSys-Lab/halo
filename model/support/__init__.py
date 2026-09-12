@@ -1,1 +1,1 @@
-"""Bounded support-conditioned classification control retained for transfer checks."""
+"""Active support-conditioned semantic classification modules."""

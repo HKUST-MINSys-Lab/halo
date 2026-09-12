@@ -123,7 +123,7 @@ def test_deployment_batch_never_relaxes_an_impossible_k():
         )
 
 
-def test_deployment_zero_shot_has_no_support_and_distinct_queries():
+def test_deployment_zero_shot_has_no_support_bank_and_distinct_queries():
     corpus = _corpus(subjects_per_label=5)
     episodes, _ = draw_batch(
         corpus, _rng(33), batch_size=1, deployment_matched=True,
@@ -132,6 +132,8 @@ def test_deployment_zero_shot_has_no_support_and_distinct_queries():
         same_subject_probability=0.0, semantic_zero_shot=True,
     )
     assert all(episode.is_zero_shot and not episode.support for episode in episodes)
+    for episode in episodes:
+        assert not episode.support_candidate
     units = {(corpus.recordings[e.query].subject, corpus.recordings[e.query].execution)
              for e in episodes}
     assert len(units) == len(episodes)
@@ -216,7 +218,7 @@ def test_available_units_preserves_order_and_never_mutates_corpus(relation):
     assert corpus.by_key_label_unit == before
 
 
-def test_zero_shot_candidates_are_all_compatible_and_keep_background():
+def test_zero_shot_candidates_are_all_compatible_without_a_support_bank():
     corpus = _corpus(sites=("left_wrist", "phone_pocket"))
     for seed in range(30):
         episode = draw_episode(corpus, _rng(seed), p_gt_present=0., support_size=8)
@@ -224,13 +226,13 @@ def test_zero_shot_candidates_are_all_compatible_and_keep_background():
         key = corpus.key_of(corpus.recordings[episode.query])
         assert all((key, label) in corpus.by_key_label for label in episode.candidates)
         assert len(episode.candidates) >= 2
-        assert episode.support
-        assert all(corpus.recordings[i].label not in episode.candidates for i in episode.support)
+        assert episode.support == ()
 
 
 def test_zero_shot_does_not_invent_out_of_configuration_distractors():
     corpus = _corpus(labels=("walking", "sitting"))
-    assert draw_episode(corpus, _rng(), p_gt_present=0.) is None
+    episode = draw_episode(corpus, _rng(), p_gt_present=0.)
+    assert episode is not None and set(episode.candidates) == {"walking", "sitting"}
 
 
 def test_query_is_never_in_its_own_support():
@@ -332,7 +334,7 @@ def test_realised_gt_rate_tracks_p():
         assert abs(telemetry["sampler/realised_gt_rate"] - p) < 0.08
 
 
-def test_zero_shot_keeps_answer_as_candidate_but_excludes_all_candidate_support():
+def test_zero_shot_keeps_answer_as_candidate_without_hidden_support():
     corpus = _corpus()
     rng = _rng(8)
     seen = 0
@@ -343,9 +345,8 @@ def test_zero_shot_keeps_answer_as_candidate_but_excludes_all_candidate_support(
         seen += 1
         query = corpus.recordings[episode.query]
         assert episode.candidates[episode.gt_slot] == query.label
-        assert all(slot == -1 for slot in episode.support_candidate)
-        for index in episode.support:
-            assert corpus.recordings[index].label not in episode.candidates
+        assert episode.support_candidate == ()
+        assert episode.support == ()
     assert seen > 0
 
 
@@ -556,8 +557,8 @@ def test_regime_ce_is_finite_with_ragged_candidate_counts():
     assert torch.isfinite(out["few_shot_ce"]) and torch.isfinite(out["zero_shot_ce"])
 
 
-def test_episode_mix_probability_controls_the_loss_weight():
-    """A rare regime must not be silently reweighted to equal a common regime."""
+def test_episode_mix_balances_the_two_information_conditions():
+    """Zero-shot and enrolled heads receive equal aggregate loss when both are present."""
     import torch
 
     from training.support_classifier.sampling import Episode
@@ -572,7 +573,8 @@ def test_episode_mix_probability_controls_the_loss_weight():
     logits = torch.tensor([[3.0, 0.0], [3.0, 0.0], [0.0, 3.0]])
     text = {"candidate_mask": torch.ones(3, 2, dtype=torch.bool)}
     out = episode_loss(logits, episodes, text)
-    expected = torch.nn.functional.cross_entropy(logits, torch.zeros(3, dtype=torch.long))
+    per_row = torch.nn.functional.cross_entropy(logits, torch.zeros(3, dtype=torch.long), reduction="none")
+    expected = 0.5 * (per_row[:2].mean() + per_row[2])
     assert torch.allclose(out["loss"], expected)
     assert not torch.allclose(out["loss"], out["few_shot_ce"] + out["zero_shot_ce"])
 

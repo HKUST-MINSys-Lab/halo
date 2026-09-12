@@ -26,9 +26,9 @@ baseline belongs in that baseline adapter and is documented as part of its publi
 ## Metadata conditioning
 
 Configuration text can describe observed channels and their acquisition context. It is not a label
-and must not encode dataset identity as a shortcut. The current sensor-only learned support
-comparator deliberately does not consume this text; it reasons from query/support sensor vectors
-only. Configuration remains available to the encoder where it can explain honest input variation.
+and must not encode dataset identity as a shortcut. The encoder consumes this text to explain
+honest input variation. The support classifier receives only the resulting motion vectors and
+label-text tokens supplied by the episode; it never receives a separate acquisition-text shortcut.
 
 ## Split and episode rules
 

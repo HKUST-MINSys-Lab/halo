@@ -73,17 +73,25 @@ def test_semantically_distinct_wrists_do_not_collapse():
 
 
 def test_separating_the_wrists_cost_no_compatible_pool():
-    """The split was made only because it was free; assert that it stayed free."""
+    """The split was made only because it was free; assert that it stayed free.
+
+    Originally checked against monipar; that source left the roster on 2026-09-11, so the guard
+    now covers every live watch-wrist evaluation stream instead.
+    """
     from data.scripts.curate.compatibility import are_compatible
 
     train = set(deployment_policy.EXPANDED_PHASE_A_TRAIN_DATASETS)
     keys = corpus_keys()
-    monipar = stream_key("monipar", "watch_wrist")
-    partners = [
-        1 for (dataset, _stream), other in keys.items()
-        if dataset in train and are_compatible(monipar, other)
-    ]
-    assert partners, "monipar lost its only compatible training stream"
+    for eval_dataset in deployment_policy.PRIMARY_EVAL_DATASETS:
+        for spec in deployment_policy.stream_specs(eval_dataset, "primary"):
+            key = stream_key(eval_dataset, spec.stream_id)
+            if key.device_family != "watch":
+                continue
+            partners = [
+                1 for (dataset, _stream), other in keys.items()
+                if dataset in train and are_compatible(key, other)
+            ]
+            assert partners, f"{eval_dataset}/{spec.stream_id} has no compatible training stream"
 
 
 def test_laterality_is_preserved_not_collapsed():

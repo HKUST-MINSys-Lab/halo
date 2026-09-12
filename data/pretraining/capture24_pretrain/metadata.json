@@ -1,0 +1,22 @@
+{
+  "dataset": "capture24_pretrain",
+  "display_name": "CAPTURE-24 (label-free pretraining view)",
+  "sampling_rate_hz": 100,
+  "channels": ["acc_x", "acc_y", "acc_z"],
+  "core_channels": {
+    "acc_x": "acc_x",
+    "acc_y": "acc_y",
+    "acc_z": "acc_z"
+  },
+  "extra_channels": [],
+  "placement": "dominant wrist",
+  "num_subjects": 151,
+  "activities": [],
+  "role": "pretrain_scale",
+  "phase_a_only": true,
+  "streaming_grid": true,
+  "full_windows_only": true,
+  "pre_windowed": false,
+  "grid_dtype": "float16",
+  "note": "Source-isolated, label-free view of the full public Capture-24 release. The converter reads only time and raw accelerometer x/y/z from each participant file; activity annotations are never loaded, filtered, or used to define sessions. One participant stream may be split only at invalid timestamps or real clock discontinuities. Axivity AX3 dominant-wrist acceleration is 100 Hz, in g, with gravity present. Every emitted session carries only __unlabeled__ and is restricted to JEPA pretraining."
+}

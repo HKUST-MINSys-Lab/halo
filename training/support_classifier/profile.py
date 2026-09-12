@@ -15,9 +15,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from data.scripts.curate.deployment_policy import EXPANDED_PHASE_A_TRAIN_DATASETS
+from data.scripts.curate.deployment_policy import SUPERVISED_HEAD_TRAIN_DATASETS
 from model.blocks import AttentionSpec
-from model.support.comparator import ComparatorConfig, SupportComparator
+from model.support.token_mixer import SupportTokenMixer, TokenMixerConfig
 from training.support_classifier.corpus import support_corpus_from_index
 from training.support_classifier.train import (
     PrefetchLoader, build_dataset, calibrate_frontend, make_label_text, make_optimizer, run_step,
@@ -42,32 +42,41 @@ def main():
     device = torch.device("cuda")
     torch.backends.cuda.matmul.fp32_precision = "tf32"
     torch.backends.cudnn.conv.fp32_precision = "tf32"
-    index = CorpusIndex(datasets=EXPANDED_PHASE_A_TRAIN_DATASETS, alignment="native",
+    index = CorpusIndex(datasets=SUPERVISED_HEAD_TRAIN_DATASETS, alignment="native",
                         max_per_stream=None, seed=20260901)
     corpus = support_corpus_from_index(index)
-    args.neutral_acquisition_text = True
+    # Profile the same deployment-shaped episodes used by the trainer. A profile using the
+    # simpler legacy sampler produces attractive but irrelevant timing and memory numbers.
+    args.neutral_acquisition_text = False
     dataset = build_dataset(index, args)
     collate = SupportCollate(MultiScaleCollate(fixed_patch_seconds=PATCH_SECONDS))
     # Fork CPU workers before constructing any CUDA models or text-tower threads.
+    draw_kwargs = {
+        "semantic_zero_shot": True,
+        "deployment_matched": True,
+    }
     loaders = {n: PrefetchLoader(corpus, dataset, collate, data_seed=20260901,
-                                batch_size=args.episodes, draw_kwargs={}, workers=n)
+                                batch_size=args.episodes, draw_kwargs=draw_kwargs, workers=n)
                for n in args.workers}
     results = []
     try:
         for workers, loader in loaders.items():
             torch.manual_seed(7)
-            encoder, _ = build_random_encoder(device, "fixed", neutral_acquisition_text=True)
+            encoder, _ = build_random_encoder(device, "fixed", neutral_acquisition_text=False)
             encoder.train()
             encoder.mask_token.requires_grad_(False)
-            comparator = SupportComparator(AttentionSpec(d_model=128, n_heads=4, ffn_mult=2,
-                                                        dropout=.1), ComparatorConfig()).to(device)
+            classifier = SupportTokenMixer(
+                AttentionSpec(d_model=128, n_heads=4, ffn_mult=2, dropout=.1),
+                TokenMixerConfig(),
+            ).to(device)
             calibrate_frontend(encoder, dataset, corpus, collate, np.random.default_rng(7), device,
                                batches=1, batch_size=128, executor=None)
             text = make_label_text(corpus.all_labels, device)
-            parameters = [p for m in (encoder, comparator) for p in m.parameters() if p.requires_grad]
+            parameters = [p for m in (encoder, classifier) for p in m.parameters() if p.requires_grad]
             optimizer = make_optimizer([
-                {"params": [p for p in encoder.parameters() if p.requires_grad], "lr": 1.5e-5},
-                {"params": comparator.parameters(), "lr": 3e-4},
+                {"name": "encoder", "params": [p for p in encoder.parameters() if p.requires_grad],
+                 "lr": 1.5e-5},
+                {"name": "classifier", "params": classifier.parameters(), "lr": 3e-4},
             ], weight_decay=.05, device=device)
             times, waits = [], []
             digest = hashlib.sha256()
@@ -83,8 +92,9 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
                 with autocast(device):
                     result = run_step(episodes=episodes, corpus=corpus, dataset=dataset,
-                                      collate=collate, encoder=encoder, comparator=comparator,
-                                      text_of=text, device=device, center=True, batch=batch)
+                                      collate=collate, encoder=encoder, classifier=classifier,
+                                      classifier_mode="token_mixer", text_of=text, device=device,
+                                      batch=batch)
                 if not bool(torch.isfinite(result["loss"])):
                     raise FloatingPointError("non-finite profile loss")
                 result["loss"].backward()
@@ -104,7 +114,7 @@ def main():
                       "loss": float(result["loss"].detach())}
             print(json.dumps(record), flush=True)
             results.append(record)
-            del encoder, comparator, optimizer, parameters, result
+            del encoder, classifier, optimizer, parameters, result
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(results, indent=2) + "\n")
     finally:
