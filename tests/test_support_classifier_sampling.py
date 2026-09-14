@@ -112,6 +112,37 @@ def test_deployment_batch_draws_exact_k_and_reuses_one_support_set():
         assert len(query_units) == len(group) and not (query_units & support_units)
 
 
+def test_deployment_candidate_masking_removes_only_the_selected_support_rows():
+    corpus = _corpus(subjects_per_label=7, windows_per_subject=3)
+    episodes, telemetry = draw_batch(
+        corpus, _rng(92), batch_size=8, deployment_matched=True,
+        enrollment_k=(2,), queries_per_support_set=2, windows_per_execution=1,
+        p_gt_present=1.0, label_subset=(4, 4), mode="compatible",
+        same_subject_probability=0.0, semantic_zero_shot=False,
+        p_mask_candidate=1.0, p_mask_gt=0.0,
+    )
+    assert episodes
+    for episode in episodes:
+        assert set(episode.masked_candidates) == set(range(4)) - {episode.gt_slot}
+        assert set(episode.support_candidate) == {episode.gt_slot}
+        assert not episode.is_zero_shot
+    assert telemetry["sampler/mean_k_per_candidate"] == pytest.approx(0.5)
+
+
+def test_masking_every_candidate_marks_the_episode_zero_shot():
+    corpus = _corpus(subjects_per_label=7, windows_per_subject=3)
+    episodes, telemetry = draw_batch(
+        corpus, _rng(93), batch_size=4, deployment_matched=True,
+        enrollment_k=(1,), queries_per_support_set=2, windows_per_execution=1,
+        p_gt_present=1.0, label_subset=(3, 3), mode="compatible",
+        same_subject_probability=0.0, semantic_zero_shot=False,
+        p_mask_candidate=1.0, p_mask_gt=1.0,
+    )
+    assert all(episode.is_zero_shot and not episode.support for episode in episodes)
+    assert all(set(episode.masked_candidates) == set(range(3)) for episode in episodes)
+    assert telemetry["sampler/mean_k_per_candidate"] == 0.0
+
+
 def test_deployment_batch_never_relaxes_an_impossible_k():
     corpus = _corpus(subjects_per_label=2)
     with pytest.raises(RuntimeError, match="refusing to relax compatibility or duplicate"):

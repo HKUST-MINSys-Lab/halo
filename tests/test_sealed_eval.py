@@ -7,7 +7,9 @@ import torch
 
 from baselines.data import EvalStream
 from model.blocks import AttentionSpec
+from model.support.residual_classifier import ResidualClassifierConfig, ResidualSupportClassifier
 from model.support.token_mixer import SupportTokenMixer, TokenMixerConfig
+from training.support_classifier.neighbors import differentiable_neighbor_logits
 from training.support_classifier.sealed_eval import (
     DEFAULT_K,
     _halo_token_mixer_predictions,
@@ -134,3 +136,48 @@ def test_halo_token_mixer_uses_the_same_enrolled_manifest(tmp_path, monkeypatch)
     )
     assert len(zero) == stream.n_windows
     assert set(zero) <= set(stream.eval_labels)
+
+
+def test_v3_evaluator_dispatch_matches_centred_neighbor_floor(tmp_path, monkeypatch):
+    stream = _stream()
+    plans = build_manifest(stream, 1, seed=12)
+    spec = AttentionSpec(d_model=4, n_heads=1, ffn_mult=1, dropout=0.0)
+    cfg = ResidualClassifierConfig(n_layers=0, centring="support_mean")
+    classifier = ResidualSupportClassifier(spec, cfg)
+    classifier.set_corpus_mean(torch.zeros(4))
+    checkpoint = tmp_path / "residual.pt"
+    torch.save({
+        "architecture_version": "support_classifier_v3",
+        "classifier": classifier.state_dict(),
+        "classifier_config": cfg.__dict__,
+        "attention_spec": spec.__dict__,
+    }, checkpoint)
+
+    class _Text:
+        matrix = torch.zeros((3, 384), dtype=torch.float32)
+
+        @staticmethod
+        def ids(labels):
+            return [{"a": 0, "b": 1, "c": 2}[label] for label in labels]
+
+    monkeypatch.setattr("training.support_classifier.sealed_eval.make_label_text",
+                        lambda labels, device: _Text())
+    features = np.repeat(np.eye(3, 4, dtype=np.float32), 3, axis=0)
+    predicted = _halo_token_mixer_predictions(
+        features, stream, plans, checkpoint, torch.device("cpu"), batch_size=3,
+    )
+
+    expected = []
+    label_to_slot = {label: slot for slot, label in enumerate(stream.eval_labels)}
+    for plan in plans:
+        query = torch.from_numpy(features[[plan.query]])
+        support = torch.from_numpy(features[np.asarray(plan.support)][None])
+        mean = support.mean(dim=1)
+        logits, _ = differentiable_neighbor_logits(
+            query - mean, support - mean[:, None],
+            torch.tensor([[label_to_slot[label] for label in plan.support_labels]]),
+            torch.ones((1, len(plan.support)), dtype=torch.bool),
+            torch.ones((1, len(stream.eval_labels)), dtype=torch.bool),
+        )
+        expected.append(stream.eval_labels[int(logits.argmax())])
+    assert predicted == expected
