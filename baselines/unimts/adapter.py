@@ -34,7 +34,8 @@ from types import SimpleNamespace
 import numpy as np
 from scipy.signal import resample_poly
 
-from ..base import CosineAdapter, InputContract, register
+from baselines import data as eval_data
+from ..base import CosineAdapter, InputContract, UnsupportedEvaluationCell, register
 
 # --- reused-on-disk locations (legacy repo + released checkpoint; see module docstring) ---
 _LEGACY_ROOT = Path("/home/alex/code/HALO/legacy_code")
@@ -61,6 +62,11 @@ GRAVITY_INCOMPATIBLE = frozenset({"kuhar"})
 # Matched on the stream id first (placement-derived), then a per-dataset fallback, then pelvis.
 DEFAULT_JOINT = 0
 _SIDE_PLACEMENT_JOINTS = [
+    # Exact deployment stream ids come first. This keeps simultaneous left/right devices on
+    # distinct SMPL joints instead of letting the generic ``pocket`` rule collapse both to R-hip.
+    ("phone_left_pocket", 1), ("phone_right_pocket", 5),
+    ("phone_belt", 9), ("watch_wrist_proxy", 21),
+    ("phone_forearm", 20), ("phone_thigh", 5), ("phone_waist", 9),
     ("left rectus femoris", 1), ("left_rectus_femoris", 1),
     ("left hamstrings", 1), ("left_hamstrings", 1),
     ("right rectus femoris", 5), ("right_rectus_femoris", 5),
@@ -141,7 +147,9 @@ def _resample_to_20hz(acc: np.ndarray, rate_hz: float) -> np.ndarray:
 class UniMTSAdapter(CosineAdapter):
     name = "unimts"
     # accel-only, 20 Hz, 10 s window (short windows wrap-padded internally).
-    contract = InputContract(channels=("acc_x", "acc_y", "acc_z"), rate_hz=20.0, window_sec=10.0)
+    contract = InputContract(channels=("acc_x", "acc_y", "acc_z"), rate_hz=20.0,
+                             native_window_sec=10.0)
+    supports_multi_device = True
 
     def evaluation_artifacts(self, state):
         return {"released_checkpoint": UNIMTS_CKPT}
@@ -223,27 +231,49 @@ class UniMTSAdapter(CosineAdapter):
         import torch
 
         model = state["model"]
-        ai = _accel_indices(stream.channels)
-        acc = np.asarray(stream.windows, np.float32)[:, :, ai]     # (N,T,3) in g
-        acc = _resample_to_20hz(acc, stream.rate_hz)               # (N,T20,3), 20 Hz
-        acc = acc * GRAVITY_MS2                                     # g -> m/s^2 (gravity present)
-        N, T, _ = acc.shape
-        joint = _joint_for(stream)
+        members = stream.devices if isinstance(stream, eval_data.MultiDeviceEvalStream) else [stream]
+        joints = [_joint_for(member) for member in members]
+        if len(set(joints)) != len(joints):
+            raise UnsupportedEvaluationCell(
+                f"UniMTS device-to-joint collision: {list(zip(stream.device_ids, joints))}"
+            )
+        n_windows = members[0].n_windows
+        # The released ST-GCN accepts variable temporal length.  One full evaluation
+        # interval is therefore one forward input; chunking 8/16 s into 10 s fragments
+        # discarded cross-window temporal context without being required by the model.
+        buckets: dict[int, list[tuple[int, np.ndarray]]] = {}
+        for row in range(n_windows):
+            per_device = []
+            target_length = None
+            for member in members:
+                valid = int(member.lengths[row]) if member.lengths is not None else member.windows.shape[1]
+                acc = member.windows[row:row + 1, :valid, _accel_indices(member.channels)]
+                acc = _resample_to_20hz(np.asarray(acc, np.float32), member.rate_hz)[0] * GRAVITY_MS2
+                if target_length is None:
+                    target_length = len(acc)
+                if len(acc) != target_length:
+                    raise ValueError("aligned UniMTS devices disagree on physical window duration")
+                per_device.append(acc)
+            assert target_length is not None
+            allx = np.zeros((target_length, N_JOINTS, 3), np.float32)
+            for acc, joint in zip(per_device, joints):
+                allx[:, joint, :] = acc
+            buckets.setdefault(target_length, []).append((row, allx))
 
-        embs = []
-        for s in range(0, N, batch):
-            a = acc[s:s + batch]                                             # (b,T,3)
-            allx = np.zeros((a.shape[0], T, N_JOINTS, 3), np.float32)
-            allx[:, :, joint, :] = a                                         # single-joint placement
-            if T < PAD_LEN:
-                allx = np.pad(allx, ((0, 0), (0, PAD_LEN - T), (0, 0), (0, 0)), mode="wrap")
-            else:
-                allx = allx[:, :PAD_LEN]
-            x = torch.from_numpy(allx).to(device).permute(0, 3, 1, 2).unsqueeze(-1)  # (b,3,200,22,1)
-            e = model.encode_image(x)                                        # (b,512)
-            e = e / e.norm(dim=-1, keepdim=True)
-            embs.append(e.float().cpu().numpy())
-        return np.concatenate(embs, axis=0)
+        output = None
+        for _length, rows in buckets.items():
+            for start in range(0, len(rows), batch):
+                group = rows[start:start + batch]
+                x = torch.from_numpy(np.asarray([value for _, value in group])).to(device) \
+                    .permute(0, 3, 1, 2).unsqueeze(-1)
+                e = model.encode_image(x)
+                encoded = (e / e.norm(dim=-1, keepdim=True)).float().cpu().numpy()
+                if output is None:
+                    output = np.zeros((n_windows, encoded.shape[1]), dtype=np.float32)
+                output[[row for row, _ in group]] = encoded
+        if output is None:
+            raise ValueError("UniMTS received an empty evaluation stream")
+        return output / np.maximum(np.linalg.norm(output, axis=1, keepdims=True), 1e-12)
 
     # 2026-08-22 audit F2: upstream evaluates with ENRICHED label text — each class's whole
     # label_dictionary synonym list joined into one string (data.py: `' '.join(labels)`) — not the

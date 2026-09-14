@@ -200,13 +200,40 @@ def _select_accel(windows: np.ndarray, channels: List[str]) -> np.ndarray:
 
 @torch.no_grad()
 def _extract_feats(model: nn.Module, x_n3l: np.ndarray, device) -> np.ndarray:
-    """(N, 3, 150) -> (N, FEAT_DIM) frozen-trunk features."""
+    """Variable-length input -> one frozen-trunk vector via temporal global mean."""
     feats = []
     for s in range(0, len(x_n3l), EMBED_BATCH):
         b = torch.from_numpy(x_n3l[s:s + EMBED_BATCH]).float().to(device)
-        f = model.feature_extractor(b)              # (B, C, 1)
-        feats.append(f.flatten(1).cpu().numpy())
+        f = model.feature_extractor(b)              # (B, C, T')
+        feats.append(f.flatten(2).mean(dim=2).cpu().numpy())
     return np.concatenate(feats, axis=0).astype(np.float32)
+
+
+def _window_chunk_features(model: nn.Module, windows: np.ndarray, rate_hz: float,
+                           lengths: np.ndarray | None, device) -> np.ndarray:
+    """Encode each complete window in one pass; pad only tails shorter than the 4 s trunk floor."""
+    valid = (np.asarray(lengths, dtype=np.int64) if lengths is not None
+             else np.full(len(windows), windows.shape[1], dtype=np.int64))
+    output: np.ndarray | None = None
+    for length in np.unique(valid):
+        owners = np.flatnonzero(valid == length)
+        frac = Fraction(int(round(TARGET_HZ)), int(round(rate_hz))).limit_denominator(1000)
+        values = resample_poly(
+            windows[owners, :int(length)].astype(np.float64),
+            frac.numerator, frac.denominator, axis=1,
+        )
+        min_samples = int(round(4.0 * TARGET_HZ))
+        if values.shape[1] < min_samples:
+            values = np.pad(values, ((0, 0), (0, min_samples - values.shape[1]), (0, 0)), mode="wrap")
+        encoded = _extract_feats(
+            model, np.transpose(values, (0, 2, 1)).astype(np.float32), device,
+        )
+        if output is None:
+            output = np.empty((len(windows), encoded.shape[1]), dtype=np.float32)
+        output[owners] = encoded
+    if output is None:
+        raise ValueError("HARNet received an empty evaluation stream")
+    return output
 
 
 # =============================================================================
@@ -249,7 +276,7 @@ def _fit_fp(vocab) -> str:
                            hp=[FIT_EPOCHS, FIT_BATCH, FIT_LR, FIT_SEED], probe=PROBE_SPEC,
                            cap=(MATCHED_MAX_PER_STREAM if CORPUS_MODE == 'matched' else None),
                            corpus=CORPUS_MODE, datasets=_corpus_datasets(),
-                           backbone=HARNET_NAME + SSL_HUB_TAG, prep="native-length-aware-v2")
+                           backbone=HARNET_NAME + SSL_HUB_TAG, prep="native-length-aware-v3-shared-fit")
 
 
 @register
@@ -261,7 +288,17 @@ class HarnetAdapter(ConSEAdapter):
     # overwrote the legacy results and the table could never show both rows.
     name = "harnet" if CORPUS_MODE == "legacy" else "harnet_matched"
     contract = InputContract(channels=list(ACC_CHANNELS), rate_hz=TARGET_HZ,
-                             window_sec=TARGET_LEN / TARGET_HZ)
+                             native_window_sec=TARGET_LEN / TARGET_HZ)
+
+    def input_accounting(self, stream) -> dict:
+        member = stream.devices[0] if isinstance(stream, eval_data.MultiDeviceEvalStream) else stream
+        lengths = (np.asarray(member.lengths, dtype=np.float64) if member.lengths is not None
+                   else np.full(member.n_windows, member.windows.shape[1], dtype=np.float64))
+        durations = lengths / float(member.rate_hz)
+        consumed = np.maximum(durations, 4.0)
+        padded = consumed - durations
+        fraction = float(padded.sum() / consumed.sum()) if consumed.size else 0.0
+        return {"padded": bool(np.any(padded > 1e-9)), "padded_fraction": fraction}
 
     # ---- gravity compatibility (disclosed N/A instead of a bad number) --------
     def is_incompatible(self, dataset: str):
@@ -388,9 +425,13 @@ class HarnetAdapter(ConSEAdapter):
                 if CORPUS_MODE == "matched" and keep_idx.size > MATCHED_MAX_PER_STREAM:
                     keep_idx = np.sort(cap_rng.choice(keep_idx, MATCHED_MAX_PER_STREAM,
                                                       replace=False))
-                x = _to_30hz_150(_select_accel(windows[keep_idx], channels), rate,
-                                  lengths[keep_idx])
-                feats.append(_extract_feats(model, x, fit_device))
+                # The fitted classifier must see exactly the representation used at inference.
+                # The old centre-cropped 5 s helper made a cached head distributionally stale
+                # on 4/8/16 s evaluation windows.
+                feats.append(_window_chunk_features(
+                    model, _select_accel(windows[keep_idx], channels), rate,
+                    lengths[keep_idx], fit_device,
+                ))
                 labs.append(gl[keep_idx])
                 subjs.append(np.array([f"{ds}:{s}" for s in np.asarray(subjects)[keep_idx]]))
                 used.append(f"{ds}/{stream}({keep_idx.size})")
@@ -471,19 +512,19 @@ class HarnetAdapter(ConSEAdapter):
     def window_probs(self, stream, state, device) -> np.ndarray:
         model = state["model"]
         T = float(state.get("temperature", 1.0))    # calibrated temperature (#82)
-        x = _to_30hz_150(_select_accel(stream.windows, stream.channels), stream.rate_hz,
-                          stream.lengths)
+        features = self.window_features(stream, state, device)
         probs = []
         with torch.no_grad():
-            for s in range(0, len(x), EMBED_BATCH):
-                b = torch.from_numpy(x[s:s + EMBED_BATCH]).float().to(device)
-                probs.append(F.softmax(model(b) / T, dim=1).cpu().numpy())
+            for s in range(0, len(features), EMBED_BATCH):
+                b = torch.from_numpy(features[s:s + EMBED_BATCH]).float().to(device)
+                probs.append(F.softmax(model.classifier(b) / T, dim=1).cpu().numpy())
         return np.concatenate(probs, axis=0)
 
     def window_features(self, stream, state, device) -> np.ndarray:
-        x = _to_30hz_150(_select_accel(stream.windows, stream.channels), stream.rate_hz,
-                          stream.lengths)
-        return _extract_feats(state["model"], x, device)
+        return _window_chunk_features(
+            state["model"], _select_accel(stream.windows, stream.channels), stream.rate_hz,
+            stream.lengths, device,
+        )
 
     def predict_candidates_from_features(self, features, candidates, state, device):
         model = state["model"]

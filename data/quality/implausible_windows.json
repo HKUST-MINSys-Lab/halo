@@ -1,6 +1,7 @@
 {
   "alignment": "native",
-  "grid_fingerprint": "988844ac501a2e09dba0870ed29ee8fae9e1f5a5a3f5c866e68048b4ebb74d94",
+  "window_seconds": 6.0,
+  "grid_fingerprint": "4c2e4be2dde1f00f37a7b11c75402833f2f8a99850863bee8fac7c70615b17f9",
   "stream_fingerprints": {
     "capture24/watch_wrist": "e035c8696d0246a5162d3358ffe4febd77855ec1f10501611a92ba557ba22f78",
     "capture24_pretrain/watch_wrist": "2433c4182d3ad06808138fa17482bc613d73ac4dea7f83f40677fe18e43223bb",
@@ -80,8 +81,13 @@
     "realdisp/rla": "156860674b305a13379fad1b07167d589d3c0718f59c892e6fd9d1f8c42cab1e",
     "realdisp/rt": "37d49a38b95aaf424202cb520af71af7630e5f52f71efdf774c5c4b7b3f6c812",
     "realdisp/rua": "cf31f496ecea90c0d383688c53ebfae978693877779f18a9a2531da4256b6984",
-    "realworld/phone_waist": "65aef0333b6c7b57454f20f95346b3bee4d845086d8d98e81c59f602f1d7e37a",
-    "shoaib/phone_right_pocket": "788e2bc37fb27334101586db1a29454323638af8d1c963b1ec0d3c7d9398def5",
+    "realworld/phone_forearm": "db3ec1c040b5262a31016ffa3aad835cb86c0a03c3610684d79be8904625bd5f",
+    "realworld/phone_thigh": "e9ecf03e6e6b0337a0a7f2011c8db0a9d6d49743045e6c1b7e5cd7c3596cc8ba",
+    "realworld/phone_waist": "76da9f369b64aff08efbdad601e9264389ebb4c27f7dabe38b6d29b2b64ba50b",
+    "shoaib/phone_belt": "adb3c65cf3a1f1eb8f3289a73cc3d3b76bb3590920b7a17d38f97f2c644a0ad1",
+    "shoaib/phone_left_pocket": "295d01ec9eff536b84862d5483775f288a5590cc27c9b158cef1f12783bc859c",
+    "shoaib/phone_right_pocket": "28e777ae434c8d580cf3c73101aed0600d09badace1d6c38ebbc11411f6804b2",
+    "shoaib/watch_wrist_proxy": "c86b93d51045c07952acba0fdabbe9e9ad54f898f62caf0e2b5843798b7c2e1e",
     "sp_sw_har/phone_pocket": "1d95cc011d8eaa3248f66b01533812288b98bc7134584bd547d406dff3235af9",
     "sp_sw_har/watch_wrist": "83c45e1cf1209dd410c1cad7d0d0a65f20daa4b057219435a9fd4cd23f3c1963",
     "spar/watch_left_wrist": "086aced63d89d8a9a08d46794d63de7d4c31fa463207c02f9fe7cb2c2789d01b",
@@ -102,7 +108,7 @@
     "upper_limb_use/patient_affected_wrist": "3b228ffa37408d20a506c6828d094262026bc5557c8ba20e825afff13393086c",
     "upper_limb_use/patient_unaffected_wrist": "ae52f2ff29678c46cce2e5209bfbb03eb82134231f6770842b5a65337f438a0a",
     "usc_had/phone_hip": "ae9119aa5ee79a091e4f74b1d41984b21cbf65e34046a38a0eb3feb4157895bc",
-    "ut_complex/watch_wrist": "9163bd50fc5b536b037c6f067138b76b5090ebc7a18ad25721b19960fd0a199d",
+    "ut_complex/watch_wrist": "b1f8a2f610f5f820c053189e81ee4151b5bf9fac6d9709471489bc281f656bfb",
     "wisdm/phone_pocket": "833419ddb1e9ec663772c3c345506d83e0ee399a455123ccdba5f0bb82eb930e",
     "wisdm/watch_wrist": "e18cb783a04fbfd43fec8d70a101cd322ba5c306a5d3e4ebfef84e07e0c07b2f",
     "xrf_v2/airpods_ear": "196f7670ae42f42bfd99eeb3eb03964fe96327d94fe5970b073ee84711c7b7fb",
@@ -115,30 +121,6 @@
   "gyro_rail_rad_s": 34.90658503988659,
   "accel_rail_g": 16.0,
   "windows": {
-    "pamap2/watch_wrist": [
-      3291
-    ],
-    "phytmo/left_shin": [
-      2295
-    ],
-    "synthetic_imu/virt_lforearm": [
-      4515
-    ],
-    "synthetic_imu/virt_sternum": [
-      4516
-    ],
-    "nymeria_xsens/xsens_rforearm": [
-      1484,
-      1577,
-      2707,
-      2708,
-      2710,
-      2717,
-      2720,
-      2753,
-      2756,
-      2758
-    ],
     "kuhar/phone_waist": [
       10680,
       10681,
@@ -236,9 +218,49 @@
       11021,
       11022,
       11023
+    ],
+    "nymeria_xsens/xsens_rforearm": [
+      1484,
+      1577,
+      2707,
+      2708,
+      2710,
+      2717,
+      2720,
+      2753,
+      2756,
+      2758
+    ],
+    "pamap2/watch_wrist": [
+      3291
+    ],
+    "phytmo/left_shin": [
+      2295
+    ],
+    "synthetic_imu/virt_lforearm": [
+      4515
+    ],
+    "synthetic_imu/virt_sternum": [
+      4516
     ]
   },
   "summary": [
+    [
+      "kuhar/phone_waist",
+      96,
+      11546,
+      91.72572326660156,
+      7.220249176025391,
+      0
+    ],
+    [
+      "nymeria_xsens/xsens_rforearm",
+      10,
+      4645,
+      35.15625,
+      17.046875,
+      0
+    ],
     [
       "pamap2/watch_wrist",
       1,
@@ -269,22 +291,6 @@
       10358,
       78.0625,
       4.06640625,
-      0
-    ],
-    [
-      "nymeria_xsens/xsens_rforearm",
-      10,
-      4645,
-      35.15625,
-      17.046875,
-      0
-    ],
-    [
-      "kuhar/phone_waist",
-      96,
-      11546,
-      91.72572326660156,
-      7.220249176025391,
       0
     ]
   ]

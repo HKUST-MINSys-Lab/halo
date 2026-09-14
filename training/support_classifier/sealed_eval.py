@@ -19,8 +19,12 @@ import torch
 
 import baselines
 from baselines import scoring
-from baselines.data import EvalStream, list_streams, load_eval_stream, load_global_labels
+from baselines.data import (
+    EvalStream, MultiDeviceEvalStream, list_streams, load_eval_stream, load_global_labels,
+    load_multi_device_stream, source_slice_fingerprint,
+)
 from data.scripts.curate.deployment_policy import (
+    MULTI_DEVICE_EVAL_CELLS,
     SEALED_TEST_EVAL_DATASETS,
     SUPERVISED_HEAD_TRAIN_DATASETS,
     assert_no_retired_sources,
@@ -28,11 +32,12 @@ from data.scripts.curate.deployment_policy import (
 )
 from model.blocks import AttentionSpec
 from model.support.token_mixer import SupportTokenMixer, TokenMixerConfig
+from model.support.residual_classifier import ResidualSupportClassifier, ResidualClassifierConfig
 from training.support_classifier.train import make_label_text
 from training.support_classifier.neighbors import differentiable_neighbor_logits
 from training.support_classifier.representation_diagnostics import write_embedding_diagnostics
 from training.support_classifier.sampling import MIN_RECORDING_SECONDS
-from training.tokenizer.eval_transfer import build_encoder, encode_dataset
+from training.tokenizer.eval_transfer import build_encoder, encode_dataset, encode_multi_device_dataset
 from training.tokenizer.pretrain_data import _stream_gravity_state, stream_channel_descriptions
 
 SEED = 20260912
@@ -42,7 +47,80 @@ SEED = 20260912
 # satisfies a requested support count.
 DEFAULT_K = (0, 1, 2, 4, 8, 16, 32, 64, 128)
 PRIMARY_BASELINES = ("harnet", "limubert_x", "unimts", "normwear")
+# Full released-model parameter counts in millions, measured from the pinned artifacts used by
+# the adapters.  This is model capacity, not the parameter-free common enrollment readout.
+_PARAMETER_COUNT_M = {
+    "harnet": 4.49,
+    "limubert_x": 0.055,
+    "unimts": 68.61,
+    "normwear": 1293.86,
+}
+_HALO_CLASSIFIER_PARAMETER_CACHE: dict[str, int] = {}
 TRAINING_BANK_ZERO_SHOT = frozenset({"halo", "harnet", "limubert_x"})
+# Bump whenever feature extraction semantics, cache inputs, or pooling changes.  This avoids
+# treating an old embedding array as valid after a code-only correction.
+FEATURE_CACHE_SCHEMA = "sealed-feature-v4-20260913"
+MAX_EXACT_RIDGE_SYSTEM = 512
+
+
+def _native_capabilities(name: str) -> dict[str, bool]:
+    """Disclose capabilities supplied by the model itself, not shared controls.
+
+    The common 1-NN/prototype/ridge readouts deliberately give every representation the same
+    post-hoc enrollment protocol.  They must not be mistaken for a released model's native
+    open-set or adaptation mechanism.
+    """
+    if name == "halo":
+        return {
+            "native_open_set_labels": True,
+            "native_few_shot_adaptation": True,
+        }
+    adapter = baselines.REGISTRY[name]
+    return {
+        "native_open_set_labels": bool(adapter.supports_native_zero_shot()),
+        "native_few_shot_adaptation": bool(adapter.supports_native_enrollment()),
+    }
+
+
+def _parameter_count_m(
+    name: str,
+    halo_state: tuple[torch.nn.Module, str] | None = None,
+    *,
+    halo_checkpoint: Path | None = None,
+    include_classifier: bool = False,
+) -> float:
+    """Return full model capacity for every result row.
+
+    HALO is checkpoint-dependent, so count its materialized encoder at runtime; released
+    baselines use the audited counts above.  The second tuple member is the checkpoint
+    fingerprint used for cache invalidation, not a module.
+    """
+    if name != "halo":
+        return _PARAMETER_COUNT_M[name]
+    if halo_state is None:
+        raise ValueError("HALO parameter count requires the loaded evaluation state")
+    encoder, _ = halo_state
+    count = sum(parameter.numel() for parameter in encoder.parameters())
+    if include_classifier:
+        if halo_checkpoint is None:
+            raise ValueError("learned HALO classifier count requires its checkpoint")
+        cache_key = str(halo_checkpoint.resolve())
+        if cache_key not in _HALO_CLASSIFIER_PARAMETER_CACHE:
+            blob = torch.load(halo_checkpoint, map_location="cpu", weights_only=False)
+            if blob.get("architecture_version") not in {"support_classifier_v2", "support_classifier_v3"}:
+                raise ValueError("only a residual support-classifier checkpoint exposes the learned count")
+            classifier_config = dict(blob["classifier_config"])
+            if blob.get("architecture_version") == "support_classifier_v2":
+                classifier_config.setdefault("normalized_token_composition", False)
+            head = ResidualSupportClassifier(
+                AttentionSpec(**blob["attention_spec"]),
+                ResidualClassifierConfig(**classifier_config),
+            )
+            _HALO_CLASSIFIER_PARAMETER_CACHE[cache_key] = sum(
+                parameter.numel() for parameter in head.parameters()
+            )
+        count += _HALO_CLASSIFIER_PARAMETER_CACHE[cache_key]
+    return count / 1_000_000.0
 
 
 @dataclass(frozen=True)
@@ -61,6 +139,29 @@ def sealed_cells() -> tuple[tuple[str, str], ...]:
         for dataset in SEALED_TEST_EVAL_DATASETS
         for spec in stream_specs(dataset, "primary")
     )
+
+
+def duration_cells(window_seconds: Sequence[float]) -> tuple[tuple[float, str, str], ...]:
+    """Expand the fixed sealed roster over declared evidence budgets deterministically."""
+    return tuple(
+        (float(duration), dataset, stream)
+        for duration in sorted(set(window_seconds))
+        for dataset, stream in sealed_cells()
+    )
+
+
+def evaluation_cells(window_seconds: Sequence[float]) -> tuple[tuple[float, str, str, tuple[str, ...]], ...]:
+    """Single placements plus one declared all-device composite per eligible dataset."""
+    singles = [
+        (duration, dataset, stream, ())
+        for duration, dataset, stream in duration_cells(window_seconds)
+    ]
+    composites = [
+        (float(duration), cell.dataset, cell.cell_id, tuple(cell.stream_ids))
+        for duration in sorted(set(window_seconds))
+        for cell in MULTI_DEVICE_EVAL_CELLS
+    ]
+    return tuple(singles + composites)
 
 
 def _aligned_labels(stream: EvalStream) -> np.ndarray:
@@ -213,19 +314,19 @@ def _readout_predictions(
     z = _normalise(features)
     result = {"1nn": [], "prototype": [], "ridge": []}
     candidate_index = {label: index for index, label in enumerate(candidates)}
-    for plan in plans:
-        query = z[plan.query]
-        support = np.asarray(plan.support, dtype=np.int64)
-        if not len(support):
-            continue
-        x = z[support]
-        y = np.asarray([candidate_index[label] for label in plan.support_labels], dtype=np.int64)
-        result["1nn"].append(str(plan.support_labels[int(np.argmax(x @ query))]))
-        prototypes = np.stack([
-            x[y == slot].mean(axis=0) for slot in range(len(candidates))
-        ])
-        result["prototype"].append(str(candidates[int(np.argmax(_normalise(prototypes) @ query))]))
-        if device is None:
+    if device is None:
+        for plan in plans:
+            query = z[plan.query]
+            support = np.asarray(plan.support, dtype=np.int64)
+            if not len(support):
+                continue
+            x = z[support]
+            y = np.asarray([candidate_index[label] for label in plan.support_labels], dtype=np.int64)
+            result["1nn"].append(str(plan.support_labels[int(np.argmax(x @ query))]))
+            prototypes = np.stack([
+                x[y == slot].mean(axis=0) for slot in range(len(candidates))
+            ])
+            result["prototype"].append(str(candidates[int(np.argmax(_normalise(prototypes) @ query))]))
             # Reference path used by unit tests and CPU-only callers.
             target = np.eye(len(candidates), dtype=np.float64)[y]
             if len(x) <= x.shape[1]:
@@ -237,11 +338,67 @@ def _readout_predictions(
                 coefficient = np.linalg.solve(gram, x.T @ target)
                 ridge_scores = query @ coefficient
             result["ridge"].append(str(candidates[int(np.argmax(ridge_scores))]))
-    if device is not None:
-        result["ridge"] = _ridge_predictions_batched(
-            z, candidates, plans, device, ridge_alpha=ridge_alpha,
-        )
+    else:
+        result.update(_neighbor_prototype_predictions_batched(z, candidates, plans, device))
+        support_count = len(plans[0].support) if plans else 0
+        # Ridge needs one query-specific solve because every immutable episode has different
+        # enrolled rows. Beyond this exact-system order, especially for 2,048-D NormWear features,
+        # the requested high-k control takes hours. High-k 1-NN/prototype remain exact and are the
+        # primary parameter-free enrollment controls; disclose ridge as N/A rather than approximate it.
+        if min(support_count, z.shape[1]) <= MAX_EXACT_RIDGE_SYSTEM:
+            result["ridge"] = _ridge_predictions_batched(
+                z, candidates, plans, device, ridge_alpha=ridge_alpha,
+            )
+        else:
+            result.pop("ridge", None)
     return result
+
+
+@torch.no_grad()
+def _neighbor_prototype_predictions_batched(
+    normalized_features: np.ndarray,
+    candidates: Sequence[str],
+    plans: Sequence[QueryPlan],
+    device: torch.device,
+) -> dict[str, list[str]]:
+    """GPU-batch exact 1-NN and prototype scoring for query-specific episodes."""
+    if not plans:
+        return {"1nn": [], "prototype": []}
+    candidate_index = {label: index for index, label in enumerate(candidates)}
+    support_count = len(plans[0].support)
+    if not support_count or any(len(plan.support) != support_count for plan in plans):
+        raise ValueError("batched enrollment plans must have one non-zero support width")
+    dim = int(normalized_features.shape[1])
+    # Bound the gathered support tensor to roughly 96 MiB. This scales safely from compact
+    # released encoders to NormWear's 2,048-dimensional representation and large-k episodes.
+    batch_size = max(1, min(256, (24 * 1024 * 1024) // max(1, support_count * dim)))
+    nearest: list[str] = []
+    prototype: list[str] = []
+    for start in range(0, len(plans), batch_size):
+        chunk = plans[start:start + batch_size]
+        support_rows = np.asarray([plan.support for plan in chunk], dtype=np.int64)
+        query_rows = np.asarray([plan.query for plan in chunk], dtype=np.int64)
+        bindings = torch.as_tensor(
+            [[candidate_index[label] for label in plan.support_labels] for plan in chunk],
+            dtype=torch.long, device=device,
+        )
+        x = torch.as_tensor(normalized_features[support_rows], dtype=torch.float32, device=device)
+        query = torch.as_tensor(normalized_features[query_rows], dtype=torch.float32, device=device)
+
+        similarities = torch.einsum("bsd,bd->bs", x, query)
+        selected = similarities.argmax(dim=1)
+        selected_labels = bindings.gather(1, selected[:, None]).squeeze(1)
+        nearest.extend(candidates[index] for index in selected_labels.cpu().tolist())
+
+        sums = torch.zeros((len(chunk), len(candidates), dim), dtype=x.dtype, device=device)
+        sums.scatter_add_(1, bindings.unsqueeze(-1).expand(-1, -1, dim), x)
+        counts = torch.zeros((len(chunk), len(candidates)), dtype=x.dtype, device=device)
+        counts.scatter_add_(1, bindings, torch.ones_like(bindings, dtype=x.dtype))
+        means = sums / counts.clamp_min(1).unsqueeze(-1)
+        means = torch.nn.functional.normalize(means, dim=-1)
+        scores = torch.einsum("bcd,bd->bc", means, query)
+        prototype.extend(candidates[index] for index in scores.argmax(dim=1).cpu().tolist())
+    return {"1nn": nearest, "prototype": prototype}
 
 
 @torch.no_grad()
@@ -346,16 +503,20 @@ def _metric_row(
     metrics.update({
         "dataset": stream.dataset,
         "stream": stream.stream,
+        "window_seconds": float(stream.window_seconds),
         "n_queries": int(len(indices)),
         "n_candidates": int(len(stream.eval_labels)),
         "quality_screen": stream.quality_screen,
         "quality_excluded": int(stream.n_quality_excluded),
+        "source_slice_fingerprint": source_slice_fingerprint(stream),
     })
     return metrics
 
 
 def _cache_key(name: str, stream: EvalStream, fingerprint: str) -> str:
-    text = f"{name}|{stream.dataset}|{stream.stream}|{stream.alignment}|{fingerprint}"
+    devices = tuple(getattr(stream, "device_ids", (stream.stream,)))
+    text = (f"{FEATURE_CACHE_SCHEMA}|{name}|{stream.dataset}|{stream.stream}|{stream.alignment}|"
+            f"{stream.window_seconds:g}|{devices}|{fingerprint}|{source_slice_fingerprint(stream)}")
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
@@ -379,13 +540,74 @@ def _halo_features(
         fingerprint = _file_hash(checkpoint)
     else:
         encoder, fingerprint = state
-    features = encode_dataset(
-        encoder, stream.windows, stream_channel_descriptions(stream.dataset, stream.stream), device,
-        stream.rate_hz, _stream_gravity_state(stream.dataset, stream.stream),
-        channel_mask=stream.mask, dataset=stream.dataset, stream=stream.stream,
-        lengths=stream.lengths, amp_dtype=torch.bfloat16 if device.type == "cuda" else None,
-    )
+    if isinstance(stream, MultiDeviceEvalStream):
+        features = encode_multi_device_dataset(
+            encoder, stream.devices, device,
+            amp_dtype=torch.bfloat16 if device.type == "cuda" else None,
+        )
+    else:
+        features = encode_dataset(
+            encoder, stream.windows, stream_channel_descriptions(stream.dataset, stream.stream), device,
+            stream.rate_hz, _stream_gravity_state(stream.dataset, stream.stream),
+            channel_mask=stream.mask, dataset=stream.dataset, stream=stream.stream,
+            lengths=stream.lengths, amp_dtype=torch.bfloat16 if device.type == "cuda" else None,
+        )
     return np.asarray(features.cpu(), dtype=np.float32), fingerprint
+
+
+@torch.no_grad()
+def _halo_residual_predictions(
+    features: np.ndarray, stream: EvalStream, plans: Sequence[QueryPlan], checkpoint: Path,
+    device: torch.device, *, residual_enabled: bool = True, text_term_enabled: bool = True,
+    batch_size: int = 64,
+) -> list[str]:
+    """Evaluate v2's unified scorer; shared parameter-free controls remain elsewhere unchanged."""
+    blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if blob.get("architecture_version") not in {"support_classifier_v2", "support_classifier_v3"}:
+        raise ValueError("residual readout requires a residual support-classifier checkpoint")
+    classifier_config = dict(blob["classifier_config"])
+    if blob.get("architecture_version") == "support_classifier_v2":
+        classifier_config.setdefault("normalized_token_composition", False)
+    cfg = ResidualClassifierConfig(**classifier_config)
+    cfg = replace(cfg, residual_enabled=residual_enabled, text_term_enabled=text_term_enabled)
+    head = ResidualSupportClassifier(AttentionSpec(**blob["attention_spec"]), cfg).to(device).eval()
+    head.load_state_dict(blob["classifier"], strict=True)
+    candidates = tuple(stream.eval_labels)
+    table = make_label_text(candidates, device)
+    candidate_text = table.matrix[torch.as_tensor(table.ids(candidates), device=device)].unsqueeze(0)
+    label_to_slot = {label: slot for slot, label in enumerate(candidates)}
+    output: list[str] = []
+    for start in range(0, len(plans), batch_size):
+        chunk = plans[start:start + batch_size]
+        b, c = len(chunk), len(candidates)
+        width = max((len(plan.support) for plan in chunk), default=0)
+        rows = np.zeros((b, width), dtype=np.int64)
+        bound = torch.full((b, width), -1, dtype=torch.long, device=device)
+        support_mask = torch.zeros((b, width), dtype=torch.bool, device=device)
+        for row, plan in enumerate(chunk):
+            if plan.support:
+                rows[row, :len(plan.support)] = plan.support
+                bound[row, :len(plan.support)] = torch.tensor(
+                    [label_to_slot[label] for label in plan.support_labels], device=device,
+                )
+                support_mask[row, :len(plan.support)] = True
+        support_feature = torch.as_tensor(features[rows], dtype=torch.float32, device=device)
+        support_feature = support_feature * support_mask.unsqueeze(-1)
+        safe_bound = bound.clamp_min(0)
+        support_text = candidate_text.expand(b, -1, -1).gather(
+            1, safe_bound.unsqueeze(-1).expand(-1, -1, candidate_text.shape[-1]),
+        ) * support_mask.unsqueeze(-1)
+        result = head(
+            query_feature=torch.as_tensor(features[[plan.query for plan in chunk]], dtype=torch.float32, device=device),
+            support_feature=support_feature, support_label_text=support_text, support_bound=bound,
+            support_mask=support_mask,
+            support_pair_slot=torch.arange(1, width + 1, device=device).unsqueeze(0).expand(b, -1),
+            candidate_text=candidate_text.expand(b, -1, -1),
+            candidate_mask=torch.ones((b, c), dtype=torch.bool, device=device),
+            candidate_slot=torch.arange(1, c + 1, device=device).unsqueeze(0).expand(b, -1),
+        )
+        output.extend(candidates[index] for index in result["logits"].argmax(dim=1).cpu().tolist())
+    return output
 
 
 @torch.no_grad()
@@ -404,6 +626,8 @@ def _halo_token_mixer_predictions(
     it never has an implicit retrieval bank outside the manifest.
     """
     blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if blob.get("architecture_version") in {"support_classifier_v2", "support_classifier_v3"}:
+        return _halo_residual_predictions(features, stream, plans, checkpoint, device)
     if blob.get("architecture_version") != "support_token_mixer_v1" \
             or "classifier" not in blob or "classifier_config" not in blob \
             or "attention_spec" not in blob:
@@ -466,7 +690,7 @@ def _baseline_feature_state(
 ):
     """Load a released feature provider and fingerprint it without encoding a stream."""
     adapter = baselines.REGISTRY[name]
-    reason = adapter.is_incompatible(stream.dataset)
+    reason = adapter.incompatibility_for_stream(stream)
     if reason is not None:
         raise baselines.UnsupportedEvaluationCell(reason)
     state = adapter.setup_features(device) if state is None else state
@@ -498,21 +722,27 @@ def _load_or_encode(
     meta_path = array_path.with_suffix(".json")
     if array_path.exists() and meta_path.exists():
         meta = json.loads(meta_path.read_text())
-        if meta.get("cache_key") == key and meta.get("n_windows") == stream.n_windows:
-            return np.load(array_path), str(meta["artifact_fingerprint"])
+        if (meta.get("cache_schema") == FEATURE_CACHE_SCHEMA and meta.get("cache_key") == key
+                and meta.get("n_windows") == stream.n_windows
+                and meta.get("source_slice_fingerprint") == source_slice_fingerprint(stream)):
+            cached = np.load(array_path)
+            if cached.ndim == 2 and cached.shape[0] == stream.n_windows and np.isfinite(cached).all():
+                return cached, str(meta["artifact_fingerprint"])
     if name == "halo":
         values, fingerprint = _halo_features(
             stream, halo_checkpoint, device, state=halo_state,
         )
     else:
-        values = np.asarray(adapter.window_features(stream, state, device), dtype=np.float32)
+        values = np.asarray(adapter.features_for_stream(stream, state, device), dtype=np.float32)
         fingerprint = probe
     if values.shape[0] != stream.n_windows or values.ndim != 2 or not np.isfinite(values).all():
         raise ValueError(f"{name}: invalid feature matrix {values.shape} for {stream.dataset}/{stream.stream}")
     cache_dir.mkdir(parents=True, exist_ok=True)
     np.save(array_path, values)
-    meta_path.write_text(json.dumps({"cache_key": key, "n_windows": stream.n_windows,
-                                     "artifact_fingerprint": fingerprint}, indent=2) + "\n")
+    meta_path.write_text(json.dumps({"cache_schema": FEATURE_CACHE_SCHEMA, "cache_key": key, "n_windows": stream.n_windows,
+                                     "artifact_fingerprint": fingerprint,
+                                     "source_slice_fingerprint": source_slice_fingerprint(stream)},
+                                    indent=2) + "\n")
     return values, fingerprint
 
 
@@ -626,8 +856,10 @@ def _build_training_reference_bank(
 
 
 def _write_markdown(rows: Sequence[dict], path: Path) -> None:
-    columns = ("model", "readout", "k", "dataset", "stream", "f1_macro", "balanced_accuracy",
-               "f1_macro_ci_lo", "f1_macro_ci_hi", "n_queries", "n_candidates", "status")
+    columns = ("model", "readout", "window_seconds", "k", "dataset", "stream", "n_devices",
+               "multi_device_mode", "padded", "padded_fraction", "f1_macro", "balanced_accuracy",
+               "accuracy", "f1_macro_ci_lo", "f1_macro_ci_hi", "n_queries", "n_candidates",
+               "parameters_m", "native_open_set_labels", "native_few_shot_adaptation", "status")
     lines = ["# Sealed support-conditioned HAR results", "",
              "Generated by `training.support_classifier.sealed_eval`; no values select a checkpoint.", "",
              "| " + " | ".join(columns) + " |",
@@ -643,7 +875,11 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--models", nargs="+", default=list(PRIMARY_BASELINES))
     parser.add_argument("--halo-checkpoint", type=Path, default=None)
+    parser.add_argument("--allow-retired-jepa-checkpoint", action="store_true",
+                        help="allow a future-JEPA checkpoint only to reproduce historical results")
     parser.add_argument("--k", nargs="+", type=int, default=list(DEFAULT_K))
+    parser.add_argument("--window-seconds", type=float, nargs="+", default=[4.0, 8.0, 16.0],
+                        help="physical evidence budgets to score; each requires its own grid")
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--bootstrap", type=int, default=scoring.BOOTSTRAP_B)
     parser.add_argument(
@@ -664,23 +900,32 @@ def main() -> None:
     args = parser.parse_args()
     if not args.k or min(args.k) < 0:
         parser.error("--k must contain non-negative support counts")
+    if (not args.window_seconds or any(value <= 0 or not np.isfinite(value)
+                                       for value in args.window_seconds)):
+        parser.error("--window-seconds must contain finite positive durations")
     unknown = sorted(set(args.models) - set(PRIMARY_BASELINES) - {"halo"})
     if unknown:
         parser.error(f"models outside the registered primary roster: {unknown}")
     if len(set(args.models)) != len(args.models):
         parser.error("--models must not repeat a provider")
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
-    args.out.mkdir(parents=True, exist_ok=True)
-    cache_dir = args.feature_cache or args.out / "feature_cache"
     halo_state: tuple[torch.nn.Module, str] | None = None
     if "halo" in args.models:
         if args.halo_checkpoint is None:
             parser.error("--halo-checkpoint is required when model list includes halo")
         halo_blob = torch.load(args.halo_checkpoint, map_location="cpu", weights_only=False)
+        if "jepa_mode" in halo_blob.get("config", {}) \
+                and not args.allow_retired_jepa_checkpoint:
+            parser.error(
+                "future-JEPA checkpoints are retired from the active HALO recipe; pass "
+                "--allow-retired-jepa-checkpoint only for historical reproduction"
+            )
         halo_state = (
             build_encoder(halo_blob, device).eval(),
             _file_hash(args.halo_checkpoint),
         )
+    args.out.mkdir(parents=True, exist_ok=True)
+    cache_dir = args.feature_cache or args.out / "feature_cache"
     # A very large native model (notably NormWear) must be instantiated once and reused across
     # sealed streams. The same state also serves training-bank encoding so ordinary released
     # encoders are not reconstructed once per source stream.
@@ -704,10 +949,37 @@ def main() -> None:
             )
     all_rows: list[dict] = []
     manifests: dict[str, dict] = {}
-    for dataset, stream_id in sealed_cells():
-        stream = load_eval_stream(dataset, stream_id, alignment="native", apply_quality_screen=True)
+    for window_seconds, dataset, stream_id, device_ids in evaluation_cells(args.window_seconds):
+        cell_row_start = len(all_rows)
+        stream = (
+            load_multi_device_stream(
+                dataset, device_ids, alignment="native", window_seconds=window_seconds,
+                apply_quality_screen=True,
+            )
+            if device_ids else
+            load_eval_stream(
+                dataset, stream_id, alignment="native", window_seconds=window_seconds,
+                apply_quality_screen=True,
+            )
+        )
         if stream.quality_screen != "applied":
             raise RuntimeError(f"{dataset}/{stream_id}: quality screen unavailable ({stream.quality_screen})")
+        # Freeze every episode before any provider is loaded or invoked. All models consume these
+        # same query/support row ids; representation extraction cannot influence episode creation.
+        plans_by_k: dict[int, list[QueryPlan]] = {}
+        for k in sorted(set(args.k)):
+            plans = build_manifest(stream, k, seed=args.seed)
+            plans_by_k[k] = plans
+            manifest_id = f"{dataset}/{stream_id}/w={window_seconds:g}/k={k}"
+            manifests[manifest_id] = {
+                "fingerprint": manifest_fingerprint(plans), "n_queries": len(plans), "k": k,
+                "candidates": stream.eval_labels,
+                "device_ids": list(getattr(stream, "device_ids", (stream.stream,))),
+                "window_seconds": float(window_seconds),
+                "source_slice_fingerprint": source_slice_fingerprint(stream),
+                "seed": args.seed,
+                "construction": "execution_disjoint_stable_choice_v1",
+            }
         # A representation depends only on the provider and the stream, never on enrollment k.
         # Encode/cache it once, then run all protocol readouts on immutable manifests.
         features_by_model: dict[str, tuple[np.ndarray, str]] = {}
@@ -733,17 +1005,8 @@ def main() -> None:
                 except baselines.UnsupportedEvaluationCell as exc:
                     feature_errors[name] = str(exc)
         for k in sorted(set(args.k)):
-            plans = build_manifest(stream, k, seed=args.seed)
-            manifest_id = f"{dataset}/{stream_id}/k={k}"
-            manifests[manifest_id] = {"fingerprint": manifest_fingerprint(plans),
-                                      "n_queries": len(plans), "k": k,
-                                      "candidates": stream.eval_labels,
-                                      # The complete row lists can be regenerated exactly from
-                                      # the sealed stream, this protocol version, and ``seed``.
-                                      # Persisting them duplicated gigabytes of index data at
-                                      # k=64/128 without adding audit value.
-                                      "seed": args.seed,
-                                      "construction": "execution_disjoint_stable_choice_v1"}
+            plans = plans_by_k[k]
+            manifest_id = f"{dataset}/{stream_id}/w={window_seconds:g}/k={k}"
             if not plans:
                 for name in args.models:
                     all_rows.append({"model": name, "readout": "all", "k": k,
@@ -752,6 +1015,41 @@ def main() -> None:
                 continue
             for name in args.models:
                 if k == 0:
+                    # A current token-mixer checkpoint has an explicit zero-support head.
+                    # Exercise it before considering the historical training-bank bridge; it
+                    # works for single and native multi-device features alike.
+                    if name == "halo" and name not in feature_errors:
+                        features, fingerprint = features_by_model[name]
+                        is_v2 = torch.load(args.halo_checkpoint, map_location="cpu", weights_only=False).get(
+                            "architecture_version"
+                        ) in {"support_classifier_v2", "support_classifier_v3"}
+                        try:
+                            predicted = _halo_token_mixer_predictions(
+                                features, stream, plans, args.halo_checkpoint, device,
+                            )
+                        except ValueError:
+                            # The differentiable-neighbours control intentionally has no mixer.
+                            pass
+                        else:
+                            metric = _metric_row(stream, plans, predicted, bootstrap=args.bootstrap)
+                            metric.update({"model": name, "readout": (
+                                "halo-classifier" if is_v2 else "retrieve-mix-vote-zero-shot"
+                            ),
+                                           "k": k, "status": "ok",
+                                           "feature_fingerprint": fingerprint,
+                                           "manifest": manifests[manifest_id]["fingerprint"]})
+                            all_rows.append(metric)
+                            # v2's raw-query text bridge and the historical training-bank ConSE
+                            # bridge answer the same k=0 question differently. Keep both as named,
+                            # disclosed comparison rows; v1 retains its historical single row.
+                            if not is_v2:
+                                continue
+                    if isinstance(stream, MultiDeviceEvalStream):
+                        all_rows.append({"model": name, "readout": "training-bank-1nn-conse", "k": k,
+                                         "window_seconds": float(window_seconds),
+                                         "dataset": dataset, "stream": stream_id, "status": "n/a",
+                                         "reason": "no matching multi-device training reference bank"})
+                        continue
                     if name in TRAINING_BANK_ZERO_SHOT:
                         if name in feature_errors:
                             all_rows.append({"model": name, "readout": "training-bank-1nn-conse", "k": k,
@@ -826,16 +1124,24 @@ def main() -> None:
                                    "status": "ok", "feature_fingerprint": fingerprint,
                                    "manifest": manifests[manifest_id]["fingerprint"]})
                     all_rows.append(metric)
-                predicted = _differentiable_neighbor_predictions(
-                    features, stream.eval_labels, plans, device,
-                )
-                metric = _metric_row(stream, plans, predicted, bootstrap=args.bootstrap)
-                metric.update({"model": name, "readout": "differentiable-neighbors", "k": k,
-                               "status": "ok", "feature_fingerprint": fingerprint,
-                               "manifest": manifests[manifest_id]["fingerprint"]})
-                all_rows.append(metric)
+                if "ridge" not in predictions:
+                    all_rows.append({
+                        "model": name, "readout": "ridge", "k": k,
+                        "dataset": dataset, "stream": stream_id,
+                        "status": "n/a",
+                        "reason": (
+                            "exact query-specific ridge system exceeds "
+                            f"{MAX_EXACT_RIDGE_SYSTEM} dimensions"
+                        ),
+                    })
                 if name == "halo":
+                    # Differentiable neighbours is used only to train and diagnose the HALO
+                    # encoder. Sealed reports use the deployment readouts: 1-NN, prototype,
+                    # ridge, and the learned HALO classifier.
                     try:
+                        is_v2 = torch.load(args.halo_checkpoint, map_location="cpu", weights_only=False).get(
+                            "architecture_version"
+                        ) in {"support_classifier_v2", "support_classifier_v3"}
                         predicted = _halo_token_mixer_predictions(
                             features, stream, plans, args.halo_checkpoint, device,
                         )
@@ -845,10 +1151,48 @@ def main() -> None:
                                          "status": "n/a", "reason": str(exc)})
                     else:
                         metric = _metric_row(stream, plans, predicted, bootstrap=args.bootstrap)
-                        metric.update({"model": name, "readout": "retrieve-mix-vote", "k": k,
+                        metric.update({"model": name, "readout": (
+                            "halo-classifier" if is_v2 else "retrieve-mix-vote"
+                        ), "k": k,
                                        "status": "ok", "feature_fingerprint": fingerprint,
                                        "manifest": manifests[manifest_id]["fingerprint"]})
                         all_rows.append(metric)
+                        if is_v2:
+                            predicted = _halo_residual_predictions(
+                                features, stream, plans, args.halo_checkpoint, device,
+                                residual_enabled=False, text_term_enabled=False,
+                            )
+                            metric = _metric_row(stream, plans, predicted, bootstrap=args.bootstrap)
+                            metric.update({"model": name, "readout": "halo-classifier-residual-off",
+                                           "k": k, "status": "ok", "feature_fingerprint": fingerprint,
+                                           "manifest": manifests[manifest_id]["fingerprint"]})
+                            all_rows.append(metric)
+        # Attach model-input disclosures uniformly, including N/A rows. This is deliberately done
+        # once at the cell boundary so no readout can forget the duration/device fairness fields.
+        for row in all_rows[cell_row_start:]:
+            name = row["model"]
+            row.update(_native_capabilities(name))
+            learned_head = name == "halo" and row.get("readout") in {
+                "halo-classifier", "halo-classifier-residual-off",
+            }
+            row["parameters_m"] = round(_parameter_count_m(
+                name, halo_state, halo_checkpoint=args.halo_checkpoint,
+                include_classifier=learned_head,
+            ), 3)
+            if name == "halo":
+                accounting = {"padded": False, "padded_fraction": 0.0}
+                mode = "native" if isinstance(stream, MultiDeviceEvalStream) else "single-device"
+            else:
+                adapter = baselines.REGISTRY[name]
+                accounting = adapter.input_accounting(stream)
+                mode = ("native" if adapter.supports_multi_device else "per-device-pooled") \
+                    if isinstance(stream, MultiDeviceEvalStream) else "single-device"
+            row.setdefault("window_seconds", float(window_seconds))
+            row["n_devices"] = len(stream.devices) if isinstance(stream, MultiDeviceEvalStream) else 1
+            row["multi_device_mode"] = mode
+            row["padded"] = accounting["padded"]
+            row["padded_fraction"] = accounting["padded_fraction"]
+            row["source_slice_fingerprint"] = source_slice_fingerprint(stream)
     (args.out / "episode_manifests.json").write_text(json.dumps(manifests, indent=2) + "\n")
     (args.out / "results.json").write_text(json.dumps(all_rows, indent=2, allow_nan=True) + "\n")
     _write_markdown(all_rows, args.out / "RESULTS.md")

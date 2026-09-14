@@ -155,12 +155,12 @@ def test_wisdm_missing_gyro_remains_accelerometer_only():
     assert tuple(curated.columns) == ("timestamp_sec", "acc_x", "acc_y", "acc_z")
 
 
-def test_shoaib_primary_and_diagnostic_placements_are_separate():
-    assert [s.stream_id for s in stream_specs("shoaib", "primary")] == ["phone_right_pocket"]
-    assert {s.stream_id for s in stream_specs("shoaib", "diagnostic")} == {
-        "phone_left_pocket", "phone_belt", "watch_wrist_proxy",
-    }
-    assert not any("upper_arm" in source for source in all_source_channels("shoaib", "diagnostic"))
+def test_shoaib_declared_multi_device_placements_are_primary():
+    assert [s.stream_id for s in stream_specs("shoaib", "primary")] == [
+        "phone_right_pocket", "phone_left_pocket", "phone_belt", "watch_wrist_proxy",
+    ]
+    assert stream_specs("shoaib", "diagnostic") == ()
+    assert not any("upper_arm" in source for source in all_source_channels("shoaib", "primary"))
 
 
 def test_non_deployment_datasets_are_not_primary():

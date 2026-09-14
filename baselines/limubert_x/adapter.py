@@ -23,7 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.signal import resample_poly
 
-from ..base import BaselineAdapter, InputContract, register
+from ..base import BaselineAdapter, InputContract, UnsupportedEvaluationCell, register
 
 FEATURE_NUM = 6
 HIDDEN = 72
@@ -140,11 +140,15 @@ def _channel_indices(stream) -> list[int]:
     index = {name: position for position, name in enumerate(stream.channels)}
     missing = [name for name in SIX_CHANNELS if name not in index]
     if missing:
-        raise ValueError(f"LiMU-BERT-X requires {SIX_CHANNELS}; missing {missing}")
+        raise UnsupportedEvaluationCell(
+            f"LiMU-BERT-X requires measured six-axis IMU; missing channels: {missing}"
+        )
     selected = [index[name] for name in SIX_CHANNELS]
     if not np.asarray(stream.mask, dtype=bool)[selected].all():
         masked = [name for name, position in zip(SIX_CHANNELS, selected) if not stream.mask[position]]
-        raise ValueError(f"LiMU-BERT-X requires measured six-axis IMU; masked channels: {masked}")
+        raise UnsupportedEvaluationCell(
+            f"LiMU-BERT-X requires measured six-axis IMU; masked channels: {masked}"
+        )
     return selected
 
 
@@ -211,7 +215,7 @@ class LiMUBERTXAdapter(BaselineAdapter):
 
     name = "limubert_x"
     tier = "representation"
-    contract = InputContract(channels=SIX_CHANNELS, rate_hz=TARGET_HZ, window_sec=1.0)
+    contract = InputContract(channels=SIX_CHANNELS, rate_hz=TARGET_HZ, native_window_sec=1.0)
 
     def setup(self, device):
         if not CHECKPOINT.exists():

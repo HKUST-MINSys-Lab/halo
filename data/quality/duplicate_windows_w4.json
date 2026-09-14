@@ -1,0 +1,93 @@
+{
+  "alignment": "native",
+  "window_seconds": 4.0,
+  "grid_fingerprint": "148610ef64347585336277c928fce64520118ec1789975c04f93ae5f0cf51f96",
+  "stream_fingerprints": {
+    "inclusivehar/phone_waist": "a7018721095d4a139739b403a5c643fbea9a57adc38e6b1f23973414dce94229",
+    "motionsense/phone_front_pocket": "4e68d4002f26a6effdd0aa1bb8e5a05bc29274b613d3bad0719fbee60892a4c5",
+    "realworld/phone_forearm": "2dc2d04df145dc4660799e1dca6ba45f58e0541a687a9b6fafb6ba025420d3d2",
+    "realworld/phone_thigh": "ea68409bf3d49127906abcc0347798e0f920b4b41263ed021e0801dd04af5a5d",
+    "realworld/phone_waist": "7f27887769783e251487c4958610cf03afcf4c840151f2453ea6f7cec49dbbee",
+    "shoaib/phone_belt": "b9d4d10ac637b06487f75ebc8d1226061e402f5809c5c4ddf571852f4f83bada",
+    "shoaib/phone_left_pocket": "44ad5bd8fee52b52e94cb75ecee6f876d5081ed894864d1ef075cebde48c364b",
+    "shoaib/phone_right_pocket": "3cd3d34fe6d218db0021a223e50a93385119988fff91663597602114e07304d7",
+    "shoaib/watch_wrist_proxy": "fb4eb716589c7c7811a4dbc4e0376cadaa6fa583f925231c258c931fd74063ec",
+    "usc_had/phone_hip": "4e137aed9c9604d457f6f82f1158d9c743d59746363aa5a38975626fbbc96509",
+    "ut_complex/watch_wrist": "1566b8f1e6cbb56e7bc5cc5ff0e2ae0e803c2d44abd3dade6b70afa8514a2983"
+  },
+  "windows": {
+    "motionsense/phone_front_pocket": [
+      112,
+      113,
+      114,
+      115,
+      116,
+      117,
+      118,
+      119,
+      120,
+      121,
+      122,
+      123,
+      124,
+      125,
+      126,
+      127,
+      128,
+      129,
+      130,
+      131,
+      132,
+      133,
+      134,
+      135,
+      136,
+      137,
+      138,
+      139,
+      140,
+      141,
+      142,
+      143,
+      144,
+      145,
+      146,
+      147,
+      148,
+      149,
+      150,
+      151,
+      152,
+      153,
+      154,
+      155,
+      156,
+      157,
+      158,
+      159,
+      160,
+      161,
+      162,
+      163
+    ],
+    "usc_had/phone_hip": [
+      4859
+    ]
+  },
+  "summary": [
+    [
+      "motionsense/phone_front_pocket",
+      52,
+      7246,
+      52,
+      0
+    ],
+    [
+      "usc_had/phone_hip",
+      1,
+      7359,
+      1,
+      0
+    ]
+  ]
+}

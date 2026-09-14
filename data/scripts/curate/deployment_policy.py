@@ -342,6 +342,15 @@ class CuratedMetadata:
     note: str
 
 
+@dataclass(frozen=True)
+class MultiDeviceCell:
+    """One declared simultaneous-placement evaluation cell, in fixed device order."""
+
+    dataset: str
+    cell_id: str
+    stream_ids: Tuple[str, ...]
+
+
 def _xyz(prefix: str) -> Dict[str, Tuple[str, ...]]:
     return {f"acc_{axis}": (f"{prefix}{axis}",) for axis in "xyz"}
 
@@ -589,6 +598,10 @@ STREAM_SPECS: Tuple[StreamSpec, ...] = (
     StreamSpec("realworld", "phone_waist", "phone", "waist",
                _GENERIC_ACC, _GENERIC_GYRO, "present",
                note="Gyro is retained only when the converted waist stream actually contains a complete finite triad."),
+    StreamSpec("realworld", "phone_forearm", "phone", "the forearm",
+               _xyz("forearm_acc_"), _gyro("forearm_gyro_"), "present"),
+    StreamSpec("realworld", "phone_thigh", "phone", "the thigh",
+               _xyz("thigh_acc_"), _gyro("thigh_gyro_"), "present"),
     StreamSpec("mobiact", "phone_trouser_pocket", "phone", "trouser pocket",
                _GENERIC_ACC, _GENERIC_GYRO, "present"),
     StreamSpec("shoaib", "phone_right_pocket", "phone", "right trouser pocket",
@@ -648,18 +661,31 @@ STREAM_SPECS: Tuple[StreamSpec, ...] = (
                     "50 Hz in the converter, because the tremor bands this dataset exists to "
                     "measure would otherwise sit 5.7% off."),
 
-    # Deployment-plausible diagnostic views, never mixed into the primary score.
+    # Shoaib simultaneous placement views. The wrist stream is explicitly a phone-on-wrist proxy,
+    # but all four streams are retained so the declared multi-device cell can be evaluated.
     StreamSpec("shoaib", "phone_left_pocket", "phone", "left trouser pocket",
-               _xyz("left_pocket_acc_"), _gyro("left_pocket_gyro_"), "present", role="diagnostic"),
+               _xyz("left_pocket_acc_"), _gyro("left_pocket_gyro_"), "present"),
     StreamSpec("shoaib", "phone_belt", "phone", "belt/holster",
-               _xyz("belt_acc_"), _gyro("belt_gyro_"), "present", role="diagnostic"),
+               _xyz("belt_acc_"), _gyro("belt_gyro_"), "present"),
     StreamSpec("shoaib", "watch_wrist_proxy", "watch_proxy", "right wrist",
-               _xyz("wrist_acc_"), _gyro("wrist_gyro_"), "present", role="diagnostic",
+               _xyz("wrist_acc_"), _gyro("wrist_gyro_"), "present",
                note="A wrist-mounted smartphone is a placement proxy, not a true smartwatch."),
     StreamSpec("harth", "stress_lower_back", "non_deployment", "lower back",
                _xyz("back_acc_"), {}, "present", role="stress"),
     StreamSpec("harth", "stress_thigh", "non_deployment", "thigh",
                _xyz("thigh_acc_"), {}, "present", role="stress"),
+)
+
+
+MULTI_DEVICE_EVAL_CELLS: Tuple[MultiDeviceCell, ...] = (
+    MultiDeviceCell(
+        "realworld", "phone_forearm+phone_thigh+phone_waist",
+        ("phone_forearm", "phone_thigh", "phone_waist"),
+    ),
+    MultiDeviceCell(
+        "shoaib", "phone_left_pocket+phone_right_pocket+watch_wrist_proxy+phone_belt",
+        ("phone_left_pocket", "phone_right_pocket", "watch_wrist_proxy", "phone_belt"),
+    ),
 )
 
 

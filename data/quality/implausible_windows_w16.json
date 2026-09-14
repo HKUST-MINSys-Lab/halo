@@ -1,0 +1,22 @@
+{
+  "alignment": "native",
+  "window_seconds": 16.0,
+  "grid_fingerprint": "2bfabe1e1bde265120ab16424163f09564fe73b4668ffcb97d282ef69c63ba5c",
+  "stream_fingerprints": {
+    "inclusivehar/phone_waist": "6f6c13b9bf96a2292e858eda28c1634ab35129500a6e0fee4c9221e251941f7c",
+    "motionsense/phone_front_pocket": "6410862aa39e004c99fe7832259432ff9e83ed54e6c0ffe4320eac5cc08c929f",
+    "realworld/phone_forearm": "d48bac30a273969acadceed476e852cd7d29af5e657f7bcd0517e51407f6fc5a",
+    "realworld/phone_thigh": "04c2121b846714e6c11fcb3b47854aa0be50cc129e45e2b569d75cdca0b70b3c",
+    "realworld/phone_waist": "892a1f8ee55f01023db98a8cfeb69717d0ca0b88b0a2b364f1ccd7da8923f89f",
+    "shoaib/phone_belt": "3627f091207f1bd8c753b44c8a5ff8553e25f1f235d44008427f71fcc7502e98",
+    "shoaib/phone_left_pocket": "c9f648986cfa1a1af2bc64d188399c4030e137bffaca4d35050fe41ca14364aa",
+    "shoaib/phone_right_pocket": "2a93b247f94374904c4f5345d79b01d60061c8e5d6d2e43afe8176e430dfbceb",
+    "shoaib/watch_wrist_proxy": "32e46614ed680fe76f8d0ff8d30dddd928e27e6cd1e8343d9e2970eeb192b554",
+    "usc_had/phone_hip": "f146ad8fd00b6531c2a3043c0a2ef8792952423af74204891ec56d3e31097c88",
+    "ut_complex/watch_wrist": "40e6b777697f7f2acd9f4f17f934092f53d05150f87bed5c63109c5e1450fd26"
+  },
+  "gyro_rail_rad_s": 34.90658503988659,
+  "accel_rail_g": 16.0,
+  "windows": {},
+  "summary": []
+}

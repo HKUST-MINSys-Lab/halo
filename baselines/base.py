@@ -23,7 +23,7 @@ from baselines import scoring
 REGISTRY: Dict[str, "BaselineAdapter"] = {}
 
 
-class UnsupportedEvaluationCell(RuntimeError):
+class UnsupportedEvaluationCell(ValueError, RuntimeError):
     """A model cannot score one protocol cell without changing its declared mechanism."""
 
 
@@ -46,7 +46,8 @@ class InputContract:
     """
     channels: Optional[Sequence[str]] = None  # required channel names/order, or None
     rate_hz: Optional[float] = None           # required sampling rate, or None
-    window_sec: Optional[float] = None        # required window length in seconds, or None
+    native_window_sec: Optional[float] = None # native chunk length, not the evaluation evidence budget
+    max_window_sec: Optional[float] = None    # longest one-pass input verified by the adapter/probe
 
 
 class BaselineAdapter:
@@ -59,6 +60,33 @@ class BaselineAdapter:
     name: str = ""
     tier: str = ""  # "conse" | "cosine"
     contract: InputContract = InputContract()
+    supports_multi_device: bool = False
+
+    @staticmethod
+    def pool_features(features: Sequence[np.ndarray], weights: Sequence[float] | None = None) -> np.ndarray:
+        """Shared parameter-free pooling for chunks or independently encoded devices."""
+        if not features:
+            raise ValueError("cannot pool an empty feature sequence")
+        arrays = [np.asarray(value, dtype=np.float32) for value in features]
+        if any(value.ndim != 2 or value.shape != arrays[0].shape for value in arrays):
+            raise ValueError("pooled feature matrices must have one matching (N,D) shape")
+        weight = np.ones(len(arrays), dtype=np.float32) if weights is None else np.asarray(weights, dtype=np.float32)
+        if weight.shape != (len(arrays),) or np.any(weight < 0) or not float(weight.sum()):
+            raise ValueError("pooling weights must be non-negative and align with feature matrices")
+        pooled = np.average(np.stack(arrays), axis=0, weights=weight)
+        return pooled / np.maximum(np.linalg.norm(pooled, axis=1, keepdims=True), 1e-12)
+
+    def features_for_stream(self, stream, state, device) -> np.ndarray:
+        """One representation path for single and composite cells.
+
+        Native multi-device adapters override ``window_features`` for the composite. Other models
+        receive every declared device and pool once here, so no adapter can quietly drop a device.
+        """
+        if isinstance(stream, eval_data.MultiDeviceEvalStream):
+            if self.supports_multi_device:
+                return self.window_features(stream, state, device)
+            return self.pool_features([self.window_features(member, state, device) for member in stream.devices])
+        return self.window_features(stream, state, device)
 
     def setup(self, device):
         """Load model + artifacts once; return an opaque state object."""
@@ -91,6 +119,33 @@ class BaselineAdapter:
         None. The driver records such a case as an explicit, disclosed N/A cell —
         not silently scored, and not counted as a failure."""
         return None
+
+    def incompatibility_for_stream(self, stream) -> Optional[str]:
+        """Apply the declared compatibility rule to every member of a composite cell."""
+        members = stream.devices if isinstance(stream, eval_data.MultiDeviceEvalStream) else [stream]
+        reasons = [self.is_incompatible(member.dataset) for member in members]
+        reasons = [reason for reason in reasons if reason is not None]
+        return reasons[0] if reasons else None
+
+    def input_accounting(self, stream) -> dict:
+        """Disclose padding introduced by a released model's native chunk contract."""
+        native = self.contract.native_window_sec
+        members = stream.devices if isinstance(stream, eval_data.MultiDeviceEvalStream) else [stream]
+        if native is None:
+            return {"padded": False, "padded_fraction": 0.0}
+        padded = consumed = 0.0
+        # Simultaneous members have the same physical duration; count time once, not per device.
+        member = members[0]
+        lengths = (np.asarray(member.lengths, dtype=np.float64) if member.lengths is not None
+                   else np.full(member.n_windows, member.windows.shape[1], dtype=np.float64))
+        durations = lengths / float(member.rate_hz)
+        for duration in durations.tolist():
+            slots = max(1, int(np.ceil(duration / float(native))))
+            model_time = slots * float(native)
+            padded += model_time - duration
+            consumed += model_time
+        fraction = padded / consumed if consumed else 0.0
+        return {"padded": bool(padded > 1e-9), "padded_fraction": float(fraction)}
 
     def predict(self, stream: eval_data.EvalStream, state, device) -> Tuple[List[str], dict]:
         """Per-window predictions over ``stream.eval_labels`` (aligned 1:1 with

@@ -1,9 +1,9 @@
 """
 Convert RealWorld HAR (2016) dataset to the new HALO raw-session layout.
 
-Deployment stream: `phone_waist` (see data/scripts/curate/deployment_policy.py) — we convert
-ONLY the WAIST body position, emitting generic accelerometer columns acc_x/acc_y/acc_z and,
-when a complete finite triad exists, gyroscope columns gyro_x/gyro_y/gyro_z.
+Deployment streams: waist, forearm, and thigh (see deployment_policy.py). They are emitted in one
+session on one shared clock so a grid row has exact simultaneous counterparts at every placement.
+The historical waist columns retain their generic names and numerical construction.
 
 RealWorld raw layout (data/datasets/realworld/downloads/probandN/data/):
   - Per (sensor, activity) outer zip: {acc|gyr}_{activity}_csv.zip
@@ -19,8 +19,8 @@ Output (new layout, this directory):
   - labels.json                        : {session_id: [activity_name]}
   - manifest.json / metadata.json      : informational + native rate for build_grids
 
-We emit RAW whole-recording sessions (one per continuous waist recording / recording part).
-build_grids performs the fixed 6-second windowing — do NOT pre-window here.
+We emit RAW whole-recording sessions (one per continuous recording / recording part).
+build_grids applies the requested physical evidence budget — do NOT pre-window here.
 """
 
 import io
@@ -42,9 +42,10 @@ DS_DIR = Path(__file__).resolve().parent
 DOWNLOADS_DIR = DS_DIR / "downloads"
 OUTPUT_DIR = DS_DIR
 SESSIONS_DIR = OUTPUT_DIR / "sessions"
+LEGACY_SESSIONS_DIR = OUTPUT_DIR / "sessions_legacy_pre_clock_v1"
 
 # Body position for the phone_waist deployment stream.
-TARGET_POSITION = "waist"
+TARGET_POSITIONS = ("waist", "forearm", "thigh")
 # RealWorld records at ~50 Hz; we resample each recording onto a uniform 50 Hz grid so the
 # acc/gyro streams share one timeline and build_grids' fixed native rate is exact.
 TARGET_SAMPLE_RATE = 50.0
@@ -66,12 +67,11 @@ ACTIVITIES = [
 SENSORS = {"acc": "acc", "gyr": "gyro"}
 
 
-def _waist_member(namelist: List[str]) -> Optional[str]:
-    """Return the per-position CSV member for the waist position (acc_*_waist.csv or
-    Gyroscope_*_waist.csv), or None. Matching by the `_waist.csv` suffix is robust to the
+def _position_member(namelist: List[str], position: str) -> Optional[str]:
+    """Return a per-position CSV member. Matching by suffix is robust to the
     differing acc (`acc_`) vs gyro (`Gyroscope_`) filename prefixes."""
     for name in namelist:
-        if name.lower().endswith("_waist.csv"):
+        if name.lower().endswith(f"_{position}.csv"):
             return name
     return None
 
@@ -91,14 +91,17 @@ def _parse_waist_csv(fileobj, sensor_out: str) -> Optional[pd.DataFrame]:
 
     t_ms = df[time_col].values.astype(float)
     out = pd.DataFrame()
-    out["timestamp_sec"] = (t_ms - t_ms[0]) / 1000.0  # Unix ms -> seconds, relative to start
+    # Keep the acquisition clock intact until all placements are joined.  Resetting every
+    # CSV independently makes a half-second placement offset look simultaneous.
+    out["timestamp_sec"] = t_ms / 1000.0
     for axis in "xyz":
         out[f"{sensor_out}_{axis}"] = df[f"attr_{axis}"].values.astype(float)
     return out
 
 
-def load_sensor_parts(outer_zip_path: Path, sensor_out: str) -> List[Optional[pd.DataFrame]]:
-    """Return the ordered list of per-recording-part waist DataFrames for one sensor.
+def load_sensor_parts(outer_zip_path: Path, sensor_out: str,
+                      position: str = "waist") -> List[Optional[pd.DataFrame]]:
+    """Return the ordered list of per-recording-part position DataFrames for one sensor.
 
     Single-recording zips yield a 1-element list; multi-part (nested-zip) activities yield one
     entry per part, ordered by part index. Entries may be None if a part lacks a waist CSV.
@@ -122,14 +125,14 @@ def load_sensor_parts(outer_zip_path: Path, sensor_out: str) -> List[Optional[pd
             for inner_name in sorted(inner_zips, key=part_key):
                 inner_bytes = z.read(inner_name)
                 with zipfile.ZipFile(io.BytesIO(inner_bytes)) as zi:
-                    member = _waist_member(zi.namelist())
+                    member = _position_member(zi.namelist(), position)
                     if member is None:
                         parts.append(None)
                         continue
                     with zi.open(member) as f:
                         parts.append(_parse_waist_csv(f, sensor_out))
         else:
-            member = _waist_member(names)
+            member = _position_member(names, position)
             if member is not None:
                 with z.open(member) as f:
                     parts.append(_parse_waist_csv(f, sensor_out))
@@ -138,38 +141,72 @@ def load_sensor_parts(outer_zip_path: Path, sensor_out: str) -> List[Optional[pd
 
 
 def resample_part(acc_df: pd.DataFrame, gyro_df: Optional[pd.DataFrame],
-                  rate: float = TARGET_SAMPLE_RATE) -> Optional[pd.DataFrame]:
+                  rate: float = TARGET_SAMPLE_RATE,
+                  extra_positions: dict[str, tuple[pd.DataFrame | None, pd.DataFrame | None]] | None = None,
+                  ) -> Optional[pd.DataFrame]:
     """Resample one recording part onto a uniform `rate` Hz timeline.
 
-    Accelerometer is required and defines the session duration; gyroscope (if present) is
-    interpolated onto the same timeline. Both are treated relative to their own start (the
-    acc/gyro clocks differ by a few ms; negligible at 50 Hz). Gyro is kept only if it forms a
-    complete finite triad over the whole session.
+    Accelerometer is required and defines the single-placement session duration.  All other
+    streams are interpolated against the same *absolute* acquisition clock.  A channel that
+    does not cover that interval remains absent: endpoint extrapolation is not measurement.
     """
-    src_t = acc_df["timestamp_sec"].values - acc_df["timestamp_sec"].values[0]
-    duration = float(src_t[-1])
+    src_t = acc_df["timestamp_sec"].values.astype(float)
+    if not np.all(np.isfinite(src_t)) or np.any(np.diff(src_t) <= 0):
+        return None
+    origin = float(src_t[0])
+    duration = float(src_t[-1] - origin)
     if duration <= 0:
         return None
 
     n = int(duration * rate) + 1
     if n < 10:
         return None
-    t = np.linspace(0.0, duration, n)
+    # Integer sample ticks avoid stretching the recording with linspace.  The final source
+    # remainder is retained as a partial grid interval by build_grids.
+    t = origin + np.arange(n, dtype=float) / rate
+    t = t[t <= src_t[-1] + 1e-9]
 
     out = pd.DataFrame()
-    out["timestamp_sec"] = t
+    out["timestamp_sec"] = t - origin
     for axis in "xyz":
         out[f"acc_{axis}"] = np.interp(t, src_t, acc_df[f"acc_{axis}"].values)
 
     if gyro_df is not None and len(gyro_df) >= 10:
-        g_t = gyro_df["timestamp_sec"].values - gyro_df["timestamp_sec"].values[0]
+        g_t = gyro_df["timestamp_sec"].values.astype(float)
         gyro_cols = {}
-        for axis in "xyz":
-            gyro_cols[f"gyro_{axis}"] = np.interp(t, g_t, gyro_df[f"gyro_{axis}"].values)
+        if (np.all(np.isfinite(g_t)) and np.all(np.diff(g_t) > 0)
+                and g_t[0] <= t[0] and g_t[-1] >= t[-1]):
+            for axis in "xyz":
+                gyro_cols[f"gyro_{axis}"] = np.interp(t, g_t, gyro_df[f"gyro_{axis}"].values)
         # Retain gyro only when the converted triad is complete and finite.
-        if all(np.all(np.isfinite(v)) for v in gyro_cols.values()):
+        if gyro_cols and all(np.all(np.isfinite(v)) for v in gyro_cols.values()):
             for col, vals in gyro_cols.items():
                 out[col] = vals
+
+    for position, (position_acc, position_gyro) in (extra_positions or {}).items():
+        if position_acc is None or len(position_acc) < 10:
+            continue
+        p_t = position_acc["timestamp_sec"].values.astype(float)
+        if (not np.all(np.isfinite(p_t)) or np.any(np.diff(p_t) <= 0)
+                or p_t[0] > t[0] or p_t[-1] < t[-1]):
+            continue
+        for axis in "xyz":
+            out[f"{position}_acc_{axis}"] = np.interp(
+                t, p_t, position_acc[f"acc_{axis}"].values,
+            )
+        if position_gyro is not None and len(position_gyro) >= 10:
+            g_t = position_gyro["timestamp_sec"].values.astype(float)
+            if (not np.all(np.isfinite(g_t)) or np.any(np.diff(g_t) <= 0)
+                    or g_t[0] > t[0] or g_t[-1] < t[-1]):
+                continue
+            values = {
+                f"{position}_gyro_{axis}": np.interp(
+                    t, g_t, position_gyro[f"gyro_{axis}"].values,
+                ) for axis in "xyz"
+            }
+            if all(np.isfinite(value).all() for value in values.values()):
+                for name, value in values.items():
+                    out[name] = value
 
     if not np.all(np.isfinite(out[["acc_x", "acc_y", "acc_z"]].values)):
         return None
@@ -178,7 +215,7 @@ def resample_part(acc_df: pd.DataFrame, gyro_df: Optional[pd.DataFrame],
 
 def convert_realworld() -> bool:
     print("=" * 80)
-    print("RealWorld HAR -> HALO raw sessions (waist / phone_waist)")
+    print("RealWorld HAR -> HALO aligned waist + forearm + thigh sessions")
     print("=" * 80)
 
     if not DOWNLOADS_DIR.exists():
@@ -186,7 +223,12 @@ def convert_realworld() -> bool:
         return False
 
     if SESSIONS_DIR.exists():
-        shutil.rmtree(SESSIONS_DIR)
+        # Retain the prior materialization for historical result reproduction.  A corrected
+        # multi-device clock must not overwrite the evidence used by an earlier protocol.
+        if LEGACY_SESSIONS_DIR.exists():
+            shutil.rmtree(SESSIONS_DIR)
+        else:
+            SESSIONS_DIR.replace(LEGACY_SESSIONS_DIR)
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
     subject_folders = sorted(
@@ -220,6 +262,13 @@ def convert_realworld() -> bool:
         for activity in ACTIVITIES:
             acc_parts = load_sensor_parts(data_dir / f"acc_{activity}_csv.zip", "acc")
             gyro_parts = load_sensor_parts(data_dir / f"gyr_{activity}_csv.zip", "gyro")
+            extra = {
+                position: (
+                    load_sensor_parts(data_dir / f"acc_{activity}_csv.zip", "acc", position),
+                    load_sensor_parts(data_dir / f"gyr_{activity}_csv.zip", "gyro", position),
+                )
+                for position in TARGET_POSITIONS[1:]
+            }
 
             if not acc_parts:
                 # No waist accelerometer for this (subject, activity) — cannot emit.
@@ -231,7 +280,14 @@ def convert_realworld() -> bool:
                     continue
                 gyro_df = gyro_parts[idx] if idx < len(gyro_parts) else None
 
-                frame = resample_part(acc_df, gyro_df)
+                extra_part = {
+                    position: (parts[0][idx] if idx < len(parts[0]) else None,
+                               parts[1][idx] if idx < len(parts[1]) else None)
+                    for position, parts in extra.items()
+                }
+                # Single-placement streams remain valid when another placement is absent.
+                # Composite construction later intersects only genuinely co-covered rows.
+                frame = resample_part(acc_df, gyro_df, extra_positions=extra_part)
                 if frame is None:
                     skipped_no_acc += 1
                     continue
@@ -292,25 +348,26 @@ def convert_realworld() -> bool:
 
 
 def write_manifest(gyro_available: bool) -> None:
-    channels = [
-        {"name": "acc_x", "description": "Accelerometer X-axis (waist), m/s^2", "sampling_rate_hz": TARGET_SAMPLE_RATE},
-        {"name": "acc_y", "description": "Accelerometer Y-axis (waist), m/s^2", "sampling_rate_hz": TARGET_SAMPLE_RATE},
-        {"name": "acc_z", "description": "Accelerometer Z-axis (waist), m/s^2", "sampling_rate_hz": TARGET_SAMPLE_RATE},
-    ]
-    if gyro_available:
-        channels += [
-            {"name": "gyro_x", "description": "Gyroscope X-axis (waist), rad/s", "sampling_rate_hz": TARGET_SAMPLE_RATE},
-            {"name": "gyro_y", "description": "Gyroscope Y-axis (waist), rad/s", "sampling_rate_hz": TARGET_SAMPLE_RATE},
-            {"name": "gyro_z", "description": "Gyroscope Z-axis (waist), rad/s", "sampling_rate_hz": TARGET_SAMPLE_RATE},
-        ]
+    channels = []
+    for position in TARGET_POSITIONS:
+        prefix = "" if position == "waist" else f"{position}_"
+        for sensor, unit in (("acc", "m/s^2"), ("gyro", "rad/s")):
+            if sensor == "gyro" and not gyro_available:
+                continue
+            for axis in "xyz":
+                channels.append({
+                    "name": f"{prefix}{sensor}_{axis}",
+                    "description": f"{sensor} {axis.upper()}-axis ({position}), {unit}",
+                    "sampling_rate_hz": TARGET_SAMPLE_RATE,
+                })
     manifest = {
         "dataset_name": "RealWorld HAR",
         "description": ("RealWorld HAR (University of Mannheim). 15 subjects, 8 activities. "
-                        "Waist position, triaxial accelerometer (m/s^2, gravity present) plus "
-                        "gyroscope where a complete finite triad exists, on a uniform 50 Hz grid."),
+                        "Simultaneous waist, forearm, and thigh triaxial accelerometer "
+                        "(m/s^2, gravity present) plus gyroscope on a uniform 50 Hz grid."),
         "source": "https://www.uni-mannheim.de/dws/research/projects/activity-recognition/dataset/dataset-realworld/",
         "num_subjects": 15,
-        "body_position": TARGET_POSITION,
+        "body_positions": list(TARGET_POSITIONS),
         "channels": channels,
     }
     with open(OUTPUT_DIR / "manifest.json", "w") as f:
@@ -326,14 +383,17 @@ def update_metadata(num_sessions: int, activities: List[str], gyro_available: bo
     meta["display_name"] = meta.get("display_name", "RealWorld HAR")
     meta["num_sessions"] = num_sessions
     meta["sampling_rate_hz"] = int(TARGET_SAMPLE_RATE)
-    channels = ["acc_x", "acc_y", "acc_z"]
-    if gyro_available:
-        channels += ["gyro_x", "gyro_y", "gyro_z"]
+    channels = []
+    for position in TARGET_POSITIONS:
+        prefix = "" if position == "waist" else f"{position}_"
+        channels.extend(f"{prefix}acc_{axis}" for axis in "xyz")
+        if gyro_available:
+            channels.extend(f"{prefix}gyro_{axis}" for axis in "xyz")
     meta["channels"] = channels
     meta["core_channels"] = {c: c for c in channels}
     meta["extra_channels"] = []
     meta.pop("note", None)
-    meta["placement"] = meta.get("placement", TARGET_POSITION)
+    meta["placement"] = "waist, forearm, and thigh (simultaneous)"
     meta["num_subjects"] = 15
     meta["activities"] = activities
     meta.pop("pre_windowed", None)

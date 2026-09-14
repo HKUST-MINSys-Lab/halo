@@ -178,6 +178,75 @@ def _to_normwear_input(windows: np.ndarray, mask: np.ndarray, rate_hz: float) ->
     return np.ascontiguousarray(X, dtype=np.float32)       # C-contiguous: calc_cwt uses .view()
 
 
+def _normwear_chunks(stream) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """Prepare native 6 s chunks while retaining every declared device and sample.
+
+    Rows are grouped by their valid-length tuple before resampling.  Evaluation grids usually
+    contain thousands of equal-length rows; batching them turns thousands of tiny SciPy calls into
+    one polyphase operation per device and length group without changing the physical-time rule.
+    """
+    members = stream.devices if isinstance(stream, eval_data.MultiDeviceEvalStream) else [stream]
+    chunks: list[np.ndarray] = []
+    owners: list[np.ndarray] = []
+    weights: list[np.ndarray] = []
+    n_rows = members[0].n_windows
+    if any(member.n_windows != n_rows for member in members):
+        raise ValueError("aligned NormWear devices disagree on window count")
+    valid_lengths = np.stack([
+        np.asarray(member.lengths, dtype=np.int64)
+        if member.lengths is not None
+        else np.full(n_rows, member.windows.shape[1], dtype=np.int64)
+        for member in members
+    ], axis=1)
+    groups: dict[tuple[int, ...], list[int]] = {}
+    for row, length_tuple in enumerate(valid_lengths.tolist()):
+        groups.setdefault(tuple(int(value) for value in length_tuple), []).append(row)
+
+    from scipy import signal as _sig
+    total_channels = 0
+    for length_tuple, group_rows in groups.items():
+        rows = np.asarray(group_rows, dtype=np.int64)
+        prepared: list[np.ndarray] = []
+        target_length = None
+        for member, valid in zip(members, length_tuple):
+            raw = member.windows[rows, :valid]
+            # Reuse the released preprocessing one physical 6 s chunk at a time below; here only
+            # resample to its native 65 Hz clock and retain real channels in declared order.
+            mask = np.asarray(member.mask, dtype=bool)
+            values = np.asarray(raw[:, :, mask], dtype=np.float64)
+            source = int(round(member.rate_hz))
+            if source != TARGET_HZ:
+                divisor = np.gcd(TARGET_HZ, source)
+                values = _sig.resample_poly(values, TARGET_HZ // divisor, source // divisor, axis=1)
+            if target_length is None:
+                target_length = values.shape[1]
+            if values.shape[1] != target_length:
+                raise ValueError("aligned NormWear devices disagree on physical window duration")
+            prepared.append(values)
+        assert target_length is not None
+        combined = np.concatenate(prepared, axis=2)
+        total_channels = combined.shape[2]
+        chunk_count = int(np.ceil(target_length / WINDOW_65))
+        padded_length = chunk_count * WINDOW_65
+        if padded_length != target_length:
+            combined = np.pad(
+                combined, ((0, 0), (0, padded_length - target_length), (0, 0)), mode="edge",
+            )
+        chunks.append(combined.reshape(len(rows) * chunk_count, WINDOW_65, total_channels))
+        owners.append(np.repeat(rows, chunk_count))
+        chunk_weights = np.ones(chunk_count, dtype=np.float32)
+        remainder = target_length % WINDOW_65
+        if remainder:
+            chunk_weights[-1] = remainder / WINDOW_65
+        weights.append(np.tile(chunk_weights, len(rows)))
+
+    values = np.transpose(np.concatenate(chunks, axis=0), (0, 2, 1))
+    values = _sig.detrend(values, axis=2, type="linear")
+    values /= np.mean(np.abs(values), axis=2, keepdims=True) + 1e-6
+    return (np.ascontiguousarray(values, dtype=np.float32), np.concatenate(owners),
+            np.concatenate(weights).astype(np.float32, copy=False), total_channels)
+
+
 @register
 class NormWearAdapter(BaselineAdapter):
     """NormWear zero-shot: MSiTF signal embedding vs candidate-label TinyLlama embeddings,
@@ -185,7 +254,8 @@ class NormWearAdapter(BaselineAdapter):
 
     name = "normwear"
     tier = "bespoke"
-    contract = InputContract(channels=None, rate_hz=float(TARGET_HZ), window_sec=6.0)
+    contract = InputContract(channels=None, rate_hz=float(TARGET_HZ), native_window_sec=6.0)
+    supports_multi_device = True
 
     def supports_native_zero_shot(self) -> bool:
         return True
@@ -220,15 +290,30 @@ class NormWearAdapter(BaselineAdapter):
     @torch.no_grad()
     def window_features(self, stream: eval_data.EvalStream, state, device) -> np.ndarray:
         model, query_emb = state["model"], state["query_emb"]
-        inputs = _to_normwear_input(stream.windows, stream.mask, stream.rate_hz)
+        inputs, owners, weights, n_channels = _normwear_chunks(stream)
         outputs = []
-        batch = int(os.environ.get("NORMWEAR_BATCH", "32"))
+        configured_batch = os.environ.get("NORMWEAR_BATCH")
+        # CWT/backbone activation memory scales approximately with batch * measured channels.
+        # Keep that product bounded so six-channel cells can fill the 4090 while native
+        # multi-device cells automatically use a safe batch. An explicit environment override is
+        # retained for reproduction on different hardware.
+        batch = (int(configured_batch) if configured_batch is not None
+                 else min(128, max(1, 768 // n_channels)))
+        if batch <= 0:
+            raise ValueError("NORMWEAR_BATCH must be positive")
         for start in range(0, len(inputs), batch):
             embedding = _signal_encode_np(
                 model, inputs[start:start + batch], query_emb, device
             )
             outputs.append(embedding.float().cpu().numpy())
-        return np.concatenate(outputs, axis=0).astype(np.float32, copy=False)
+        encoded = np.concatenate(outputs, axis=0).astype(np.float32, copy=False)
+        result = np.zeros((stream.n_windows, encoded.shape[1]), dtype=np.float32)
+        denom = np.zeros(stream.n_windows, dtype=np.float32)
+        for feature, owner, weight in zip(encoded, owners, weights):
+            result[owner] += feature * weight
+            denom[owner] += weight
+        state["_last_n_channels_used"] = int(n_channels)
+        return result / denom[:, None]
 
     @torch.no_grad()
     def predict(self, stream: eval_data.EvalStream, state, device) -> Tuple[List[str], dict]:
@@ -240,7 +325,7 @@ class NormWearAdapter(BaselineAdapter):
         predictions, info = self.predict_candidates_from_features(
             win, candidates, state, device
         )
-        info["n_channels_used"] = int(np.asarray(stream.mask, dtype=bool).sum())
+        info["n_channels_used"] = int(state.get("_last_n_channels_used", 0))
         return predictions, info
 
     def predict_candidates_from_features(self, features, candidates, state, device):

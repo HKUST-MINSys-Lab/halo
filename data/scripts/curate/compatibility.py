@@ -105,6 +105,7 @@ PLACEMENT_SITE: dict[str, str] = {
     # ---- forearm ----------------------------------------------------------
     "the left forearm": "left_forearm",
     "the right forearm": "right_forearm",
+    "the forearm": "forearm_unspecified",
     "the dominant forearm": "forearm_unspecified",
     # ---- upper arm --------------------------------------------------------
     "the left upper arm": "left_upper_arm",
@@ -129,6 +130,7 @@ PLACEMENT_SITE: dict[str, str] = {
     "the left thigh": "left_thigh",
     "the right thigh": "right_thigh",
     "thigh": "thigh_unspecified",
+    "the thigh": "thigh_unspecified",
     # ---- shin / calf ------------------------------------------------------
     "the left shin": "left_shin",
     "the right shin": "right_shin",

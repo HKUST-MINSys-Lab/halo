@@ -12,9 +12,12 @@ from data.scripts.eda.grid_io import (
 )
 
 
-def _write_grid(root: Path, dataset: str, stream: str, mask: list[bool]) -> None:
+def _write_grid(root: Path, dataset: str, stream: str, mask: list[bool], *,
+                duration_dir: str | None = None) -> None:
     grid = root / dataset / "grids" / "harmonised" / stream
-    grid.mkdir(parents=True)
+    if duration_dir is not None:
+        grid /= duration_dir
+    grid.mkdir(parents=True, exist_ok=True)
     labels = ["walking", "walking", "sitting", "walking"]
     subjects = ["s1", "s1", "s2", "s3"]
     data = np.arange(4 * 8 * 6, dtype=np.float32).reshape(4, 8, 6)
@@ -42,6 +45,27 @@ def test_discovery_modalities_and_selector_order(tmp_path: Path) -> None:
     assert triad_indices(refs[1], "gyro") is None
     selected = matching_refs(refs, "walking", ["beta/watch", "alpha/phone"])
     assert [ref.key for ref in selected] == ["beta/watch", "alpha/phone"]
+
+
+def test_watch_stream_is_not_mistaken_for_duration_directory(tmp_path: Path) -> None:
+    _write_grid(tmp_path, "alpha", "watch_wrist", [1, 1, 1, 0, 0, 0])
+    _write_grid(tmp_path, "beta", "phone", [1, 1, 1, 0, 0, 0], duration_dir="w4")
+
+    refs = discover_grids(datasets_dir=tmp_path)
+
+    assert [ref.key for ref in refs] == ["alpha/watch_wrist", "beta/phone"]
+
+
+def test_explicit_six_second_discovery_prefers_w6_and_falls_back_per_stream(tmp_path: Path) -> None:
+    _write_grid(tmp_path, "alpha", "watch_wrist", [1, 1, 1, 0, 0, 0])
+    _write_grid(tmp_path, "alpha", "watch_wrist", [1, 1, 1, 1, 1, 1], duration_dir="w6")
+    _write_grid(tmp_path, "beta", "phone", [1, 1, 1, 0, 0, 0])
+
+    refs = discover_grids(datasets_dir=tmp_path, window_seconds=6.0)
+
+    assert [(ref.key, ref.grid_dir.name) for ref in refs] == [
+        ("alpha/watch_wrist", "w6"), ("beta/phone", "phone"),
+    ]
 
 
 def test_sampling_is_deterministic_and_prefers_distinct_subjects(tmp_path: Path) -> None:

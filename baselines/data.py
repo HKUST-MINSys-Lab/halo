@@ -2,7 +2,7 @@
 
 Each dataset stores windowed grids under::
 
-    data/datasets/<ds>/grids/{harmonised,non_harmonised}/<stream>/
+    data/datasets/<ds>/grids/{harmonised,non_harmonised}/<stream>/w<seconds>/
         data.npy   float32 (N, T, C)   accelerometer (+gyro) in g
         mask.npy   bool    (C,)         per-channel validity (False = zero-pad)
         meta.json  {dataset, stream_id, alignment, rate_hz, channels[list],
@@ -26,10 +26,11 @@ exposed via the `alignment` argument.
 from __future__ import annotations
 
 import json
+import hashlib
 from functools import lru_cache
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import numpy as np
 
@@ -80,6 +81,7 @@ class EvalStream:
     rate_hz: float
     mask: np.ndarray
     eval_labels: List[str]
+    window_seconds: float = 6.0
     event_ids: Optional[np.ndarray] = None
     execution_ids: Optional[np.ndarray] = None
     block_ids: Optional[np.ndarray] = None
@@ -102,18 +104,218 @@ class EvalStream:
         return self.windows.shape[0]
 
 
-def _grid_dir(dataset: str, stream: str, alignment: str) -> Path:
+@dataclass
+class MultiDeviceEvalStream:
+    """Aligned simultaneous-device evaluation cell.
+
+    Members remain native-rate streams; consumers must encode/resample each member themselves.
+    The common arrays are deliberately exposed under the single-stream names used by episode
+    construction, while raw signal access is only possible through ``devices``.
+    """
+    dataset: str
+    cell_id: str
+    devices: list[EvalStream]
+    device_ids: list[str]
+    event_ids: np.ndarray
+    gt: List[str]
+    subjects: np.ndarray
+    eval_labels: List[str]
+    execution_ids: np.ndarray | None
+    execution_identity_known: bool
+    quality_screen: str
+    n_quality_excluded: int
+    quality_excluded_by_device: dict[str, int]
+    window_seconds: float
+    alignment: str
+    # Rows available to a single placement but not to every member.  They are excluded rather
+    # than aligned approximately: a composite example must retain the converter's exact event id.
+    n_alignment_excluded: int = 0
+
+    @property
+    def stream(self) -> str:
+        return self.cell_id
+
+    @property
+    def n_windows(self) -> int:
+        return len(self.event_ids)
+
+
+def source_slice_fingerprint(stream: EvalStream | MultiDeviceEvalStream) -> str:
+    """Hash the exact valid raw samples and row metadata shared by every provider.
+
+    The evaluator records this independently of model feature caches. It makes the fairness
+    contract auditable: two reported provider rows with the same cell must name the same source
+    fingerprint, even though each released model performs its own documented resampling.
+    """
+    cached = getattr(stream, "_source_slice_fingerprint", None)
+    if cached is not None:
+        return str(cached)
+    digest = hashlib.sha256()
+    members = stream.devices if isinstance(stream, MultiDeviceEvalStream) else [stream]
+    digest.update(str(stream.dataset).encode())
+    digest.update(str(stream.stream).encode())
+    digest.update(np.asarray(stream.event_ids, dtype=str).tobytes())
+    digest.update(np.asarray(stream.gt, dtype=str).tobytes())
+    for member in members:
+        digest.update(member.stream.encode())
+        digest.update(str(float(member.rate_hz)).encode())
+        digest.update("\0".join(member.channels).encode())
+        digest.update(np.asarray(member.mask, dtype=np.bool_).tobytes())
+        for field in ("source_rate_hz", "gravity_state", "config_text", "device_ids"):
+            if hasattr(member, field):
+                digest.update(field.encode())
+                digest.update(repr(getattr(member, field)).encode())
+        lengths = (np.asarray(member.lengths, dtype=np.int64) if member.lengths is not None
+                   else np.full(member.n_windows, member.windows.shape[1], dtype=np.int64))
+        digest.update(lengths.tobytes())
+        # Padding is excluded deliberately: it is not measured evidence and adapters must use
+        # ``lengths``. Hashing row-by-row avoids materialising a second corpus-sized tensor.
+        for row, length in enumerate(lengths.tolist()):
+            digest.update(np.ascontiguousarray(member.windows[row, :length]).view(np.uint8))
+    value = digest.hexdigest()
+    setattr(stream, "_source_slice_fingerprint", value)
+    return value
+
+
+def load_multi_device_stream(
+    dataset: str,
+    device_ids: Sequence[str],
+    alignment: str = "non_harmonised",
+    *,
+    window_seconds: float = 6.0,
+    apply_quality_screen: bool = True,
+) -> MultiDeviceEvalStream:
+    """Load an ordered composite on the exact event-id intersection.
+
+    Each device grid may legitimately be a superset when a recording retains one placement after
+    another placement's clock fails coverage validation.  The composite therefore uses only event
+    ids emitted verbatim by *every* member.  It never joins by timestamp, nearest neighbour, or
+    window index, and it still rejects any disagreement in metadata for a retained physical event.
+    """
+    ids = list(device_ids)
+    if len(ids) < 2 or len(set(ids)) != len(ids):
+        raise ValueError("a multi-device cell requires at least two distinct ordered stream ids")
+    # Load unfiltered first: quality is applied once to the composite intersection below.
+    members = [load_eval_stream(dataset, device, alignment, window_seconds=window_seconds,
+                                apply_quality_screen=False) for device in ids]
+    reference = members[0]
+    common_ids = set(map(str, reference.event_ids))
+    for member in members[1:]:
+        common_ids.intersection_update(map(str, member.event_ids))
+        if member.eval_labels != reference.eval_labels:
+            raise ValueError(f"{dataset}: multi-device members disagree on candidate labels")
+    if not common_ids:
+        raise ValueError(f"{dataset}: multi-device members have no exact common event ids")
+    row_indices = []
+    for member in members:
+        lookup = {str(event_id): row for row, event_id in enumerate(member.event_ids)}
+        if len(lookup) != member.n_windows:
+            raise ValueError(f"{dataset}/{member.stream}: duplicate event ids prevent exact composite alignment")
+        row_indices.append(np.asarray(
+            [lookup[str(event_id)] for event_id in reference.event_ids if str(event_id) in common_ids],
+            dtype=np.int64,
+        ))
+    reference_indices = row_indices[0]
+    for member, indices in zip(members[1:], row_indices[1:]):
+        for field in ("gt", "subjects", "execution_ids"):
+            expected = np.asarray(getattr(reference, field), dtype=object)[reference_indices]
+            actual = np.asarray(getattr(member, field), dtype=object)[indices]
+            if not np.array_equal(expected, actual):
+                raise ValueError(f"{dataset}: multi-device members disagree on {field} for common event ids")
+    n_alignment_excluded = int(reference.n_windows - len(reference_indices))
+    def align(member: EvalStream, indices: np.ndarray) -> EvalStream:
+        return EvalStream(**{**member.__dict__, "windows": member.windows[indices],
+                             "gt": [member.gt[row] for row in indices],
+                             "subjects": member.subjects[indices], "event_ids": member.event_ids[indices],
+                             "execution_ids": member.execution_ids[indices] if member.execution_ids is not None else None,
+                             "block_ids": member.block_ids[indices] if member.block_ids is not None else None,
+                             "lengths": member.lengths[indices] if member.lengths is not None else None})
+    members = [align(member, indices) for member, indices in zip(members, row_indices)]
+    reference = members[0]
+    keep = np.ones(reference.n_windows, dtype=bool)
+    excluded_by_device: dict[str, int] = {}
+    quality = "not requested"
+    if apply_quality_screen:
+        quality = "applied"
+        for member in members:
+            excluded, status = _quality_excluded(
+                dataset, member.stream, alignment, window_seconds,
+            )
+            if status != "applied":
+                quality = status
+                break
+            # Quality artifacts refer to pre-intersection grid rows.  Map only those exact rows
+            # which survived event-id alignment onto the composite's shared index space.
+            original_rows = row_indices[len(excluded_by_device)]
+            original_to_composite = {int(row): pos for pos, row in enumerate(original_rows)}
+            composite_rows = np.asarray(
+                [original_to_composite[int(row)] for row in excluded
+                 if int(row) in original_to_composite], dtype=np.int64,
+            )
+            excluded_by_device[member.stream] = int(len(composite_rows))
+            keep[composite_rows] = False
+        if quality != "applied":
+            raise RuntimeError(f"{dataset}/{'+'.join(ids)}: composite quality screen {quality}")
+    def subset(member: EvalStream) -> EvalStream:
+        return EvalStream(**{**member.__dict__, "windows": member.windows[keep],
+                             "gt": [x for x, ok in zip(member.gt, keep) if ok],
+                             "subjects": member.subjects[keep], "event_ids": member.event_ids[keep],
+                             "execution_ids": member.execution_ids[keep] if member.execution_ids is not None else None,
+                             "block_ids": member.block_ids[keep] if member.block_ids is not None else None,
+                             "lengths": member.lengths[keep] if member.lengths is not None else None,
+                             "quality_screen": quality, "n_quality_excluded": int((~keep).sum())})
+    members = [subset(member) for member in members]
+    return MultiDeviceEvalStream(
+        dataset=dataset, cell_id="+".join(ids), devices=members, device_ids=ids,
+        event_ids=members[0].event_ids, gt=members[0].gt, subjects=members[0].subjects,
+        eval_labels=members[0].eval_labels, execution_ids=members[0].execution_ids,
+        execution_identity_known=all(member.execution_identity_known for member in members),
+        quality_screen=quality, n_quality_excluded=int((~keep).sum()),
+        quality_excluded_by_device=excluded_by_device, window_seconds=float(window_seconds),
+        alignment=alignment, n_alignment_excluded=n_alignment_excluded,
+    )
+
+
+def _window_dir_name(window_seconds: float) -> str:
+    value = float(window_seconds)
+    if not np.isfinite(value) or value <= 0:
+        raise ValueError("window_seconds must be finite and positive")
+    return f"w{value:g}".replace(".", "p")
+
+
+def _grid_dir(dataset: str, stream: str, alignment: str, window_seconds: float = 6.0) -> Path:
     if alignment not in ALIGNMENTS:
         raise ValueError(f"alignment must be one of {ALIGNMENTS}, got {alignment!r}")
-    return DATASETS_DIR / dataset / "grids" / alignment / stream
+    root = DATASETS_DIR / dataset / "grids" / alignment / stream
+    qualified = root / _window_dir_name(window_seconds)
+    # Migration: the historical 6 s schema stored files directly under <stream>.
+    # Prefer duration-qualified materializations when present, but never make old sealed grids
+    # unreadable merely because the schema has advanced.
+    if qualified.exists():
+        return qualified
+    # Only the historical unqualified schema is a documented 6 s compatibility path.
+    # Never serve a different evidence duration under the caller's requested label.
+    if np.isclose(float(window_seconds), 6.0) and (root / "meta.json").exists():
+        return root
+    raise FileNotFoundError(
+        f"missing {float(window_seconds):g} s grid for {dataset}/{stream}/{alignment}; "
+        f"expected {qualified}"
+    )
 
 
-def list_streams(dataset: str, alignment: str = "non_harmonised") -> List[str]:
+def list_streams(dataset: str, alignment: str = "non_harmonised", *, window_seconds: float = 6.0) -> List[str]:
     """Stream ids available for a dataset under the given alignment."""
     root = DATASETS_DIR / dataset / "grids" / alignment
     if not root.exists():
         return []
-    return sorted(p.name for p in root.iterdir() if p.is_dir())
+    result = []
+    duration_dir = _window_dir_name(window_seconds)
+    for stream_dir in root.iterdir():
+        if not stream_dir.is_dir():
+            continue
+        if (stream_dir / "meta.json").exists() or (stream_dir / duration_dir / "meta.json").exists():
+            result.append(stream_dir.name)
+    return sorted(result)
 
 
 def load_eval_labels(dataset: str, stream: Optional[str] = None) -> List[str]:
@@ -197,21 +399,22 @@ def load_global_labels() -> List[str]:
     return list(json.loads(GLOBAL_LABELS_PATH.read_text())["labels"])
 
 
-@lru_cache(maxsize=3)
-def _quality_exclusion_cache(alignment: str) -> dict[str, set[int]]:
+@lru_cache(maxsize=12)
+def _quality_exclusion_cache(alignment: str, window_seconds: float = 6.0) -> dict[str, set[int]]:
     """Validate each corpus-wide quality artifact once per process."""
     from data.scripts.scan_duplicates import load as load_duplicates
     from data.scripts.scan_implausible import load as load_implausible
 
-    duplicate = load_duplicates(alignment, require=True)
-    implausible = load_implausible(alignment, require=True)
+    duplicate = load_duplicates(alignment, require=True, window_seconds=window_seconds)
+    implausible = load_implausible(alignment, require=True, window_seconds=window_seconds)
     return {
         key: set(duplicate.get(key, ())) | set(implausible.get(key, ()))
         for key in set(duplicate) | set(implausible)
     }
 
 
-def _quality_excluded(dataset: str, stream: str, alignment: str) -> tuple[np.ndarray, str]:
+def _quality_excluded(dataset: str, stream: str, alignment: str,
+                      window_seconds: float = 6.0) -> tuple[np.ndarray, str]:
     """Window indices this stream must not serve, plus a one-word provenance string.
 
     ``scan_duplicates`` (byte-identical stale-buffer windows) and ``scan_implausible`` (windows
@@ -228,7 +431,7 @@ def _quality_excluded(dataset: str, stream: str, alignment: str) -> tuple[np.nda
     """
     key = f"{dataset}/{stream}"
     try:
-        excluded = _quality_exclusion_cache(alignment).get(key, set())
+        excluded = _quality_exclusion_cache(alignment, float(window_seconds)).get(key, set())
     except (FileNotFoundError, ValueError) as error:
         return np.zeros(0, dtype=int), f"unavailable: {error}"
     return np.asarray(sorted(excluded), dtype=int), "applied"
@@ -239,6 +442,7 @@ def load_eval_stream(
     stream: str,
     alignment: str = "non_harmonised",
     *,
+    window_seconds: float = 6.0,
     apply_quality_screen: bool = True,
     candidate_labels: Optional[List[str]] = None,
 ) -> EvalStream:
@@ -263,9 +467,9 @@ def load_eval_stream(
     from the grid — align and restrict `gt` to `eval_labels` at scoring time via
     :func:`baselines.scoring.filter_ground_truth`.
     """
-    gdir = _grid_dir(dataset, stream, alignment)
+    gdir = _grid_dir(dataset, stream, alignment, window_seconds)
     if not gdir.exists():
-        avail = list_streams(dataset, alignment)
+        avail = list_streams(dataset, alignment, window_seconds=window_seconds)
         raise FileNotFoundError(
             f"No grid for {dataset}/{stream} ({alignment}) at {gdir}. "
             f"Available {alignment} streams: {avail}"
@@ -326,7 +530,8 @@ def load_eval_stream(
     screen = "not requested"
     n_excluded = 0
     if apply_quality_screen:
-        excluded, screen = _quality_excluded(dataset, stream, alignment)
+        actual_window = float(meta.get("window_seconds", window_seconds))
+        excluded, screen = _quality_excluded(dataset, stream, alignment, actual_window)
         if len(excluded):
             keep = np.ones(n, dtype=bool)
             keep[excluded[excluded < n]] = False
@@ -343,6 +548,7 @@ def load_eval_stream(
         dataset=dataset,
         stream=stream,
         alignment=alignment,
+        window_seconds=float(meta.get("window_seconds", window_seconds)),
         windows=windows,
         gt=gt,
         subjects=subjects,

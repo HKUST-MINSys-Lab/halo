@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -18,6 +19,15 @@ REPO = Path(__file__).resolve().parents[3]
 # spans every corpus root (labelled + label-free pretraining) via ``grid_search_roots()``.
 DATASETS_DIR = REPO / "data" / "datasets"
 _FINGERPRINT_CACHE: dict[tuple, str] = {}
+_WINDOW_DIR_RE = re.compile(r"^w(?:\d+(?:p\d+)?|p\d+)$")
+
+
+def _is_window_dir(path: Path) -> bool:
+    """True only for version directories such as ``w4`` or ``w0p5``.
+
+    A prefix check is invalid because deployment streams commonly start with ``watch_``.
+    """
+    return bool(_WINDOW_DIR_RE.fullmatch(path.name))
 
 
 @dataclass(frozen=True)
@@ -83,6 +93,8 @@ class GridRef:
 def discover_grids(
     alignment: str = "harmonised",
     datasets_dir: Path | None = None,
+    *,
+    window_seconds: float | None = None,
 ) -> list[GridRef]:
     """Discover and validate all persisted grids for one alignment.
 
@@ -91,15 +103,44 @@ def discover_grids(
     ``datasets_dir`` to restrict discovery to one root.
     """
     refs: list[GridRef] = []
-    pattern = f"*/grids/{alignment}/*/meta.json"
+    if window_seconds is None:
+        # Keep existing corpus discovery stable: legacy direct-stream grids remain its default.
+        # A duration-qualified grid must be requested explicitly so 4/8/16 s evaluation assets
+        # cannot silently multiply the label-free/pretraining corpus.
+        patterns = (f"*/grids/{alignment}/*/meta.json", f"*/grids/{alignment}/*/w*/meta.json")
+    else:
+        token = f"w{float(window_seconds):g}".replace(".", "p")
+        # During migration, requested 6 s grids may still live directly under the stream. The
+        # evaluator prefers an explicit w6 when present and falls back per stream otherwise;
+        # discovery and quality scans must resolve the identical corpus.
+        patterns = ((f"*/grids/{alignment}/*/meta.json", f"*/grids/{alignment}/*/{token}/meta.json")
+                    if np.isclose(float(window_seconds), 6.0)
+                    else (f"*/grids/{alignment}/*/{token}/meta.json",))
     roots = (datasets_dir,) if datasets_dir is not None else grid_search_roots()
-    meta_paths = sorted(
-        (path for root in roots for path in root.glob(pattern)),
-        # <root>/<dataset>/grids/<alignment>/<stream>/meta.json — sort by (dataset, stream)
-        # so discovery order is identical to the single-root glob it replaces. Ordering is
-        # load-bearing: CorpusIndex seeds its sampling off the ref list.
-        key=lambda path: (path.parts[-5], path.parts[-2]),
-    )
+    def _grid_key(path: Path) -> tuple[str, str]:
+        stream_dir = path.parent.parent if _is_window_dir(path.parent) else path.parent
+        return stream_dir.parents[2].name, stream_dir.name
+
+    candidates = [path for root in roots for pattern in patterns for path in root.glob(pattern)]
+    if window_seconds is None or np.isclose(float(window_seconds), 6.0):
+        # Default corpus discovery keeps a direct legacy grid authoritative. An explicit 6 s
+        # request mirrors ``baselines.data._grid_dir`` and prefers w6, with legacy fallback.
+        selected: dict[tuple[str, str], Path] = {}
+        for path in candidates:
+            key = _grid_key(path)
+            old = selected.get(key)
+            def rank(value: Path) -> int:
+                # A no-duration call is the historical six-second corpus.  New streams
+                # have no direct legacy directory, so choose explicit w6 deterministically.
+                if not _is_window_dir(value.parent):
+                    return 1 if window_seconds is not None else 0
+                if value.parent.name == "w6":
+                    return 0 if window_seconds is not None else 1
+                return 2
+            if old is None or rank(path) < rank(old) or (rank(path) == rank(old) and str(path) < str(old)):
+                selected[key] = path
+        candidates = list(selected.values())
+    meta_paths = sorted(candidates, key=lambda path: (*_grid_key(path), str(path)))
     for meta_path in meta_paths:
         grid_dir = meta_path.parent
         data_path = grid_dir / "data.npy"

@@ -46,6 +46,7 @@ from data.scripts.curate.deployment_policy import (
     PRIMARY_EVAL_DATASETS,
     STANDARD_CHANNEL_ORDER,
     StreamSpec,
+    channel_names_for_frame,
     deployment_streams,
     session_stream_specs,
     stream_specs,
@@ -227,6 +228,7 @@ def iter_sessions(dataset: str, spec: StreamSpec,
     # would have survived in the grid, defeating the fix. Verified 2026-08-11 that labels.json
     # covers every session directory exactly for all 34 converted datasets.
     orphans = 0
+    unavailable = 0
 
     # One session per subdir: sessions/<session_id>/data.parquet.
     for pq in sorted((ds_dir / "sessions").glob("*/data.parquet")):
@@ -242,6 +244,15 @@ def iter_sessions(dataset: str, spec: StreamSpec,
         if "activity" not in frame.columns and sid in labels_map:
             act = labels_map[sid]
             frame = frame.assign(activity=act[0] if isinstance(act, list) else act)
+        # A converted physical session may retain one placement when another device's clock has
+        # no valid overlap.  That is valid single-device evidence, but it is not evidence for a
+        # stream whose required source triad is absent.  Check this before assembly rather than
+        # treating an optional placement as a converter failure or emitting fabricated zero rows.
+        try:
+            channel_names_for_frame(frame, spec)
+        except ValueError:
+            unavailable += 1
+            continue
         # Set this AFTER DataFrame transformations: pandas does not make attrs propagation part of
         # the assign/copy contract. Losing it would silently disable verified placement positives.
         frame.attrs["halo_session_id"] = sid
@@ -257,6 +268,9 @@ def iter_sessions(dataset: str, spec: StreamSpec,
     if orphans:
         print(f"  [{dataset}/{spec.stream_id}] skipped {orphans} session directories absent from "
               f"labels.json (stale output of an earlier converter run)", flush=True)
+    if unavailable:
+        print(f"  [{dataset}/{spec.stream_id}] skipped {unavailable} sessions without this "
+              "stream's required source channels", flush=True)
 
 
 def _pre_windowed(dataset: str) -> bool:
@@ -432,6 +446,22 @@ def _session_grid(
     )
 
 
+def _window_dir_name(window_seconds: float) -> str:
+    """Stable schema component for a physical grid duration (``w4``, ``w0p5``)."""
+    value = float(window_seconds)
+    if not np.isfinite(value) or value <= 0:
+        raise ValueError("window_seconds must be finite and positive")
+    text = f"{value:g}".replace(".", "p")
+    return f"w{text}"
+
+
+def _grid_destination(
+    out_root: Path | None, dataset: str, alignment: str, stream_id: str, window_seconds: float,
+) -> Path:
+    return (_grid_root(out_root, dataset) / "grids" / alignment / stream_id
+            / _window_dir_name(window_seconds))
+
+
 def _write_streaming_grid(
     out_root: Path,
     dataset: str,
@@ -504,10 +534,12 @@ def _write_streaming_grid(
             pre_windowed=pre_windowed,
             window_seconds=window_seconds,
         )
-        _save(out_root, spec, empty, subjects)
+        _save(out_root, spec, empty, subjects, window_seconds=window_seconds)
         return
 
-    destination = _grid_root(out_root, dataset) / "grids" / alignment / spec.stream_id
+    destination = _grid_destination(
+        out_root, dataset, alignment, spec.stream_id, window_seconds,
+    )
     destination.mkdir(parents=True, exist_ok=True)
     temp_data = destination / "data.npy.part"
     if temp_data.exists():
@@ -670,7 +702,7 @@ def build(out_root: Optional[Path] = None, datasets: Optional[Sequence[str]] = N
                     window_seconds=window_seconds,
                     include_partial=include_partial,
                 )
-                _save(out_root, spec, grid, subjects)
+                _save(out_root, spec, grid, subjects, window_seconds=window_seconds)
 
 
 def build_stream_specs(datasets: Optional[Sequence[str]] = None) -> Tuple[StreamSpec, ...]:
@@ -681,10 +713,20 @@ def build_stream_specs(datasets: Optional[Sequence[str]] = None) -> Tuple[Stream
     """
     want = set(datasets) if datasets else None
     if want:
-        return tuple(
+        deployment = tuple(
             spec for spec in deployment_streams(placement_strict=False, role=None)
             if spec.dataset in want
         )
+        # Explicit rebuilds must also materialise every declared primary evaluation stream.
+        # Deployment filtering intentionally excludes disclosed placement proxies, but sealed
+        # evaluation still needs their grids (currently UT-Complex and Shoaib wrist proxies).
+        primary = tuple(
+            spec for dataset in sorted(want) for spec in stream_specs(dataset, "primary")
+        )
+        merged: dict[tuple[str, str], StreamSpec] = {}
+        for spec in deployment + primary:
+            merged.setdefault((spec.dataset, spec.stream_id), spec)
+        return tuple(merged.values())
     default_datasets = set(EXPANDED_PHASE_A_TRAIN_DATASETS) | set(PRIMARY_EVAL_DATASETS)
     # The sealed roster may include an explicitly disclosed placement proxy (currently
     # UT-Complex's wrist-mounted phone).  It is not eligible for phone/watch compatibility
@@ -708,8 +750,15 @@ def build_stream_specs(datasets: Optional[Sequence[str]] = None) -> Tuple[Stream
     return tuple(merged)
 
 
-def _save(out_root: Optional[Path], spec: StreamSpec, grid: Grid, subjects: List) -> None:
-    d = _grid_root(out_root, spec.dataset) / "grids" / grid.alignment / spec.stream_id
+def _save(
+    out_root: Optional[Path], spec: StreamSpec, grid: Grid, subjects: List,
+    *, window_seconds: float | None = None,
+) -> None:
+    # Private legacy callers/tests that omit ``window_seconds`` retain the direct-stream layout.
+    # ``build()`` always passes it explicitly and therefore always writes the versioned schema.
+    d = (_grid_destination(out_root, spec.dataset, grid.alignment, spec.stream_id, window_seconds)
+         if window_seconds is not None else
+         _grid_root(out_root, spec.dataset) / "grids" / grid.alignment / spec.stream_id)
     d.mkdir(parents=True, exist_ok=True)
     store_dtype = _store_dtype(spec.dataset)
     np.save(d / "data.npy", np.asarray(grid.data, dtype=store_dtype))

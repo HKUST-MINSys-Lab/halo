@@ -37,14 +37,28 @@ import numpy as np
 OUT = Path(__file__).resolve().parents[2] / "data" / "quality" / "duplicate_windows.json"
 
 
-def cache_path(alignment: str) -> Path:
+def _duration_tag(window_seconds: float) -> str:
+    return f"w{float(window_seconds):g}".replace(".", "p")
+
+
+def cache_path(alignment: str, window_seconds: float = 6.0) -> Path:
     """One cache per alignment; native keeps the historical filename."""
-    if alignment == "native":
-        return OUT
-    return OUT.with_name(f"{OUT.stem}_{alignment}{OUT.suffix}")
+    suffix = "" if alignment == "native" else f"_{alignment}"
+    duration = "" if np.isclose(window_seconds, 6.0) else f"_{_duration_tag(window_seconds)}"
+    return OUT.with_name(f"{OUT.stem}{suffix}{duration}{OUT.suffix}")
 
 #: Windows are hashed in blocks so a 4 GB grid is never fully resident.
 BLOCK = 4096
+
+
+def _discover(discover_grids, alignment: str, window_seconds: float):
+    try:
+        return discover_grids(alignment, window_seconds=window_seconds)
+    except TypeError:
+        # Compatibility for narrow synthetic test doubles predating duration-qualified grids.
+        if np.isclose(window_seconds, 6.0):
+            return discover_grids(alignment)
+        raise
 
 
 def scan_stream(data, labels, lengths=None) -> tuple[list[int], int, int]:
@@ -75,7 +89,8 @@ def scan_stream(data, labels, lengths=None) -> tuple[list[int], int, int]:
     return sorted(drop), n_groups, n_conflict
 
 
-def scan(alignment: str = "native", datasets: Sequence[str] | None = None) -> dict:
+def scan(alignment: str = "native", datasets: Sequence[str] | None = None,
+         window_seconds: float = 6.0) -> dict:
     """Scan all grids, or safely refresh only named datasets in an existing cache.
 
     Incremental refresh retains old exclusions only after checking that every unselected
@@ -84,7 +99,7 @@ def scan(alignment: str = "native", datasets: Sequence[str] | None = None) -> di
     """
     from data.scripts.eda.grid_io import discover_grids, grid_corpus_fingerprint
 
-    refs = discover_grids(alignment)
+    refs = _discover(discover_grids, alignment, window_seconds)
     requested = set(datasets or ())
     selected_refs = refs
     bad: dict[str, list[int]] = {}
@@ -94,7 +109,7 @@ def scan(alignment: str = "native", datasets: Sequence[str] | None = None) -> di
         missing = sorted(requested - available)
         if missing:
             raise ValueError(f"no {alignment} grids for requested dataset(s): {missing}")
-        path = cache_path(alignment)
+        path = cache_path(alignment, window_seconds)
         if not path.exists():
             raise FileNotFoundError(
                 f"{path} is required for an incremental refresh; run a full scan first"
@@ -123,14 +138,16 @@ def scan(alignment: str = "native", datasets: Sequence[str] | None = None) -> di
         if drop:
             bad[ref.key] = drop
             stats.append((ref.key, len(drop), ref.n_windows, n_groups, n_conflict))
-    return {"alignment": alignment, "grid_fingerprint": grid_corpus_fingerprint(alignment, refs),
+    return {"alignment": alignment, "window_seconds": float(window_seconds),
+            "grid_fingerprint": grid_corpus_fingerprint(alignment, refs),
             "stream_fingerprints": {
                 ref.key: grid_corpus_fingerprint(alignment, [ref]) for ref in refs
             },
             "windows": bad, "summary": stats}
 
 
-def load(alignment: str = "native", *, require: bool = False) -> dict[str, set[int]]:
+def load(alignment: str = "native", *, require: bool = False,
+         window_seconds: float = 6.0) -> dict[str, set[int]]:
     """stream key -> set of window indices to exclude.
 
     ``require=True`` refuses to return an empty screen. A missing or wrong-alignment cache is
@@ -138,7 +155,7 @@ def load(alignment: str = "native", *, require: bool = False) -> dict[str, set[i
     without ``data/quality/duplicate_windows.json`` training would silently readmit every stale
     ExtraSensory buffer. Callers that depend on the screen should pass require=True.
     """
-    path = cache_path(alignment)
+    path = cache_path(alignment, window_seconds)
     if not path.exists():
         if require:
             raise FileNotFoundError(
@@ -155,11 +172,15 @@ def load(alignment: str = "native", *, require: bool = False) -> dict[str, set[i
                 "re-run data.scripts.scan_duplicates for this alignment."
             )
         return {}
+    if not np.isclose(float(blob.get("window_seconds", 6.0)), float(window_seconds)):
+        if require:
+            raise ValueError(f"{path} was built for a different window duration")
+        return {}
     from data.scripts.eda.grid_io import discover_grids, grid_corpus_fingerprint
     stream_fingerprints = blob.get("stream_fingerprints")
     if stream_fingerprints:
         stale = [
-            ref.key for ref in discover_grids(alignment)
+            ref.key for ref in _discover(discover_grids, alignment, window_seconds)
             if stream_fingerprints.get(ref.key) != grid_corpus_fingerprint(alignment, [ref])
         ]
         current_matches = not stale
@@ -186,9 +207,10 @@ def main() -> None:
                         choices=("native", "harmonised", "non_harmonised"))
     parser.add_argument("--datasets", nargs="+", default=None,
                         help="incrementally refresh only these datasets; requires current unchanged cache")
+    parser.add_argument("--window-seconds", type=float, default=6.0)
     args = parser.parse_args()
-    blob = scan(args.alignment, args.datasets)
-    path = cache_path(args.alignment)
+    blob = scan(args.alignment, args.datasets, args.window_seconds)
+    path = cache_path(args.alignment, args.window_seconds)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(blob, indent=2) + "\n")
     total = sum(len(v) for v in blob["windows"].values())

@@ -4,8 +4,8 @@ import numpy as np
 import pytest
 import torch
 
-from training.tokenizer.eval_transfer import (encode_dataset, encode_dataset_detailed,
-                                               subject_holdout)
+from training.tokenizer.eval_transfer import (build_encoder, encode_dataset,
+                                               encode_dataset_detailed, subject_holdout)
 
 
 def test_subject_holdout_is_stream_order_invariant():
@@ -103,3 +103,77 @@ def test_detailed_export_can_retain_a_live_autograd_graph():
     assert detailed["patch_Z"].requires_grad
     assert encoder.scale.grad is not None
     assert float(encoder.scale.grad.abs()) > 0
+
+
+def test_revision_three_multispan_checkpoint_round_trip():
+    from model.tokenizer.encoder import SetTokenizerEncoder
+
+    config = {
+        "d_model": 32,
+        "num_layers": 1,
+        "num_heads": 4,
+        "dim_feedforward": 64,
+        "dropout": 0.0,
+        "frontend": "multispan",
+        "trunk": "temporal",
+        "descriptor_prediction": False,
+        "text_conditioning": "factored",
+        "token_granularity": "sensor",
+        "use_duration_embedding": True,
+        "duration_min_seconds": 0.5,
+        "duration_max_seconds": 2.0,
+        "num_resolutions": 3,
+        "multispan_durations": (0.5, 1.0, 2.0),
+        "multispan_frame_rate_hz": 16,
+        "multispan_centre_spacing": "log",
+        "multispan_compression_scale": "calibrated",
+        "multispan_stem": "conv",
+        "multispan_stem_channels": 64,
+        "multispan_stem_kernel": 5,
+        "multispan_stem_dilations": (1, 2, 4),
+        "multispan_stem_shared": True,
+    }
+    original = SetTokenizerEncoder(
+        d_model=config["d_model"], num_layers=config["num_layers"],
+        num_heads=config["num_heads"], dim_feedforward=config["dim_feedforward"],
+        dropout=0.0, frontend="multispan", trunk="temporal",
+        descriptor_prediction=False, text_conditioning="factored",
+        token_granularity="sensor", use_duration_embedding=True,
+        duration_min_seconds=0.5, duration_max_seconds=2.0, num_resolutions=3,
+        spans=config["multispan_durations"], frame_rate_hz=16,
+        centre_spacing="log", compression_scale="calibrated", stem="conv",
+        stem_channels=64, stem_kernel=5, stem_dilations=(1, 2, 4), stem_shared=True,
+    ).eval()
+    restored = build_encoder(
+        {"config": config, "encoder": original.state_dict()}, torch.device("cpu"),
+    )
+    assert restored.filterbank.span_list == [0.5, 1.0, 2.0]
+    assert restored.filterbank.frame_rate_hz == 16
+    assert restored.filterbank.stem_type == "conv"
+    assert int(restored.filterbank._frontend_revision) == 3
+    for name, value in original.state_dict().items():
+        assert torch.equal(value, restored.state_dict()[name]), name
+
+
+def test_fixed_filterbank_checkpoint_reconstruction_preserves_polarization_era():
+    """Missing config must retain the old 98-wide projection; new checkpoints retain 195."""
+    from model.tokenizer.encoder import SetTokenizerEncoder
+
+    base = {
+        "d_model": 32, "num_layers": 1, "num_heads": 4, "dim_feedforward": 64,
+        "dropout": 0.0, "frontend": "fixed", "trunk": "temporal",
+        "descriptor_prediction": False, "text_conditioning": "factored",
+        "token_granularity": "channel", "use_duration_embedding": False,
+    }
+    old = SetTokenizerEncoder(**base, use_polarization=False).eval()
+    restored_old = build_encoder({"config": base, "encoder": old.state_dict()}, torch.device("cpu"))
+    assert restored_old.filterbank.use_polarization is False
+    assert restored_old.filterbank.in_dim == 98
+
+    modern_config = {**base, "use_polarization": True, "polarization_energy_kappa": 0.05}
+    modern = SetTokenizerEncoder(**modern_config).eval()
+    restored_modern = build_encoder(
+        {"config": modern_config, "encoder": modern.state_dict()}, torch.device("cpu"),
+    )
+    assert restored_modern.filterbank.use_polarization is True
+    assert restored_modern.filterbank.in_dim == 195
