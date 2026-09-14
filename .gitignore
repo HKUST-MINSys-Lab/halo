@@ -135,3 +135,12 @@ references/**/webpage.html
 # Extracted full text of the same PDFs — same copyright status, same rule. The notes derived from
 # them (docs/design/LITERATURE_*.md) ARE versioned; the source text is not.
 references/**/paper.txt
+
+# Per-run support-classifier artifacts (logs, checkpoints, feature caches, per-run eval trees).
+# Mirrors the tokenizer rules above. The single promoted result artifact is force-added when a
+# run is promoted in docs/results/RESULTS.md; everything else stays local.
+training/support_classifier/outputs/*/
+training/support_classifier/evaluations/*/
+
+# Converter backups taken before a schema change (e.g. the 2026-09-13 grid-clock rebuild).
+data/datasets/*/grids_legacy_*/
