@@ -1,6 +1,6 @@
 # Evaluation protocol: support-conditioned HAR
 
-> Protocol of record, 2026-09-12. A score is reportable only when the run records the data split,
+> Protocol of record, revised 2026-09-13. A score is reportable only when the run records the data split,
 > encoder checkpoint, baseline adapter revision, episode manifest, and support/candidate settings.
 
 > **Operational status:** `training.support_classifier.sealed_eval` is the only sealed-test entry
@@ -14,20 +14,17 @@
 
 1. Split subjects before constructing recordings or episodes.
 2. Keep every recording, session, and source segment assigned to one split only.
-3. There are three disjoint source roles: label-free JEPA pretraining, supervised
-   support-classifier training, and sealed test. There is no separate development-source roster.
-   Subject-held-out folds formed only from the eight supervised training sources may select the
-   support-classifier checkpoint. JEPA follows a fixed schedule and uses its final checkpoint.
+3. There are two disjoint active source roles: supervised support-classifier training and sealed
+   test. There is no separate development-source roster. Subject-held-out folds formed only from
+   the eight supervised training sources may select the support-classifier checkpoint.
    The internal splitter keeps at least one training subject for every label. A label observed in
    only one training subject remains optimizer-only rather than moving wholly into validation; it
    is not included in the internal model-selection score unless a subject-disjoint validation
    example exists.
 4. Temperatures, candidate distributions, and every other operating decision are fixed a priori
    or read from training data. Touch the sealed test sources once, after those choices are frozen.
-5. A pretraining source cannot also support an unseen-dataset generalization claim. Such a score is
-   still a deployment comparison, but must be labelled as such.
 
-The exact 3/8/6 source lists are recorded once in
+The exact active 8/6 source lists are recorded once in
 [DESIGN_OF_RECORD.md](DESIGN_OF_RECORD.md) and enforced in code by roster tests.
 
 ## Episode contract
@@ -44,6 +41,18 @@ point for every valid query while excluding the query's physical execution from 
 the manifest builder continues to omit and report a query if a later grid revision cannot do so.
 Large candidate-set episodes are required because a small `C` is an easier task; the held-out test
 set determines the deployment candidate set.
+
+The complete curve is repeated at **4, 8, and 16 seconds**. Query and support units use the same
+physical duration within a cell. The evaluator constructs and fingerprints the raw native-rate
+window set and every query/support manifest before loading a model. All providers therefore receive
+the same event rows and valid samples; only their published input conversion may differ. A partial
+tail remains a partial tail and is identified by its valid length rather than treated as measured
+padding.
+
+RealWorld and Shoaib additionally report every declared placement separately and one preregistered
+all-device cell. Composite rows require elementwise-identical event, label, subject, and execution
+identities. A row rejected by any member's quality screen is removed from the composite for every
+model. The ordered device list and exact raw-slice fingerprint are stored in the manifest.
 
 ## Compared methods
 
@@ -78,6 +87,13 @@ masking. No baseline is retrained by this project for the primary table. If a mo
 recording or cannot expose a representation at the required granularity, mark the combination
 unsupported instead of giving it custom privileged preprocessing.
 
+Models consume all valid samples in the shared evidence window. Length-flexible trunks run once;
+fixed-length trunks use consecutive native-size chunks and pad only the final partial chunk with the
+published rule. Results disclose whether padding occurred and its fraction. UniMTS and NormWear
+consume a composite natively. HARNet and LiMU-BERT-X encode every device independently and use the
+single shared equal-device mean plus L2 normalization; these rows are labelled
+`per-device-pooled`, not native multi-device inference.
+
 HALO is shown with the same frozen-representation readouts and, for a support-classifier checkpoint,
 its retrieve-mix-vote readout on the exact same manifest. This distinguishes representation
 quality from a task-specific training gain. Upstream training corpus, parameter count, inference
@@ -93,6 +109,7 @@ For every promoted result, save:
 
 - code commit and checkpoint hashes;
 - split and episode-manifest hashes;
+- raw source-slice hashes, duration, ordered device set, multi-device mode, and padding fraction;
 - `C` and `k` distributions;
 - per-dataset macro F1, balanced accuracy, and subject-level uncertainty;
 - training/evaluation time, peak memory, and unsupported combinations; and

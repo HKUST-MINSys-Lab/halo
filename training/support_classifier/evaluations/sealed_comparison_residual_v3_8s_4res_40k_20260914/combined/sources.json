@@ -1,0 +1,9 @@
+{
+  "sources": [
+    "training/support_classifier/evaluations/sealed_comparison_residual_v3_8s_4res_40k_20260914/halo/results.json",
+    "training/support_classifier/evaluations/sealed_comparison_residual_v3_8s_4res_40k_20260914/harnet/results.json",
+    "training/support_classifier/evaluations/sealed_comparison_residual_v3_8s_4res_40k_20260914/unimts/results.json",
+    "training/support_classifier/evaluations/sealed_comparison_residual_v3_8s_4res_40k_20260914/normwear/results.json",
+    "training/support_classifier/evaluations/sealed_comparison_residual_v3_8s_4res_40k_20260914/limubert_x/results.json"
+  ]
+}

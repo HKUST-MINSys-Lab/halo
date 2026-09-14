@@ -161,36 +161,32 @@ remains available. It reuses the multi-resolution filterbank machinery (tagged t
 grids, centre-time RoPE, log-duration embedding, equal-weight per-resolution pooling) rather than
 duplicating it.
 
-**Bank.** Span groups `T in {0.5, 1, 1.5}` s (`--spans`). Within a group the kernels are the
-harmonics of `1 / T`, capped at both 15 Hz and harmonic 12: 7, 12 and 12 kernels, 31 in total.
-Their highest initial carrier frequencies are 14, 12 and 8 Hz respectively. This intentional
-capacity cap keeps the experiment small; it is not full coverage to 15 Hz at every span. The same
-frequency is measured at every retained span, narrowband at long spans and broadband at short ones:
-a two-dimensional tiling of the
-time-frequency plane. Each kernel keeps its 24 learnable coefficients, envelope and gain; the rate
-contract (exact sample offsets, integral scaling, re-zero-mean, energy-retained observability mask)
-is unchanged and tested per group (cross-rate correlation > 0.97 at 20/25/50 vs 100 Hz).
+**Bank.** Span groups are `T in {0.5, 1, 2}` seconds. Each group has 7, 12, and 12 log-spaced
+physical centre frequencies. A centre need not be an integer harmonic: initialization projects its
+zero-mean Gaussian-windowed analytic carrier onto the twelve-harmonic Fourier basis and retains
+more than 95% of its energy. This provides 14 distinct centres below 2.5 Hz. Coefficient shape and
+envelope width are learnable at the encoder learning rate. The redundant gain remains in historical
+state dicts but is fixed at unit gain. `--freeze-kernels` declares the fixed-bank control.
 
-**Frames per group.** Stride `T / frames_per_span` (`--frames-per-span`, default 4, an initial
-temporal-resolution choice rather than an exact bandwidth guarantee). The eight-second JEPA window
-yields 64 + 32 + 22 = 118 tokens per
-sensor. The grid follows the longest recording in the batch; shorter recordings are masked beyond
-their own duration and get exactly the tokens they get alone (tested).
+**Compression and calibration.** Magnitude uses `log1p(|z| / s_k)`, where `s_k` is the observed
+per-kernel median estimated in a first calibration pass. A second pass fits frozen mean and scale
+on the compressed features. Local amplitude and signed DC statistics are separate for
+accelerometer and gyroscope channels within every span. Missing channels, padding, and
+unobservable coefficients never contribute. Standardized-response drift is runtime telemetry.
 
-**Tokens.** One token per (group, frame, sensor): the group's standardised kernel magnitudes on the
-three axes, its observability entries, the span's edge support at that frame, the local log
-amplitude and signed DC over the span, and the axis-validity bits, through one linear map per
-group. Every token carries its physical centre time (RoPE, fastest period = two strides of the
-finest group, 0.25 s by default), its span (duration embedding over [0.5, 1.5] s) and its group
-(`resolution_id`, `num_resolutions = 3`). The encoder's forward takes these from the frontend
-instead of the collate, so the collate's patch grid only supplies the contiguous window: 1 s and
-1.5 s collates give identical tokens (tested). The dense CNN and ordered flatten are gone;
-reversing a recording reverses each group's token sequence and changes the pooled vector through
-RoPE, where the fixed filterbank is reversal-invariant (tested).
+**Dense physical-time grid and stem.** All three groups are sampled at 16 analysis frames per
+second. Per-group pointwise entry projections map their feature widths to 128 channels. A
+sensor-shared causal residual stem applies three depthwise temporal convolutions with dilations
+1, 2, and 4, channel-only LayerNorm, and pointwise mixing. Two causal stride-two stages reduce the
+grid to four output tokens per second per span, followed by a shared projection to `d_model`.
+Sensors are independent batch rows and cannot mix inside the frontend. Invalid future frames are
+zero before the stem, so a past-only JEPA student cannot read or backpropagate through future
+samples. Six- and eight-second windows tile exactly at every span.
 
-Kernel magnitudes have frozen per-kernel statistics. Local amplitude and signed DC have frozen
-per-span statistics, fitted on live training samples only. Missing axes and padding never
-contribute to calibration; unobserved groups fall back to mean zero and scale one.
+**Tokens.** One token per (span, quarter-second frame, sensor) carries centre time through RoPE,
+physical span through the duration embedding, and span group through `resolution_id`. An
+eight-second recording emits 32 tokens per span, 96 per sensor in total. The collate patch grid
+only packages a contiguous recording and does not determine this output grid.
 
 Checkpoints record `multiresolution=true`, `token_grid_owner=frontend`, and the actual spans in
 `eval_resolutions`. These describe the output tokens. Input still uses one non-overlapping patch
@@ -198,13 +194,11 @@ grid; `--patching checkpoint` selects that packaging automatically. Explicit eva
 `--patching multiresolution` and multiple input resolution IDs are rejected because concatenating
 those grids would duplicate the raw recording.
 
-**Checkpoint revision.** Current continuous modules save `_frontend_revision=2`. Earlier
-checkpoints without this marker are rejected with an actionable error: they were trained with
-different observability mathematics or, for the multi-span pilot, shared amplitude/DC statistics.
-Reproduce those historical runs using their original commit and saved source patch. Training the
-corrected frontend requires a fresh run and fresh evaluation. Do not add a revision marker to an
-old checkpoint to bypass the check. The 2026-09-08 continuous score is historical, not a score for
-this implementation and remains archived outside the live result record.
+**Checkpoint revision.** The dense/log-spaced multi-span frontend saves `_frontend_revision=3`
+and serializes spans, frame rate, centre spacing, compression mode, and stem settings. Revision-2
+harmonic checkpoints remain loadable only through their explicit legacy configuration
+(`frames_per_span`, harmonic centres, unscaled compression, no stem); they never inherit the new
+defaults silently. Older checkpoints without a revision marker remain rejected.
 
 **Pooling and gradients.** Mean within group, equal weight across groups (the existing rule).
 Every query and support window of an episode goes through the same encoder in one forward pass and
@@ -214,30 +208,33 @@ kernels from both sides; `frontend/*` telemetry and `--frontend-lr-scale` /
 
 **Historical classifier cost, measured on the RTX 4090** (40 steps, `neighbors` readout, four
 episodes per step, capped corpus, four loader workers): 43 ms per step against 17 ms for the fixed
-filterbank, i.e. 2.6x, so that earlier 35k-step classifier run was about 25 minutes. This is not the
-current JEPA workload. The current JEPA measurement and planning budget live only in
+filterbank, i.e. 2.6x, so that earlier 35k-step classifier run was about 25 minutes. The JEPA
+measurement and planning budget are historical and live only in
 [PRETRAINING_CORPUS.md](../data/PRETRAINING_CORPUS.md). Per-token export for the evaluation adapter
 follows the frontend's grid (`out["token_grid"]`).
 
-**Future JEPA.** The past-only future objective supports this frontend directly. Student kernels see
+**Historical Future JEPA.** The past-only future objective supported this frontend directly. Student kernels saw
 only the raw prefix; the EMA teacher sees the complete window. The trainer derives RoPE's fastest
-period from the shortest span and frame density, audits targets per span, logs frontend gradient,
+period from the four-token-per-second output grid, audits targets per span, logs frontend gradient,
 observability and dead-kernel telemetry, and sizes the batch from the actual emitted token count.
 The historical bidirectional masked objective remains unsupported because it cannot provide honest
 raw-signal masking for kernels whose support overlaps a masked interval.
 
-Smoke and tests: `tests/test_multispan_kernel.py` plus the encoder/export suites, including
-normalization, checkpoint revision checks and refusal of duplicated input grids.
+Smoke and tests: `tests/test_multispan_kernel.py` plus the trainer, encoder, monitor, and export
+suites cover normalization, compression, causality, rate consistency, gradient reach, checkpoint
+revision checks, and refusal of duplicated input grids.
 
-Verification on 2026-09-09: 179 focused tests passed. A three-step real-corpus RTX 4090 smoke
-completed with finite training/validation losses and nonzero query, support, kernel and duration
-gradients. Reloading its checkpoint through the detailed evaluator exported 120 tokens for a
-4 s recording and 180 for a 6 s recording, with valid physical times. The invalid multi-resolution
-input override raised an error before encoding. Local diagnostic artifacts are in
-`/tmp/halo_multispan_fixes_20260909/`; these smoke scores are not performance results.
+Verification on 2026-09-12: the complete repository suite passed (744 passed, 1 skipped). Current
+revision-3 grids emit 48, 72, and 96 tokens per sensor for 4, 6, and 8 seconds respectively. A
+ten-step pretraining smoke and three-step support-classifier smoke on the RTX 4090 completed with
+finite losses and gradients; the pretraining smoke had nonzero encoder, frontend, predictor, and
+physical-decoder gradients. Both checkpoints reconstructed the serialized revision-3 frontend
+exactly. These smoke runs are wiring checks, not performance results, and no E0-E7 experiment or
+sealed evaluation was run.
 
 ```bash
 /home/alex/code/HALO/legacy_code/.venv/bin/python -m training.support_classifier.train --frontend multispan \
-  --out training/support_classifier/outputs/<run> [--spans 0.5 1 1.5] \
-  [--frames-per-span 4] [--frontend-lr-scale 1.0] [--frontend-reg-weight 0.0]
+  --out training/support_classifier/outputs/<run> [--spans 0.5 1 2] \
+  [--multispan-frame-rate-hz 16] [--multispan-stem conv] \
+  [--frontend-lr-scale 1.0] [--frontend-reg-weight 0.0]
 ```

@@ -25,6 +25,11 @@ Each recording retains its native samples and metadata:
 - sensor placement and device description; and
 - recording, subject, and dataset provenance.
 
+Several simultaneous devices are represented as additional `(device, modality)` sensor rows with
+an explicit device id. The parameter-free recording path first averages modalities within each
+device and then averages devices, so an accelerometer-plus-gyroscope device does not count twice as
+much as an accelerometer-only device. The learned recording pool receives every valid sensor token.
+
 Preprocessing never invents a missing modality. Acceleration-only streams are masked rather than
 treated as measured gyroscope signals. All time spans are in seconds, not sample counts.
 
@@ -38,19 +43,15 @@ validity masks.
 |---|---|---|
 | fixed control | one-second physical filterbank | small, interpretable baseline |
 | fixed multiresolution | filterbank at 0.5, 1.0, and 1.5 seconds, jointly contextualized | frequency features at multiple physical spans |
-| continuous multispan | learnable continuous kernels at 0.5, 1.0, and 1.5 seconds | temporal as well as frequency-sensitive representation |
+| continuous multispan | retired experimental frontend; retained only for checkpoint loading/reproduction | not part of the active recipe or reported comparison |
+
+New fixed-filterbank runs append bounded per-triad polarization features when complete xyz metadata
+is available. This preserves the physical band-energy path while adding rotation-aware motion
+geometry. The complete contract, including checkpoint compatibility, is in
+[FILTERBANK_POLARIZATION.md](FILTERBANK_POLARIZATION.md).
 
 Acquisition-description conditioning is auxiliary context. It may explain which channels are
 present and how they were acquired; it must not become a shortcut for dataset or label identity.
-
-## Optional predictive pretraining
-
-Future-JEPA uses a student encoder that sees only a prefix of an unlabeled region and an EMA
-teacher that supplies later patch targets. A lightweight predictor forecasts each later latent's
-residual from a past-only EMA context reference; the reconstructed future latent is decoded to
-standardized physical measurements. The student is the only encoder retained after pretraining.
-Full leakage and masking rules are in
-[JEPA_PRETRAINING_OBJECTIVE.md](JEPA_PRETRAINING_OBJECTIVE.md).
 
 ## Support classifier
 
@@ -75,28 +76,32 @@ encoder quality without classifier reasoning.
 
 ## Training and evaluation boundary
 
-Encoder pretraining and support-classifier training are independent stages. A classifier experiment
-may freeze a selected encoder or train a dedicated HALO copy end to end. Query and support encodings
-must both receive gradients in the end-to-end arm, including the learned recording pool. The
+Support-classifier training is the active optimization stage. A classifier experiment may freeze a
+selected encoder or train a dedicated HALO copy end to end. Query and support encodings must both
+receive gradients in the end-to-end arm, including the learned recording pool. The
 zero-shot and enrolled losses are averaged by regime when both appear in a batch, so the shared
 encoder is not dominated by whichever condition happened to supply more queries.
 
-The current paper roster has three pairwise-disjoint source roles. This table is explanatory; the
+The current paper roster has two pairwise-disjoint active source roles. This table is explanatory; the
 executable authority is `data/scripts/curate/deployment_policy.py`.
 
 | role | count | datasets |
 |---|---:|---|
-| label-free JEPA pretraining | 3 | `capture24_pretrain`, `nymeria_xsens`, `extrasensory_pretrain` |
 | support-classifier training | 8 | `hhar`, `wisdm`, `kuhar`, `harmes`, `xrf_v2`, `dsads`, `forth_trace`, `realdisp` |
 | sealed test | 6 | `motionsense`, `realworld`, `shoaib`, `inclusivehar`, `usc_had`, `ut_complex` |
 
 The eight supervised sources are split by subject into optimizer data and an internal validation
 fold. That fold selects support-classifier checkpoints, but it is not a separate development-source
-roster. Candidate count and support count are episode properties recorded with every score. JEPA
-uses a fixed training schedule and takes its final checkpoint because its three label-free sources
-provide no meaningful label probe. The sealed sources never select a checkpoint or hyperparameter
-and are touched only after the protocol is frozen. See
+roster. Candidate count and support count are episode properties recorded with every score. The
+sealed sources never select a checkpoint or hyperparameter and are touched only after the protocol
+is frozen. See
 [EVALUATION_PROTOCOL.md](EVALUATION_PROTOCOL.md).
+
+Training mixes single-device examples with exact event-aligned 2-4-device examples from `realdisp`,
+`xrf_v2`, `dsads`, and `forth_trace`. Device subsets are drawn independently whenever a query or
+support recording is loaded. Internal checkpoint validation stays single-device and deterministic;
+the sealed protocol measures both single placements and fixed all-device composites at 4, 8, and
+16 seconds.
 
 ## Exclusions
 

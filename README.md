@@ -21,8 +21,9 @@ separate, explicitly reported evaluation regimes.
 
 - **Encoder arms:** a one-second fixed physical filterbank control, a fixed multiresolution
   filterbank (0.5, 1.0, and 1.5 seconds), and a continuous multispan frontend at the same spans.
-- **Optional pretraining:** label-free future-JEPA trains contextual patch representations before
-  support-classifier training. It is encoder-agnostic at the physical-time token interface.
+- **No active label-free pretraining:** future-JEPA was evaluated and retired because supervised
+  end-to-end encoder adaptation recovered its observed gain. The reproducibility code and results
+  remain archived behind an explicit command-line acknowledgment.
 - **Classifier:** a semantic token mixer with separate zero-support and enrolled-support weights.
   With enrollment it jointly contextualises query, support, paired support-label, and candidate-label
   tokens before a soft support vote. The parameter-free `neighbors` path is the encoder control.
@@ -39,7 +40,7 @@ baselines/                    # retained released-checkpoint adapters and public
 data/                         # labelled data, curation, and label-free pretraining sources
 model/tokenizer/              # HALO frontends and contextual encoder
 model/support/                # current support-conditioned comparison head
-training/tokenizer/           # encoder pretraining
+training/tokenizer/           # encoder utilities and archived JEPA reproducibility code
 training/support_classifier/  # support-classifier training and validation
 docs/                         # current design, data, protocol, and results record
 tests/                        # regression tests for the retained surface

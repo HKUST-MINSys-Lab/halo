@@ -22,6 +22,10 @@ clock gaps, and session boundaries are hard boundaries for sampling and target c
 Frontend geometry, patch spans, positions, and JEPA horizons use physical seconds. Native rate is
 preserved alongside any frontend-specific resampling. A rate conversion required by an external
 baseline belongs in that baseline adapter and is documented as part of its published input contract.
+The multi-span frontend also exposes coefficient observability to the encoder. This vector honestly
+identifies which frequency components the source rate can resolve and therefore encodes a coarse
+source-rate class; it is metadata, not inferred motion, and must be ablated before claiming that the
+representation itself is rate-blind.
 
 ## Metadata conditioning
 

@@ -1,7 +1,7 @@
-# Label-free pretraining corpus
+# Retired label-free pretraining corpus
 
-> Operational source of truth: `data/pretraining/corpus_plan.py`. This document explains the live
-> plan; it does not activate a source that lacks a tested converter and loader.
+> Historical record. `data/pretraining/corpus_plan.py` and the associated data remain preserved for
+> reproducibility, but future-JEPA is not an active HALO recipe.
 
 ## Purpose and isolation
 
@@ -10,7 +10,7 @@ reserved `__unlabeled__` marker, and are excluded from label vocabularies, suppo
 episodes, and evaluation splits. This makes a transfer claim auditable: a dataset used as a held-out
 recognition test cannot silently have entered encoder pretraining.
 
-## Current operational plan
+## Historical operational plan
 
 | source | contribution | subjects | streams | usable windows | usable stream-hours |
 |---|---|---:|---:|---:|---:|
@@ -57,7 +57,7 @@ Pretraining samples eight-second regions. This is a context region for predictiv
 downstream recording-length policy. It may not cross a session, subject, stream, configuration, or
 clock gap.
 
-## Operation
+## Historical operation
 
 ```bash
 python -m data.pretraining.build_corpus --plan
@@ -70,21 +70,25 @@ Stages are resumable. Fetching is always explicit and licence-gated sources fail
 approved local assets or URL manifest are available. Before a full run, build one source at a time,
 inspect loader outputs, and record the exact `CORPUS_PLAN` revision with the checkpoint.
 
-## Measured training budget
+## Historical measured training budget
 
 Production-shape profiling on 2026-09-12 used the full materialized corpus, the full JEPA model,
 BF16 neural computation, and an otherwise idle RTX 4090. Each bounded probe included the ordinary
 50-step telemetry and used the same LR and EMA schedule as a complete run; periodic transfer
 evaluation was disabled so its cost is not hidden in the optimizer throughput.
 
+These measurements predate the revision-3 0.5/1.0/2.0-second multispan frontend and its dense
+convolutional stem. They remain useful only as revision-2 historical measurements; do not use them
+to promise revision-3 runtime. Re-profile the current arms before launching a full run.
+
 | encoder arm | batch | full steps | measured steady throughput | optimizer-time projection | peak allocated VRAM |
 |---|---:|---:|---:|---:|---:|
 | fixed multiresolution filterbank, 0.5/1.0/1.5 s | 512 | 15,000 | about 14.3 steps/s | about 17.5 min | 3.32 GiB |
 | continuous multispan kernels, 0.5/1.0/1.5 s | 384 | 20,000 | about 10.8 steps/s | about 30.9 min | 7.27 GiB |
 
-Allow roughly 20 minutes and 35 minutes respectively for startup, frontend calibration, final
+The historical runs allowed roughly 20 minutes and 35 minutes respectively for startup, frontend calibration, final
 checkpointing, and normal run-to-run variation. Sequentially training both arms should therefore
-take about 55 minutes on the reference machine, with one hour as the practical planning budget.
+have taken about 55 minutes on the reference machine, with one hour as the practical planning budget.
 These figures supersede the older 2026-09-11 JEPA profiles. Timings in the continuous-frontend
 design for historical support-classifier experiments measure a different workload and must not be
 used to estimate JEPA pretraining.

@@ -7,8 +7,8 @@ The architecture and protocol are defined in `DESIGN_OF_RECORD.md` and
 
 ## Question
 
-Can label-free predictive pretraining improve a heterogeneous IMU representation, and can a
-support-conditioned semantic classifier improve adaptation beyond a simple nearest-neighbor rule?
+Can a heterogeneous physical-time encoder and support-conditioned semantic classifier improve
+adaptation beyond a simple nearest-neighbor rule?
 
 The answer requires separating representation quality from classifier reasoning. A better score
 from a learned head alone is not evidence of a better encoder; a better encoder score alone does
@@ -22,7 +22,7 @@ current sealed protocol:
 | finding | historical artifact | current use |
 |---|---|---|
 | End-to-end differentiable-neighbor training substantially improved the encoder over random initialization. | `IMWUT_DIFFERENTIABLE_NEIGHBORS_20260908.md` | Retain neighbors as the encoder-only control. |
-| Fixed multi-resolution filterbank at 0.5/1.0/1.5 s was strongest overall; continuous multi-span was competitive. | `TEMPORAL_RESOLUTION_20260909.md` | Retain both as JEPA arms. |
+| Future-JEPA improved frozen representations but not the end-to-end adapted route. | `journal/2026-09-13-jepa-value-measured.md` | Retired; preserve as a negative result, not an active arm. |
 | Earlier learned support engines did not consistently beat the same encoder with 1-NN. | `IMWUT_MATCHED_ADAPTATION_20260908.md` | Require a direct same-encoder neighbor comparison for every new semantic head. |
 
 Those experiments used earlier source rosters, candidate ranges, manifests, and classifier designs.
@@ -39,49 +39,20 @@ Each row uses the current disjoint rosters and the immutable manifest produced b
 | 0 | released external baselines | none | none | Establish released-checkpoint 1-NN, prototype, ridge, and native `k=0` reference rows. |
 | 1 | HALO initialized / neighbors | none after initialization | none | Random-encoder and implementation floor. |
 | 2 | HALO supervised end-to-end / neighbors | yes | none | Measure what direct enrollment training can teach the encoder without semantic-head capacity. |
-| 3 | HALO JEPA frozen / 1-NN, prototype, ridge, differentiable-neighbors | none | none | Test whether label-free JEPA improves representation quality before any supervised adaptation. |
-| 4 | HALO JEPA encoder-only tuning / neighbors | yes | none | Test label-efficient supervised adaptation of the pretrained encoder. |
-| 5 | HALO frozen encoder / token mixer | no | yes | Test classifier reasoning independently of encoder adaptation. |
-| 6 | HALO end-to-end / token mixer | yes | yes | Test the complete system against the matched neighbors control. |
+| 3 | HALO frozen encoder / token mixer | no | yes | Test classifier reasoning independently of encoder adaptation. |
+| 4 | HALO end-to-end / token mixer | yes | yes | Test the complete system against the matched neighbors control. |
 
-Rows 3-6 are repeated for the fixed multi-resolution filterbank and continuous multi-span frontend
-at 0.5/1.0/1.5 seconds. The one-second fixed filterbank is retained as the compact architectural
-control. Do not add a new frontend until this ladder identifies a specific representation failure.
+The one-second fixed filterbank is retained as the compact architectural control. The current
+multiresolution filterbank is the only planned extension. Do not add a new frontend until this
+ladder identifies a specific representation failure.
 
-## JEPA Evaluation
+## Retired JEPA experiment
 
-Future-JEPA is evaluated in increasing adaptation capacity:
-
-1. **Frozen representation:** 1-NN, prototype, ridge, and the parameter-free
-   differentiable-neighbors vote at enrollment `k > 0`. These require no gradient-based fitting
-   of the encoder. The soft vote is exactly the scoring rule used by encoder-only tuning.
-2. **Encoder-only adaptation:** the parameter-free differentiable-neighbors objective updates the
-   shared encoder through both query and support recordings. There is no learned classifier.
-3. **Frozen encoder, learned classifier:** train only the token mixer, separately for `k=0` and
-   `k>0`.
-4. **Full adaptation:** train encoder and the corresponding token-mixer head jointly.
-
-The first stage answers whether JEPA itself created a useful representation. Later stages answer
-whether that representation is efficiently adaptable and whether semantic mixing adds value.
-
-## Current JEPA Representation Experiment
-
-This experiment is deliberately outside the model design. It is a reproducible four-condition
-comparison for each retained 0.5/1.0/1.5-second encoder arm:
-
-| condition | initialization | updates | recording pool |
-|---|---|---|---|
-| random frozen | random | none | deterministic duration-weighted pool |
-| JEPA frozen | label-free JEPA checkpoint | none | deterministic duration-weighted pool |
-| random adapted | random | 5,000 neighbor-only steps | learned recording pool plus encoder |
-| JEPA adapted | label-free JEPA checkpoint | 5,000 neighbor-only steps | learned recording pool plus encoder |
-
-The fixed final checkpoint is evaluated after 5,000 steps; subject-held-out training-source
-validation diagnoses the trajectory but does not choose a favorable sealed-test checkpoint.
-The random-adapted control is required: it distinguishes value added by JEPA from value added by
-the supervised neighbor objective itself.  The sealed evaluator can additionally write opt-in,
-non-decision embedding artifacts: PCA by label, same/different-label cosine distributions, label
-centroid similarity, effective rank, centroid margins, and leave-one-out label-neighbour purity.
+Future-JEPA is not in the active ladder. Its frozen-versus-adapted comparison is recorded in
+[2026-09-13-jepa-value-measured.md](../journal/2026-09-13-jepa-value-measured.md): it improved a
+frozen representation, but the gain disappeared once the supervised neighbor objective adapted the
+encoder. The code and exact result rows remain reproducible but must not be used as current model
+references.
 
 ## Classifier Experiment
 

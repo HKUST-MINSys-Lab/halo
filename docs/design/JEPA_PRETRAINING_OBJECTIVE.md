@@ -1,9 +1,9 @@
-# HALO predictive pretraining objective
+# Retired HALO predictive pretraining objective
 
-> **Implemented design of record, updated 2026-09-10.** The default path in
-> `training/tokenizer/pretrain.py` implements this multi-horizon future-JEPA objective. The former
-> bidirectional masked JEPA plus VICReg recipe remains available only as the explicitly selected
-> `--jepa-mode masked` control. Literature evidence and the audit that motivated the change remain in
+> **Historical reproducibility record.** The former default path in
+> `training/tokenizer/pretrain.py` implements this multi-horizon future-JEPA objective only behind
+> an explicit archival acknowledgement. It is not part of the active recipe. Literature evidence and
+> the audit that motivated the change remain in
 > [`JEPA_LITERATURE_NOTES_20260909.md`](JEPA_LITERATURE_NOTES_20260909.md).
 
 ## 1. Purpose
@@ -387,8 +387,9 @@ hardware-dependent estimates.
 
 The future path requires sensor-granularity tokens but supports the fixed filterbank,
 constrained-learnable filterbank, single-span continuous-kernel, and multi-span continuous-kernel
-frontends. The filterbank arms use fixed 0.5/1.0/1.5-second grids; the single-span continuous arm
-uses its native one-second token grid; and the multi-span arm uses its declared span grid. In every arm,
+frontends. New multiresolution filterbank and revision-3 multispan runs use 0.5/1.0/2.0-second
+grids; the single-span continuous arm uses its native one-second token grid. Historical revision-2
+checkpoints retain their serialized 0.5/1.0/1.5-second grid. In every arm,
 future selection and leakage checks operate on the emitted physical intervals rather than assuming
 a sampling rate or interpreting token indices as time.
 

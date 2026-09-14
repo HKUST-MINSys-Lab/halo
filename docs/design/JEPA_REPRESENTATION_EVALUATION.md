@@ -1,8 +1,14 @@
-# JEPA representation evaluation
+# Retired JEPA representation evaluation
+
+> **Historical experiment record.** Do not use these commands for a current HALO run.
 
 This document defines the narrow experiment that asks whether the two 2026-09-12 label-free JEPA
 checkpoints produce useful support-classification representations. It is an experiment harness,
 not a model-design document.
+
+The commands below reproduce revision-2 checkpoints whose physical durations were
+`0.5/1.0/1.5` seconds. They are historical controls, not templates for the revision-3 frontend in
+[CONTINUOUS_KERNEL_FRONTEND.md](CONTINUOUS_KERNEL_FRONTEND.md), which uses `0.5/1.0/2.0` seconds.
 
 ## Arms
 

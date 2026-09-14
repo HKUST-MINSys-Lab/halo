@@ -13,11 +13,11 @@ optional recording representation.
 | `sensor_tokens.py` | sensor-level token construction and validity masks |
 | `transformer.py`, `encoder.py` | temporal/cross-sensor context and representation interface |
 | `channel_text.py` | acquisition-configuration conditioning |
-| `future_jepa.py` | pretraining-only EMA teacher, predictor, and physical decoder |
+| `future_jepa.py` | retired pretraining-only EMA teacher, predictor, and physical decoder |
 
 The encoder preserves patch-level states until a downstream recording pool is explicitly requested.
-The support classifier can train that pool end to end; future-JEPA targets patch states, not pooled
-recording vectors.
+The support classifier can train that pool end to end. The retired future-JEPA path targeted patch
+states rather than pooled recording vectors.
 
 ## `support/`
 
