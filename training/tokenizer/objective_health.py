@@ -1,4 +1,4 @@
-"""Fast, model-free health audit for the exact future-JEPA data/objective configuration."""
+"""Retired future-JEPA configuration audit, retained for reproducibility."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from model.tokenizer.multispan_kernel import MS_FRAMES_PER_SPAN, MultiSpanKernelTokenizer
+from model.tokenizer.multispan_kernel import MS_FRAME_RATE_HZ, MultiSpanKernelTokenizer
 from training.tokenizer.future_jepa import DEFAULT_HORIZON_BINS_SECONDS, make_future_target_plan
 from training.tokenizer.pretrain import _corpus_datasets, validate_source_window_contract
 from training.tokenizer.pretrain_data import (
@@ -19,7 +19,7 @@ from training.tokenizer.pretrain_data import (
     TemperatureSampler, _seed_worker, modalities_present,
 )
 
-DEFAULT_DURATIONS = (0.5, 1.0, 1.5)
+DEFAULT_DURATIONS = (0.5, 1.0, 2.0)
 
 
 def distribution(values: list[float]) -> dict[str, float | int]:
@@ -33,9 +33,9 @@ def distribution(values: list[float]) -> dict[str, float | int]:
     }
 
 
-def _multispan_metadata(batch: dict, durations: tuple[float, ...], frames: int) -> dict:
+def _multispan_metadata(batch: dict, durations: tuple[float, ...], frame_rate: int) -> dict:
     real_duration = (batch["patch_ends"] * batch["patch_padding_mask"]).amax(dim=1)
-    frontend = MultiSpanKernelTokenizer(d_model=8, spans=durations, frames_per_span=frames)
+    frontend = MultiSpanKernelTokenizer(d_model=8, spans=durations, frame_rate_hz=frame_rate)
     meta = frontend.token_metadata(real_duration)
     half = 0.5 * meta["durations"]
     return {
@@ -48,18 +48,25 @@ def _multispan_metadata(batch: dict, durations: tuple[float, ...], frames: int) 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--allow-retired-jepa", action="store_true",
+                        help="acknowledge that this is a historical JEPA-only diagnostic")
     parser.add_argument("--frontend", choices=("fixed", "multispan"), default="fixed")
     parser.add_argument("--corpus", choices=("label_free", "expanded", "matched"),
                         default="label_free")
     parser.add_argument("--datasets", nargs="+", default=None)
     parser.add_argument("--durations", nargs="+", type=float, default=DEFAULT_DURATIONS)
-    parser.add_argument("--frames-per-span", type=int, default=MS_FRAMES_PER_SPAN)
+    parser.add_argument("--multispan-frame-rate-hz", type=int, default=MS_FRAME_RATE_HZ)
     parser.add_argument("--batches", type=int, default=8)
     parser.add_argument("--batch", type=int, default=128)
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
-    if args.batches <= 0 or args.batch <= 0 or args.frames_per_span <= 0:
-        parser.error("batches, batch size, and frames-per-span must be positive")
+    if not args.allow_retired_jepa:
+        parser.error(
+            "future-JEPA is retired from the active recipe; pass --allow-retired-jepa only "
+            "for historical reproducibility"
+        )
+    if args.batches <= 0 or args.batch <= 0 or args.multispan_frame_rate_hz <= 0:
+        parser.error("batches, batch size, and multispan frame rate must be positive")
     durations = tuple(sorted(set(float(value) for value in args.durations)))
     if len(durations) < 2 or any(not np.isfinite(value) or value <= 0 for value in durations):
         parser.error("durations must contain at least two distinct finite positive values")
@@ -103,7 +110,7 @@ def main() -> None:
     generator = torch.Generator().manual_seed(SEED)
     for batch in loader:
         meta = (batch if args.frontend == "fixed"
-                else _multispan_metadata(batch, durations, args.frames_per_span))
+                else _multispan_metadata(batch, durations, args.multispan_frame_rate_hz))
         plan = make_future_target_plan(
             meta["patch_starts"], meta["patch_ends"], meta["patch_padding_mask"],
             meta["resolution_ids"], horizon_bins_seconds=DEFAULT_HORIZON_BINS_SECONDS,
@@ -144,7 +151,8 @@ def main() -> None:
     report = {
         "frontend": args.frontend, "corpus": args.corpus, "datasets": list(datasets),
         "batches": args.batches, "windows": windows,
-        "durations_seconds": durations, "frames_per_span": args.frames_per_span,
+        "durations_seconds": durations,
+        "multispan_frame_rate_hz": args.multispan_frame_rate_hz,
         "future_jepa": {
             "context_tokens_per_window": distribution(context_tokens),
             "target_tokens_per_window": distribution(target_tokens),

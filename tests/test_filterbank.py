@@ -204,7 +204,8 @@ def test_dc_feature_encodes_gravity_axis():
     assert (dc_z[2] - dc_z[0]) > 1.0
 
     # in_dim includes exactly one DC slot; zeroing it makes the two postures collapse.
-    assert tok.use_dc and tok.in_dim == 32 * 3 + 1 + 1
+    # K=32: energy, observability, resolution, amplitude, DC, and 97 polarization slots.
+    assert tok.use_dc and tok.in_dim == 32 * 3 + 1 + 1 + (3 * 32 + 1)
 
 
 def test_dc_disabled_is_blind_to_posture():
@@ -287,18 +288,26 @@ def test_calibration_streaming_matches_oneshot():
 
 
 def test_param_count_matches_spec():
-    """Arm A, K=32, no resolution mask -> Linear(65->384) = 25,344 (spec §2)."""
+    """The legacy no-polarization shape is retained; the enabled shape is explicit."""
     t = PhysicalFilterbankTokenizer(d_model=384, n_bands=32, use_resolution_mask=False,
-                                    use_amplitude=True, use_dc=False)
+                                    use_amplitude=True, use_dc=False, use_polarization=False)
     assert t.in_dim == 65
     n_proj = t.proj.weight.numel() + t.proj.bias.numel()
     assert n_proj == 65 * 384 + 384 == 25344
     # with the resolution flag on: Linear(97->384)
-    t2 = PhysicalFilterbankTokenizer(d_model=384, n_bands=32, use_resolution_mask=True, use_dc=False)
+    t2 = PhysicalFilterbankTokenizer(
+        d_model=384, n_bands=32, use_resolution_mask=True, use_dc=False,
+        use_polarization=False,
+    )
     assert t2.in_dim == 97
     # DC feature adds exactly one input dim (signed per-channel gravity/tilt scalar).
-    t3 = PhysicalFilterbankTokenizer(d_model=384, n_bands=32, use_resolution_mask=True, use_dc=True)
+    t3 = PhysicalFilterbankTokenizer(
+        d_model=384, n_bands=32, use_resolution_mask=True, use_dc=True,
+        use_polarization=False,
+    )
     assert t3.in_dim == 98
+    t4 = PhysicalFilterbankTokenizer(d_model=384, n_bands=32, use_resolution_mask=True, use_dc=True)
+    assert t4.in_dim == 195
 
 
 def test_learnable_arm_b_trains():
@@ -389,6 +398,28 @@ def test_calibration_is_observability_masked():
                           torch.full((int(hi_only.sum()),), float(rows), dtype=torch.float64))
     assert torch.allclose(t._acc_count[both],
                           torch.full((int(both.sum()),), float(2 * rows), dtype=torch.float64))
+
+
+def test_per_channel_source_rates_calibrate_like_separate_native_streams():
+    """A mixed-device row must preserve each channel's acquisition Nyquist during calibration."""
+    torch.manual_seed(19)
+    mixed = PhysicalFilterbankTokenizer(d_model=32, n_bands=16, dft_size=128)
+    reference = PhysicalFilterbankTokenizer(d_model=32, n_bands=16, dft_size=128)
+    patches = torch.randn(1, 2, 128, 2)
+    rate = torch.tensor([100.0])
+    lengths = torch.full((1, 2), 100, dtype=torch.long)
+
+    mixed.reset_norm_accumulator()
+    mixed.accumulate_norm_stats(
+        patches, rate, lengths, source_rate_hz=torch.tensor([[20.0, 100.0]]),
+    )
+    reference.reset_norm_accumulator()
+    reference.accumulate_norm_stats(patches[..., :1], rate, lengths, source_rate_hz=torch.tensor([20.0]))
+    reference.accumulate_norm_stats(patches[..., 1:], rate, lengths, source_rate_hz=torch.tensor([100.0]))
+
+    torch.testing.assert_close(mixed._acc_count, reference._acc_count)
+    torch.testing.assert_close(mixed._acc_sum, reference._acc_sum, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(mixed._acc_sqsum, reference._acc_sqsum, rtol=1e-6, atol=1e-6)
 
 
 if __name__ == "__main__":

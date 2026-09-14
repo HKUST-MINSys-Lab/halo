@@ -229,7 +229,9 @@ class ContinuousKernelTokenizer(nn.Module):
         self.sigma_logit = nn.Parameter(
             torch.full((self.K,), math.log(sigma_fraction / (1.0 - sigma_fraction)))
         )
-        self.gain_logit = nn.Parameter(torch.zeros(self.K))
+        # Retained in the state dict for historical checkpoints; scale is owned by calibration and
+        # the learned projection, so this redundant direction remains fixed at unit gain.
+        self.gain_logit = nn.Parameter(torch.zeros(self.K), requires_grad=False)
         if gabor_init:
             # A Gabor wavelet at the carrier: the quadrature pair is (cos, sin) of that harmonic,
             # so at step 0 this bank approximates the physical filterbank we already trust.
@@ -302,7 +304,9 @@ class ContinuousKernelTokenizer(nn.Module):
 
     def adaptation_parameters(self) -> tuple[nn.Parameter, ...]:
         """Mildly learned analysis-bank parameters, excluding the ordinary CNN/projection."""
-        return (self.cos_coeff, self.sin_coeff, self.sigma_logit, self.gain_logit)
+        # Kernel gain is exactly absorbable by the following standardisation/projection. Keeping it
+        # frozen removes an unidentifiable optimizer direction while preserving checkpoint shape.
+        return (self.cos_coeff, self.sin_coeff, self.sigma_logit)
 
     def adaptation_regularization(self) -> torch.Tensor:
         """Dimensionless pull toward the physical Gabor initialisation."""
@@ -311,8 +315,7 @@ class ContinuousKernelTokenizer(nn.Module):
         shape = shape + (sin_coeff - self.initial_sin_coeff).square().mean()
         sigma = ((self._sigmas() - self.initial_sigma) /
                  (self.sigma_max - self.sigma_min)).square().mean()
-        gain = torch.tanh(self.gain_logit).square().mean()
-        return torch.stack((shape, sigma, gain)).mean()
+        return torch.stack((shape, sigma)).mean()
 
     @torch.no_grad()
     def adaptation_summary(self) -> dict[str, float]:
@@ -483,7 +486,7 @@ class ContinuousKernelTokenizer(nn.Module):
             self.nyquist_margin * source_rate.view(B, 1, 1) / 2.0)
         cos_coeff, sin_coeff = self._normalised_coefficients()
         energy = (cos_coeff.square() + sin_coeff.square()).detach().to(spans.dtype)   # (K,M), rows sum to 1
-        nyq = (energy.view(1, self.K, self.M) * live.to(spans.dtype)).sum(dim=2)     # (B,K)
+        nyq = (energy.view(1, self.K, self.M) * live.to(spans.dtype)).sum(dim=2).clamp(0.0, 1.0)
         res = (duration_s.unsqueeze(1) / spans.unsqueeze(0)).clamp(0.0, 1.0)    # (B, K)
         return nyq, res
 

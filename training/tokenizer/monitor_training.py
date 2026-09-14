@@ -170,10 +170,12 @@ def assess(run_dir: Path, stale_seconds: float = 120.0) -> dict:
               f"Recent input finite fraction is {latest['data/input_finite_fraction']:.6f}.")
     if config.get("frontend") == "multispan" and latest_step > warmup_steps:
         frontend_grad = _median(train[-6:], "grad/frontend")
-        if not math.isfinite(frontend_grad):
+        kernels_frozen = bool(config.get("freeze_kernels", False)) \
+            or float(config.get("frontend_lr_scale", 1.0)) == 0.0
+        if not kernels_frozen and not math.isfinite(frontend_grad):
             alert("critical", "frontend_gradient_missing",
                   "Multi-span frontend gradient telemetry is missing after warmup.")
-        elif frontend_grad <= 0.0:
+        elif not kernels_frozen and frontend_grad <= 0.0:
             alert("critical", "frontend_no_gradient",
                   "The learnable multi-span frontend has zero recent gradient norm.")
         dead_fraction = float(latest.get("frontend/dead_kernel_fraction", float("nan")))
@@ -187,6 +189,17 @@ def assess(run_dir: Path, stale_seconds: float = 120.0) -> dict:
         if math.isfinite(observable) and observable <= 0.0:
             alert("critical", "frontend_unobservable",
                   "No multi-span kernel is observable at the sampled acquisition rates.")
+        standardised_mean = float(latest.get(
+            "frontend/standardised_mean_abs", float("nan"),
+        ))
+        standardised_sd = float(latest.get("frontend/standardised_sd", float("nan")))
+        if not math.isfinite(standardised_mean) or not math.isfinite(standardised_sd):
+            alert("warning", "frontend_standardisation_missing",
+                  "Multi-span standardisation telemetry is missing.")
+        elif standardised_mean > 0.5 or abs(standardised_sd - 1.0) > 0.5:
+            alert("warning", "frontend_standardisation_drift",
+                  f"Multi-span standardised responses drifted to mean |{standardised_mean:.2f}|, "
+                  f"sd {standardised_sd:.2f}.")
     if int(latest.get("amp/consecutive_skips", 0)) >= 3:
         alert("critical", "amp_repeated_skips", "At least three optimizer updates were skipped in a row.")
     elif int(latest.get("amp/skipped_updates_window", 0)) > 0:
@@ -325,6 +338,8 @@ def assess(run_dir: Path, stale_seconds: float = 120.0) -> dict:
             "dead_kernel_fraction": latest.get("frontend/dead_kernel_fraction"),
             "response_std_mean": latest.get("frontend/response_std_mean"),
             "edge_support_mean": latest.get("frontend/edge_support_mean"),
+            "standardised_mean_abs": latest.get("frontend/standardised_mean_abs"),
+            "standardised_sd": latest.get("frontend/standardised_sd"),
         },
         "representation": {
             "encoder_effective_rank": latest.get("repr_encoder/effective_rank"),

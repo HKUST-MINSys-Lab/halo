@@ -331,10 +331,12 @@ def test_gradients_reach_every_analysis_parameter(tokenizer):
     module = ContinuousKernelTokenizer()
     patches, lengths, mask = _as_patches(_band_limited_signal(50.0), 50.0)
     module(patches, 50.0, lengths, patch_mask=mask).pow(2).mean().backward()
-    for name in ("cos_coeff", "sin_coeff", "sigma_logit", "gain_logit"):
+    for name in ("cos_coeff", "sin_coeff", "sigma_logit"):
         grad = getattr(module, name).grad
         assert grad is not None and torch.isfinite(grad).all(), name
         assert grad.abs().sum() > 0, f"{name} received no gradient"
+    assert not module.gain_logit.requires_grad
+    assert module.gain_logit.grad is None
 
 
 def test_mixed_rate_batch_matches_separate_processing_and_batch_order():

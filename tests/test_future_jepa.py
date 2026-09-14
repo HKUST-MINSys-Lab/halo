@@ -32,7 +32,7 @@ from training.tokenizer.pretrain import (
 
 def _three_scale_grid(batch: int = 2):
     entries = []
-    for resolution, duration in enumerate((0.5, 1.0, 1.5)):
+    for resolution, duration in enumerate((0.5, 1.0, 2.0)):
         start = 0.0
         while start + duration <= 6.0 + 1e-8:
             entries.append((start, start + duration, resolution))
@@ -63,6 +63,11 @@ def test_future_jepa_model_is_frontend_agnostic(
     assert model.future_predictor.resolution_embedding.num_embeddings >= expected_resolutions
     assert model.physical_target_analyzer is not None
     assert model.physical_target_analyzer.learnable is False
+    assert model.physical_target_analyzer.use_polarization is False
+    if frontend == "fixed":
+        assert model.encoder.filterbank.use_polarization is True
+        assert model.encoder.filterbank.in_dim == 195
+        assert model.physical_target_analyzer.in_dim == 98
     assert not any(parameter.requires_grad
                    for parameter in model.physical_target_analyzer.parameters())
     assert model.physical_decoder[-1].out_features == 3 * (
@@ -73,19 +78,19 @@ def test_future_jepa_model_is_frontend_agnostic(
 
 def test_eight_second_future_schedules_fit_the_token_budget():
     fixed = PretrainConfig(source_window_seconds=8.0)
-    assert future_tokens_per_window(fixed) == 30
+    assert future_tokens_per_window(fixed) == 28
     assert batch_under_token_budget(future_tokens_per_window(fixed)) == 512
 
     multispan = PretrainConfig(
         frontend="multispan", multiresolution=False, source_window_seconds=8.0,
     )
-    assert future_tokens_per_window(multispan) == 118
+    assert future_tokens_per_window(multispan) == 96
     assert batch_under_token_budget(
         future_tokens_per_window(multispan),
         reference_batch=MULTISPAN_REFERENCE_BATCH,
         max_batch_tokens=MULTISPAN_MAX_BATCH_TOKENS,
     ) == 384
-    assert frontend_rope_min_period(multispan) == pytest.approx(0.25)
+    assert frontend_rope_min_period(multispan) == pytest.approx(0.5)
 
 
 def test_label_free_window_contract_rejects_a_stale_grid():
@@ -239,7 +244,7 @@ def test_one_physical_anchor_selects_at_most_one_patch_per_resolution():
 
 def test_overlapping_multispan_grid_selects_one_frame_per_resolution_and_horizon():
     entries = []
-    for resolution, span in enumerate((0.5, 1.0, 1.5)):
+    for resolution, span in enumerate((0.5, 1.0, 2.0)):
         stride = span / 4
         for frame in range(int(6.0 / stride)):
             center = (frame + 0.5) * stride

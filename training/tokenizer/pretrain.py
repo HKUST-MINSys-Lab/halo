@@ -1,4 +1,4 @@
-"""Label-free HALO representation pretraining.
+"""Retired label-free HALO future-JEPA reproducibility entry point.
 
 The default objective is multi-horizon future JEPA: a past-only student predicts normalized
 contextual states from a full-view EMA teacher, the predicted states decode back to fixed physical
@@ -19,8 +19,8 @@ Other invariants:
 Model selection: subject-disjoint val kNN recall macro-averaged over label/stream cells, not loss.
 Checkpoints carry config + label map + filterbank norm stats + provenance.
 
-Run (CPU smoke):   .../python -m training.tokenizer.pretrain --steps 20 --smoke
-Run (real, GPU):   .../python -m training.tokenizer.pretrain --device cuda
+This command is intentionally guarded by ``--allow-retired-jepa``. The active HALO recipe trains
+the fixed-filterbank encoder and support classifier end to end instead.
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ from data.pretraining.corpus_plan import PRETRAIN_WINDOW_SECONDS
 from model.tokenizer.encoder import SetTokenizerEncoder
 from model.tokenizer.continuous_kernel import ContinuousKernelTokenizer
 from model.tokenizer.filterbank import PhysicalFilterbankTokenizer
-from model.tokenizer.multispan_kernel import MS_FRAMES_PER_SPAN, multispan_frame_count
+from model.tokenizer.multispan_kernel import MS_FRAME_RATE_HZ, multispan_frame_count
 from model.tokenizer.sensor_tokens import descriptor_retrieval_loss
 from training.tokenizer.losses_repr import (
     MASK_RATIO_TIME,
@@ -129,7 +129,10 @@ def future_tokens_per_window(cfg: "PretrainConfig") -> int:
 
     if cfg.frontend == "multispan":
         return multispan_frame_count(
-            cfg.multispan_durations, cfg.source_window_seconds, cfg.frames_per_span,
+            cfg.multispan_durations, cfg.source_window_seconds,
+            token_rate_hz=(cfg.multispan_frame_rate_hz / 4.0
+                           if cfg.multispan_stem == "conv"
+                           else cfg.multispan_frame_rate_hz),
         )
     return sum(
         max(1, int(math.ceil(cfg.source_window_seconds / duration - 1e-6)))
@@ -155,7 +158,9 @@ def frontend_rope_min_period(cfg: "PretrainConfig") -> float:
     """Fastest physical period resolvable by the selected token grid."""
 
     if cfg.frontend == "multispan":
-        return 2.0 * min(cfg.multispan_durations) / cfg.frames_per_span
+        return 2.0 / (cfg.multispan_frame_rate_hz / 4.0
+                      if cfg.multispan_stem == "conv"
+                      else cfg.multispan_frame_rate_hz)
     return 0.4 if cfg.multiresolution else 0.5
 
 
@@ -224,9 +229,17 @@ class PretrainConfig:
     # Future JEPA aligns all target choices in physical time. Fixed durations make runs directly
     # comparable and let the predictor condition explicitly on temporal support.
     multiresolution: bool = True
-    future_patch_durations: tuple[float, ...] = (0.5, 1.0, 1.5)
-    multispan_durations: tuple[float, ...] = (0.5, 1.0, 1.5)
-    frames_per_span: int = MS_FRAMES_PER_SPAN
+    future_patch_durations: tuple[float, ...] = (0.5, 1.0, 2.0)
+    multispan_durations: tuple[float, ...] = (0.5, 1.0, 2.0)
+    multispan_frame_rate_hz: int = MS_FRAME_RATE_HZ
+    multispan_centre_spacing: str = "log"
+    multispan_compression_scale: str = "calibrated"
+    multispan_stem: str = "conv"
+    multispan_stem_channels: int = 128
+    multispan_stem_kernel: int = 5
+    multispan_stem_dilations: tuple[int, ...] = (1, 2, 4)
+    multispan_stem_shared: bool = True
+    freeze_kernels: bool = False
     rope_min_period: float = 0.5
     future_context_fraction: tuple[float, float] = (0.4, 0.7)
     future_horizon_bins_seconds: tuple[tuple[float, float], ...] = DEFAULT_HORIZON_BINS_SECONDS
@@ -235,14 +248,18 @@ class PretrainConfig:
     future_predictor_layers: int = 2
     future_predictor_heads: int = 4
     patch_seconds: float = PATCH_SECONDS
-    frontend_lr_scale: float = 0.1         # physical adaptation moves slower than the encoder
-    frontend_reg_weight: float = 1e-3
+    frontend_lr_scale: float = 1.0
+    frontend_reg_weight: float = 0.0
     center_shift_fraction: float = 0.45
     bandwidth_factor_max: float = 1.5
     compression_gain_max: float = 2.0
     filter_shape_min: float = 1.5
     filter_shape_max: float = 2.5
     adaptive_gate_init: float = 0.1
+    # Fixed-filterbank bounded triad features. Existing checkpoints omit these fields and are
+    # reconstructed with polarization disabled by eval_transfer.py.
+    use_polarization: bool = True
+    polarization_energy_kappa: float = 0.05
     duration_gate_init: float = 0.1
     short_patch_choices: tuple[float, ...] = SHORT_PATCH_SECONDS_CHOICES
     long_patch_choices: tuple[float, ...] = LONG_PATCH_SECONDS_CHOICES
@@ -429,7 +446,17 @@ class PipelineAModel(nn.Module):
             filter_shape_min=cfg.filter_shape_min,
             filter_shape_max=cfg.filter_shape_max,
             adaptive_gate_init=cfg.adaptive_gate_init,
-            **({"spans": cfg.multispan_durations, "frames_per_span": cfg.frames_per_span}
+            use_polarization=cfg.use_polarization,
+            polarization_energy_kappa=cfg.polarization_energy_kappa,
+            **({"spans": cfg.multispan_durations,
+                "frame_rate_hz": cfg.multispan_frame_rate_hz,
+                "centre_spacing": cfg.multispan_centre_spacing,
+                "compression_scale": cfg.multispan_compression_scale,
+                "stem": cfg.multispan_stem,
+                "stem_channels": cfg.multispan_stem_channels,
+                "stem_kernel": cfg.multispan_stem_kernel,
+                "stem_dilations": cfg.multispan_stem_dilations,
+                "stem_shared": cfg.multispan_stem_shared}
                if cfg.frontend == "multispan" else {}),
         )
         self.encoder.multiresolution = cfg.multiresolution or cfg.frontend == "multispan"
@@ -469,6 +496,7 @@ class PipelineAModel(nn.Module):
                 # serializable module; JEPA reads `analyze()` and never calls `project()`.
                 self.physical_target_analyzer = PhysicalFilterbankTokenizer(
                     d_model=cfg.d_model, dft_size=cfg.dft_size, learnable=False,
+                    use_polarization=False,
                 )
                 self.physical_target_analyzer.requires_grad_(False)
                 # Standardized band energies and signed DC for each xyz axis. Raw total energy is
@@ -1126,7 +1154,8 @@ def embed_stratified(model: PipelineAModel, loader: DataLoader, device, per_labe
             patches = batch["patches"].to(device, non_blocking=True).float()
             rates = batch["rates"].to(device, non_blocking=True)
             plen = batch["patch_len"].to(device, non_blocking=True)
-            source_rates = batch.get("source_rates", batch["rates"]).to(
+            source_rates = (batch["channel_source_rates"] if batch.get("channel_source_rates") is not None
+                            else batch.get("source_rates", batch["rates"])).to(
                 device, non_blocking=True,
             )
             with torch.amp.autocast(
@@ -1224,6 +1253,9 @@ def _corpus_datasets(name: str) -> tuple[str, ...]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--allow-retired-jepa", action="store_true",
+                        help="acknowledge that future-JEPA is retired and run this historical "
+                             "reproducibility path anyway")
     parser.add_argument("--amp-dtype", choices=("bf16", "fp16"), default=None,
                         help="CUDA neural-path mixed precision (default: bf16; filterbank DSP and "
                              "loss statistics remain fp32)")
@@ -1274,14 +1306,26 @@ def main() -> None:
                              "one-second token grid)")
     parser.add_argument("--patch-seconds", type=float, default=None,
                         help="single-resolution patch duration in seconds (default 1.0)")
+    parser.add_argument("--polarization", action=argparse.BooleanOptionalAction, default=None,
+                        help="append bounded fixed-filterbank triad polarization features "
+                             "(default: enabled for new fixed-filterbank runs)")
+    parser.add_argument("--polarization-energy-kappa", type=float, default=None,
+                        help="scale-free silent-band gate for polarization features (default: 0.05)")
     parser.add_argument("--future-patch-durations", type=float, nargs="+", default=None,
                         help="fixed physical patch durations used jointly by future JEPA "
-                             "(default: 0.5 1.0 1.5 seconds)")
+                             "(default: 0.5 1.0 2.0 seconds)")
     parser.add_argument("--multispan-durations", type=float, nargs="+", default=None,
                         help="physical spans represented by the multi-span continuous frontend "
-                             "(default: 0.5 1.0 1.5 seconds)")
-    parser.add_argument("--frames-per-span", type=int, default=None,
-                        help="multi-span analysis frames per physical span (default: 4)")
+                             "(default: 0.5 1.0 2.0 seconds)")
+    parser.add_argument("--multispan-frame-rate-hz", type=int, default=None,
+                        help="dense physical-time analysis rate shared by all spans (default: 16)")
+    parser.add_argument("--multispan-centre-spacing", choices=("harmonic", "log"), default=None)
+    parser.add_argument("--multispan-compression-scale", choices=("none", "calibrated"), default=None)
+    parser.add_argument("--multispan-stem", choices=("none", "conv"), default=None)
+    parser.add_argument("--freeze-kernels", action="store_true",
+                        help="freeze continuous analysis coefficients/envelopes while training the stem/trunk")
+    parser.add_argument("--frontend-lr-scale", type=float, default=None)
+    parser.add_argument("--frontend-reg-weight", type=float, default=None)
     parser.add_argument("--future-context-fraction", type=float, nargs=2, default=None,
                         metavar=("MIN", "MAX"),
                         help="fractional range from which the past-only context boundary is drawn")
@@ -1445,6 +1489,11 @@ def main() -> None:
                         help="DATA seed = the subject train/val split. Keep FIXED across all arms and "
                              "replicates so the split (and the metric harness) stays identical (#1).")
     args = parser.parse_args()
+    if not args.allow_retired_jepa:
+        parser.error(
+            "future-JEPA is retired from the active HALO recipe; use --allow-retired-jepa "
+            "only to reproduce a historical experiment"
+        )
 
     cfg = PretrainConfig(
         device=args.device,
@@ -1478,12 +1527,27 @@ def main() -> None:
         cfg.multiresolution = args.multiresolution
     if args.patch_seconds is not None:
         cfg.patch_seconds = args.patch_seconds
+    if args.polarization is not None:
+        cfg.use_polarization = bool(args.polarization)
+    if args.polarization_energy_kappa is not None:
+        cfg.polarization_energy_kappa = args.polarization_energy_kappa
     if args.future_patch_durations is not None:
         cfg.future_patch_durations = tuple(args.future_patch_durations)
     if args.multispan_durations is not None:
         cfg.multispan_durations = tuple(args.multispan_durations)
-    if args.frames_per_span is not None:
-        cfg.frames_per_span = args.frames_per_span
+    if args.multispan_frame_rate_hz is not None:
+        cfg.multispan_frame_rate_hz = args.multispan_frame_rate_hz
+    if args.multispan_centre_spacing is not None:
+        cfg.multispan_centre_spacing = args.multispan_centre_spacing
+    if args.multispan_compression_scale is not None:
+        cfg.multispan_compression_scale = args.multispan_compression_scale
+    if args.multispan_stem is not None:
+        cfg.multispan_stem = args.multispan_stem
+    cfg.freeze_kernels = bool(args.freeze_kernels)
+    if args.frontend_lr_scale is not None:
+        cfg.frontend_lr_scale = args.frontend_lr_scale
+    if args.frontend_reg_weight is not None:
+        cfg.frontend_reg_weight = args.frontend_reg_weight
     if args.future_context_fraction is not None:
         cfg.future_context_fraction = tuple(args.future_context_fraction)
     if args.future_teacher_top_layers is not None:
@@ -1647,8 +1711,12 @@ def main() -> None:
         cfg.grad_clip = args.grad_clip
     if not math.isfinite(cfg.source_window_seconds) or cfg.source_window_seconds <= 0:
         parser.error("source-window duration must be finite and positive")
-    if cfg.frames_per_span <= 0:
-        parser.error("--frames-per-span must be a positive integer")
+    if cfg.multispan_frame_rate_hz <= 0:
+        parser.error("--multispan-frame-rate-hz must be a positive integer")
+    if cfg.frontend_lr_scale < 0:
+        parser.error("--frontend-lr-scale must be non-negative")
+    if not math.isfinite(cfg.polarization_energy_kappa) or cfg.polarization_energy_kappa < 0:
+        parser.error("--polarization-energy-kappa must be finite and non-negative")
     if cfg.frontend == "multispan" and (
         any(not math.isfinite(value) or value <= 0 for value in cfg.multispan_durations)
         or tuple(sorted(set(cfg.multispan_durations))) != cfg.multispan_durations
@@ -1656,7 +1724,7 @@ def main() -> None:
         parser.error("multi-span durations must be unique, finite, positive, and increasing")
 
     # Resolve time position at the fastest frontend stride. For multi-span this is twice the
-    # shortest T/frames_per_span interval (the temporal Nyquist period).
+    # configured output-token interval (the temporal Nyquist period).
     cfg.rope_min_period = frontend_rope_min_period(cfg)
 
     # Derive schedule defaults from the real token count. Both arms see the same 7.68 million
@@ -2074,6 +2142,18 @@ def main() -> None:
     fe = model.encoder.filterbank
     target_fe = model.physical_target_analyzer
     print(f"calibrating frontend norm on {cfg.calib_batches} batches ...", flush=True)
+    if hasattr(fe, "accumulate_compression_stats") \
+            and getattr(fe, "compression_scale_mode", "none") == "calibrated":
+        fe.reset_compression_accumulator()
+        for b in calibration_loader:
+            fe.accumulate_compression_stats(
+                b["patches"].to(device), b["rates"].to(device), b["patch_len"].to(device),
+                patch_mask=b["patch_padding_mask"].to(device),
+                channel_mask=b["channel_mask"].to(device),
+                source_rate_hz=(b["channel_source_rates"] if b.get("channel_source_rates") is not None
+                                else b.get("source_rates", b["rates"])).to(device),
+            )
+        fe.finalize_compression_stats()
     fe.reset_norm_accumulator()
     if target_fe is not None and cfg.frontend != "fixed":
         target_fe.reset_norm_accumulator()
@@ -2084,7 +2164,8 @@ def main() -> None:
         calibration_kwargs = {
             "patch_mask": b["patch_padding_mask"].to(device),
             "channel_mask": b["channel_mask"].to(device),
-            "source_rate_hz": b.get("source_rates", b["rates"]).to(device),
+            "source_rate_hz": (b["channel_source_rates"] if b.get("channel_source_rates") is not None
+                                else b.get("source_rates", b["rates"])).to(device),
         }
         fe.accumulate_norm_stats(*calibration_args, **calibration_kwargs)
         if target_fe is not None and cfg.frontend not in {"fixed", "multispan"}:
@@ -2093,7 +2174,7 @@ def main() -> None:
     if target_fe is not None:
         if cfg.frontend == "fixed":
             # Identical fixed analyzers can share the already measured calibration exactly.
-            target_fe.load_state_dict(fe.state_dict())
+            target_fe.copy_normalization_from(fe)
         elif cfg.frontend == "multispan":
             assert target_calibration_loader is not None
             for b in target_calibration_loader:
@@ -2101,7 +2182,8 @@ def main() -> None:
                     b["patches"].to(device), b["rates"].to(device), b["patch_len"].to(device),
                     patch_mask=b["patch_padding_mask"].to(device),
                     channel_mask=b["channel_mask"].to(device),
-                    source_rate_hz=b.get("source_rates", b["rates"]).to(device),
+                    source_rate_hz=(b["channel_source_rates"] if b.get("channel_source_rates") is not None
+                                    else b.get("source_rates", b["rates"])).to(device),
                 )
             target_fe.finalize_norm_stats()
         else:
@@ -2124,7 +2206,11 @@ def main() -> None:
         if has_internal_classification_probe else None
     )
 
-    adaptive_ids = {id(parameter) for parameter in fe.adaptation_parameters()}
+    if cfg.freeze_kernels or cfg.frontend_lr_scale == 0:
+        for parameter in fe.adaptation_parameters():
+            parameter.requires_grad_(False)
+    adaptive_ids = {id(parameter) for parameter in fe.adaptation_parameters()
+                    if parameter.requires_grad}
     adaptive_params, base_params = [], []
     for _, parameter in model.named_parameters():
         if not parameter.requires_grad:
@@ -2369,7 +2455,8 @@ def main() -> None:
         tokens_b = model.encoder.tokenize(
             p_b, r_b, pl_b,
             channel_mask=cmask_b,
-            source_rate_hz=batch.get("source_rates_b", r_b).to(device, non_blocking=True),
+            source_rate_hz=(batch["channel_source_rates_b"] if batch.get("channel_source_rates_b") is not None
+                            else batch.get("source_rates_b", r_b)).to(device, non_blocking=True),
             sensor_id=sid_b,
             n_sensors=(max(map(len, batch["sensor_texts_b"]))
                        if sensor_granularity else None))
@@ -2619,7 +2706,8 @@ def main() -> None:
                 # bit-identical anyway and running the rDFT + constant-Q einsum twice per step
                 # was pure waste. The learnable arm's analysis reads EMA-diverging parameters,
                 # so it keeps its own pass (shared_analysis stays None).
-                _src_rate = batch.get("source_rates", rates).to(device, non_blocking=True)
+                _src_rate = (batch["channel_source_rates"] if batch.get("channel_source_rates") is not None
+                             else batch.get("source_rates", rates)).to(device, non_blocking=True)
                 if cfg.frontend == "multispan":
                     student_lengths, student_raw_mask = truncate_patch_lengths_at_time(
                         raw_patch_len, raw_patch_starts, rates, future_context_end,
@@ -2632,7 +2720,9 @@ def main() -> None:
                     shared_analysis = None
                 elif cfg.frontend == "fixed":
                     shared_analysis = model.encoder.analyze(
-                        patches.float(), rates, patch_len, source_rate_hz=_src_rate)
+                        patches.float(), rates, patch_len, source_rate_hz=_src_rate,
+                        sensor_id=projection_sensor_id, channel_mask=channel_mask,
+                    )
                 else:
                     shared_analysis = None
                 if cfg.frontend != "multispan":
@@ -2640,6 +2730,8 @@ def main() -> None:
                                         model.encoder.analyze(
                                             patches.float(), rates, patch_len,
                                             source_rate_hz=_src_rate,
+                                            sensor_id=projection_sensor_id,
+                                            channel_mask=channel_mask,
                                             patch_mask=(future_context_mask
                                                         if cfg.jepa_mode == "future"
                                                         and cfg.frontend == "continuous"
@@ -2650,7 +2742,7 @@ def main() -> None:
                     # A frozen, separately calibrated analyzer defines the decoder target for
                     # every encoder arm. `no_grad` prevents needless FFT autograd state while the
                     # predictor-to-decoder path remains fully differentiable.
-                    if cfg.frontend == "fixed":
+                    if cfg.frontend == "fixed" and not fe.use_polarization:
                         # Calibration and fixed analysis parameters are exact copies, so this is
                         # the same target without paying for a duplicate FFT.
                         physical_target_analysis = shared_analysis.detach()
@@ -2805,7 +2897,8 @@ def main() -> None:
                         with torch.amp.autocast(device.type, enabled=False):
                             teacher_analysis = jepa_teacher.analyze(
                                 patches.float(), rates, patch_len,
-                                source_rate_hz=batch.get("source_rates", rates).to(
+                                source_rate_hz=(batch["channel_source_rates"] if batch.get("channel_source_rates") is not None
+                                                else batch.get("source_rates", rates)).to(
                                     device, non_blocking=True),
                             )
                     if cfg.frontend != "multispan":

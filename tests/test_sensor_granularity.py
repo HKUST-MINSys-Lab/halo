@@ -242,7 +242,7 @@ def test_sensor_encoder_forward_shapes_and_masking():
     B, P, C, S_PAD, N_TRUE = 2, 5, 6, 256, 64
     enc = SetTokenizerEncoder(d_model=64, num_layers=2, num_heads=4, dim_feedforward=128,
                               dropout=0.0, token_granularity="sensor",
-                              sensor_bias_dim=SENSOR_BIAS_DIM).eval()
+                              sensor_bias_dim=SENSOR_BIAS_DIM, dft_size=S_PAD).eval()
     patches = torch.zeros(B, P, S_PAD, C)
     patches[:, :, :N_TRUE] = torch.randn(B, P, N_TRUE, C)
     sensor_texts = [["a phone accelerometer on the front pocket; includes gravity",
@@ -327,7 +327,7 @@ def test_sensor_encoder_handles_accel_only_streams():
     B, P, C, S_PAD, N_TRUE = 2, 5, 6, 256, 64
     enc = SetTokenizerEncoder(d_model=64, num_layers=2, num_heads=4, dim_feedforward=128,
                               dropout=0.0, token_granularity="sensor",
-                              sensor_bias_dim=SENSOR_BIAS_DIM).eval()
+                              sensor_bias_dim=SENSOR_BIAS_DIM, dft_size=S_PAD).eval()
     patches = torch.zeros(B, P, S_PAD, C)
     patches[:, :, :N_TRUE] = torch.randn(B, P, N_TRUE, C)
     cm = torch.ones(B, C, dtype=torch.bool)
@@ -350,7 +350,7 @@ def test_retrieval_rows_are_sensor_isolated():
     torch.manual_seed(18)
     enc = SetTokenizerEncoder(
         d_model=64, num_layers=2, num_heads=4, dim_feedforward=128, dropout=0.0,
-        token_granularity="sensor", use_sensor_isolated_retrieval=True,
+        token_granularity="sensor", use_sensor_isolated_retrieval=True, dft_size=256,
     ).eval()
     patches = torch.randn(2, 4, 256, 6)
     positions = torch.arange(4).float().expand(2, 4)
@@ -387,7 +387,7 @@ def test_retrieval_only_shortcut_matches_full_forward_rows():
     torch.manual_seed(23)
     enc = SetTokenizerEncoder(
         d_model=32, num_layers=2, num_heads=4, dim_feedforward=64, dropout=0.0,
-        token_granularity="sensor", use_sensor_isolated_retrieval=True,
+        token_granularity="sensor", use_sensor_isolated_retrieval=True, dft_size=256,
     ).eval()
     patches = torch.randn(2, 3, 256, 6)
     kwargs = dict(
@@ -425,7 +425,7 @@ def test_multiresolution_sensor_pooling_is_duration_weighted():
     B, P, C, S_PAD, N_TRUE = 1, 4, 6, 256, 64
     enc = SetTokenizerEncoder(d_model=64, num_layers=2, num_heads=4, dim_feedforward=128,
                               dropout=0.0, token_granularity="sensor",
-                              sensor_bias_dim=SENSOR_BIAS_DIM).eval()
+                              sensor_bias_dim=SENSOR_BIAS_DIM, dft_size=S_PAD).eval()
     patches = torch.zeros(B, P, S_PAD, C)
     patches[:, :, :N_TRUE] = torch.randn(B, P, N_TRUE, C)
     positions = torch.tensor([[0.25, 0.6, 0.5, 1.1]])
@@ -494,7 +494,7 @@ def test_checkpoint_reconstruction_preserves_sensor_design():
     assert restored.multiresolution is True
     assert restored.use_duration_embedding is True
     assert restored.num_resolutions == 3
-    assert restored.eval_resolutions == (0.5, 1.0, 1.5)
+    assert restored.eval_resolutions == (0.5, 1.0, 2.0)
     assert restored.fusion is None
 
     data = torch.randn(2, 300, 6).numpy()

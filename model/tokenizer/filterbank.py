@@ -54,13 +54,12 @@ FB_Q = 4.0
 #   is pure frequency-domain interpolation — it does NOT change the band-energy
 #   output (verified: S=256 vs 512 give band-cosine 1.000000 and identical Nyquist/
 #   resolution masks at 20/25/50/100 Hz). So S only trades compute vs headroom.
-#   Reference worst case: 1.0 s * 100 Hz = 100 samples. The retained multi-resolution
-#   ablation reaches 1.5 s * 100 Hz = 150 samples. 256 covers both with margin and is ~2x cheaper
-#   than 512 in the tokenizer hot path (rDFT is ~S log S: measured 1.1 ms vs 2.6 ms
-#   per batch). Overflow is a hard ValueError (never silent truncation), so if a
-#   future patch exceeds this the run fails loudly — raise S then. Keep it a power
+#   The active multi-resolution classifier recipe emits a shared 512-sample patch tensor for
+#   0.5/1/2/4-second grids. Long high-rate views are bounded before analysis, but the common
+#   collate/tokenizer contract must still agree on S=512. Overflow is a hard ValueError (never
+#   silent truncation), so if a future patch exceeds this the run fails loudly. Keep it a power
 #   of two for FFT efficiency.
-FB_DFT_SIZE = 256
+FB_DFT_SIZE = 512
 #
 # FB_NYQUIST_MARGIN — a band is "observable" only if center + 2*sigma <= margin *
 #   (rate/2). 0.9 keeps a 10% guard below Nyquist so a band's Gaussian tail does
@@ -127,6 +126,8 @@ class PhysicalFilterbankTokenizer(nn.Module):
         filter_shape_min: float = 1.5,
         filter_shape_max: float = 2.5,
         adaptive_gate_init: float = 0.1,
+        use_polarization: bool = True,
+        polarization_energy_kappa: float = 0.05,
     ):
         super().__init__()
         self.d_model = d_model
@@ -149,6 +150,8 @@ class PhysicalFilterbankTokenizer(nn.Module):
         self.filter_shape_min = float(filter_shape_min)
         self.filter_shape_max = float(filter_shape_max)
         self.adaptive_gate_init = float(adaptive_gate_init)
+        self.use_polarization = bool(use_polarization)
+        self.polarization_energy_kappa = float(polarization_energy_kappa)
         if not 0.0 <= self.center_shift_fraction < 0.5:
             raise ValueError("center_shift_fraction must be in [0, 0.5) to preserve center order")
         if self.bandwidth_factor_max < 1.0 or self.compression_gain_max < 1.0:
@@ -157,6 +160,9 @@ class PhysicalFilterbankTokenizer(nn.Module):
             raise ValueError("filter-shape bounds must strictly contain the Gaussian exponent 2")
         if not 0.0 < adaptive_gate_init < 1.0:
             raise ValueError("adaptive_gate_init must be in (0, 1)")
+        if not math.isfinite(self.polarization_energy_kappa) \
+                or self.polarization_energy_kappa < 0.0:
+            raise ValueError("polarization_energy_kappa must be finite and non-negative")
 
         # Log-spaced physical-Hz band centers f_1..f_K
         k = torch.arange(self.n_bands, dtype=torch.float32)
@@ -204,6 +210,11 @@ class PhysicalFilterbankTokenizer(nn.Module):
             in_dim += 1                                      # amplitude scalar
         if self.use_dc:
             in_dim += 1                                      # signed DC (gravity/tilt) scalar
+        # Per-triad bounded polarization values (vertical energy share, circularity, signed spin)
+        # plus gravity confidence. They are replicated onto the three axis rows of a triad so the
+        # existing per-axis projection and SensorFold contract remain unchanged.
+        self.polarization_dim = 3 * self.n_bands + 1 if self.use_polarization else 0
+        in_dim += self.polarization_dim
         self.in_dim = in_dim
         self.proj = nn.Linear(in_dim, d_model)
 
@@ -335,6 +346,25 @@ class PhysicalFilterbankTokenizer(nn.Module):
             )
         return r, N
 
+    def _prep_source_rate(self, source_rate_hz, patch_len_samples, B, C, device, dtype, P=None):
+        """Normalize source bandwidth as either one rate per recording or per channel.
+
+        The stored timeline has one common rate, but exact multi-device recordings can combine
+        channels acquired at different native rates.  Their Nyquist masks must remain channel
+        specific in both calibration and the regular forward path.
+        """
+        supplied = torch.as_tensor(source_rate_hz, device=device, dtype=dtype)
+        if supplied.ndim == 2:
+            if supplied.shape != (B, C):
+                raise ValueError(
+                    f"per-channel source_rate_hz must have shape {(B, C)}, got {tuple(supplied.shape)}"
+                )
+            return supplied
+        source_rate, _ = self._prep_rate_len(
+            supplied, patch_len_samples, B, device, dtype, P=P,
+        )
+        return source_rate
+
     def _hann_and_valid(self, N, device, dtype) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-token Hann window (...,S) placed in [0,N) plus a validity mask."""
         idx = torch.arange(self.S, device=device).view(*([1] * N.ndim), self.S)
@@ -345,7 +375,11 @@ class PhysicalFilterbankTokenizer(nn.Module):
         return window, valid
 
     def _spectral_power(self, patches, N):
-        """Compute one shared spectrum so fixed/adaptive banks do not duplicate the FFT."""
+        """Compute one shared normalized complex spectrum and its power.
+
+        The complex spectrum is normalized by the Hann-window energy, so amplitude-domain band
+        pooling has squared magnitude on the same scale as the ordinary band-energy path.
+        """
         B, P, S, _ = patches.shape
         window, valid = self._hann_and_valid(N, patches.device, patches.dtype)  # (B,P,S)
         vm = valid.unsqueeze(-1)
@@ -354,19 +388,32 @@ class PhysicalFilterbankTokenizer(nn.Module):
         dc = mean.squeeze(2)
         x_win = (patches - mean) * vm * window.unsqueeze(-1)
         X = torch.fft.rfft(x_win, n=S, dim=2)
-        power = X.real.square() + X.imag.square()
         win_energy = window.square().sum(dim=2).clamp(min=1e-8)
-        return power / win_energy.view(B, P, 1, 1), dc
+        spectrum = X / win_energy.sqrt().view(B, P, 1, 1)
+        power = spectrum.real.square() + spectrum.imag.square()
+        return spectrum, power, dc
 
     def _apply_filterbank(self, power, r, centers, sigma, shape):
-        m = torch.arange(self.M + 1, device=power.device, dtype=power.dtype)
+        H = self._filter_weights(r, centers, sigma, shape, dtype=power.dtype)
+        return torch.einsum("bkm,bpmc->bpck", H, power)
+
+    def _filter_weights(self, r, centers, sigma, shape, *, dtype):
+        m = torch.arange(self.M + 1, device=r.device, dtype=dtype)
         phi = m.unsqueeze(0) * r.unsqueeze(1) / self.S
         diff = (phi.unsqueeze(1) - centers.view(1, -1, 1)).abs()
         # clamp avoids the undefined shape-gradient 0**p * log(0) when a center lands
         # exactly on an FFT bin; the value remains numerically indistinguishable from 0.
         ratio = (diff / sigma.view(1, -1, 1)).clamp_min(1e-12)
-        H = torch.exp(-0.5 * ratio.pow(shape))
-        return torch.einsum("bkm,bpmc->bpck", H, power)
+        return torch.exp(-0.5 * ratio.pow(shape))
+
+    def _apply_filterbank_complex(self, spectrum, r, centers, sigma, shape):
+        """Complex amplitude pooling paired with :meth:`_apply_filterbank`.
+
+        ``sqrt(H)`` is essential: a pure tone then gives ``|Z|² == E`` in the matched band.
+        Complex arithmetic stays in the caller's FP32 spectral-analysis island.
+        """
+        H = self._filter_weights(r, centers, sigma, shape, dtype=spectrum.real.dtype)
+        return torch.einsum("bkm,bpmc->bpck", H.sqrt().to(spectrum.dtype), spectrum)
 
     def _band_energy(self, patches, r, N):
         """
@@ -378,12 +425,112 @@ class PhysicalFilterbankTokenizer(nn.Module):
         device, dtype = patches.device, patches.dtype
         if N.ndim == 1:
             N = N.view(B, 1).expand(B, P)
-        power, dc = self._spectral_power(patches, N)
+        _, power, dc = self._spectral_power(patches, N)
         centers = self._band_centers().to(device=device, dtype=dtype)
         sigma = self._band_sigmas(centers, adaptive=True).to(dtype)
         E = self._apply_filterbank(power, r, centers, sigma,
                                    self._filter_shape(adaptive=True).to(dtype))
         return E, centers, sigma, dc
+
+    def _polarization_features(
+        self,
+        spectrum: torch.Tensor,
+        r: torch.Tensor,
+        centers: torch.Tensor,
+        sigma: torch.Tensor,
+        dc: torch.Tensor,
+        observability: torch.Tensor,
+        sensor_id: torch.Tensor | None,
+        device_id: torch.Tensor | None,
+        channel_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Bounded triad polarization features, replicated to the triad's axis rows.
+
+        The recorded six-slot convention is [acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z].
+        ``sensor_id`` is required to opt into the feature: callers without triad metadata receive
+        neutral zero slots, preserving the tensor contract for generic legacy call sites.
+        """
+        B, P, _, C = spectrum.shape
+        output = spectrum.real.new_zeros(B, P, C, self.polarization_dim)
+        if sensor_id is None or C < 3:
+            return output
+        sensor_id = torch.as_tensor(sensor_id, device=spectrum.device, dtype=torch.long)
+        if sensor_id.shape != (B, C):
+            raise ValueError(f"sensor_id must have shape {(B, C)}, got {tuple(sensor_id.shape)}")
+        if channel_mask is None:
+            live = torch.ones(B, C, dtype=torch.bool, device=spectrum.device)
+        else:
+            live = torch.as_tensor(channel_mask, device=spectrum.device, dtype=torch.bool)
+            if live.shape != (B, C):
+                raise ValueError(
+                    f"channel_mask must have shape {(B, C)}, got {tuple(live.shape)}"
+                )
+
+        # ``sqrt(H)`` amplitude pooling keeps a matched pure tone on the same scale as ordinary
+        # band energy. Observability zeros interpolation-only high bands before ratios are formed.
+        Z_all = self._apply_filterbank_complex(
+            spectrum, r, centers, sigma, centers.new_tensor(2.0),
+        ) * (observability.view(B, 1, C, self.n_bands)
+             if observability.ndim == 3 else observability.view(B, 1, 1, self.n_bands)).to(spectrum.dtype)
+
+        starts = tuple(range(0, C - 2, 3))
+        sensor_device = None
+        if device_id is not None:
+            device_id = torch.as_tensor(device_id, device=spectrum.device, dtype=torch.long)
+            if device_id.ndim != 2 or device_id.shape[0] != B:
+                raise ValueError("device_id must have shape (B,N_sensor)")
+            sensor_device = torch.gather(device_id, 1, sensor_id)
+
+        for start in starts:
+            stop = start + 3
+            same_sensor = sensor_id[:, start:stop].eq(sensor_id[:, start:start + 1]).all(dim=1)
+            triad_live = live[:, start:stop].all(dim=1) & same_sensor
+            if sensor_device is None:
+                gravity_dc = dc[:, :, :3]
+                acc_live = live[:, :3].all(dim=1)
+            else:
+                triad_devices = torch.stack([sensor_device[:, value] for value in starts], dim=1)
+                triad_sensors = torch.stack([sensor_id[:, value] for value in starts], dim=1)
+                target_device = sensor_device[:, start:start + 1]
+                candidates = triad_sensors.masked_fill(
+                    triad_devices != target_device, torch.iinfo(torch.long).max,
+                )
+                gravity_slot = candidates.argmin(dim=1)
+                triad_dc = torch.stack([dc[:, :, value:value + 3] for value in starts], dim=2)
+                gather = gravity_slot.view(B, 1, 1, 1).expand(B, P, 1, 3)
+                gravity_dc = torch.gather(triad_dc, 2, gather).squeeze(2)
+                live_triads = torch.stack([
+                    live[:, value:value + 3].all(dim=1) for value in starts
+                ], dim=1)
+                acc_live = torch.gather(live_triads, 1, gravity_slot[:, None]).squeeze(1)
+            gravity_norm = gravity_dc.square().sum(dim=-1).sqrt()
+            gravity = gravity_dc / gravity_norm.unsqueeze(-1).clamp_min(1e-8)
+            grav_ok = torch.sigmoid((gravity_norm - 0.5) / 0.1) * acc_live[:, None].to(dc.dtype)
+            Z = Z_all[:, :, start:stop]                                      # (B,P,3,K)
+            tr = Z.real.square().add(Z.imag.square()).sum(dim=2)             # (B,P,K)
+            mean_energy = tr.mean(dim=-1, keepdim=True)
+            energy_gate = tr / (tr + self.polarization_energy_kappa * mean_energy).clamp_min(1e-8)
+
+            # Im(conj(Z) x Z), expanded explicitly to keep the rotational sign convention clear.
+            vx = 2.0 * (Z[:, :, 1].conj() * Z[:, :, 2]).imag
+            vy = 2.0 * (Z[:, :, 2].conj() * Z[:, :, 0]).imag
+            vz = 2.0 * (Z[:, :, 0].conj() * Z[:, :, 1]).imag
+            rotary = torch.stack((vx, vy, vz), dim=2)                         # (B,P,3,K)
+            denom = tr.clamp_min(1e-8)
+            vertical_complex = (gravity.unsqueeze(-1) * Z).sum(dim=2)
+            vertical = vertical_complex.real.square().add(vertical_complex.imag.square()) / denom
+            circular = rotary.square().sum(dim=2).sqrt() / denom
+            spin = (rotary * gravity.unsqueeze(-1)).sum(dim=2) / denom
+
+            valid = triad_live[:, None, None].to(tr.dtype)
+            vertical = vertical.clamp(0.0, 1.0) * energy_gate * grav_ok.unsqueeze(-1) * valid
+            circular = circular.clamp(0.0, 1.0) * energy_gate * valid
+            spin = spin.clamp(-1.0, 1.0) * energy_gate * grav_ok.unsqueeze(-1) * valid
+            values = torch.cat((vertical, circular, spin, grav_ok.unsqueeze(-1)), dim=-1)
+            # An incomplete/non-triad group contributes no partially meaningful metadata.
+            values = values * valid
+            output[:, :, start:stop] = values.unsqueeze(2).expand(B, P, 3, -1)
+        return output
 
     def _observability_masks(self, r, N, centers, sigma, source_r=None
                              ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -395,9 +542,13 @@ class PhysicalFilterbankTokenizer(nn.Module):
         Nyquist bound must come from the SOURCE rate while the DFT bin->frequency mapping keeps
         using the true array rate. Defaults to ``r`` (no resampling)."""
         dtype = r.dtype
-        nyq = self.nyquist_margin * ((r if source_r is None else source_r) * 0.5)   # (B,)
-        o = (centers.view(1, -1) + 2.0 * sigma.view(1, -1)
-             <= nyq.view(-1, 1)).to(dtype)                              # (B,K)
+        nyq = self.nyquist_margin * ((r if source_r is None else source_r) * 0.5)
+        if nyq.ndim == 2:
+            o = (centers.view(1, 1, -1) + 2.0 * sigma.view(1, 1, -1)
+                 <= nyq.unsqueeze(-1)).to(dtype)                       # (B,C,K)
+        else:
+            o = (centers.view(1, -1) + 2.0 * sigma.view(1, -1)
+                 <= nyq.view(-1, 1)).to(dtype)                          # (B,K)
         if N.ndim == 1:
             D = (N.to(dtype) / r).clamp(min=1e-6)
             res = (centers.view(1, -1) * D.view(-1, 1)
@@ -453,17 +604,18 @@ class PhysicalFilterbankTokenizer(nn.Module):
         B, P, S, C = patches.shape
         r, N = self._prep_rate_len(sampling_rate_hz, patch_len_samples, B,
                                    patches.device, patches.dtype, P=P)
-        power, dc = self._spectral_power(patches, N)
+        _, power, dc = self._spectral_power(patches, N)
         centers = self.centers.to(device=patches.device, dtype=patches.dtype)
         sigma = centers / (2.0 * self.Q)
         E = self._apply_filterbank(power, r, centers, sigma, centers.new_tensor(2.0))
-        src_r = None
-        if source_rate_hz is not None:
-            src_r, _ = self._prep_rate_len(
-                source_rate_hz, patch_len_samples, B, patches.device, patches.dtype, P=P)
-        o, _ = self._observability_masks(r, N, centers, sigma, source_r=src_r)  # (B,K)
+        src_r = (self._prep_source_rate(
+            source_rate_hz, patch_len_samples, B, C, patches.device, patches.dtype, P=P,
+        ) if source_rate_hz is not None else None)
+        o, _ = self._observability_masks(r, N, centers, sigma, source_r=src_r)
         e = torch.log1p(E).to(torch.float64)                           # (B,P,C,K)
-        w = o.view(B, 1, 1, self.n_bands).expand_as(e).to(torch.float64)
+        w = (o.view(B, 1, C, self.n_bands).expand_as(e)
+             if o.ndim == 3 else o.view(B, 1, 1, self.n_bands).expand_as(e))
+        w = w.to(torch.float64)
         if patch_mask is not None:
             w = w * patch_mask.view(B, P, 1, 1).to(torch.float64)      # exclude padded patches
         if channel_mask is not None:
@@ -532,7 +684,8 @@ class PhysicalFilterbankTokenizer(nn.Module):
 
     # --------------------------------------------------------------------- forward
     def analyze(self, patches, sampling_rate_hz, patch_len_samples=None,
-                source_rate_hz=None) -> torch.Tensor:
+                source_rate_hz=None, sensor_id=None, device_id=None,
+                channel_mask=None) -> torch.Tensor:
         """Physical feature (B, P, C, in_dim) — everything BEFORE the learnable projection.
 
         Split out from ``forward`` so callers holding two copies of this module can share the
@@ -548,7 +701,7 @@ class PhysicalFilterbankTokenizer(nn.Module):
         )
         device, dtype = patches.device, patches.dtype
         r, N = self._prep_rate_len(sampling_rate_hz, patch_len_samples, B, device, dtype, P=P)
-        power, dc = self._spectral_power(patches, N)
+        spectrum, power, dc = self._spectral_power(patches, N)
         fixed_centers = self.centers.to(device=device, dtype=dtype)
         fixed_sigma = fixed_centers / (2.0 * self.Q)
         E_fixed = self._apply_filterbank(power, r, fixed_centers, fixed_sigma,
@@ -583,11 +736,12 @@ class PhysicalFilterbankTokenizer(nn.Module):
         # since e_hat is standardized). Resolution flag (res) is the low-freq mirror:
         # a band at f_k needs ~resolution_min_cycles cycles within D=N/r to be resolved;
         # below that the value is present-but-blurry, so we *flag* it rather than zero it.
-        src_r = None
-        if source_rate_hz is not None:
-            src_r, _ = self._prep_rate_len(source_rate_hz, patch_len_samples, B, device, dtype, P=P)
+        src_r = (self._prep_source_rate(
+            source_rate_hz, patch_len_samples, B, C, device, dtype, P=P,
+        ) if source_rate_hz is not None else None)
         o, res = self._observability_masks(r, N, fixed_centers, fixed_sigma, source_r=src_r)
-        o_bpck = o.view(B, 1, 1, self.n_bands).expand(B, P, C, self.n_bands)
+        o_bpck = (o.view(B, 1, C, self.n_bands).expand(B, P, C, self.n_bands)
+                  if o.ndim == 3 else o.view(B, 1, 1, self.n_bands).expand(B, P, C, self.n_bands))
         e_hat = e_hat * o_bpck
 
         feats = [e_hat, o_bpck]
@@ -602,14 +756,36 @@ class PhysicalFilterbankTokenizer(nn.Module):
         if self.use_dc:
             feats.append(dc_feat)
 
+        if self.use_polarization:
+            feats.append(self._polarization_features(
+                spectrum, r, fixed_centers, fixed_sigma, dc, o, sensor_id, device_id, channel_mask,
+            ))
+
         return torch.cat(feats, dim=-1)                            # (B,P,C,in_dim)
 
     def project(self, token_in: torch.Tensor) -> torch.Tensor:
         """The learnable half: (B,P,C,in_dim) -> (B,P,C,d_model)."""
         return self.proj(token_in)
 
+    @torch.no_grad()
+    def copy_normalization_from(self, other: "PhysicalFilterbankTokenizer") -> None:
+        """Copy only frozen corpus calibration, never the learned projection.
+
+        The JEPA physical-target analyzer intentionally has a smaller input when the student
+        enables polarization.  It must share the fixed feature calibration, but copying a full
+        state dict would incorrectly couple its projection shape to the student frontend.
+        """
+        if self.n_bands != other.n_bands:
+            raise ValueError("cannot share normalization across different band counts")
+        for name in ("norm_mu", "norm_sd", "dc_mu", "dc_sd", "_norm_fitted"):
+            getattr(self, name).copy_(getattr(other, name))
+
     def forward(self, patches, sampling_rate_hz, patch_len_samples=None,
-                source_rate_hz=None) -> torch.Tensor:
+                source_rate_hz=None, sensor_id=None, device_id=None,
+                channel_mask=None) -> torch.Tensor:
         return self.project(
-            self.analyze(patches, sampling_rate_hz, patch_len_samples, source_rate_hz)
+            self.analyze(
+                patches, sampling_rate_hz, patch_len_samples, source_rate_hz,
+                sensor_id=sensor_id, device_id=device_id, channel_mask=channel_mask,
+            )
         )

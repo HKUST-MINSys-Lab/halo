@@ -47,6 +47,34 @@ ROPE_MIN_PERIOD_S = 0.5
 ROPE_MAX_PERIOD_S = 600.0
 
 
+def hierarchical_device_pool(h: torch.Tensor, weights: torch.Tensor,
+                             sensor_present: torch.Tensor,
+                             device_id: torch.Tensor | None):
+    """Average modalities within a device, then devices equally for each patch."""
+    B, P, N, _ = h.shape
+    if device_id is None or not bool((device_id > 0).any()):
+        denom = weights.sum(dim=2, keepdim=True).clamp(min=1.0)
+        per_patch = (h * weights.unsqueeze(-1)).sum(dim=2) / denom.squeeze(2).unsqueeze(-1)
+        return per_patch, per_patch.unsqueeze(2), weights.amax(dim=2, keepdim=True).bool()
+    if device_id.shape != (B, N):
+        raise ValueError(f"device_id must have shape {(B, N)}, got {tuple(device_id.shape)}")
+    device_rows, device_masks = [], []
+    for slot in range(int(device_id.max().item()) + 1):
+        member = device_id.eq(slot).view(B, 1, N) & sensor_present.view(B, 1, N)
+        member_weight = weights * member.to(weights.dtype)
+        member_denom = member_weight.sum(dim=2, keepdim=True)
+        device_rows.append(
+            (h * member_weight.unsqueeze(-1)).sum(dim=2)
+            / member_denom.squeeze(2).clamp_min(1.0).unsqueeze(-1)
+        )
+        device_masks.append(member_denom.squeeze(2).gt(0))
+    per_device = torch.stack(device_rows, dim=2)
+    device_valid = torch.stack(device_masks, dim=2)
+    per_patch = (per_device * device_valid.unsqueeze(-1).to(h.dtype)).sum(dim=2) \
+        / device_valid.sum(dim=2).clamp_min(1).unsqueeze(-1).to(h.dtype)
+    return per_patch, per_device, device_valid
+
+
 class RecordingAttentionPool(nn.Module):
     """One learned query that pools a masked set of contextual sensor tokens.
 
@@ -164,7 +192,7 @@ class SetTokenizerEncoder(nn.Module):
             for physical_only in (
                 "dft_size", "center_shift_fraction", "bandwidth_factor_max",
                 "compression_gain_max", "filter_shape_min", "filter_shape_max",
-                "adaptive_gate_init",
+                "adaptive_gate_init", "use_polarization", "polarization_energy_kappa",
             ):
                 continuous_kwargs.pop(physical_only, None)
             if frontend == "continuous":
@@ -330,7 +358,7 @@ class SetTokenizerEncoder(nn.Module):
     # text embeddings ONCE and only re-runs the cheap transformer tail.
 
     def tokenize(self, patches, sampling_rate_hz, patch_len_samples, channel_mask=None,
-                 source_rate_hz=None, sensor_id=None, n_sensors=None) -> torch.Tensor:
+                 source_rate_hz=None, sensor_id=None, device_id=None, n_sensors=None) -> torch.Tensor:
         """Signal tokens identical across masked/clean views.
 
         The physical filterbank returns ``(B,P,C,d)`` axis tokens.  The continuous front end
@@ -341,9 +369,12 @@ class SetTokenizerEncoder(nn.Module):
         log-energy standardization to FP16's limited dynamic range.
         """
         with torch.amp.autocast(patches.device.type, enabled=False):
+            analyze_kwargs = {"source_rate_hz": source_rate_hz}
+            if isinstance(self.filterbank, PhysicalFilterbankTokenizer):
+                analyze_kwargs.update(sensor_id=sensor_id, device_id=device_id,
+                                      channel_mask=channel_mask)
             token_in = self.filterbank.analyze(
-                patches.float(), sampling_rate_hz, patch_len_samples,
-                source_rate_hz=source_rate_hz,
+                patches.float(), sampling_rate_hz, patch_len_samples, **analyze_kwargs,
             )
         if getattr(self.filterbank, "emits_sensor_tokens", False):
             return self.filterbank.project(
@@ -353,16 +384,16 @@ class SetTokenizerEncoder(nn.Module):
         return self.filterbank.project(token_in)
 
     def analyze(self, patches, sampling_rate_hz, patch_len_samples, source_rate_hz=None,
-                patch_mask=None):
+                patch_mask=None, sensor_id=None, device_id=None, channel_mask=None):
         """Parameter-free (fixed arm) physical feature, shareable across encoder copies."""
         kwargs = {"source_rate_hz": source_rate_hz}
         if patch_mask is not None:
             if not getattr(self.filterbank, "emits_sensor_tokens", False):
                 raise ValueError("raw-prefix patch masks are only supported by continuous frontends")
             kwargs["patch_mask"] = patch_mask
-        return self.filterbank.analyze(
-            patches, sampling_rate_hz, patch_len_samples, **kwargs,
-        )
+        if isinstance(self.filterbank, PhysicalFilterbankTokenizer):
+            kwargs.update(sensor_id=sensor_id, device_id=device_id, channel_mask=channel_mask)
+        return self.filterbank.analyze(patches, sampling_rate_hz, patch_len_samples, **kwargs)
 
     def project_tokens(self, token_in, *, sensor_id=None, channel_mask=None,
                        n_sensors=None) -> torch.Tensor:
@@ -638,6 +669,7 @@ class SetTokenizerEncoder(nn.Module):
         sensor_text_masks: Optional[torch.Tensor] = None,  # (B,N,S_tok)
         sensor_descriptors: Optional[torch.Tensor] = None, # unique (U,384) or dense (B,N,384)
         sensor_id: Optional[torch.Tensor] = None,          # (B,C)
+        device_id: Optional[torch.Tensor] = None,          # (B,N), sensor slot -> physical device
         sensor_text_ids: Optional[torch.Tensor] = None,
         sensor_bias: Optional[torch.Tensor] = None,        # (B,N,sensor_bias_dim)
         descriptor_mask: Optional[torch.Tensor] = None,    # (B,N) True = hide the descriptor
@@ -759,8 +791,9 @@ class SetTokenizerEncoder(nn.Module):
         weights = h.new_ones(B, P, N) * sensor_present.view(B, 1, N).to(h.dtype)
         if patch_padding_mask is not None:
             weights = weights * patch_padding_mask.view(B, P, 1).to(h.dtype)
-        denom = weights.sum(dim=2, keepdim=True).clamp(min=1.0)
-        per_patch = (h * weights.unsqueeze(-1)).sum(dim=2) / denom.squeeze(2).unsqueeze(-1)
+        per_patch, per_device, device_valid = hierarchical_device_pool(
+            h, weights, sensor_present, device_id,
+        )
         patch_w = weights.amax(dim=2)
         if resolution_ids is None:
             temporal_w = patch_w
@@ -778,6 +811,9 @@ class SetTokenizerEncoder(nn.Module):
             pooled = (means * present.unsqueeze(-1)).sum(dim=1) \
                 / present.sum(dim=1, keepdim=True).clamp(min=1.0)
 
+        # The learned path deliberately sees every (patch, sensor) token.  Hierarchical
+        # device balancing is only for the parameter-free mean: pre-averaging here would
+        # make accelerometer and gyroscope indistinguishable to trained checkpoints.
         learned_pool = self._learned_recording_pool(h, weights.gt(0))
         if learned_pool is not None:
             pooled = learned_pool
@@ -808,7 +844,9 @@ class SetTokenizerEncoder(nn.Module):
                            and self.descriptor_head is not None else None)
         output = {"tokens": h, "retrieval_tokens": retrieval_tokens,
                   "per_patch": per_patch, "pooled": pooled,
+                  "per_device": per_device, "device_present": device_valid,
                   "sensor_context": sensor_context, "sensor_present": sensor_present,
+                  "device_id": device_id,
                   "descriptor": descriptor,
                   "descriptor_pred": descriptor_pred}
         if return_layer_states:
@@ -831,6 +869,7 @@ class SetTokenizerEncoder(nn.Module):
         patch_padding_mask: Optional[torch.Tensor] = None,  # (B, P) True = real patch
         sensor_texts: Optional[Sequence[Sequence[str]]] = None,  # factored: B lists of N_sensor strings
         sensor_id: Optional[torch.Tensor] = None,                # factored: (B, C) long
+        device_id: Optional[torch.Tensor] = None,                # sensor granularity: (B,N)
         source_rate_hz=None,                         # scalar | (B,) acquisition bandwidth bound
         sensor_bias: Optional[torch.Tensor] = None,  # sensor granularity: (B, N, sensor_bias_dim)
         descriptor_mask: Optional[torch.Tensor] = None,  # sensor granularity: (B, N)
@@ -876,7 +915,8 @@ class SetTokenizerEncoder(nn.Module):
                 sensor_tokens = self.tokenize(
                     patches, sampling_rate_hz, patch_len_samples,
                     channel_mask=channel_mask, source_rate_hz=source_rate_hz,
-                    sensor_id=sensor_id, n_sensors=sensor_text_ids.shape[1],
+                    sensor_id=sensor_id, device_id=device_id,
+                    n_sensors=sensor_text_ids.shape[1],
                 )
             encoded = self._encode_sensor(
                 sensor_tokens, None, None, positions,
@@ -885,6 +925,7 @@ class SetTokenizerEncoder(nn.Module):
                 patch_padding_mask=patch_padding_mask,
                 sensor_descriptors=sensor_descriptors,
                 sensor_id=sensor_id, sensor_text_ids=sensor_text_ids,
+                device_id=device_id,
                 sensor_bias=sensor_bias, descriptor_mask=descriptor_mask,
                 return_retrieval_tokens=return_retrieval_tokens,
                 retrieval_only=retrieval_only,

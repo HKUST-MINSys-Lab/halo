@@ -62,18 +62,31 @@ def _analysis(module, rate, **kw):
 # ---------------------------------------------------------------------------------------------
 # bank and grid layout
 # ---------------------------------------------------------------------------------------------
-def test_bank_is_one_gabor_per_span_harmonic(tokenizer):
-    assert tokenizer.span_list == [0.5, 1.0, 1.5]
-    assert tokenizer.group_sizes == [7, 12, 12]               # capped at 15 Hz and harmonic 12
+def test_bank_has_log_spaced_projected_gabors(tokenizer):
+    assert tokenizer.span_list == [0.5, 1.0, 2.0]
+    assert tokenizer.group_sizes == [7, 12, 12]
     assert tokenizer.K == 31
-    assert torch.allclose(tokenizer.centres, tokenizer.carrier.float() / tokenizer.spans)
-    assert float(tokenizer.centres.max()) <= 15.0
-    pairs = {(float(s), int(c)) for s, c in zip(tokenizer.spans, tokenizer.carrier)}
+    assert float(tokenizer.centres.max()) <= 15.0 + 1e-5
+    pairs = {(float(s), round(float(c), 5)) for s, c in zip(tokenizer.spans, tokenizer.centres)}
     assert len(pairs) == tokenizer.K
-    # the same frequency is measured at every retained span
-    assert sum(1 for c in tokenizer.centres.tolist() if abs(c - 4.0) < 1e-6) == 3
-    assert [float(tokenizer.centres[tokenizer.group_slice(g)].max())
-            for g in range(tokenizer.G)] == [14.0, 12.0, 8.0]
+    assert int((tokenizer.centres < 2.5).sum()) >= 8
+
+    u = torch.linspace(-0.5, 0.5, 2048)
+    harmonic = torch.arange(1, tokenizer.M + 1)
+    angle = 2 * math.pi * u[:, None] * harmonic[None]
+    cos_coeff, sin_coeff = tokenizer._normalised_coefficients()
+    envelope = torch.exp(-u.square() / (2 * tokenizer.envelope_sigma ** 2))
+    retained = []
+    for index, (centre, span) in enumerate(zip(tokenizer.centres, tokenizer.spans)):
+        real = angle.cos() @ cos_coeff[index] + angle.sin() @ sin_coeff[index]
+        imag = angle.cos() @ sin_coeff[index] - angle.sin() @ cos_coeff[index]
+        predicted = torch.stack((real, imag)) * envelope
+        predicted -= predicted.mean(-1, keepdim=True)
+        target_angle = 2 * math.pi * centre * span * u
+        target = torch.stack((target_angle.cos(), -target_angle.sin())) * envelope
+        target -= target.mean(-1, keepdim=True)
+        retained.append(1.0 - (predicted - target).square().sum() / target.square().sum())
+    assert float(torch.stack(retained).min().detach()) >= 0.95
 
 
 def test_token_grid_layout_follows_duration_not_rate(tokenizer):
@@ -81,17 +94,39 @@ def test_token_grid_layout_follows_duration_not_rate(tokenizer):
     for rate in (20.0, 50.0, 100.0):
         grid = _grid(tokenizer, rate)
         shapes.add(tuple(grid["tokens"].shape))
-        assert grid["tokens"].shape[1] == 48 + 24 + 16
+        assert grid["tokens"].shape[1] == 24 * 3
         assert bool(grid["token_mask"].all())
-        for g, (span, count) in enumerate(zip(tokenizer.span_list, (48, 24, 16))):
+        for g, (span, count) in enumerate(zip(tokenizer.span_list, (24, 24, 24))):
             rows = grid["resolution_ids"][0] == g
             assert int(rows.sum()) == count
             assert torch.allclose(grid["durations"][0][rows], torch.full((count,), span))
             positions = grid["positions"][0][rows]
-            stride = span / tokenizer.frames_per_span
+            stride = 0.25
             assert positions[0] == pytest.approx(0.5 * stride)
             assert positions[-1] == pytest.approx(6.0 - 0.5 * stride)
     assert len(shapes) == 1, f"token grid varies with sampling rate: {shapes}"
+
+
+def test_nondefault_analysis_rate_updates_output_time_metadata():
+    module = MultiSpanKernelTokenizer(d_model=16, frame_rate_hz=12).eval()
+    metadata = module.token_metadata(torch.tensor([6.0]))
+    assert module.token_rate_hz == pytest.approx(3.0)
+    assert metadata["positions"].shape[1] == 18 * 3
+    for group in range(module.G):
+        rows = metadata["resolution_ids"][0].eq(group)
+        position = metadata["positions"][0, rows]
+        assert float(position[0]) == pytest.approx(1.0 / 6.0)
+        assert float(position[-1]) == pytest.approx(6.0 - 1.0 / 6.0)
+
+
+@pytest.mark.parametrize("duration, count", [(6.0, 72), (8.0, 96)])
+def test_default_spans_tile_training_windows_without_partial_tokens(tokenizer, duration, count):
+    meta = tokenizer.token_metadata(torch.tensor([duration]))
+    assert meta["positions"].shape[1] == count
+    assert bool(meta["token_mask"].all())
+    for group in range(tokenizer.G):
+        rows = meta["resolution_ids"][0].eq(group)
+        assert float(meta["positions"][0, rows][-1]) == pytest.approx(duration - 0.125)
 
 
 def test_batch_composition_does_not_change_a_recordings_tokens(tokenizer):
@@ -169,12 +204,38 @@ def test_response_magnitude_is_not_a_function_of_sampling_rate(tokenizer):
     assert all(0.6 < r < 1.6 for r in ratios), ratios
 
 
-def test_observability_is_binary_at_initialisation(tokenizer):
+@pytest.mark.parametrize("stored_rate", [20.0, 25.0, 50.0])
+def test_stem_output_preserves_rate_invariance(tokenizer, stored_rate):
+    """Resampling storage must not alter tokens when the physical source rate is unchanged."""
+    signal = _band_limited_signal(20.0)
+    from scipy.signal import resample_poly
+
+    ratio = Fraction(stored_rate / 20.0).limit_denominator(1000)
+    stored = resample_poly(signal, ratio.numerator, ratio.denominator).astype(np.float32)
+    low = _as_patches(signal, 20.0)
+    candidate = _as_patches(stored, stored_rate)
+    with torch.no_grad():
+        a = tokenizer.token_grid(
+            low[0], 20.0, low[1], patch_mask=low[2], source_rate_hz=20.0,
+        )
+        b = tokenizer.token_grid(
+            candidate[0], stored_rate, candidate[1], patch_mask=candidate[2],
+            source_rate_hz=20.0,
+        )
+    assert torch.equal(a["token_mask"], b["token_mask"])
+    for group in range(tokenizer.G):
+        rows = a["resolution_ids"][0].eq(group) & a["token_mask"][0]
+        x = a["tokens"][0, rows].flatten().double().numpy()
+        y = b["tokens"][0, rows].flatten().double().numpy()
+        correlation = float(np.corrcoef(x, y)[0, 1])
+        assert correlation > 0.95, (stored_rate, group, correlation)
+
+
+def test_observability_is_bounded_and_tracks_available_harmonics(tokenizer):
     for rate in (20.0, 25.0, 50.0, 100.0):
         nyq, _ = tokenizer.masks(rate, torch.tensor([6.0]))
-        carrier_live = tokenizer.centres <= tokenizer.nyquist_margin * rate / 2
-        assert torch.equal(nyq[0] > 0.5, carrier_live)
-        assert bool(((nyq[0] == 0) | (nyq[0] == 1)).all())
+        assert bool(((nyq[0] >= 0) & (nyq[0] <= 1)).all())
+        assert float(nyq[0][tokenizer.centres < rate * 0.2].mean()) > 0.9
 
 
 def test_kernels_are_zero_mean(tokenizer):
@@ -187,10 +248,8 @@ def test_kernels_are_zero_mean(tokenizer):
 # ---------------------------------------------------------------------------------------------
 # what the grid keeps that a per-patch summary loses
 # ---------------------------------------------------------------------------------------------
-def test_time_reversal_is_equivariant_on_the_grid(tokenizer):
-    """Reversing the recording reverses each group's token sequence (symmetric kernels, symmetric
-    frame grid) rather than leaving the tokens unchanged. Order therefore survives into attention
-    through the positions, where the fixed filterbank's per-patch energies are reversal-invariant."""
+def test_time_reversal_changes_the_grid(tokenizer):
+    """The causal stem preserves temporal order rather than collapsing to frame statistics."""
     rate = 50.0
     patches, lengths, mask = _as_patches(_band_limited_signal(rate, seed=5), rate)
     reversed_patches = patches.flip(1).flip(2)
@@ -205,11 +264,7 @@ def test_time_reversal_is_equivariant_on_the_grid(tokenizer):
         rows = forward["resolution_ids"][0] == g
         a = forward["tokens"][0][rows]
         b = backward["tokens"][0][rows]
-        flipped = float((a - b.flip(0)).norm() / a.norm())
-        unflipped = float((a - b).norm() / a.norm())
-        assert flipped < 0.08, f"group {g}: reversed-and-flipped differs by {flipped:.3f}"
-        assert unflipped > 3 * flipped, (
-            f"group {g}: tokens carry no temporal order ({unflipped:.3f} vs {flipped:.3f})")
+        assert not torch.allclose(a, b, atol=1e-4)
 
 
 def test_gradients_reach_every_parameter(tokenizer):
@@ -218,6 +273,8 @@ def test_gradients_reach_every_parameter(tokenizer):
     grid = module.token_grid(patches, 50.0, lengths, patch_mask=mask)
     grid["tokens"].square().mean().backward()
     for name, parameter in module.named_parameters():
+        if not parameter.requires_grad:
+            continue
         assert parameter.grad is not None, f"{name} received no gradient"
         assert torch.isfinite(parameter.grad).all(), f"{name} gradient is not finite"
         assert float(parameter.grad.abs().sum()) > 0, f"{name} gradient is identically zero"
@@ -225,7 +282,7 @@ def test_gradients_reach_every_parameter(tokenizer):
 
 def test_past_only_grid_cannot_read_or_backpropagate_through_future_signal():
     torch.manual_seed(19)
-    module = MultiSpanKernelTokenizer(d_model=16, spans=(0.5, 1.0, 1.5)).eval()
+    module = MultiSpanKernelTokenizer(d_model=16, spans=(0.5, 1.0, 2.0)).eval()
     patches = torch.randn(1, 6, 50, 3, requires_grad=True)
     changed = patches.detach().clone()
     changed[:, 3:] += 1000.0
@@ -264,6 +321,44 @@ def test_norm_statistics_round_trip_and_ignore_absent_channels():
     assert bool((reference.norm_sd > 1e-5).all())
 
 
+def test_calibrated_compression_operates_outside_the_linear_regime():
+    torch.manual_seed(4)
+    module = MultiSpanKernelTokenizer(d_model=16, stem="none")
+    patches = torch.randn(4, 6, 50, 6)
+    lengths = torch.full((4, 6), 50, dtype=torch.long)
+    mask = lengths > 0
+    module.reset_compression_accumulator()
+    module.accumulate_compression_stats(patches, 50.0, lengths, patch_mask=mask)
+    module.finalize_compression_stats()
+    analysis = module.analyze_grid(patches, 50.0, lengths, patch_mask=mask)
+    ratios = []
+    for group in range(module.G):
+        sl = module.group_slice(group)
+        ratios.append(
+            analysis["groups"][group]["magnitude"]
+            / module.compression_knee[sl].view(1, 1, -1, 1)
+        )
+    assert float(torch.cat([value.flatten() for value in ratios]).gt(0.5).float().mean()) >= 0.3
+
+
+def test_revision_two_harmonic_checkpoint_still_loads_exactly():
+    old = MultiSpanKernelTokenizer(
+        d_model=16, spans=(0.5, 1.0, 1.5), frame_rate_hz=None, frames_per_span=4,
+        centre_spacing="harmonic", compression_scale="none", stem="none",
+    )
+    restored = MultiSpanKernelTokenizer(
+        d_model=16, spans=(0.5, 1.0, 1.5), frame_rate_hz=None, frames_per_span=4,
+        centre_spacing="harmonic", compression_scale="none", stem="none",
+    )
+    state = old.state_dict()
+    del state["compression_knee"]
+    for name in ("amp_mu", "amp_sd", "dc_mu", "dc_sd"):
+        state[name] = state[name][:, 0]
+    restored.load_state_dict(state)
+    assert int(restored._frontend_revision) == 2
+    assert torch.equal(restored.centres, old.centres)
+
+
 def test_missing_axes_are_marked_not_invented(tokenizer):
     torch.manual_seed(0)
     patches = torch.randn(1, 6, 50, 6)
@@ -276,7 +371,7 @@ def test_missing_axes_are_marked_not_invented(tokenizer):
                                  channel_mask=full, n_sensors=2)["tokens"]
         b = tokenizer.token_grid(patches, 50.0, lengths, sensor_id=sensor_id,
                                  channel_mask=accel_only, n_sensors=2)["tokens"]
-    assert a.shape == (1, 88, 2, 32) and torch.isfinite(a).all() and torch.isfinite(b).all()
+    assert a.shape == (1, 72, 2, 32) and torch.isfinite(a).all() and torch.isfinite(b).all()
     assert torch.allclose(a[:, :, 0], b[:, :, 0], atol=1e-6), "the accelerometer token changed"
     assert not torch.allclose(a[:, :, 1], b[:, :, 1]), "an absent gyroscope produced live tokens"
 
@@ -289,7 +384,8 @@ def test_local_summaries_are_standardized_separately_per_span():
     for g, group in enumerate(analysis["groups"]):
         for name, key in (("amp", "amplitude"), ("dc", "dc")):
             values = group[key][..., group["valid"][0]]
-            standardized = (values - getattr(module, name + "_mu")[g]) / getattr(module, name + "_sd")[g]
+            standardized = ((values - getattr(module, name + "_mu")[g, 0])
+                            / getattr(module, name + "_sd")[g, 0])
             assert abs(float(standardized.mean())) < 1e-5
             assert float(standardized.std(unbiased=False)) == pytest.approx(1.0, abs=1e-5)
     restored = MultiSpanKernelTokenizer(d_model=16)
@@ -298,8 +394,8 @@ def test_local_summaries_are_standardized_separately_per_span():
     # With no live channels, each group's fallback must stay finite and neutral.
     module.fit_norm_stats(patches, 50.0, lengths, patch_mask=mask,
                           channel_mask=torch.zeros(1, 1, dtype=torch.bool))
-    assert torch.equal(module.dc_mu, torch.zeros(module.G))
-    assert torch.equal(module.dc_sd, torch.ones(module.G))
+    assert torch.equal(module.dc_mu, torch.zeros(module.G, 2))
+    assert torch.equal(module.dc_sd, torch.ones(module.G, 2))
 
 
 @pytest.mark.parametrize("frontend", ["continuous", "multispan"])
@@ -387,8 +483,8 @@ def test_encoder_uses_the_frontends_token_grid():
     with torch.no_grad():
         out = _forward(encoder, patches)
     assert out["pooled"].shape == (2, 32)
-    assert out["per_patch"].shape == (2, 88, 32)
-    assert out["token_grid"]["token_mask"].shape == (2, 88)
+    assert out["per_patch"].shape == (2, 72, 32)
+    assert out["token_grid"]["token_mask"].shape == (2, 72)
     assert torch.isfinite(out["pooled"]).all()
 
 

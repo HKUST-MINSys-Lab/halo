@@ -1,10 +1,9 @@
-# Encoder pretraining
+# Retired encoder pretraining
 
-`training.tokenizer.pretrain` trains a selected HALO encoder on label-free IMU windows. The default
-live objective is future-JEPA; `--jepa-mode masked` remains a named historical control, not the
-default recipe.
+`training.tokenizer.pretrain` is retained solely to reproduce the retired label-free future-JEPA
+experiments. It requires `--allow-retired-jepa` and is not an active HALO training entry point.
 
-## Future-JEPA
+## Historical Future-JEPA
 
 The student receives only a physical-time prefix of an eight-second source window. An EMA teacher
 encodes the clean window. Target-query tokens request later intervals without exposing their signal.
@@ -17,26 +16,22 @@ measurements. The predictor and decoder are removed after pretraining.
 The implementation accepts any frontend that returns the common token-grid contract: token values,
 physical start/center/end times, durations or resolution IDs, sensor metadata, and validity masks.
 The retained arms are fixed one-second filterbank, fixed multiresolution filterbank at
-0.5/1.0/1.5 seconds, and continuous multispan kernels at 0.5/1.0/1.5 seconds.
+0.5/1.0/2.0 seconds, and revision-3 continuous multispan kernels at 0.5/1.0/2.0 seconds.
+The loader reconstructs historical revision-2 0.5/1.0/1.5-second checkpoints from their saved
+configuration; those checkpoints do not silently inherit current frontend math.
 
-## Operational commands
+## Historical commands
 
 ```bash
 PY=/home/alex/code/HALO/legacy_code/.venv/bin/python
-$PY -m training.tokenizer.pretrain --help
-$PY -m training.tokenizer.objective_health --frontend fixed --corpus label_free --out /tmp/halo_health.json
-$PY -m training.tokenizer.monitor_training --run-dir training/tokenizer/outputs/<run> --render
+$PY -m training.tokenizer.pretrain --allow-retired-jepa --help
+$PY -m training.tokenizer.objective_health --allow-retired-jepa --frontend fixed --corpus label_free --out /tmp/halo_health.json
 ```
 
-Before a full run, use `objective_health` on the chosen corpus/frontend to confirm finite targets,
-valid future horizons, teacher/student separation, loss scales, and gradient reach. During a run,
-`monitor_training` reads the lightweight JSON telemetry without touching the GPU.
+These commands are historical reproducibility utilities only. The corpus and timing record live in
+[PRETRAINING_CORPUS.md](../../docs/data/PRETRAINING_CORPUS.md).
 
-The current full-corpus batches, step counts, measured RTX 4090 throughput, and wall-time planning
-budget are maintained in [PRETRAINING_CORPUS.md](../../docs/data/PRETRAINING_CORPUS.md). Do not use
-historical support-classifier timings to estimate JEPA pretraining.
-
-## Retained utilities
+## Retained historical utilities
 
 - `pretrain.py`: configuration, training, validation, checkpointing, and telemetry;
 - `pretrain_data.py`: corpus indexing, balanced sampling, and collate contract;

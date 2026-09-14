@@ -57,26 +57,32 @@ WINDOW_SECONDS = 6.0
 PATCH_SECONDS = 1.0
 VAL_SUBJECT_FRACTION = 0.10      # subject-disjoint val within the train datasets
 # Explicit multi-resolution ablation settings. The reference path above uses PATCH_SECONDS only.
-PATCH_SECONDS_CHOICES = (0.5, 0.75, 1.0, 1.5)
+PATCH_SECONDS_CHOICES = (0.5, 0.75, 1.0, 1.5, 2.0)
 SHORT_PATCH_SECONDS_CHOICES = (0.4, 0.5, 0.6, 0.7, 0.8)
-LONG_PATCH_SECONDS_CHOICES = (1.0, 1.1, 1.2, 1.3, 1.4, 1.5)
+LONG_PATCH_SECONDS_CHOICES = (1.0, 1.2, 1.4, 1.6, 1.8, 2.0)
 MIN_RESOLUTION_RATIO = 1.75
 MIN_TAIL_FRACTION = 0.25          # F7: drop a resolution's tail patch if it covers < this fraction of
                                  # a full patch (and it isn't the only patch) — avoids degenerate
                                  # 1-sample tokens whose duration is clamped to the embedding floor.
-VAL_RESOLUTION_PAIR = (0.5, 1.5)
+VAL_RESOLUTION_PAIR = (0.5, 2.0)
 # Hard ceiling on the per-batch TOKEN count (batch x patches). Peak VRAM tracks tokens, not
 # windows, and patch_seconds is drawn PER BATCH — so without this, memory is a random variable:
 # measured P swings 12->22 at fixed batch. The current sensor-granularity encoder was profiled at
 # 7.46 GiB for batch 384 and 10.06 GiB for batch 512 with every resolution pair enabled on a 24 GiB
-# RTX 4090. The current fixed 0.5/1.0/1.5 s JEPA grid uses 15,360 tokens at batch 512 and was
-# re-profiled at 3.87 GiB on 2026-09-11, so 16,384 admits the measured throughput optimum while
-# retaining ample headroom for validation and allocator variation. Set 0 to disable.
+# RTX 4090. The fixed 0.5/1.0/2.0 s JEPA grid remains under this 16,384-token ceiling at batch 512;
+# the dense-hop continuous frontend has its own output grid and must be profiled separately.
+# Set 0 to disable.
 MAX_BATCH_TOKENS = 16_384
-# Covers the largest declared future-JEPA patch in the label-free corpus: 240 Hz x 1.5 s = 360
+MULTI_DEVICE_TRAIN_DATASETS = frozenset({"realdisp", "xrf_v2", "dsads", "forth_trace"})
+# Covers the largest declared future-JEPA patch in the label-free corpus: 240 Hz x 2.0 s = 480
 # samples. Keeping one power-of-two capacity across collate, encoder, frozen physical targets and
 # evaluation avoids frontend-specific truncation or a run that succeeds only on low-rate sources.
 DFT_SIZE = 512
+# Four-second filterbank patches must not make FFT cost proportional to a 100--240 Hz acquisition
+# clock.  Forty Hz clears the 15 Hz physical analysis band with margin and bounds 4/8 s patches at
+# 160/320 samples, respectively.  The conversion is enabled only when a requested resolution is at
+# least four seconds, preserving the established <=2 s collate bit-for-bit.
+FILTERBANK_LONG_PATCH_ANALYSIS_HZ = 40.0
 # Streams whose SOURCE (acquisition) rate differs from the rate the grid is stored at, because a
 # converter resampled them onto the dataset-wide grid rate. Upsampling cannot create information, so
 # the filterbank must take its Nyquist/observability bound from the ACQUISITION rate while the DFT
@@ -304,6 +310,23 @@ def _pad_sensor_rows(batch: list[dict], key: str, width: int | None = None) -> t
     return out
 
 
+def _pad_channel_rows(batch: list[dict], key: str, *, value=0) -> torch.Tensor | None:
+    """Pad a ragged per-channel tensor; composite recordings may carry more than six slots."""
+    if key not in batch[0] or batch[0][key] is None:
+        return None
+    rows = [torch.as_tensor(item[key]) for item in batch]
+    width = max(len(row) for row in rows)
+    out = torch.full((len(rows), width), value, dtype=rows[0].dtype)
+    for index, row in enumerate(rows):
+        out[index, :len(row)] = row
+    return out
+
+
+def _pad_channel_text(batch: list[dict], key: str) -> list[list[str | None]]:
+    width = max(len(item.get(key) or ()) for item in batch)
+    return [list(item.get(key) or ()) + [None] * (width - len(item.get(key) or ())) for item in batch]
+
+
 def stream_sensor_texts(
     dataset: str,
     stream: str,
@@ -486,7 +509,8 @@ class CorpusIndex:
     """Discover, curate, subject-split, and label the lazy pretraining corpus index."""
 
     def __init__(self, max_per_stream: int | None = None, seed: int = SEED,
-                 datasets: Sequence[str] = TRAIN_DATASETS, alignment: str = "native"):
+                 datasets: Sequence[str] = TRAIN_DATASETS, alignment: str = "native",
+                 window_seconds: float | None = None):
         # HALO trains on the "native" grids: native sampling RATE (no 60 Hz resample — the filterbank
         # is rate-invariant, so real rates beat a homogenized base + synthetic rate aug) with the
         # canonical labels + 6-ch pad+mask layout this loader expects. The 60 Hz "harmonised" grids
@@ -495,8 +519,10 @@ class CorpusIndex:
         self.max_per_stream = max_per_stream   # retained for the checkpoint corpus fingerprint (F5)
         self.seed = seed
         self.datasets = tuple(datasets)
+        self.window_seconds = window_seconds
         self.refs: list[GridRef] = [
-            r for r in discover_grids(alignment) if r.dataset in set(datasets)
+            r for r in discover_grids(alignment, window_seconds=window_seconds)
+            if r.dataset in set(datasets)
         ]
         if not self.refs:
             raise FileNotFoundError(f"no {alignment} train grids found — build grids first "
@@ -517,12 +543,17 @@ class CorpusIndex:
         # Windows the plausibility scan rejected as physically impossible (accel/gyro beyond any
         # consumer full-scale range). Cached by data.scripts.scan_implausible so indexing stays lazy.
         from data.scripts.scan_implausible import load as _load_implausible
-        self.implausible = _load_implausible(alignment, require=True)
+        quality_window_seconds = 6.0 if window_seconds is None else float(window_seconds)
+        self.implausible = _load_implausible(
+            alignment, require=True, window_seconds=quality_window_seconds,
+        )
         # Byte-identical repeated windows — a device re-emitting a stale buffer, not motion
         # (ExtraSensory's Pebble does this for hours at a time). Merged into the same drop set:
         # both are "this window is not an observation", and CorpusIndex applies one filter.
         from data.scripts.scan_duplicates import load as _load_duplicates
-        self.duplicates = _load_duplicates(alignment, require=True)
+        self.duplicates = _load_duplicates(
+            alignment, require=True, window_seconds=quality_window_seconds,
+        )
         self.excluded = {
             key: self.implausible.get(key, set()) | self.duplicates.get(key, set())
             for key in set(self.implausible) | set(self.duplicates)
@@ -543,12 +574,42 @@ class CorpusIndex:
         self.val: list[WindowKey] = []
         self.n_implausible_dropped = 0
         self.n_duplicate_dropped = 0
+        chosen_by_stream: dict[int, np.ndarray] = {}
+        if max_per_stream is not None:
+            by_dataset: dict[str, list[int]] = {}
+            for stream_i, ref in enumerate(self.refs):
+                by_dataset.setdefault(ref.dataset, []).append(stream_i)
+            for dataset, stream_indices in by_dataset.items():
+                if dataset in MULTI_DEVICE_TRAIN_DATASETS and len(stream_indices) > 1:
+                    refs = [self.refs[index] for index in stream_indices]
+                    if not all(ref.event_ids_explicit for ref in refs):
+                        raise ValueError(f"{dataset}: aligned multi-device training needs explicit event ids")
+                    common = set(refs[0].event_ids)
+                    for ref in refs[1:]:
+                        common.intersection_update(ref.event_ids)
+                    ordered = np.asarray(sorted(common), dtype=object)
+                    if len(ordered) > max_per_stream:
+                        ordered = ordered[np.sort(rng.choice(
+                            len(ordered), size=max_per_stream, replace=False,
+                        ))]
+                    selected_events = set(ordered.tolist())
+                    for stream_i, ref in zip(stream_indices, refs):
+                        chosen_by_stream[stream_i] = np.asarray([
+                            row for row, event in enumerate(ref.event_ids)
+                            if event in selected_events
+                        ], dtype=np.int64)
+                else:
+                    for stream_i in stream_indices:
+                        n = self.refs[stream_i].n_windows
+                        chosen_by_stream[stream_i] = (
+                            np.arange(n) if n <= max_per_stream
+                            else np.sort(rng.choice(n, size=max_per_stream, replace=False))
+                        )
         for stream_i, ref in enumerate(self.refs):
             n = ref.n_windows
             bad = self.implausible.get(ref.key, set())
             dup = self.duplicates.get(ref.key, set())
-            chosen = (np.arange(n) if max_per_stream is None or n <= max_per_stream
-                      else rng.choice(n, size=max_per_stream, replace=False))
+            chosen = np.arange(n) if max_per_stream is None else chosen_by_stream[stream_i]
             for w in np.sort(chosen):
                 if int(w) in bad:                    # physically impossible window — drop, never clip
                     self.n_implausible_dropped += 1
@@ -630,11 +691,20 @@ class PretrainDataset(Dataset):
                  augment: bool = True, two_view: bool = False,
                  augmentation_config: AugmentationConfig | None = None,
                  rotation_pairing: str = "shared",
-                 neutral_acquisition_text: bool = False):
+                 neutral_acquisition_text: bool = False,
+                 multi_device_probability: float = 0.0,
+                 max_devices: int = 4):
         self.index = index
         self.keys = keys
         self.two_view = two_view
+        self.augment_enabled = bool(augment)
         self.neutral_acquisition_text = bool(neutral_acquisition_text)
+        if not 0.0 <= multi_device_probability <= 1.0:
+            raise ValueError("multi_device_probability must be in [0,1]")
+        if max_devices < 2:
+            raise ValueError("max_devices must be at least 2")
+        self.multi_device_probability = float(multi_device_probability)
+        self.max_devices = int(max_devices)
         if rotation_pairing not in {"shared", "independent"}:
             raise ValueError("rotation_pairing must be 'shared' or 'independent'")
         cfg = (augmentation_config or AugmentationConfig.phase_a()) \
@@ -648,13 +718,39 @@ class PretrainDataset(Dataset):
         self.nuisance_augmenter = IMUAugmenter(nuisance_cfg)
         self._data_cache: dict[int, np.ndarray] = {}
         self._length_cache: dict[int, np.ndarray] = {}
+        self._aligned_devices = self._build_aligned_device_index() \
+            if self.multi_device_probability > 0 else {}
+
+    def _build_aligned_device_index(self) -> dict[int, tuple[int, ...]]:
+        groups: dict[tuple[str, str], list[int]] = {}
+        for position, key in enumerate(self.keys):
+            ref = self.index.refs[key.stream_i]
+            if ref.dataset not in MULTI_DEVICE_TRAIN_DATASETS:
+                continue
+            groups.setdefault((ref.dataset, str(ref.event_ids[key.window_i])), []).append(position)
+        result = {}
+        for positions in groups.values():
+            streams = {self.index.refs[self.keys[position].stream_i].stream for position in positions}
+            if len(streams) < 2:
+                continue
+            labels = {self.keys[position].label_id for position in positions}
+            if len(labels) != 1:
+                raise ValueError("aligned device rows disagree on label")
+            ordered = tuple(sorted(positions, key=lambda p: self.index.refs[self.keys[p].stream_i].stream))
+            for position in ordered:
+                result[position] = ordered
+        return result
 
     def __len__(self) -> int:
         return len(self.keys)
 
     def _grid(self, stream_i: int) -> np.ndarray:
         if stream_i not in self._data_cache:
-            self._data_cache[stream_i] = self.index.refs[stream_i].load_data()
+            # Copy-on-write mappings are writable from PyTorch's perspective but never modify the
+            # persisted grid. This permits allocation-free tensor views on the plain classifier
+            # path without PyTorch's undefined-behaviour warning for read-only NumPy buffers.
+            path = self.index.refs[stream_i].grid_dir / "data.npy"
+            self._data_cache[stream_i] = np.load(path, mmap_mode="c")
         return self._data_cache[stream_i]
 
     def _lengths(self, stream_i: int) -> np.ndarray:
@@ -680,12 +776,24 @@ class PretrainDataset(Dataset):
             applied_augmentations=list(sample.applied_augmentations),
         )
 
-    def _raw_sample(self, ref, key: WindowKey, base_texts: list[str]) -> IMUSample:
+    def _raw_sample(
+        self,
+        ref,
+        key: WindowKey,
+        base_texts: list[str],
+        *,
+        copy_data: bool = True,
+    ) -> IMUSample:
         valid_length = int(self._lengths(key.stream_i)[key.window_i])
-        # Own the array so downstream augmentation cannot mutate the memory-mapped grid.
-        window = torch.from_numpy(np.array(
-            self._grid(key.stream_i)[key.window_i, :valid_length], dtype=np.float32, copy=True,
-        ))
+        source = self._grid(key.stream_i)[key.window_i, :valid_length]
+        if copy_data:
+            # Augmenters mutate samples, so their input must never alias the memory-mapped grid.
+            source = np.array(source, dtype=np.float32, copy=True)
+        else:
+            # The plain classification path only reads this view and immediately copies it into
+            # compact collate storage. Avoid a redundant per-recording allocation beforehand.
+            source = np.asarray(source, dtype=np.float32)
+        window = torch.from_numpy(source)
         role_texts, sensor_texts, sensor_id = stream_sensor_texts(
             ref.dataset, ref.stream,
             has_accel=bool(any(ref.mask[:3])), has_gyro=bool(any(ref.mask[3:])),
@@ -750,6 +858,8 @@ class PretrainDataset(Dataset):
             "data": data6,                                # (T', 6) canonical slots
             "rate": float(sample.sampling_rate),
             "source_rate": source_rate,
+            "channel_source_rates": torch.full(
+                (len(CHANNELS),), source_rate, dtype=torch.float32),
             "texts": texts6,
             # Factored text (docs/design/TEXT_CONDITIONING.md §4b): carried per view so the VICReg
             # second view gets its OWN independently-augmented role/sensor text. label_id is
@@ -757,6 +867,7 @@ class PretrainDataset(Dataset):
             "role_texts": role_texts6,
             "sensor_texts": sensor_texts_out,
             "sensor_id": sensor_id6,
+            "device_id": torch.zeros(len(sensor_texts_out), dtype=torch.long),
             # Placement group id per sensor. The sensor-mask JEPA objective uses this to refuse
             # cross-placement prediction; within one stream every sensor shares a placement, so
             # this is constant here and becomes meaningful when paired streams are fused.
@@ -767,18 +878,70 @@ class PretrainDataset(Dataset):
             "augmentations": tuple(sample.applied_augmentations),
         }
 
-    def __getitem__(self, i: int) -> dict:
+    def _plain_sample_to_slots(self, ref, sample: IMUSample) -> dict:
+        """Zero-copy metadata assembly for the non-augmented classification/eval path."""
+        if sample.channel_names != list(CHANNELS) or sample.data.shape[1] != len(CHANNELS):
+            raise ValueError("plain grid samples must already use the canonical six-channel layout")
+        sensor_texts = list(sample.sensor_descriptions or ())
+        if not sensor_texts:
+            raise ValueError("a plain sample has no sensor description")
+        hardware_rate = STREAM_SOURCE_RATE_HZ.get(
+            f"{ref.dataset}/{ref.stream}", float(ref.rate_hz),
+        )
+        source_rate = min(float(hardware_rate), float(sample.sampling_rate))
+        return {
+            "data": sample.data,
+            "rate": float(sample.sampling_rate),
+            "source_rate": source_rate,
+            "channel_source_rates": torch.full(
+                (len(CHANNELS),), source_rate, dtype=torch.float32),
+            "texts": list(sample.channel_descriptions),
+            "role_texts": list(sample.role_descriptions or (_CHANNEL_ROLE_TEXT[c] for c in CHANNELS)),
+            "sensor_texts": sensor_texts,
+            "sensor_id": torch.as_tensor(sample.sensor_id, dtype=torch.long),
+            "device_id": torch.zeros(len(sensor_texts), dtype=torch.long),
+            "sensor_placement": torch.zeros(len(sensor_texts), dtype=torch.long),
+            "channel_mask": torch.as_tensor(sample.channel_mask, dtype=torch.bool),
+            "gravity_state": sample.gravity_state,
+            "augmentations": (),
+        }
+
+    def _can_use_plain_sample(self) -> bool:
+        """Return whether the current, possibly test-overridden augmenters are no-ops."""
+        if self.two_view:
+            return False
+        return all(
+            not getattr(augmenter.cfg, name).enabled
+            for augmenter in (self.config_augmenter, self.nuisance_augmenter)
+            for name in AugmentationConfig.ORDER
+        )
+
+    def _single_item(self, i: int) -> dict:
         key = self.keys[i]
         ref = self.index.refs[key.stream_i]
         base_texts = stream_channel_descriptions(
             ref.dataset, ref.stream, neutral=self.neutral_acquisition_text,
         )
         slot = {c: k for k, c in enumerate(CHANNELS)}
+        plain = not self.augment_enabled and self._can_use_plain_sample()
+        raw = self._raw_sample(ref, key, base_texts, copy_data=not plain)
+        if plain:
+            view = self._plain_sample_to_slots(ref, raw)
+            sensor_target_texts = list(view["sensor_texts"])
+            view["sensor_target_texts"] = sensor_target_texts
+            return {
+                **view,
+                "label_id": key.label_id,
+                "source": ref.dataset,
+                "stream": ref.key,
+                "window_index": key.window_i,
+                "subject": f"{ref.dataset}:{ref.subjects[key.window_i]}",
+            }
         # Historical masked control: draw acquisition CONFIG once. Both VICReg views then
         # independently draw only nuisance
         # variation from clones of that configured sample. This is both the intended semantics and
         # substantially cheaper than replaying every CONFIG transform under saved global RNG state.
-        configured = self.config_augmenter(self._raw_sample(ref, key, base_texts))
+        configured = self.config_augmenter(raw)
         # Descriptor-mask prediction must target acquisition SEMANTICS, not the random surface form
         # drawn later by the nuisance paraphrase augmentation. Otherwise two equivalent phrasings of
         # the same sensor become false negatives and the hidden signal cannot determine which wording
@@ -813,6 +976,27 @@ class PretrainDataset(Dataset):
                 "source": ref.dataset,
             }
         return item
+
+    def item_with_rng(self, i: int, rng: np.random.Generator) -> dict:
+        """Load one item using caller-owned randomness for device composition.
+
+        Augmentations retain their existing worker-local stochasticity; the structural
+        device subset is part of the episode contract and must replay across workers.
+        """
+        peers = self._aligned_devices.get(i, ())
+        if (not peers or rng.random() >= self.multi_device_probability):
+            return self._single_item(i)
+        others = [position for position in peers if position != i]
+        count = int(rng.integers(2, min(self.max_devices, len(peers)) + 1))
+        chosen = [i, *rng.choice(others, size=count - 1, replace=False).tolist()]
+        # Canonical stream order makes device IDs stable while query/support subsets remain
+        # independently sampled by separate dataset accesses.
+        chosen.sort(key=lambda p: self.index.refs[self.keys[p].stream_i].stream)
+        return merge_device_items([self._single_item(position) for position in chosen])
+
+    def __getitem__(self, i: int) -> dict:
+        # DataLoader compatibility. Trainer prefetch uses a step-owned generator instead.
+        return self.item_with_rng(i, np.random.default_rng(int(i)))
 
 
 def _capped_probabilities(
@@ -1038,6 +1222,55 @@ def _batch_identity_seed(batch: list[dict], seed: int) -> int:
     return int.from_bytes(digest.digest(), "little")
 
 
+def merge_device_items(items: Sequence[dict]) -> dict:
+    """Combine exact-time-aligned single-device rows into one variable-channel recording."""
+    if len(items) < 2:
+        raise ValueError("a composite training/evaluation item needs at least two devices")
+    first = items[0]
+    for item in items[1:]:
+        if item["data"].shape[0] != first["data"].shape[0] or not np.isclose(item["rate"], first["rate"]):
+            raise ValueError("HALO composite members must share one sampled timeline")
+        if item.get("label_id") != first.get("label_id"):
+            raise ValueError("HALO composite members disagree on the activity label")
+    sensor_offsets = np.cumsum([0] + [len(item.get("sensor_texts") or ()) for item in items[:-1]])
+    sensor_ids = [torch.as_tensor(item["sensor_id"], dtype=torch.long) + int(offset)
+                  for item, offset in zip(items, sensor_offsets)]
+    sensor_texts = [text for item in items for text in item.get("sensor_texts", ())]
+    target_texts = [text for item in items
+                    for text in item.get("sensor_target_texts", item.get("sensor_texts", ()))]
+    return {
+        **first,
+        "data": torch.cat([torch.as_tensor(item["data"]) for item in items], dim=1),
+        "texts": [text for item in items for text in item["texts"]],
+        "role_texts": [text for item in items for text in item.get("role_texts", item["texts"])],
+        "sensor_texts": sensor_texts,
+        "sensor_target_texts": target_texts,
+        "sensor_id": torch.cat(sensor_ids),
+        "device_id": torch.cat([
+            torch.full((len(item.get("sensor_texts") or ()),), device, dtype=torch.long)
+            for device, item in enumerate(items)
+        ]),
+        "sensor_placement": torch.cat([
+            torch.full((len(item.get("sensor_texts") or ()),), device, dtype=torch.long)
+            for device, item in enumerate(items)
+        ]),
+        "sensor_bias": torch.cat([torch.as_tensor(item["sensor_bias"]) for item in items], dim=0)
+        if all(item.get("sensor_bias") is not None for item in items) else None,
+        "channel_mask": torch.cat([torch.as_tensor(item["channel_mask"]) for item in items]),
+        # Kept as a scalar compatibility field for older callers. Per-channel bandwidth is
+        # carried separately so a low-rate device cannot hide another device's valid bands.
+        "source_rate": min(float(item.get("source_rate", item["rate"])) for item in items),
+        "channel_source_rates": torch.cat([
+            torch.as_tensor(item.get("channel_source_rates", torch.full(
+                (torch.as_tensor(item["channel_mask"]).numel(),),
+                float(item.get("source_rate", item["rate"])))))
+            for item in items
+        ]),
+        "stream": "+".join(str(item.get("stream", "?")) for item in items),
+        "augmentations": tuple(value for item in items for value in item.get("augmentations", ())),
+    }
+
+
 def _physical_patch_bounds(num_samples: int, rate_hz: float,
                            patch_seconds: float) -> list[tuple[int, int]]:
     """Partition samples using rounded physical-time boundaries.
@@ -1061,6 +1294,83 @@ def _physical_patch_bounds(num_samples: int, rate_hz: float,
         end = max(end, start + 1)
         bounds.append((start, end))
     return bounds
+
+
+def _bounded_analysis_view(data: np.ndarray, rate_hz: float, durations: Sequence[float]) -> tuple[np.ndarray, float]:
+    """Anti-alias a long-resolution view to the bounded physical analysis clock.
+
+    The filterbank maps FFT bins back to Hz using the returned rate, while callers retain the
+    original source rate separately for observability metadata.  This is not a second view or an
+    acquisition-rate augmentation: it is the one signal supplied to every resolution in a
+    long-patch batch, so overlapping resolutions remain temporally consistent.
+    """
+    if max(map(float, durations), default=0.0) < 4.0 or rate_hz <= FILTERBANK_LONG_PATCH_ANALYSIS_HZ:
+        return data, float(rate_hz)
+    from fractions import Fraction
+    from scipy.signal import resample_poly
+
+    target = FILTERBANK_LONG_PATCH_ANALYSIS_HZ
+    ratio = Fraction(target / float(rate_hz)).limit_denominator(10_000)
+    was_tensor = torch.is_tensor(data)
+    values = resample_poly(
+        np.asarray(data.detach().cpu() if was_tensor else data, dtype=np.float32),
+        ratio.numerator, ratio.denominator, axis=0,
+    )
+    expected = max(1, int(round(len(data) * target / float(rate_hz))))
+    if len(values) > expected:
+        values = values[:expected]
+    elif len(values) < expected:
+        values = np.pad(values, ((0, expected - len(values)), (0, 0)), mode="edge")
+    values = np.asarray(values, dtype=np.float32)
+    if was_tensor:
+        values = torch.from_numpy(values).to(dtype=data.dtype)
+    return values, float(target)
+
+
+def _bounded_analysis_views(
+    batch: Sequence[dict], durations: Sequence[float],
+) -> list[tuple[torch.Tensor, float]]:
+    """Vectorized equivalent of :func:`_bounded_analysis_view` for collate workers.
+
+    Grid rows in one support batch overwhelmingly share a rate and length. Designing and applying
+    one polyphase filter to that stack is the same independent operation along each row's time
+    axis, while avoiding hundreds of tiny SciPy calls.
+    """
+    result: list[tuple[torch.Tensor, float] | None] = [None] * len(batch)
+    groups: dict[tuple[float, tuple[int, ...]], list[int]] = {}
+    long_grid = max(map(float, durations), default=0.0) >= 4.0
+    for index, item in enumerate(batch):
+        data = torch.as_tensor(item["data"], dtype=torch.float32)
+        rate = float(item["rate"])
+        if not long_grid or rate <= FILTERBANK_LONG_PATCH_ANALYSIS_HZ:
+            result[index] = (data, rate)
+        else:
+            groups.setdefault((rate, tuple(data.shape)), []).append(index)
+
+    if groups:
+        from fractions import Fraction
+        from scipy.signal import resample_poly
+
+        target = FILTERBANK_LONG_PATCH_ANALYSIS_HZ
+        for (rate, shape), indices in groups.items():
+            values = np.stack([
+                np.asarray(batch[index]["data"], dtype=np.float32) for index in indices
+            ])
+            ratio = Fraction(target / rate).limit_denominator(10_000)
+            values = resample_poly(values, ratio.numerator, ratio.denominator, axis=1)
+            expected = max(1, int(round(shape[0] * target / rate)))
+            if values.shape[1] > expected:
+                values = values[:, :expected]
+            elif values.shape[1] < expected:
+                values = np.pad(
+                    values, ((0, 0), (0, expected - values.shape[1]), (0, 0)), mode="edge",
+                )
+            values = np.asarray(values, dtype=np.float32)
+            for row, index in enumerate(indices):
+                result[index] = (torch.from_numpy(values[row]), float(target))
+    if any(value is None for value in result):
+        raise RuntimeError("bounded analysis failed to materialize every batch row")
+    return result  # type: ignore[return-value]
 
 
 class MultiScaleCollate:
@@ -1103,10 +1413,11 @@ class MultiScaleCollate:
         if self.two_view and batch and "view_b" in batch[0]:
             # Historical masked control: the positive view uses the same patch duration.
             out_b = self._collate_impl([item["view_b"] for item in batch], ps)
-            for k in ("patches", "patch_len", "rates", "source_rates", "positions",
+            for k in ("patches", "patch_len", "rates", "source_rates", "channel_source_rates", "positions",
                       "patch_durations", "patch_starts", "patch_ends", "resolution_ids",
                       "resolution_count", "texts",
                       "role_texts", "sensor_texts", "sensor_target_texts", "sensor_id",
+                      "device_id",
                       "sensor_placement",
                       "channel_mask", "patch_padding_mask", "augmentations"):
                 out[f"{k}_b"] = out_b[k]
@@ -1117,14 +1428,18 @@ class MultiScaleCollate:
     def _collate_impl(self, batch: list[dict], ps: float) -> dict:
         bounds_by_shape = {}
         bounds = []
+        prepared = []
         for item in batch:
-            key = (item["data"].shape[0], float(item["rate"]))
+            data, rate = _bounded_analysis_view(item["data"], float(item["rate"]), (ps,))
+            prepared.append((data, rate))
+            key = (data.shape[0], float(rate))
             if key not in bounds_by_shape:
                 bounds_by_shape[key] = _physical_patch_bounds(*key, ps)
             bounds.append(bounds_by_shape[key])
         P = max(1, max(map(len, bounds)))
         B = len(batch)
-        patches = torch.zeros(B, P, self.dft_size, len(CHANNELS))
+        channels = max(data.shape[1] for data, _ in prepared)
+        patches = torch.zeros(B, P, self.dft_size, channels)
         # Fill small metadata arrays on the CPU without a tensor dispatch per scalar.
         patch_len = np.zeros((B, P), dtype=np.int64)
         patch_durations = np.zeros((B, P), dtype=np.float32)
@@ -1135,8 +1450,7 @@ class MultiScaleCollate:
         patch_starts = np.zeros((B, P), dtype=np.float32)
         patch_ends = np.zeros((B, P), dtype=np.float32)
 
-        for b, item in enumerate(batch):
-            data, rate = item["data"], item["rate"]
+        for b, (item, (data, rate)) in enumerate(zip(batch, prepared)):
             if int(np.ceil(rate * ps)) > self.dft_size:
                 raise ValueError(
                     f"patch length {int(np.ceil(rate * ps))} exceeds dft_size {self.dft_size}"
@@ -1144,7 +1458,7 @@ class MultiScaleCollate:
             usable = 0
             for p, (start, end) in enumerate(bounds[b]):
                 length = end - start
-                patches[b, p, :length] = data[start:end]
+                patches[b, p, :length, :data.shape[1]] = data[start:end]
                 patch_len[b, p] = length
                 patch_durations[b, p] = length / rate
                 positions[b, p] = (start + 0.5 * length) / rate
@@ -1159,6 +1473,7 @@ class MultiScaleCollate:
             "patch_len": torch.from_numpy(patch_len),
             "rates": torch.from_numpy(rates),
             "source_rates": torch.from_numpy(source_rates),
+            "channel_source_rates": _pad_channel_rows(batch, "channel_source_rates"),
             "positions": torch.from_numpy(positions),
             "patch_durations": torch.from_numpy(patch_durations),
             "patch_starts": torch.from_numpy(patch_starts),
@@ -1170,17 +1485,17 @@ class MultiScaleCollate:
             ),
             "resolution_count": 1,
             "patch_seconds": ps,
-            "texts": [item["texts"] for item in batch],
+            "texts": _pad_channel_text(batch, "texts"),
             # Factored text conditioning (docs/design/TEXT_CONDITIONING.md §4b), read ONLY by the
             # factored path. Tolerant of manual items (eval/tests) that omit them — those keep the
             # legacy per_channel path where these are unused (None), so the default is unaffected.
-            "role_texts": [item.get("role_texts") for item in batch],
+            "role_texts": _pad_channel_text(batch, "role_texts"),
             "sensor_texts": [item.get("sensor_texts") for item in batch],
             "sensor_target_texts": [
                 item.get("sensor_target_texts", item.get("sensor_texts")) for item in batch
             ],
-            "sensor_id": (torch.stack([item["sensor_id"] for item in batch])
-                          if "sensor_id" in batch[0] else None),
+            "sensor_id": _pad_channel_rows(batch, "sensor_id"),
+            "device_id": _pad_sensor_rows(batch, "device_id"),
             # Sensor-placement metadata is used only to constrain physically valid JEPA masks.
             "sensor_placement": _pad_sensor_rows(batch, "sensor_placement"),
             "labels": torch.tensor([item["label_id"] for item in batch]),
@@ -1189,7 +1504,7 @@ class MultiScaleCollate:
             "window_indices": torch.tensor([item.get("window_index", -1) for item in batch]),
             "subjects": [item.get("subject", "?") for item in batch],
             "augmentations": [item.get("augmentations", ()) for item in batch],
-            "channel_mask": torch.stack([item["channel_mask"] for item in batch]),
+            "channel_mask": _pad_channel_rows(batch, "channel_mask"),
             "patch_padding_mask": torch.from_numpy(patch_pad),
         }
         # Legacy checkpoint evaluation can inject the frozen artifact explicitly. New Phase-A
@@ -1277,9 +1592,10 @@ class MultiResolutionCollate:
         if self.two_view and batch and "view_b" in batch[0]:
             # Historical masked control: the positive view uses the same resolution pair.
             out_b = self._collate_impl([item["view_b"] for item in batch], pair)
-            for k in ("patches", "patch_len", "rates", "source_rates", "positions", "patch_durations",
+            for k in ("patches", "patch_len", "rates", "source_rates", "channel_source_rates", "positions", "patch_durations",
                       "resolution_ids", "texts", "role_texts", "sensor_texts",
                       "sensor_target_texts", "sensor_id",
+                      "device_id",
                       "sensor_placement",
                       "channel_mask", "patch_padding_mask", "augmentations"):
                 out[f"{k}_b"] = out_b[k]
@@ -1287,17 +1603,37 @@ class MultiResolutionCollate:
                 out["sensor_bias_b"] = out_b["sensor_bias"]
         return out
 
-    def _collate_impl(self, batch: list[dict], pair: tuple[float, ...]) -> dict:
+    def deferred(self, batch: list[dict]) -> dict:
+        """Collate metadata but defer DFT-padded patch materialization to the accelerator.
+
+        Support-classifier workers use this path because transferring a recording once is much
+        cheaper than transferring three resolution grids that are mostly zero tokens. The normal
+        collate remains the reference path for pretraining, calibration and compatibility tests.
+        """
+        if self.two_view:
+            raise ValueError("deferred multi-resolution collation does not support two-view data")
+        return self._collate_impl(batch, self._patch_seconds(batch), defer_patch_values=True)
+
+    def _collate_impl(
+        self,
+        batch: list[dict],
+        pair: tuple[float, ...],
+        *,
+        defer_patch_values: bool = False,
+    ) -> dict:
         B = len(batch)
         rates = torch.zeros(B)
         source_rates = torch.zeros(B)
-        channel_mask = torch.stack([item["channel_mask"] for item in batch])
+        channel_mask = _pad_channel_rows(batch, "channel_mask")
         all_entries: list[list[tuple]] = []
+        analysis_data: list[torch.Tensor] = []
 
+        bounded_views = _bounded_analysis_views(batch, pair)
         for b, item in enumerate(batch):
-            data, rate = item["data"], float(item["rate"])
+            data, rate = bounded_views[b]
+            analysis_data.append(data)
             rates[b] = rate
-            source_rates[b] = float(item.get("source_rate", rate))
+            source_rates[b] = float(item.get("source_rate", item["rate"]))
 
             entries = []
             for resolution_id, duration in enumerate(pair):
@@ -1317,12 +1653,13 @@ class MultiResolutionCollate:
                     # still joins self-attention. Drop it rather than feed a physically meaningless
                     # token; but never drop the ONLY patch of a resolution (a window shorter than one
                     # patch keeps its single partial). Duration-weighting (F1) handles the rest.
-                    if n < min_tail and len(entries) > res_start:
-                        continue
+                    # Preserve the complete measured interval.  A short terminal token is
+                    # explicitly duration-weighted downstream, while dropping it gave HALO
+                    # less evidence than the baselines from the same requested recording.
                     start_s, end_s = start / rate, end / rate
                     entries.append((
                         0.5 * (start_s + end_s), resolution_id, start_s, end_s,
-                        n / rate, n, data[start:end],
+                        n / rate, n, start, end,
                     ))
             # Physical-time order keeps RoPE and contiguous per-resolution masking meaningful.
             # Short tokens precede long tokens only when their centers are exactly equal.
@@ -1330,49 +1667,68 @@ class MultiResolutionCollate:
             all_entries.append(entries)
 
         P = max((len(entries) for entries in all_entries), default=1)
-        patches = torch.zeros(B, P, self.dft_size, len(CHANNELS))
+        channels = max(item["data"].shape[1] for item in batch)
+        patches = (None if defer_patch_values
+                   else torch.zeros(B, P, self.dft_size, channels))
         patch_len = torch.zeros(B, P, dtype=torch.long)
         patch_pad = torch.zeros(B, P, dtype=torch.bool)
         positions = torch.zeros(B, P)
         patch_durations = torch.zeros(B, P)
         patch_starts = torch.zeros(B, P)
         patch_ends = torch.zeros(B, P)
+        patch_start_samples = torch.zeros(B, P, dtype=torch.long)
         resolution_ids = torch.full((B, P), -1, dtype=torch.long)
 
         for b, entries in enumerate(all_entries):
-            for p, (center, rid, start, end, duration, n, values) in enumerate(entries):
-                patches[b, p, :n] = values
+            for p, (center, rid, start, end, duration, n,
+                    sample_start, sample_end) in enumerate(entries):
+                if patches is not None:
+                    values = analysis_data[b][sample_start:sample_end]
+                    patches[b, p, :n, :values.shape[1]] = values.to(dtype=patches.dtype)
                 patch_len[b, p] = n
                 patch_pad[b, p] = True
                 positions[b, p] = center
                 patch_durations[b, p] = duration
                 patch_starts[b, p] = start
                 patch_ends[b, p] = end
+                patch_start_samples[b, p] = sample_start
                 resolution_ids[b, p] = rid
+
+        compact_data = None
+        compact_lengths = None
+        if defer_patch_values:
+            max_samples = max((len(values) for values in analysis_data), default=1)
+            compact_data = torch.zeros(B, max_samples, channels)
+            compact_lengths = torch.zeros(B, dtype=torch.long)
+            for b, values in enumerate(analysis_data):
+                compact_data[b, :len(values), :values.shape[1]] = values
+                compact_lengths[b] = len(values)
 
         out = {
             "patches": patches,
             "patch_len": patch_len,
             "rates": rates,
             "source_rates": source_rates,
+            "channel_source_rates": _pad_channel_rows(batch, "channel_source_rates"),
             "positions": positions,
             "patch_durations": patch_durations,
             "patch_starts": patch_starts,
             "patch_ends": patch_ends,
+            "patch_start_samples": patch_start_samples,
             "resolution_ids": resolution_ids,
             "resolution_count": len(pair),
             "patch_seconds": pair,
-            "texts": [item["texts"] for item in batch],
+            "texts": _pad_channel_text(batch, "texts"),
             # Factored text conditioning (docs/design/TEXT_CONDITIONING.md §4b), read ONLY by the
             # factored path. Tolerant of manual items (eval/tests) that omit them — those keep the
             # legacy per_channel path where these are unused (None), so the default is unaffected.
-            "role_texts": [item.get("role_texts") for item in batch],
+            "role_texts": _pad_channel_text(batch, "role_texts"),
             "sensor_texts": [item.get("sensor_texts") for item in batch],
             "sensor_target_texts": [
                 item.get("sensor_target_texts", item.get("sensor_texts")) for item in batch
             ],
-            "sensor_id": (torch.stack([item["sensor_id"] for item in batch])
-                          if "sensor_id" in batch[0] else None),
+            "sensor_id": _pad_channel_rows(batch, "sensor_id"),
+            "device_id": _pad_sensor_rows(batch, "device_id"),
             # Sensor-placement metadata is used only to constrain physically valid JEPA masks.
             "sensor_placement": _pad_sensor_rows(batch, "sensor_placement"),
             "labels": torch.tensor([item["label_id"] for item in batch]),
@@ -1384,6 +1740,9 @@ class MultiResolutionCollate:
             "channel_mask": channel_mask,
             "patch_padding_mask": patch_pad,
         }
+        if defer_patch_values:
+            out["compact_data"] = compact_data
+            out["compact_lengths"] = compact_lengths
         if "sensor_bias" in batch[0]:
             out["sensor_bias"] = _pad_sensor_rows(batch, "sensor_bias")
         return out

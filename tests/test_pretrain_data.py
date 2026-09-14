@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
@@ -665,3 +666,26 @@ def test_patch_duration_draw_is_independent_of_activity_labels():
         MultiScaleCollate(seed=5)._patch_seconds(relabeled)
     assert MultiResolutionCollate(seed=5, max_batch_tokens=0)._patch_seconds(base) == \
         MultiResolutionCollate(seed=5, max_batch_tokens=0)._patch_seconds(relabeled)
+
+
+def test_four_second_resolution_uses_bounded_physical_analysis_rate():
+    """Long filterbank patches stay below DFT capacity without changing physical duration."""
+    from training.tokenizer.pretrain_data import (
+        DFT_SIZE, FILTERBANK_LONG_PATCH_ANALYSIS_HZ, MultiResolutionCollate,
+    )
+
+    item = {
+        "data": np.zeros((int(6 * 240), 6), dtype=np.float32),
+        "rate": 240.0,
+        "source_rate": 240.0,
+        "texts": ["x"] * 6,
+        "label_id": 0,
+        "channel_mask": torch.ones(6, dtype=torch.bool),
+    }
+    output = MultiResolutionCollate(fixed_patch_seconds=(0.5, 1.0, 2.0, 4.0))([item])
+    assert output["rates"].tolist() == [FILTERBANK_LONG_PATCH_ANALYSIS_HZ]
+    assert output["source_rates"].tolist() == [240.0]
+    assert int(output["patch_len"].max()) <= DFT_SIZE
+    four_second = output["resolution_ids"].eq(3) & output["patch_padding_mask"]
+    assert torch.allclose(output["patch_durations"][four_second], torch.tensor([4.0, 2.0]))
+    assert torch.isclose(output["patch_durations"][four_second].sum(), torch.tensor(6.0))

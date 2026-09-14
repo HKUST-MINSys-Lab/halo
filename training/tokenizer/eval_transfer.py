@@ -27,7 +27,8 @@ from training.tokenizer.pretrain_data import (DFT_SIZE, modalities_present,
                                               stream_sensor_bias, stream_sensor_texts,
                                               _stream_gravity_state,
                                               MultiResolutionCollate, MultiScaleCollate,
-                                              STREAM_SOURCE_RATE_HZ, VAL_RESOLUTION_PAIR)
+                                              STREAM_SOURCE_RATE_HZ, VAL_RESOLUTION_PAIR,
+                                              merge_device_items)
 from data.scripts.curate.deployment_policy import PHASE_A_TRANSFER_DATASETS, stream_specs
 
 # Held-out eval streams are derived from the deployment policy, not maintained as a second manual
@@ -169,9 +170,13 @@ def build_encoder(
         d_model=c["d_model"], num_layers=c["num_layers"], num_heads=c["num_heads"],
         dim_feedforward=c["dim_feedforward"],
         dropout=float(c.get("dropout", 0.1)) if training else 0.0,
-        # Capacity was implicit before the high-rate corpus expansion. Missing metadata therefore
-        # means the historical 256-sample architecture; every new checkpoint serializes its value.
-        dft_size=int(c.get("dft_size", FB_DFT_SIZE)),
+        # Support-classifier snapshots from the 8-second/multi-resolution recipe used the
+        # 512-point current DFT before it was serialized. Older Phase-A snapshots used 256.
+        # New checkpoints always persist this field; the architecture version resolves known
+        # historical support snapshots without changing unrelated Phase-A reproduction.
+        dft_size=int(c.get("dft_size", 512 if ckpt.get("architecture_version") in {
+            "support_classifier_v2", "support_token_mixer_v1",
+        } else 256)),
         frontend=frontend,                                  # reconstruct the ACTUAL arm (was: always filterbank)
         trunk=c.get("trunk", "dual"),
         descriptor_prediction=bool(descriptor_prediction),
@@ -203,18 +208,51 @@ def build_encoder(
         filter_shape_min=c.get("filter_shape_min", 1.5),
         filter_shape_max=c.get("filter_shape_max", 2.5),
         adaptive_gate_init=c.get("adaptive_gate_init", 0.1),
+        # Missing means a checkpoint predates the widened fixed-filterbank input. Reconstructing
+        # it with neutral legacy dimensions is mandatory for strict state-dict compatibility.
+        use_polarization=bool(c.get("use_polarization", False)),
+        polarization_energy_kappa=float(c.get("polarization_energy_kappa", 0.05)),
     )
     if frontend == "continuous":
         # The continuous frontend lays its analysis frames on the physical patch grid it was built
         # for; reconstruct that grid rather than assuming one-second tokens.
         kw["patch_seconds"] = float(c.get("patch_seconds", PATCH_SECONDS))
     elif frontend == "multispan":
-        from model.tokenizer.multispan_kernel import MS_FRAMES_PER_SPAN, MS_SPANS_S
+        from model.tokenizer.multispan_kernel import MS_FRAME_RATE_HZ, MS_FRAMES_PER_SPAN, MS_SPANS_S
 
         kw["spans"] = tuple(float(s) for s in c.get(
             "multispan_durations", c.get("spans", MS_SPANS_S),
         ))
-        kw["frames_per_span"] = int(c.get("frames_per_span", MS_FRAMES_PER_SPAN))
+        if "multispan_frame_rate_hz" in c or "frame_rate_hz" in c:
+            kw.update(
+                frame_rate_hz=int(c.get("multispan_frame_rate_hz", c.get(
+                    "frame_rate_hz", MS_FRAME_RATE_HZ,
+                ))),
+                frames_per_span=None,
+                centre_spacing=c.get("multispan_centre_spacing", c.get(
+                    "centre_spacing", "log",
+                )),
+                compression_scale=c.get("multispan_compression_scale", c.get(
+                    "compression_scale", "calibrated",
+                )),
+                stem=c.get("multispan_stem", c.get("stem", "conv")),
+                stem_channels=int(c.get("multispan_stem_channels", c.get("stem_channels", 128))),
+                stem_kernel=int(c.get("multispan_stem_kernel", c.get("stem_kernel", 5))),
+                stem_dilations=tuple(c.get("multispan_stem_dilations", c.get(
+                    "stem_dilations", (1, 2, 4),
+                ))),
+                stem_shared=bool(c.get("multispan_stem_shared", c.get("stem_shared", True))),
+            )
+        else:
+            # Revision-2 checkpoints used span-relative hops and harmonic centres. Reconstruct
+            # those exact semantics rather than applying the new frontend defaults.
+            kw.update(
+                frame_rate_hz=None,
+                frames_per_span=int(c.get("frames_per_span", MS_FRAMES_PER_SPAN)),
+                centre_spacing="harmonic",
+                compression_scale="none",
+                stem="none",
+            )
     enc = SetTokenizerEncoder(**kw)
     loaded = enc.load_state_dict(
         ckpt["encoder"],
@@ -426,6 +464,8 @@ def encode_dataset_detailed(enc, data, texts, device, rate: float, gravity_state
                 valid = int(lengths[row]) if lengths is not None else data.shape[1]
                 window = torch.tensor(np.asarray(data[row, :valid]), dtype=torch.float32)
                 item = {"data": window, "rate": rate, "source_rate": source_rate,
+                        "channel_source_rates": torch.full(
+                            (window.shape[1],), source_rate, dtype=torch.float32),
                         "texts": enc_texts, "label_id": 0,
                         "channel_mask": cmask, "gravity_state": gravity_state, "source": "eval"}
                 if factored:
@@ -454,7 +494,9 @@ def encode_dataset_detailed(enc, data, texts, device, rate: float, gravity_state
                     patch_padding_mask=batch["patch_padding_mask"].to(device),
                     sensor_texts=(batch["sensor_texts"] if factored else None),
                     sensor_id=(batch["sensor_id"].to(device) if factored else None),
-                    source_rate_hz=batch["source_rates"].to(device),
+                    source_rate_hz=(batch["channel_source_rates"]
+                                    if batch.get("channel_source_rates") is not None
+                                    else batch["source_rates"]).to(device),
                     sensor_bias=(batch["sensor_bias"].to(device)
                                  if getattr(enc, "token_granularity", "channel") == "sensor" else None),
                 )
@@ -596,6 +638,86 @@ def encode_dataset(enc, data, texts, device, rate: float, gravity_state=None,
         amp_dtype=amp_dtype,
         _require_patches=False,
     )["pooled"]
+
+
+@torch.no_grad()
+def encode_multi_device_dataset(enc, members, device,
+                                amp_dtype: torch.dtype | None = None,
+                                batch_size: int = 128) -> torch.Tensor:
+    """Encode exact-aligned devices jointly through HALO's variable-sensor path."""
+    if len(members) < 2 or any(member.n_windows != members[0].n_windows for member in members):
+        raise ValueError("HALO multi-device encoding requires aligned non-empty members")
+    rates = {float(member.rate_hz) for member in members}
+    if len(rates) != 1:
+        raise ValueError("HALO currently requires one sampled clock within a composite cell")
+    use_multi = bool(getattr(enc, "multiresolution", enc.use_duration_embedding))
+    dft_size = int(getattr(getattr(enc, "filterbank", None), "S", DFT_SIZE))
+    collate = (MultiResolutionCollate(
+        fixed_patch_seconds=getattr(enc, "eval_resolutions", VAL_RESOLUTION_PAIR),
+        min_resolution_ratio=getattr(enc, "min_resolution_ratio", 1.75), dft_size=dft_size,
+    ) if use_multi else MultiScaleCollate(
+        fixed_patch_seconds=getattr(enc, "eval_patch_seconds", PATCH_SECONDS), dft_size=dft_size,
+    ))
+    outputs = []
+    for start in range(0, members[0].n_windows, batch_size):
+        items = []
+        stop = min(start + batch_size, members[0].n_windows)
+        for row in range(start, stop):
+            device_items = []
+            for member in members:
+                valid = int(member.lengths[row]) if member.lengths is not None else member.windows.shape[1]
+                mask = torch.as_tensor(member.mask, dtype=torch.bool)
+                modalities = modalities_present(mask.tolist())
+                gravity = member.gravity_state or _stream_gravity_state(member.dataset, member.stream)
+                roles, sensors, sensor_ids = stream_sensor_texts(
+                    member.dataset, member.stream,
+                    gravity_removed=gravity == "removed",
+                    has_accel="accel" in modalities, has_gyro="gyro" in modalities,
+                )
+                device_items.append({
+                    "data": torch.as_tensor(np.asarray(member.windows[row, :valid]), dtype=torch.float32),
+                    "rate": float(member.rate_hz),
+                    "source_rate": min(
+                        float(member.rate_hz),
+                        float(STREAM_SOURCE_RATE_HZ.get(
+                            f"{member.dataset}/{member.stream}", member.rate_hz,
+                        )),
+                    ),
+                    "channel_source_rates": torch.full(
+                        (len(member.channels),), min(
+                            float(member.rate_hz),
+                            float(STREAM_SOURCE_RATE_HZ.get(
+                                f"{member.dataset}/{member.stream}", member.rate_hz,
+                            )),
+                        ), dtype=torch.float32,
+                    ),
+                    "texts": stream_channel_descriptions(member.dataset, member.stream),
+                    "role_texts": roles, "sensor_texts": sensors,
+                    "sensor_target_texts": sensors,
+                    "sensor_id": torch.as_tensor(sensor_ids),
+                    "sensor_bias": stream_sensor_bias(member.dataset, member.stream, modalities),
+                    "channel_mask": mask, "gravity_state": gravity,
+                    "label_id": 0, "source": member.dataset, "stream": member.stream,
+                })
+            items.append(merge_device_items(device_items))
+        batch = collate(items)
+        with torch.amp.autocast(device.type, enabled=device.type == "cuda" and amp_dtype is not None,
+                                dtype=amp_dtype or torch.float16):
+            encoded = enc(
+                batch["patches"].to(device), batch["rates"].to(device),
+                batch["patch_len"].to(device), batch["role_texts"], batch["positions"].to(device),
+                patch_durations=batch["patch_durations"].to(device),
+                resolution_ids=batch["resolution_ids"].to(device),
+                channel_mask=batch["channel_mask"].to(device),
+                patch_padding_mask=batch["patch_padding_mask"].to(device),
+                sensor_texts=batch["sensor_texts"], sensor_id=batch["sensor_id"].to(device),
+                device_id=batch["device_id"].to(device), source_rate_hz=(
+                    batch["channel_source_rates"] if batch.get("channel_source_rates") is not None
+                    else batch["source_rates"]).to(device),
+                sensor_bias=(batch["sensor_bias"].to(device) if batch.get("sensor_bias") is not None else None),
+            )
+        outputs.append(encoded["pooled"].float().cpu())
+    return torch.cat(outputs)
 
 
 def knn_balanced_acc(train_z, train_y, test_z, test_y, k=KNN_K) -> float:

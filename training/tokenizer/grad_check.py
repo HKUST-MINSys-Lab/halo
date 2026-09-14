@@ -95,7 +95,7 @@ def main() -> None:
     )
     frontend.finalize_norm_stats()
     target_frontend = model.physical_target_analyzer
-    target_frontend.load_state_dict(frontend.state_dict())
+    target_frontend.copy_normalization_from(frontend)
     teacher = copy.deepcopy(model.encoder).eval().requires_grad_(False)
 
     patches = batch["patches"].float()
@@ -117,6 +117,7 @@ def main() -> None:
     )
     analysis = model.encoder.analyze(
         patches, rates, lengths, source_rate_hz=batch["source_rates"],
+        sensor_id=sensor_id, channel_mask=channel_mask,
     )
     sensor_tokens = model.encoder.project_tokens(
         analysis, sensor_id=sensor_id, channel_mask=channel_mask,
