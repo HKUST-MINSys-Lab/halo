@@ -15,6 +15,7 @@ import json
 import math
 import os
 import random
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -24,8 +25,9 @@ import torch.nn.functional as F
 
 from data.scripts.curate import deployment_policy
 from model.blocks import AttentionSpec
-from model.tokenizer.multispan_kernel import MS_SPANS_S, MS_FRAMES_PER_SPAN
+from model.tokenizer.multispan_kernel import MS_SPANS_S, MS_FRAME_RATE_HZ
 from model.support.token_mixer import SupportTokenMixer, TokenMixerConfig
+from model.support.residual_classifier import ResidualSupportClassifier, ResidualClassifierConfig
 from training.support_classifier.corpus import support_corpus_from_index
 from training.support_classifier.sampling import (
     DEFAULT_ENROLLMENT_K,
@@ -40,8 +42,13 @@ from training.support_classifier.sampling import (
     balanced_query_indices,
     draw_batch,
 )
-from training.support_classifier.collate import SupportCollate
-from training.support_classifier.encoding import autocast, build_random_encoder, encode_batch
+from training.support_classifier.collate import BucketedSupportBatch, SupportCollate
+from training.support_classifier.encoding import (
+    autocast,
+    build_random_encoder,
+    encode_batch,
+    install_compiled_transformer,
+)
 from training.support_classifier.neighbors import DEFAULT_TEMPERATURE, differentiable_neighbor_logits
 from training.tokenizer.eval_transfer import build_encoder
 from training.tokenizer.pretrain_data import (
@@ -123,7 +130,15 @@ def _prefetch_worker(corpus, dataset, collate, data_seed, batch_size, draw_kwarg
             episodes, telemetry = draw_batch(
                 corpus, episode_rng(data_seed, step), batch_size=batch_size, **draw_kwargs,
             )
-            batch = collate([dataset[position] for position in episode_positions(episodes, corpus)])
+            positions = episode_positions(episodes, corpus)
+            # Structural device selection belongs to the deterministic episode stream, not
+            # global NumPy state inherited by a forked worker.
+            batch = collate([
+                dataset.item_with_rng(
+                    position, episode_rng(data_seed, step * 1_000_003 + occurrence),
+                )
+                for occurrence, position in enumerate(positions)
+            ])
             results.put((step, episodes, telemetry, batch, None))
         except Exception as error:      # noqa: BLE001 - surfaced in the parent, which re-raises
             results.put((step, None, None, None, repr(error)))
@@ -143,7 +158,7 @@ class PrefetchLoader:
     """
 
     def __init__(self, corpus, dataset, collate, *, data_seed: int, batch_size: int,
-                 draw_kwargs: dict, workers: int = 4, depth: int = 2, start_step: int = 1):
+                 draw_kwargs: dict, workers: int = 4, depth: int = 1, start_step: int = 1):
         if workers < 1:
             raise ValueError("PrefetchLoader needs at least one worker; use draw_batch directly")
         import torch.multiprocessing as mp
@@ -276,9 +291,65 @@ def recording_rows(encoded: dict) -> tuple[torch.Tensor, torch.Tensor]:
         raise KeyError("the support classifier needs pooled, descriptor and sensor_present outputs")
     if bool((~present.any(dim=1)).any()):
         raise ValueError("an encoded recording carries no real sensor")
+    device_id = encoded.get("device_id")
     weight = present.unsqueeze(-1).to(descriptor.dtype)
-    merged = (descriptor * weight).sum(dim=1) / weight.sum(dim=1).clamp_min(1.0)
+    if device_id is None or not bool((device_id > 0).any()):
+        merged = (descriptor * weight).sum(dim=1) / weight.sum(dim=1).clamp_min(1.0)
+    else:
+        per_device = []
+        valid_device = []
+        for slot in range(int(device_id.max().item()) + 1):
+            member = (device_id == slot) & present
+            member_weight = member.unsqueeze(-1).to(descriptor.dtype)
+            per_device.append(
+                (descriptor * member_weight).sum(dim=1)
+                / member_weight.sum(dim=1).clamp_min(1.0)
+            )
+            valid_device.append(member.any(dim=1))
+        values = torch.stack(per_device, dim=1)
+        valid = torch.stack(valid_device, dim=1).unsqueeze(-1).to(values.dtype)
+        merged = (values * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1.0)
     return pooled, F.normalize(merged.float(), dim=-1)
+
+
+def encode_recording_rows(
+    encoder,
+    batch: dict | BucketedSupportBatch,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Encode one dense batch or width buckets and restore dataset-row order.
+
+    Splitting by channel count is mathematically independent across recordings. Concatenating and
+    restoring rows before episode assembly therefore preserves the loss and all gradients while
+    avoiding batch-wide multi-device padding.
+    """
+    if not isinstance(batch, BucketedSupportBatch):
+        encoded = encode_batch(encoder, batch, device)
+        pooled, descriptor = recording_rows(encoded)
+        device_present = encoded.get("device_present")
+        device_count = (device_present.any(dim=1).sum(dim=1).float()
+                        if device_present is not None else pooled.new_ones(len(pooled)))
+        return pooled, descriptor, device_count
+
+    pooled_parts = []
+    descriptor_parts = []
+    device_count_parts = []
+    for dense in batch.batches:
+        encoded = encode_batch(encoder, dense, device)
+        pooled, descriptor = recording_rows(encoded)
+        device_present = encoded.get("device_present")
+        device_count = (device_present.any(dim=1).sum(dim=1).float()
+                        if device_present is not None else pooled.new_ones(len(pooled)))
+        pooled_parts.append(pooled)
+        descriptor_parts.append(descriptor)
+        device_count_parts.append(device_count)
+    restore = batch.restore_order.to(device, non_blocking=True)
+    pooled = torch.cat(pooled_parts, dim=0).index_select(0, restore)
+    descriptor = torch.cat(descriptor_parts, dim=0).index_select(0, restore)
+    device_count = torch.cat(device_count_parts, dim=0).index_select(0, restore)
+    if pooled.shape[0] != batch.row_count:
+        raise RuntimeError("bucketed encoder did not restore every recording row")
+    return pooled, descriptor, device_count
 
 
 def episode_positions(episodes: list[Episode], corpus: SupportCorpus) -> list[int]:
@@ -456,23 +527,23 @@ def episode_loss(
     target = torch.tensor([episode.gt_slot for episode in episodes], dtype=torch.long, device=device)
     per_episode = F.nll_loss(log_probability, target, reduction="none")
 
-    # Several queries may share one support roster. Give each independently drawn support set equal
-    # weight even when a sparse source cannot supply the requested number of distinct query
-    # executions. Legacy episodes carry id -1 and retain the ordinary query mean.
+    # Several queries may share an original roster, but per-query candidate masking can put them
+    # in different information regimes. Equalize each roster within each regime; assigning a
+    # roster the first query's regime makes the objective depend on row order.
     support_set_ids = torch.tensor(
         [episode.support_set_id for episode in episodes], dtype=torch.long, device=device,
     )
     if bool(support_set_ids.ge(0).all()):
-        unique_ids = list(dict.fromkeys(episode.support_set_id for episode in episodes))
+        unique_ids = list(dict.fromkeys(
+            (episode.support_set_id, episode.is_zero_shot) for episode in episodes
+        ))
         set_losses = torch.stack([
             per_episode[[index for index, episode in enumerate(episodes)
-                         if episode.support_set_id == set_id]].mean()
+                         if (episode.support_set_id, episode.is_zero_shot) == set_id]].mean()
             for set_id in unique_ids
         ])
         set_is_zero = torch.tensor([
-            next(episode.is_zero_shot for episode in episodes
-                 if episode.support_set_id == set_id)
-            for set_id in unique_ids
+            is_zero for _, is_zero in unique_ids
         ], dtype=torch.bool, device=device)
         # The two heads solve different information conditions.  Weight their set means equally
         # whenever both occur, rather than letting whichever regime produced more query windows
@@ -526,6 +597,8 @@ def build_dataset(index: CorpusIndex, args) -> PretrainDataset:
     return PretrainDataset(
         index, index.train, augment=False, two_view=False,
         neutral_acquisition_text=args.neutral_acquisition_text,
+        multi_device_probability=args.multi_device_probability,
+        max_devices=args.max_devices,
     )
 
 
@@ -536,7 +609,7 @@ def run_step(
     dataset: PretrainDataset,
     collate,
     encoder,
-    classifier: SupportTokenMixer | None,
+    classifier: SupportTokenMixer | ResidualSupportClassifier | None,
     classifier_mode: str,
     text_of,
     device: torch.device,
@@ -547,9 +620,8 @@ def run_step(
     otherwise the windows are loaded and collated here, on the calling thread."""
     if batch is None:
         positions = episode_positions(episodes, corpus)
-        batch = collate(_load_items(dataset, positions, executor))
-    encoded = encode_batch(encoder, batch, device)
-    pooled, descriptor = recording_rows(encoded)
+        batch = collate.bucketed(_load_items(dataset, positions, executor))
+    pooled, descriptor, device_count = encode_recording_rows(encoder, batch, device)
 
     rows = split_encoded(pooled, descriptor, episodes, corpus)
     text = episode_text(episodes, corpus, text_of, device)
@@ -562,7 +634,7 @@ def run_step(
             text["candidate_mask"], temperature=TAU_SUPPORT,
         )
         output = {"logits": logits, "support_weight": weight}
-    else:
+    elif classifier_mode == "token_mixer":
         if classifier is None:
             raise ValueError("token-mixer mode requires a classifier")
         output = classifier(
@@ -576,9 +648,21 @@ def run_step(
             candidate_text=text["candidate_text"], candidate_mask=text["candidate_mask"],
             candidate_slot=text["candidate_slot"],
         )
+    elif classifier_mode == "residual":
+        if not isinstance(classifier, ResidualSupportClassifier):
+            raise ValueError("residual mode requires ResidualSupportClassifier")
+        output = classifier(
+            query_feature=query, support_feature=rows["support_feature"],
+            support_label_text=text["support_label_text"], support_bound=text["support_bound"],
+            support_mask=rows["support_mask"], support_pair_slot=text["support_pair_slot"],
+            candidate_text=text["candidate_text"], candidate_mask=text["candidate_mask"],
+            candidate_slot=text["candidate_slot"],
+        )
+    else:
+        raise ValueError(f"unknown classifier mode {classifier_mode!r}")
     loss = episode_loss(output["logits"], episodes, text)
     return {**loss, **output, "pooled": pooled, "text": text, "rows": rows,
-            "readout": classifier_mode}
+            "device_count": device_count, "readout": classifier_mode}
 
 
 def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, float]:
@@ -607,7 +691,26 @@ def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, flo
         "vote/effective_support_rows": float(effective_rows.mean()),
         "vote/support_entropy": float(entropy.mean()),
         "sampler/candidate_padding_fraction": float((~mask).float().mean()),
+        "batch/mean_device_count": float(result["device_count"].mean()),
+        "batch/multi_device_fraction": float(result["device_count"].gt(1).float().mean()),
     }
+    if "r_support" in result:
+        metrics.update({
+            "classifier/mean_abs_r_support": (
+                float(result["r_support"].detach().abs().mean()) if result["r_support"].numel() else 0.0
+            ),
+            "classifier/mean_abs_r_candidate": float(result["r_candidate"].detach().abs().mean()),
+            "classifier/masked_candidate_fraction": float(torch.tensor(
+                [len(episode.masked_candidates) / max(1, len(episode.candidates)) for episode in episodes],
+                device=weights.device,
+            ).mean()),
+        })
+        target_text = result["text_score"].gather(1, target[:, None]).squeeze(1)
+        other_text = result["text_score"].detach().clone()
+        other_text.scatter_(1, target[:, None], float("-inf"))
+        metrics["classifier/text_score_gt_minus_max_other"] = float(
+            (target_text - other_text.max(dim=1).values).mean().detach()
+        )
     return metrics
 
 
@@ -627,6 +730,22 @@ def calibrate_frontend(
     frontend = getattr(encoder, "filterbank", None)
     if frontend is None or not hasattr(frontend, "reset_norm_accumulator"):
         return
+    if hasattr(frontend, "accumulate_compression_stats") \
+            and getattr(frontend, "compression_scale_mode", "none") == "calibrated":
+        frontend.reset_compression_accumulator()
+        for _ in range(batches):
+            indices = balanced_query_indices(corpus, rng, batch_size)
+            positions = [corpus.recordings[index].window_index for index in indices]
+            batch = collate(_load_items(dataset, positions, executor))
+            frontend.accumulate_compression_stats(
+                batch["patches"].to(device), batch["rates"].to(device),
+                batch["patch_len"].to(device),
+                patch_mask=batch["patch_padding_mask"].to(device),
+                channel_mask=batch["channel_mask"].to(device),
+                source_rate_hz=(batch["channel_source_rates"] if batch.get("channel_source_rates") is not None
+                                else batch.get("source_rates", batch["rates"])).to(device),
+            )
+        frontend.finalize_compression_stats()
     frontend.reset_norm_accumulator()
     for _ in range(batches):
         indices = balanced_query_indices(corpus, rng, batch_size)
@@ -638,11 +757,57 @@ def calibrate_frontend(
             batch["patch_len"].to(device),
             patch_mask=batch["patch_padding_mask"].to(device),
             channel_mask=batch["channel_mask"].to(device),
-            source_rate_hz=batch.get("source_rates", batch["rates"]).to(device),
+            source_rate_hz=(batch["channel_source_rates"] if batch.get("channel_source_rates") is not None
+                            else batch.get("source_rates", batch["rates"])).to(device),
         )
     frontend.finalize_norm_stats()
     if not bool(frontend._norm_fitted.item()):
         raise RuntimeError("filterbank normalization calibration did not complete")
+
+
+def fit_text_projection(
+    features: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    ridge_fraction: float = 1e-2,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the closed-form motion-to-text map and its scale-aware ridge coefficient."""
+    if features.ndim != 2 or targets.ndim != 2 or features.shape[0] != targets.shape[0]:
+        raise ValueError("features and targets must be aligned rank-2 matrices")
+    if features.shape[0] < 1 or not torch.isfinite(features).all() or not torch.isfinite(targets).all():
+        raise ValueError("text-projection calibration requires finite non-empty matrices")
+    if ridge_fraction < 0 or not math.isfinite(ridge_fraction):
+        raise ValueError("ridge_fraction must be finite and non-negative")
+    gram = features.T @ features
+    alpha = ridge_fraction * torch.trace(gram) / max(1, gram.shape[0])
+    regularized = gram + alpha * torch.eye(gram.shape[0], dtype=gram.dtype, device=gram.device)
+    return torch.linalg.solve(regularized, features.T @ targets), alpha
+
+
+@torch.no_grad()
+def initialise_text_projection(classifier: ResidualSupportClassifier, encoder, dataset, corpus,
+                               collate, text_of, rng, device, *, batches: int, batch_size: int,
+                               executor: ThreadPoolExecutor | None) -> dict[str, float]:
+    """Closed-form ridge bridge from pooled motion vectors to frozen SBERT label vectors."""
+    features, targets = [], []
+    was_training = encoder.training
+    encoder.eval()
+    for _ in range(batches):
+        indices = balanced_query_indices(corpus, rng, batch_size)
+        positions = [corpus.recordings[index].window_index for index in indices]
+        pooled, _, _ = encode_recording_rows(encoder, collate.bucketed(_load_items(dataset, positions, executor)), device)
+        features.append(pooled.float().cpu())
+        ids = torch.as_tensor(text_of.ids([corpus.recordings[index].label for index in indices]), device=text_of.matrix.device)
+        targets.append(text_of.matrix[ids].float().cpu())
+    if was_training:
+        encoder.train()
+    x, t = torch.cat(features), torch.cat(targets)
+    w, alpha = fit_text_projection(x, t)
+    classifier.p_text.weight.copy_(w.T.to(classifier.p_text.weight))
+    classifier.p_text.bias.zero_()
+    classifier.set_corpus_mean(x.mean(dim=0).to(device))
+    cosine = F.cosine_similarity(x @ w, t, dim=-1).mean()
+    return {"n": float(len(x)), "alpha": float(alpha), "mean_cosine": float(cosine)}
 
 
 @torch.no_grad()
@@ -777,6 +942,8 @@ def main() -> None:
                         help="optional Phase-A checkpoint for the warm-start arm. Omit for the "
                              "default end-to-end-from-scratch recipe, which is what every compact "
                              "checkpoint on disk actually used")
+    parser.add_argument("--allow-retired-jepa-checkpoint", action="store_true",
+                        help="allow a future-JEPA checkpoint only to reproduce a historical run")
     parser.add_argument("--frontend", choices=("fixed", "learnable", "continuous", "multispan"),
                         default="fixed",
                         help="front end for a from-scratch encoder; the design of record is fixed")
@@ -785,9 +952,14 @@ def main() -> None:
                         help="replace known artifacts in a non-empty output directory")
     parser.add_argument("--resume", type=Path, default=None,
                         help="resume model, optimizer, schedule and RNG state from a checkpoint")
+    parser.add_argument(
+        "--allow-resume-source-drift", action="store_true",
+        help="explicitly continue when checked-out source differs from the checkpoint; "
+             "current provenance is recorded in the new output",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--steps", type=int, default=35_000)
-    parser.add_argument("--episodes-per-step", type=int, default=8,
+    parser.add_argument("--episodes-per-step", type=int, default=4,
                         help="independently sampled support sets per optimizer step")
     parser.add_argument("--support-size", type=int, default=DEFAULT_SUPPORT,
                         help="legacy non-deployment sampler only; the paper path uses C * k rows")
@@ -810,10 +982,18 @@ def main() -> None:
                         help="override checkpoint acquisition-text mode; omitted inherits Phase-A")
     parser.add_argument("--freeze-encoder", action=argparse.BooleanOptionalAction, default=None,
                         help="default: train encoder and classifier together")
-    parser.add_argument("--classifier", choices=("token_mixer", "neighbors"),
-                        default="token_mixer",
-                        help="token_mixer is the full semantic head; neighbors is the simple "
-                             "differentiable support-vote control")
+    parser.add_argument("--classifier", choices=("token_mixer", "neighbors", "residual"),
+                        default="residual",
+                        help="residual is the identity-initialised unified support classifier; "
+                             "neighbors is the parameter-free control")
+    parser.add_argument("--centring", choices=("none", "support_mean", "corpus_mean"),
+                        default="support_mean")
+    parser.add_argument("--p-mask-candidate", type=float, default=0.25)
+    parser.add_argument("--p-mask-gt", type=float, default=0.10)
+    parser.add_argument("--no-residual", action="store_true")
+    parser.add_argument("--no-text-term", action="store_true")
+    parser.add_argument("--separate-trunk", action="store_true")
+    parser.add_argument("--text-temperature", type=float, default=0.07)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--encoder-lr-scale", type=float, default=None,
                         help="encoder LR multiplier on --lr; default 1.0 for the from-scratch "
@@ -837,6 +1017,10 @@ def main() -> None:
                         help="fixed support-set count for staged readouts (default: eight per "
                              "eligible held-out dataset); legacy episode count otherwise "
                              "(default 64)")
+    parser.add_argument("--multi-device-probability", type=float, default=0.5,
+                        help="probability that an aligned training row uses 2..max devices")
+    parser.add_argument("--max-devices", type=int, default=4,
+                        help="largest random aligned device subset used for one recording")
     parser.add_argument("--val-repeats-per-dataset", type=int, default=8,
                         help="internal subject-held-out support sets per eligible training dataset when "
                              "--val-episodes is omitted")
@@ -846,21 +1030,37 @@ def main() -> None:
                              "updated at --checkpoint-every")
     parser.add_argument("--calib-batches", type=int, default=20)
     parser.add_argument("--calib-batch-size", type=int, default=256)
-    parser.add_argument("--loader-workers", type=int, default=4,
+    parser.add_argument("--loader-workers", type=int, default=8,
                         help="forked worker PROCESSES that draw, load and collate upcoming steps "
                              "while the GPU trains (PrefetchLoader). 0 = synchronous on the main "
                              "thread. The episode sequence is identical for any value. Thread "
                              "pools were removed: the per-window work holds the GIL and 8 "
                              "threads measured 2.5-3.5x slower than none (2026-09-05)")
+    parser.add_argument(
+        "--compile-transformer", action=argparse.BooleanOptionalAction, default=False,
+        help="compile the tensor-only temporal transformer core; batch/text orchestration stays eager",
+    )
     parser.add_argument("--max-per-stream", type=int, default=None)
+    parser.add_argument(
+        "--window-seconds", type=float, default=8.0,
+        help="duration-qualified source grids used for classifier training (default: 8 s)",
+    )
     parser.add_argument("--patch-seconds", type=float, default=PATCH_SECONDS,
                         help="single filterbank patch duration; ignored with --resolutions")
+    parser.add_argument("--polarization", action=argparse.BooleanOptionalAction, default=True,
+                        help="use bounded accel/gyro triad polarization features on fixed frontends")
+    parser.add_argument("--polarization-energy-kappa", type=float, default=0.05,
+                        help="scale-free silent-band gate for fixed-filterbank polarization")
     parser.add_argument("--spans", type=float, nargs="+", default=list(MS_SPANS_S),
                         metavar="SECONDS",
                         help="multispan frontend: physical kernel spans, one token grid per span")
-    parser.add_argument("--frames-per-span", type=int, default=MS_FRAMES_PER_SPAN,
-                        help="multispan frontend: envelope frames per span (token stride = "
-                             "span / this)")
+    parser.add_argument("--multispan-frame-rate-hz", type=int, default=MS_FRAME_RATE_HZ,
+                        help="multispan frontend: dense analysis frames per physical second")
+    parser.add_argument("--multispan-centre-spacing", choices=("harmonic", "log"), default="log")
+    parser.add_argument("--multispan-compression-scale", choices=("none", "calibrated"),
+                        default="calibrated")
+    parser.add_argument("--multispan-stem", choices=("none", "conv"), default="conv")
+    parser.add_argument("--freeze-kernels", action="store_true")
     parser.add_argument("--resolutions", type=float, nargs="+", default=None,
                         metavar="SECONDS",
                         help="encode each recording on two or more explicitly tagged "
@@ -868,6 +1068,18 @@ def main() -> None:
     parser.add_argument("--smoke", action="store_true",
                         help="three steps on capped real data with telemetry; launches nothing long")
     args = parser.parse_args()
+    if args.resolutions is None and args.frontend in {"fixed", "learnable"} \
+            and args.phase_a is None and args.resume is None:
+        args.resolutions = [0.5, 1.0, 2.0, 4.0]
+    if args.phase_a is not None:
+        phase_a_config = dict(
+            torch.load(args.phase_a, map_location="cpu", weights_only=False)["config"]
+        )
+        if "jepa_mode" in phase_a_config and not args.allow_retired_jepa_checkpoint:
+            parser.error(
+                "future-JEPA checkpoints are retired from the active HALO recipe; pass "
+                "--allow-retired-jepa-checkpoint only for historical reproduction"
+            )
     if args.val_episodes is None:
         args.val_episodes = 64
     if args.label_subset is None:
@@ -875,7 +1087,7 @@ def main() -> None:
     if args.encoder_lr_scale is None:
         # A random end-to-end encoder needs the base optimizer LR.  A warm-started Phase-A
         # encoder is deliberately updated more conservatively.
-        args.encoder_lr_scale = 0.05 if args.phase_a is not None or args.resume is not None else 1.0
+        args.encoder_lr_scale = 0.05 if args.phase_a is not None else 1.0
     if args.same_subject_probability is None:
         args.same_subject_probability = DEFAULT_SAME_SUBJECT_PROBABILITY
     if args.freeze_encoder is None:
@@ -888,6 +1100,10 @@ def main() -> None:
         # A neighbor vote has no candidate-only k=0 path.  Make the control honest rather than
         # quietly giving it the semantic token mixer's zero-shot machinery.
         args.p_gt_present = 1.0
+    if not 0.0 <= args.p_mask_candidate <= 1.0 or not 0.0 <= args.p_mask_gt <= 1.0:
+        parser.error("support-mask probabilities must be in [0, 1]")
+    if args.text_temperature <= 0:
+        parser.error("text-temperature must be positive")
 
     if args.smoke:
         args.steps = min(args.steps, 3)
@@ -901,7 +1117,7 @@ def main() -> None:
         args.calib_batch_size = min(args.calib_batch_size, 32)
         args.max_per_stream = args.max_per_stream or 200
 
-    if args.steps < 1 or not 0 <= args.warmup_steps < args.steps:
+    if args.steps < 1 or (args.resume is None and not 0 <= args.warmup_steps < args.steps):
         parser.error("steps must be positive and warmup-steps must be in [0, steps)")
     if min(args.episodes_per_step, args.support_size, args.queries_per_support_set,
            args.windows_per_execution, args.log_every, args.val_every, args.val_episodes,
@@ -910,22 +1126,26 @@ def main() -> None:
         parser.error("episode, support, validation, checkpoint and calibration counts must be positive")
     if args.loader_workers < 0:
         parser.error("loader-workers must be nonnegative")
+    if not 0.0 <= args.multi_device_probability <= 1.0 or args.max_devices < 2:
+        parser.error("multi-device-probability must be in [0,1] and max-devices at least 2")
     if not 0.0 <= args.p_gt_present <= 1.0:
         parser.error("p-gt-present must be in [0,1]")
     if not 0.0 <= args.same_subject_probability <= 1.0:
         parser.error("same-subject-probability must be in [0,1]")
     if args.encoder_lr_scale <= 0:
         parser.error("encoder-lr-scale must be positive")
-    if args.frontend_lr_scale <= 0 or args.frontend_reg_weight < 0:
-        parser.error("frontend-lr-scale must be positive and frontend-reg-weight nonnegative")
+    if args.frontend_lr_scale < 0 or args.frontend_reg_weight < 0:
+        parser.error("frontend-lr-scale and frontend-reg-weight must be nonnegative")
     if not args.enrollment_k or any(value < 1 for value in args.enrollment_k):
         parser.error("enrollment-k values must be positive")
     if args.label_subset[0] < 2 or args.label_subset[1] < args.label_subset[0]:
         parser.error("label-subset must be LOW HIGH with 2 <= LOW <= HIGH")
     if args.label_subset[1] > TokenMixerConfig().max_candidates:
         parser.error("label-subset HIGH exceeds the token mixer's candidate capacity")
-    if args.patch_seconds <= 0:
-        parser.error("patch-seconds must be positive")
+    if args.patch_seconds <= 0 or args.window_seconds <= 0:
+        parser.error("patch-seconds and window-seconds must be positive")
+    if not math.isfinite(args.polarization_energy_kappa) or args.polarization_energy_kappa < 0:
+        parser.error("polarization-energy-kappa must be finite and non-negative")
     if args.resolutions is not None:
         if len(args.resolutions) < 2 or any(value <= 0 for value in args.resolutions):
             parser.error("resolutions requires at least two positive durations")
@@ -946,8 +1166,8 @@ def main() -> None:
         if len(args.spans) < 2 or any(s <= 0 for s in args.spans) \
                 or len(set(args.spans)) != len(args.spans):
             parser.error("spans must be at least two distinct positive durations in seconds")
-        if args.frames_per_span < 1:
-            parser.error("frames-per-span must be positive")
+        if args.multispan_frame_rate_hz < 1:
+            parser.error("multispan-frame-rate-hz must be positive")
         args.spans = sorted(float(s) for s in args.spans)
 
     torch.manual_seed(args.seed)
@@ -967,6 +1187,48 @@ def main() -> None:
         torch.load(args.resume, map_location="cpu", weights_only=False)
         if args.resume is not None else None
     )
+    if resume_blob is not None:
+        # A continuation is not a second experiment: inherit every data/model/optimizer setting
+        # that determines its trajectory.  Only --steps and operational settings such as output,
+        # worker count and logging cadence may differ.  Explicit incompatible overrides fail
+        # instead of silently drawing a different curriculum after the checkpoint is restored.
+        saved = dict(resume_blob.get("trajectory") or {})
+        resume_fields = {
+            "frontend": "--frontend", "patch_seconds": "--patch-seconds",
+            "window_seconds": "--window-seconds", "resolutions": "--resolutions",
+            "support_size": "--support-size", "enrollment_k": "--enrollment-k",
+            "queries_per_support_set": "--queries-per-support-set",
+            "windows_per_execution": "--windows-per-execution",
+            "p_gt_present": "--p-gt-present", "p_mask_candidate": "--p-mask-candidate",
+            "p_mask_gt": "--p-mask-gt", "same_subject_probability": "--same-subject-probability",
+            "multi_device_probability": "--multi-device-probability", "max_devices": "--max-devices",
+            "label_subset": "--label-subset", "mode": "--mode",
+            "classifier": "--classifier",
+            "freeze_encoder": "--freeze-encoder", "lr": "--lr",
+            "encoder_lr_scale": "--encoder-lr-scale",
+            "frontend_lr_scale": "--frontend-lr-scale",
+            "frontend_reg_weight": "--frontend-reg-weight", "spans": "--spans",
+            "warmup_steps": "--warmup-steps", "grad_clip": "--grad-clip",
+            "weight_decay": "--weight-decay", "seed": "--seed", "data_seed": "--data-seed",
+            "max_per_stream": "--max-per-stream",
+        }
+        for field, option in resume_fields.items():
+            if field not in saved:
+                continue
+            saved_value = saved[field]
+            current_value = getattr(args, field)
+            if option in sys.argv and current_value != saved_value:
+                parser.error(f"{option} differs from the resume checkpoint trajectory")
+            setattr(args, field, saved_value)
+        # These values are captured in the residual classifier's state/config, not a mutable
+        # run flag. Reject attempts to pretend they can be changed on an existing optimizer.
+        if resume_blob.get("architecture_version") in {"support_classifier_v2", "support_classifier_v3"}:
+            for option in ("--centring", "--no-residual", "--no-text-term", "--separate-trunk",
+                           "--text-temperature"):
+                if option in sys.argv:
+                    parser.error(f"{option} cannot change a resumed residual classifier")
+        if args.steps < 1 or not 0 <= args.warmup_steps < args.steps:
+            parser.error("resume checkpoint warmup-steps must be in [0, --steps)")
     source_config = (
         dict(resume_blob["config"]) if resume_blob is not None
         else dict(torch.load(args.phase_a, map_location="cpu", weights_only=False)["config"])
@@ -994,6 +1256,7 @@ def main() -> None:
     index = CorpusIndex(
         max_per_stream=args.max_per_stream, seed=args.data_seed,
         datasets=deployment_policy.SUPERVISED_HEAD_TRAIN_DATASETS, alignment="native",
+        window_seconds=args.window_seconds,
     )
     print(f"[compare] corpus: {index.summary()}", flush=True)
     corpus = support_corpus_from_index(index)
@@ -1005,6 +1268,11 @@ def main() -> None:
     val_dataset = PretrainDataset(
         index, index.val, augment=False, two_view=False,
         neutral_acquisition_text=args.neutral_acquisition_text,
+        # Use the same deterministic structural-composition policy as training.  Validation
+        # remains subject-disjoint and non-augmented, but must exercise a declared deployed
+        # multi-device regime before a sealed composite cell is attempted.
+        multi_device_probability=args.multi_device_probability,
+        max_devices=args.max_devices,
     )
     base_collate = (
         MultiResolutionCollate(fixed_patch_seconds=tuple(args.resolutions))
@@ -1025,13 +1293,15 @@ def main() -> None:
         "enrollment_k": tuple(args.enrollment_k),
         "queries_per_support_set": args.queries_per_support_set,
         "windows_per_execution": args.windows_per_execution,
+        "p_mask_candidate": args.p_mask_candidate if args.classifier == "residual" else 0.0,
+        "p_mask_gt": args.p_mask_gt if args.classifier == "residual" else 0.0,
     }
     # Fork the prefetch workers NOW, before the encoder, the text tower or any library thread
     # exists: forking a process that has live threads can deadlock the child on a lock a thread
     # held at fork time. The workers only need the corpus, the dataset and the collate.
     loader = (
         PrefetchLoader(
-            corpus, dataset, collate, data_seed=args.data_seed,
+            corpus, dataset, collate.bucketed, data_seed=args.data_seed,
             batch_size=args.episodes_per_step, draw_kwargs=draw_kwargs,
             workers=args.loader_workers,
             start_step=(int(resume_blob["step"]) if resume_blob is not None else 0) + 1,
@@ -1040,17 +1310,24 @@ def main() -> None:
     )
 
     if resume_blob is not None:
-        if resume_blob.get("architecture_version") != "support_token_mixer_v1":
-            raise SystemExit(
-                "cannot resume a retired scalar-reranker checkpoint; start a new token-mixer run"
-            )
         encoder_config = dict(resume_blob["config"])
         encoder = build_encoder(resume_blob, device, training=True)
         spec = AttentionSpec(**resume_blob["attention_spec"])
-        classifier = (
-            SupportTokenMixer(spec, TokenMixerConfig(**resume_blob["classifier_config"])).to(device)
-            if args.classifier == "token_mixer" else None
-        )
+        version = resume_blob.get("architecture_version")
+        if version in {"support_classifier_v2", "support_classifier_v3"}:
+            classifier_config = dict(resume_blob["classifier_config"])
+            # v2 used raw additive token composition. Do not change historical checkpoints just
+            # because the new normalized composition is now the default.
+            if version == "support_classifier_v2":
+                classifier_config.setdefault("normalized_token_composition", False)
+            classifier = ResidualSupportClassifier(
+                spec, ResidualClassifierConfig(**classifier_config),
+            ).to(device) if args.classifier == "residual" else None
+        elif version == "support_token_mixer_v1":
+            classifier = SupportTokenMixer(spec, TokenMixerConfig(**resume_blob["classifier_config"])).to(device) \
+                if args.classifier == "token_mixer" else None
+        else:
+            raise SystemExit(f"unsupported support-classifier checkpoint version: {version!r}")
         if classifier is not None:
             classifier.load_state_dict(resume_blob["classifier"])
         print(f"[compare] resuming {args.resume} at step {resume_blob['step']}", flush=True)
@@ -1070,9 +1347,19 @@ def main() -> None:
             frontend_kwargs = {"patch_seconds": float(args.patch_seconds)}
         elif multispan:
             frontend_kwargs = {
-                "spans": tuple(grid_durations), "frames_per_span": int(args.frames_per_span),
-                # RoPE's fastest period spans two of the finest group's frame strides.
-                "rope_min_period": 2.0 * grid_durations[0] / args.frames_per_span,
+                "spans": tuple(grid_durations),
+                "frame_rate_hz": int(args.multispan_frame_rate_hz),
+                "centre_spacing": args.multispan_centre_spacing,
+                "compression_scale": args.multispan_compression_scale,
+                "stem": args.multispan_stem,
+                "rope_min_period": (8.0 / args.multispan_frame_rate_hz
+                                    if args.multispan_stem == "conv"
+                                    else 2.0 / args.multispan_frame_rate_hz),
+            }
+        else:
+            frontend_kwargs = {
+                "use_polarization": bool(args.polarization),
+                "polarization_energy_kappa": float(args.polarization_energy_kappa),
             }
         encoder, encoder_config = build_random_encoder(
             device, args.frontend, neutral_acquisition_text=args.neutral_acquisition_text,
@@ -1087,9 +1374,22 @@ def main() -> None:
             "token_grid_owner": "frontend" if multispan else "collate",
             "use_duration_embedding": grid_durations is not None,
             "num_resolutions": len(grid_durations) if grid_durations is not None else 2,
-            **({"spans": grid_durations, "frames_per_span": int(args.frames_per_span),
+            **({"spans": grid_durations,
+                "multispan_durations": grid_durations,
+                "multispan_frame_rate_hz": int(args.multispan_frame_rate_hz),
+                "multispan_centre_spacing": args.multispan_centre_spacing,
+                "multispan_compression_scale": args.multispan_compression_scale,
+                "multispan_stem": args.multispan_stem,
+                "multispan_stem_channels": 128,
+                "multispan_stem_kernel": 5,
+                "multispan_stem_dilations": [1, 2, 4],
+                "multispan_stem_shared": True,
                 "rope_min_period": frontend_kwargs["rope_min_period"]} if multispan else {}),
             "patch_seconds": float(args.patch_seconds),
+            **({
+                "use_polarization": bool(args.polarization),
+                "polarization_energy_kappa": float(args.polarization_energy_kappa),
+            } if args.frontend in {"fixed", "learnable"} else {}),
             "short_patch_choices": [
                 float(grid_durations[0]) if grid_durations is not None
                 else 0.4
@@ -1136,14 +1436,21 @@ def main() -> None:
         print(f"[compare] warm-started from {args.phase_a}", flush=True)
     if resume_blob is None:
         spec = AttentionSpec(d_model=encoder.d_model, n_heads=4, ffn_mult=2, dropout=0.1)
-        classifier = SupportTokenMixer(spec, TokenMixerConfig()).to(device) \
-            if args.classifier == "token_mixer" else None
+        classifier = (ResidualSupportClassifier(
+            spec, ResidualClassifierConfig(
+                centring=args.centring, residual_enabled=not args.no_residual,
+                text_term_enabled=not args.no_text_term, shared_trunk=not args.separate_trunk,
+                text_temperature=args.text_temperature,
+            )).to(device) if args.classifier == "residual" else
+            SupportTokenMixer(spec, TokenMixerConfig()).to(device) if args.classifier == "token_mixer" else None)
     print(f"[compare] classifier={args.classifier}", flush=True)
     if hasattr(encoder, "mask_token"):
         encoder.mask_token.requires_grad_(False)
     if args.freeze_encoder:
         encoder.requires_grad_(False)
         encoder.eval()
+    if args.compile_transformer and install_compiled_transformer(encoder):
+        print("[compare] torch.compile requested for dynamic transformer core", flush=True)
 
     frontend = getattr(encoder, "filterbank", None)
     if resume_blob is None and args.phase_a is None:
@@ -1159,6 +1466,19 @@ def main() -> None:
     text_of = make_label_text(
         list(corpus.all_labels) + list(val_corpus.all_labels), device,
     )
+    p_text_init = None
+    if resume_blob is None and isinstance(classifier, ResidualSupportClassifier):
+        p_text_init = initialise_text_projection(
+            classifier, encoder, dataset, corpus, collate, text_of, rng, device,
+            batches=args.calib_batches, batch_size=args.calib_batch_size, executor=executor,
+        )
+        print(f"[compare] initialized residual text bridge on {int(p_text_init['n'])} rows "
+              f"(cos={p_text_init['mean_cosine']:.3f})", flush=True)
+
+    if frontend is not None and hasattr(frontend, "adaptation_parameters") \
+            and (args.freeze_kernels or args.frontend_lr_scale == 0):
+        for parameter in frontend.adaptation_parameters():
+            parameter.requires_grad_(False)
 
     classifier_params = ([] if classifier is None else
                          [parameter for parameter in classifier.parameters() if parameter.requires_grad])
@@ -1192,24 +1512,40 @@ def main() -> None:
             "episodes_per_step": args.episodes_per_step,
             "frontend": args.frontend,
             "patch_seconds": args.patch_seconds,
+            "window_seconds": args.window_seconds,
+            "max_per_stream": args.max_per_stream,
             "resolutions": args.resolutions,
             "support_size": args.support_size,
             "enrollment_k": list(args.enrollment_k),
             "queries_per_support_set": args.queries_per_support_set,
             "windows_per_execution": args.windows_per_execution,
             "p_gt_present": args.p_gt_present,
+            "p_mask_candidate": args.p_mask_candidate,
+            "p_mask_gt": args.p_mask_gt,
             "same_subject_probability": args.same_subject_probability,
+            "multi_device_probability": args.multi_device_probability,
+            "max_devices": args.max_devices,
+            "device_sampling_version": 2,
             "label_subset": list(args.label_subset),
             "mode": args.mode,
             "neutral_acquisition_text": args.neutral_acquisition_text,
             "classifier": args.classifier,
+            "classifier_config": (dataclasses.asdict(classifier.cfg)
+                                  if isinstance(classifier, ResidualSupportClassifier) else None),
             "freeze_encoder": args.freeze_encoder,
             "lr": args.lr,
             "encoder_lr_scale": args.encoder_lr_scale,
             "frontend_lr_scale": args.frontend_lr_scale,
             "frontend_reg_weight": args.frontend_reg_weight,
             "spans": list(args.spans) if args.frontend == "multispan" else None,
-            "frames_per_span": args.frames_per_span if args.frontend == "multispan" else None,
+            "multispan_frame_rate_hz": (args.multispan_frame_rate_hz
+                                         if args.frontend == "multispan" else None),
+            "multispan_centre_spacing": (args.multispan_centre_spacing
+                                          if args.frontend == "multispan" else None),
+            "multispan_compression_scale": (args.multispan_compression_scale
+                                              if args.frontend == "multispan" else None),
+            "multispan_stem": args.multispan_stem if args.frontend == "multispan" else None,
+            "freeze_kernels": bool(args.freeze_kernels),
             "weight_decay": args.weight_decay,
             "warmup_steps": args.warmup_steps,
             "grad_clip": args.grad_clip,
@@ -1220,18 +1556,40 @@ def main() -> None:
     start_step = 0
     if resume_blob is not None:
         saved_trajectory = dict(resume_blob.get("trajectory") or {})
+        # A continuation intentionally extends the total cosine horizon.  ``steps`` is therefore
+        # not an invariant of the model/data trajectory: every other field remains exact-match
+        # guarded below.  This lets a completed run be extended without silently changing its
+        # sampler, encoder, or optimization hyperparameters.
+        saved_trajectory["steps"] = args.steps
         saved_trajectory.setdefault("classifier", "token_mixer")
         saved_trajectory.setdefault("freeze_encoder", False)
         saved_trajectory.setdefault("enrollment_k", list(DEFAULT_ENROLLMENT_K))
         saved_trajectory.setdefault("queries_per_support_set", DEFAULT_QUERIES_PER_SUPPORT_SET)
         saved_trajectory.setdefault("windows_per_execution", DEFAULT_WINDOWS_PER_EXECUTION)
         saved_trajectory.setdefault("patch_seconds", PATCH_SECONDS)
+        saved_trajectory.setdefault("window_seconds", 6.0)
+        saved_trajectory.setdefault(
+            "max_per_stream", (resume_blob.get("args") or {}).get("max_per_stream"),
+        )
         legacy_resolutions = saved_trajectory.pop("resolution_pair", None)
+        saved_trajectory.pop("frames_per_span", None)
         saved_trajectory.setdefault("resolutions", legacy_resolutions)
         saved_trajectory.setdefault("frontend_lr_scale", 1.0)
         saved_trajectory.setdefault("frontend_reg_weight", 0.0)
         saved_trajectory.setdefault("spans", None)
-        saved_trajectory.setdefault("frames_per_span", None)
+        saved_trajectory.setdefault("multispan_frame_rate_hz", None)
+        saved_trajectory.setdefault("multispan_centre_spacing", None)
+        saved_trajectory.setdefault("multispan_compression_scale", None)
+        saved_trajectory.setdefault("multispan_stem", None)
+        saved_trajectory.setdefault("freeze_kernels", False)
+        # Candidate masking changes the information condition, not merely logging.  Historical
+        # residual snapshots predate explicit trajectory fields but used these initial defaults.
+        saved_trajectory.setdefault("p_mask_candidate", 0.25)
+        saved_trajectory.setdefault("p_mask_gt", 0.10)
+        saved_trajectory.setdefault(
+            "classifier_config",
+            dataclasses.asdict(classifier.cfg) if isinstance(classifier, ResidualSupportClassifier) else None,
+        )
         if saved_trajectory != trajectory:
             raise SystemExit("resume trajectory differs from the checkpoint configuration")
         optimizer.load_state_dict(resume_blob["optimizer"])
@@ -1252,9 +1610,15 @@ def main() -> None:
         if not isinstance(saved_source, dict) or any(
             saved_source.get(key) != source.get(key) for key in ("head", "patch_sha256")
         ):
-            raise SystemExit(
-                "resume source fingerprint differs from the checkpoint; use its recorded source "
-                "or start a new run"
+            if not args.allow_resume_source_drift:
+                raise SystemExit(
+                    "resume source fingerprint differs from the checkpoint; use its recorded source "
+                    "or start a new run"
+                )
+            print(
+                "[compare] WARNING: continuing with explicit source drift; "
+                "current provenance will be recorded in this output",
+                flush=True,
             )
     serial_source = write_source_provenance(args.out, source)
     (args.out / "runtime_provenance.json").write_text(json.dumps(runtime, indent=2) + "\n")
@@ -1269,6 +1633,8 @@ def main() -> None:
     }, indent=2) + "\n")
 
     config = dict(encoder_config)
+    if getattr(encoder, "filterbank", None) is not None:
+        config["dft_size"] = int(encoder.filterbank.S)
     config["neutral_acquisition_text"] = bool(args.neutral_acquisition_text)
 
     latest_validation: dict[str, float] | None = resume_blob.get("validation") if resume_blob else None
@@ -1282,10 +1648,12 @@ def main() -> None:
         return {
             "config": config,
             "encoder": encoder.state_dict(),
-            "architecture_version": "support_token_mixer_v1",
+            "architecture_version": ("support_classifier_v3" if args.classifier == "residual"
+                                     else "support_token_mixer_v1"),
             "classifier": None if classifier is None else classifier.state_dict(),
             "classifier_config": None if classifier is None else dataclasses.asdict(classifier.cfg),
             "attention_spec": dataclasses.asdict(spec),
+            "p_text_init": p_text_init,
             "args": {key: (str(value) if isinstance(value, Path) else value)
                      for key, value in vars(args).items()},
             "trajectory": trajectory,
@@ -1382,10 +1750,12 @@ def main() -> None:
         )
         duration_grad = _parameter_grad_norm(duration_parameters) if log_step else 0.0
         frontend_grad = _parameter_grad_norm(frontend_params) if log_step and frontend_params else 0.0
-        frontend_summary = (
-            {**frontend.adaptation_summary(), **frontend.runtime_summary()}
-            if log_step and frontend_params and hasattr(frontend, "adaptation_summary") else {}
-        )
+        frontend_summary = {}
+        if log_step and frontend is not None:
+            if frontend_params and hasattr(frontend, "adaptation_summary"):
+                frontend_summary.update(frontend.adaptation_summary())
+            if hasattr(frontend, "runtime_summary"):
+                frontend_summary.update(frontend.runtime_summary())
         preclip = float(torch.nn.utils.clip_grad_norm_(
             classifier_params + encoder_params, args.grad_clip, error_if_nonfinite=True,
         ))

@@ -2,8 +2,83 @@ import queue
 from types import SimpleNamespace
 
 import pytest
+import torch
 
+from training.support_classifier.collate import SupportCollate
+from training.support_classifier.encoding import materialize_deferred_patches
 from training.support_classifier.train import PrefetchLoader, episode_rng
+from training.tokenizer.pretrain_data import (
+    MultiResolutionCollate,
+    _bounded_analysis_view,
+    _bounded_analysis_views,
+)
+
+
+def _item(samples: int, channels: int, value: float) -> dict:
+    sensors = channels // 3
+    return {
+        "data": torch.arange(samples * channels, dtype=torch.float32).reshape(samples, channels)
+        * value,
+        "rate": 50.0,
+        "source_rate": 50.0,
+        "channel_source_rates": torch.full((channels,), 50.0),
+        "texts": ["axis"] * channels,
+        "role_texts": ["axis"] * channels,
+        "sensor_texts": ["sensor"] * sensors,
+        "sensor_target_texts": ["sensor"] * sensors,
+        "sensor_id": torch.arange(channels) // 3,
+        "device_id": torch.arange(sensors) // 2,
+        "sensor_placement": torch.arange(sensors) // 2,
+        "label_id": 0,
+        "channel_mask": torch.ones(channels, dtype=torch.bool),
+        "gravity_state": "present",
+        "source": "synthetic",
+        "stream": "synthetic_stream",
+        "window_index": 0,
+        "subject": "synthetic_subject",
+    }
+
+
+def test_deferred_patch_materialization_is_exact():
+    base = MultiResolutionCollate(fixed_patch_seconds=(0.5, 1.0, 1.5))
+    items = [_item(300, 6, 0.01), _item(237, 6, -0.02)]
+    expected = base(items)
+    deferred = base.deferred(items)
+    actual = materialize_deferred_patches(deferred, torch.device("cpu"))
+    assert torch.equal(actual, expected["patches"])
+    for key in ("patch_len", "patch_padding_mask", "positions", "patch_durations",
+                "resolution_ids"):
+        assert torch.equal(deferred[key], expected[key])
+
+
+def test_batched_long_patch_analysis_matches_individual_resampling():
+    items = [_item(600, 6, 0.01), _item(600, 6, -0.02), _item(120, 6, 0.03)]
+    items[0]["rate"] = items[1]["rate"] = 100.0
+    items[2]["rate"] = 20.0
+    durations = (0.5, 1.0, 2.0, 4.0)
+    actual = _bounded_analysis_views(items, durations)
+    for item, (values, rate) in zip(items, actual):
+        expected, expected_rate = _bounded_analysis_view(
+            item["data"], float(item["rate"]), durations,
+        )
+        assert rate == expected_rate
+        assert torch.allclose(values, torch.as_tensor(expected), atol=1e-6, rtol=1e-6)
+
+
+def test_support_collate_buckets_by_channel_width_and_restores_order():
+    collate = SupportCollate(MultiResolutionCollate(
+        fixed_patch_seconds=(0.5, 1.0, 1.5),
+    ))
+    bucketed = collate.bucketed([
+        _item(300, 12, 0.01), _item(300, 6, 0.02), _item(300, 12, 0.03),
+    ])
+    assert [batch["compact_data"].shape[-1] for batch in bucketed.batches] == [6, 12]
+    assert [indices.tolist() for indices in bucketed.row_indices] == [[1], [0, 2]]
+    assert bucketed.restore_order.tolist() == [1, 0, 2]
+    restored = torch.cat([
+        indices.float().unsqueeze(1) for indices in bucketed.row_indices
+    ]).index_select(0, bucketed.restore_order)
+    assert restored.squeeze(1).tolist() == [0.0, 1.0, 2.0]
 
 
 def _loader():

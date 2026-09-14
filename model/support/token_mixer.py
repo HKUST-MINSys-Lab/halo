@@ -206,7 +206,7 @@ class SupportTokenMixer(nn.Module):
                 candidate_mask=candidate_mask.index_select(0, zero_rows),
                 candidate_slot=candidate_slot.index_select(0, zero_rows),
             )
-            logits.index_copy_(0, zero_rows, result["logits"])
+            logits.index_copy_(0, zero_rows, result["logits"].to(logits.dtype))
         if len(few_rows):
             if any(value is None for value in (support_feature, support_label_text, support_bound,
                                                support_mask, support_pair_slot)):
@@ -222,9 +222,9 @@ class SupportTokenMixer(nn.Module):
                 support_pair_slot=support_pair_slot.index_select(0, few_rows),
                 candidate_mask=candidate_mask.index_select(0, few_rows),
             )
-            logits.index_copy_(0, few_rows, result["logits"])
+            logits.index_copy_(0, few_rows, result["logits"].to(logits.dtype))
             support_weight = query_feature.new_zeros(support_mask.shape, dtype=torch.float32)
-            support_weight.index_copy_(0, few_rows, result["support_weight"])
+            support_weight.index_copy_(0, few_rows, result["support_weight"].to(support_weight.dtype))
         return {"logits": logits, "support_weight": support_weight}
 
     def telemetry(self) -> dict[str, float]:

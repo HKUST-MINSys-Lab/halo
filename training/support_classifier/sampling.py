@@ -296,6 +296,9 @@ class Episode:
     support_set_id: int = -1
     requested_candidates: int = 0
     subject_relation_fallback: bool = False
+    # Candidate slots whose otherwise valid enrolled rows were deliberately withheld. This is
+    # training-only supervision for the text-only portion of the unified residual classifier.
+    masked_candidates: tuple[int, ...] = ()
 
     @property
     def is_zero_shot(self) -> bool:
@@ -776,6 +779,8 @@ def _draw_deployment_support_set(
     windows_per_execution: int,
     semantic_zero_shot: bool,
     query_dataset: str | None = None,
+    p_mask_candidate: float = 0.0,
+    p_mask_gt: float = 0.0,
 ) -> list[Episode] | None:
     """Draw one deployment-shaped support roster and several independent query executions."""
     query_index = _choose_query(corpus, rng, query_dataset)
@@ -854,20 +859,39 @@ def _draw_deployment_support_set(
     )
     if len(candidates) < low or not support:
         return None
+    if not 0.0 <= p_mask_candidate <= 1.0 or not 0.0 <= p_mask_gt <= 1.0:
+        raise ValueError("candidate masking probabilities must be in [0, 1]")
     query_rows = _additional_queries(
         corpus, rng, base_query=query_index, keys=keys, candidates=candidates,
         support=support, relation=relation, count=queries_per_support_set,
     )
     requested = len(candidates) * k
-    return [Episode(
-        query=row, support=tuple(support), support_candidate=tuple(slots),
-        candidates=candidates, gt_slot=candidates.index(corpus.recordings[row].label), mode=mode,
-        requested_support=requested, shrunk=False, zero_shot=False,
-        subject_relation=relation, support_window_groups=tuple(groups),
-        support_per_candidate=k, support_set_id=support_set_id,
-        requested_candidates=requested_labels,
-        subject_relation_fallback=relation_fallback,
-    ) for row in query_rows]
+    episodes = []
+    for row in query_rows:
+        row_gt_slot = candidates.index(corpus.recordings[row].label)
+        masked = [
+            slot for slot in range(len(candidates))
+            if slot != row_gt_slot and rng.random() < p_mask_candidate
+        ]
+        if rng.random() < p_mask_gt:
+            masked.append(row_gt_slot)
+        masked_tuple = tuple(sorted(set(masked)))
+        masked_set = set(masked_tuple)
+        keep = [index for index, slot in enumerate(slots) if slot not in masked_set]
+        row_support = tuple(support[index] for index in keep)
+        row_slots = tuple(slots[index] for index in keep)
+        row_groups = tuple(groups[index] for index in keep)
+        episodes.append(Episode(
+            query=row, support=row_support, support_candidate=row_slots,
+            candidates=candidates, gt_slot=row_gt_slot, mode=mode,
+            requested_support=requested, shrunk=False, zero_shot=not row_support,
+            subject_relation=relation, support_window_groups=row_groups,
+            support_per_candidate=k, support_set_id=support_set_id,
+            requested_candidates=requested_labels,
+            subject_relation_fallback=relation_fallback,
+            masked_candidates=masked_tuple,
+        ))
+    return episodes
 
 
 def _eligible_deployment_datasets(
@@ -957,6 +981,8 @@ def draw_batch(
     enrollment_k: Sequence[int] = DEFAULT_ENROLLMENT_K,
     queries_per_support_set: int = DEFAULT_QUERIES_PER_SUPPORT_SET,
     windows_per_execution: int = DEFAULT_WINDOWS_PER_EXECUTION,
+    p_mask_candidate: float = 0.0,
+    p_mask_gt: float = 0.0,
     **kwargs,
 ) -> tuple[list[Episode], dict[str, float]]:
     """Draw ``batch_size`` episodes plus the telemetry that makes the draw auditable."""
@@ -1009,6 +1035,7 @@ def draw_batch(
                     queries_per_support_set=queries_per_support_set,
                     windows_per_execution=windows_per_execution,
                     query_dataset=query_dataset,
+                    p_mask_candidate=p_mask_candidate, p_mask_gt=p_mask_gt,
                     **kwargs,
                 )
                 if group:
@@ -1024,7 +1051,10 @@ def draw_batch(
             support_sets.append(group)
         episodes = [episode for group in support_sets for episode in group]
         query_counts = [len(group) for group in support_sets]
-        regime_episodes = [group[0] for group in support_sets]
+        support_set_episodes = [group[0] for group in support_sets]
+        # Support-set-level values remain useful for data diversity, but regime and GT-support
+        # telemetry must use every query because candidate masking is deliberately per query.
+        regime_episodes = episodes
     else:
         query_counts = [1] * batch_size
 
@@ -1045,12 +1075,15 @@ def draw_batch(
                 "with a silently smaller batch"
             )
         regime_episodes = episodes
-    zero_shot = sum(1 for episode in regime_episodes if episode.is_zero_shot)
+        support_set_episodes = episodes
+    zero_shot = sum(1 for episode in episodes if episode.is_zero_shot)
+    gt_supported = [any(slot == episode.gt_slot for slot in episode.support_candidate)
+                    for episode in episodes]
     query_datasets = [corpus.recordings[episode.query].dataset for episode in episodes]
     query_labels = [corpus.recordings[episode.query].label for episode in episodes]
     dataset_counts = {value: query_datasets.count(value) for value in set(query_datasets)}
     support_set_datasets = [
-        corpus.recordings[episode.query].dataset for episode in regime_episodes
+        corpus.recordings[episode.query].dataset for episode in support_set_episodes
     ]
     support_set_dataset_counts = {
         value: support_set_datasets.count(value) for value in set(support_set_datasets)
@@ -1064,8 +1097,15 @@ def draw_batch(
         }
         duplicate_executions.append(len(episode.support) - len(units))
     telemetry = {
-        "sampler/realised_gt_rate": 1.0 - zero_shot / len(regime_episodes),
-        "sampler/zero_shot_rate": zero_shot / len(regime_episodes),
+        "sampler/realised_gt_rate": float(np.mean(gt_supported)),
+        "sampler/zero_shot_rate": zero_shot / len(episodes),
+        "sampler/gt_support_present_rate": float(np.mean(gt_supported)),
+        "sampler/partial_gt_mask_rate": float(np.mean([
+            (not present) and bool(episode.support) for present, episode in zip(gt_supported, episodes)
+        ])),
+        "sampler/masked_candidate_fraction": float(np.mean([
+            len(episode.masked_candidates) / max(1, len(episode.candidates)) for episode in episodes
+        ])),
         "sampler/same_subject_rate": sum(
             episode.subject_relation == "same_subject" for episode in regime_episodes
             if not episode.is_zero_shot
@@ -1086,10 +1126,10 @@ def draw_batch(
         "sampler/query_label_count": float(len(set(query_labels))),
         "sampler/max_query_dataset_share": max(dataset_counts.values()) / len(episodes),
         "sampler/max_support_set_dataset_share": (
-            max(support_set_dataset_counts.values()) / len(regime_episodes)
+            max(support_set_dataset_counts.values()) / len(support_set_episodes)
         ),
         "sampler/min_support_set_dataset_share": (
-            min(support_set_dataset_counts.values()) / len(regime_episodes)
+            min(support_set_dataset_counts.values()) / len(support_set_episodes)
         ),
         "sampler/duplicate_support_execution_mean": float(np.mean(duplicate_executions)),
         "sampler/support_set_count": float(len(query_counts)),
@@ -1118,8 +1158,9 @@ def draw_batch(
             count < queries_per_support_set for count in query_counts
         ])) if deployment_matched else 0.0,
         "sampler/mean_k_per_candidate": float(np.mean([
-            episode.support_per_candidate for episode in regime_episodes if not episode.is_zero_shot
-        ])) if any(not episode.is_zero_shot for episode in regime_episodes) else 0.0,
+            len(episode.support) / max(1, len(episode.candidates))
+            for episode in episodes if not episode.is_zero_shot
+        ])) if any(not episode.is_zero_shot for episode in episodes) else 0.0,
         "sampler/mean_windows_per_support_execution": float(np.mean([
             len(group) for episode in episodes for group in episode.support_window_groups
         ])) if any(episode.support_window_groups for episode in episodes) else 1.0,
@@ -1127,6 +1168,6 @@ def draw_batch(
     if deployment_matched:
         for value in dict.fromkeys(int(item) for item in enrollment_k):
             telemetry[f"sampler/k_{value}_support_set_fraction"] = sum(
-                episode.support_per_candidate == value for episode in regime_episodes
-            ) / len(regime_episodes)
+                episode.support_per_candidate == value for episode in support_set_episodes
+            ) / len(support_set_episodes)
     return episodes, telemetry

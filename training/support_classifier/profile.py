@@ -1,7 +1,8 @@
-"""Bounded, full-corpus training-throughput probe; never writes model checkpoints.
+"""Bounded profile of the current support-classifier training recipe.
 
-Run with OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 python -m training.support_classifier.profile --out /tmp/profile.json.
-Timing excludes setup and validation. Episode hashes make before/after sampling changes visible.
+This profiles the deployment-shaped residual classifier or differentiable-neighbour control.
+Optional validation only uses the training roster's held-out subjects; no checkpoints or sealed
+results are written. Worker-count variants run sequentially.
 """
 from __future__ import annotations
 
@@ -16,110 +17,316 @@ import numpy as np
 import torch
 
 from data.scripts.curate.deployment_policy import SUPERVISED_HEAD_TRAIN_DATASETS
-from model.blocks import AttentionSpec
-from model.support.token_mixer import SupportTokenMixer, TokenMixerConfig
-from training.support_classifier.corpus import support_corpus_from_index
-from training.support_classifier.train import (
-    PrefetchLoader, build_dataset, calibrate_frontend, make_label_text, make_optimizer, run_step,
-)
 from training.support_classifier.collate import SupportCollate
-from training.support_classifier.encoding import autocast, build_random_encoder
-from training.tokenizer.pretrain_data import CorpusIndex, MultiScaleCollate, PATCH_SECONDS
+from training.support_classifier.corpus import support_corpus_from_index
+from training.support_classifier.encoding import (
+    autocast,
+    build_random_encoder,
+    install_compiled_transformer,
+)
+from training.support_classifier.neighbors import differentiable_neighbor_logits
+from model.blocks import AttentionSpec
+from model.support.residual_classifier import ResidualClassifierConfig, ResidualSupportClassifier
+from training.support_classifier.train import (
+    TAU_SUPPORT,
+    PrefetchLoader,
+    build_dataset,
+    calibrate_frontend,
+    episode_loss,
+    episode_text,
+    encode_recording_rows,
+    make_label_text,
+    make_optimizer,
+    initialise_text_projection,
+    split_encoded,
+    validate,
+)
+from training.tokenizer.pretrain_data import CorpusIndex, MultiResolutionCollate, PretrainDataset
 
 
-def main():
+def _event() -> torch.cuda.Event:
+    return torch.cuda.Event(enable_timing=True)
+
+
+def _mean(values: list[float]) -> float:
+    return float(np.mean(values)) if values else 0.0
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--workers", type=int, nargs="+", default=[2, 4])
-    parser.add_argument("--episodes", type=int, default=8)
-    parser.add_argument("--steps", type=int, default=24)
+    parser.add_argument("--workers", type=int, nargs="+", default=[2, 4, 6, 8])
+    parser.add_argument("--classifier", choices=("residual", "neighbors"), default="residual")
+    parser.add_argument("--support-sets", type=int, default=4,
+                        help="independent support sets per optimizer step")
+    parser.add_argument("--queries-per-support-set", type=int, default=4)
+    parser.add_argument("--steps", type=int, default=28)
     parser.add_argument("--warmup", type=int, default=8)
-    parser.add_argument("--pin-memory", action="store_true")
+    parser.add_argument("--resolutions", type=float, nargs="+", default=[0.5, 1.0, 2.0, 4.0])
+    parser.add_argument("--trace", action="store_true", help="profile one additional step")
+    parser.add_argument("--validation-support-sets", type=int, default=0,
+                        help="optional bounded timing of subject-held-out validation (0 disables)")
+    parser.add_argument("--multi-device-probability", type=float, default=0.5)
+    parser.add_argument("--window-seconds", type=float, default=8.0)
+    parser.add_argument("--max-devices", type=int, default=4)
+    parser.add_argument("--polarization", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--compile-transformer", action=argparse.BooleanOptionalAction,
+                        default=False)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
-    if args.episodes < 1 or min(args.workers) < 1 or not 0 <= args.warmup < args.steps <= 100:
+    if args.support_sets < 1 or min(args.workers) < 1 \
+            or not 0 <= args.warmup < args.steps <= 100:
         parser.error("positive worker counts and 0 <= warmup < steps <= 100 required")
+    if not 0 <= args.validation_support_sets <= 64:
+        parser.error("validation timing is bounded to 0..64 support sets")
+
     torch.set_num_threads(2)
     device = torch.device("cuda")
     torch.backends.cuda.matmul.fp32_precision = "tf32"
     torch.backends.cudnn.conv.fp32_precision = "tf32"
-    index = CorpusIndex(datasets=SUPERVISED_HEAD_TRAIN_DATASETS, alignment="native",
-                        max_per_stream=None, seed=20260901)
+    setup_started = time.perf_counter()
+    index = CorpusIndex(
+        datasets=SUPERVISED_HEAD_TRAIN_DATASETS, alignment="native",
+        max_per_stream=None, seed=20260901, window_seconds=args.window_seconds,
+    )
     corpus = support_corpus_from_index(index)
-    # Profile the same deployment-shaped episodes used by the trainer. A profile using the
-    # simpler legacy sampler produces attractive but irrelevant timing and memory numbers.
-    args.neutral_acquisition_text = False
-    dataset = build_dataset(index, args)
-    collate = SupportCollate(MultiScaleCollate(fixed_patch_seconds=PATCH_SECONDS))
-    # Fork CPU workers before constructing any CUDA models or text-tower threads.
+    dataset_args = argparse.Namespace(
+        neutral_acquisition_text=False,
+        multi_device_probability=args.multi_device_probability,
+        max_devices=args.max_devices,
+    )
+    dataset = build_dataset(index, dataset_args)
+    collate = SupportCollate(MultiResolutionCollate(
+        fixed_patch_seconds=tuple(args.resolutions),
+    ))
     draw_kwargs = {
+        "p_gt_present": 0.5 if args.classifier == "residual" else 1.0,
+        "p_mask_candidate": 0.25 if args.classifier == "residual" else 0.0,
+        "p_mask_gt": 0.10 if args.classifier == "residual" else 0.0,
+        "same_subject_probability": 0.5,
+        "label_subset": (2, 32),
+        "mode": "compatible",
         "semantic_zero_shot": True,
         "deployment_matched": True,
+        "enrollment_k": (1, 2, 4, 8),
+        "queries_per_support_set": args.queries_per_support_set,
+        "windows_per_execution": 2,
     }
-    loaders = {n: PrefetchLoader(corpus, dataset, collate, data_seed=20260901,
-                                batch_size=args.episodes, draw_kwargs=draw_kwargs, workers=n)
-               for n in args.workers}
+
+    corpus_setup_seconds = time.perf_counter() - setup_started
+    print(f"[profile] full training corpus ready in {corpus_setup_seconds:.1f}s", flush=True)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
     results = []
-    try:
-        for workers, loader in loaders.items():
+    for workers in args.workers:
+        # Fork before CUDA/text initialization. Only this variant's workers exist during timing.
+        loader = PrefetchLoader(
+            corpus, dataset, collate.bucketed, data_seed=20260901,
+            batch_size=args.support_sets, draw_kwargs=draw_kwargs, workers=workers,
+        )
+        try:
             torch.manual_seed(7)
-            encoder, _ = build_random_encoder(device, "fixed", neutral_acquisition_text=False)
+            encoder, _ = build_random_encoder(
+                device, "fixed", neutral_acquisition_text=False,
+                duration_range=(min(args.resolutions), max(args.resolutions)),
+                num_resolutions=len(args.resolutions),
+                frontend_kwargs={
+                    "use_polarization": args.polarization,
+                    "polarization_energy_kappa": 0.05,
+                },
+            )
             encoder.train()
             encoder.mask_token.requires_grad_(False)
-            classifier = SupportTokenMixer(
-                AttentionSpec(d_model=128, n_heads=4, ffn_mult=2, dropout=.1),
-                TokenMixerConfig(),
-            ).to(device)
-            calibrate_frontend(encoder, dataset, corpus, collate, np.random.default_rng(7), device,
-                               batches=1, batch_size=128, executor=None)
+            if args.compile_transformer:
+                install_compiled_transformer(encoder)
+            calibrate_frontend(
+                encoder, dataset, corpus, collate, np.random.default_rng(7), device,
+                batches=1, batch_size=64, executor=None,
+            )
             text = make_label_text(corpus.all_labels, device)
-            parameters = [p for m in (encoder, classifier) for p in m.parameters() if p.requires_grad]
-            optimizer = make_optimizer([
-                {"name": "encoder", "params": [p for p in encoder.parameters() if p.requires_grad],
-                 "lr": 1.5e-5},
-                {"name": "classifier", "params": classifier.parameters(), "lr": 3e-4},
-            ], weight_decay=.05, device=device)
-            times, waits = [], []
+            classifier = (ResidualSupportClassifier(
+                AttentionSpec(d_model=encoder.d_model, n_heads=4, ffn_mult=2, dropout=0.1),
+                ResidualClassifierConfig(),
+            ).to(device).train() if args.classifier == "residual" else None)
+            if classifier is not None:
+                initialise_text_projection(
+                    classifier, encoder, dataset, corpus, collate, text,
+                    np.random.default_rng(7), device, batches=1, batch_size=64, executor=None,
+                )
+            parameters = [p for p in encoder.parameters() if p.requires_grad]
+            if classifier is not None:
+                parameters += list(classifier.parameters())
+            optimizer = make_optimizer(
+                [{"name": "encoder", "params": parameters, "lr": 3e-4}],
+                weight_decay=.05, device=device,
+            )
+            timings = {name: [] for name in (
+                "step", "loader_wait", "encode", "recording_pool", "episode_assembly",
+                "neighbors_loss", "backward", "clip", "optimizer",
+            )}
             digest = hashlib.sha256()
+            shape_samples = []
             torch.cuda.reset_peak_memory_stats()
+            trace = None
             for step in range(1, args.steps + 1):
+                if args.trace and step == args.steps:
+                    trace = torch.profiler.profile(activities=[
+                        torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA,
+                    ])
+                    trace.__enter__()
                 torch.cuda.synchronize()
                 started = time.perf_counter()
                 episodes, _, batch = loader.get(step)
-                if args.pin_memory:
-                    batch = {k: v.pin_memory() if isinstance(v, torch.Tensor) else v
-                             for k, v in batch.items()}
-                wait = time.perf_counter() - started
+                loader_done = time.perf_counter()
                 optimizer.zero_grad(set_to_none=True)
+
+                marks = [_event() for _ in range(8)]
+                marks[0].record()
                 with autocast(device):
-                    result = run_step(episodes=episodes, corpus=corpus, dataset=dataset,
-                                      collate=collate, encoder=encoder, classifier=classifier,
-                                      classifier_mode="token_mixer", text_of=text, device=device,
-                                      batch=batch)
-                if not bool(torch.isfinite(result["loss"])):
-                    raise FloatingPointError("non-finite profile loss")
-                result["loss"].backward()
+                    pooled, descriptor, _ = encode_recording_rows(encoder, batch, device)
+                    marks[1].record()
+                    marks[2].record()
+                    rows = split_encoded(pooled, descriptor, episodes, corpus)
+                    episode_vectors = episode_text(episodes, corpus, text, device)
+                    marks[3].record()
+                    query = rows["query_feature"].squeeze(1)
+                    if classifier is None:
+                        logits, weights = differentiable_neighbor_logits(
+                            query, rows["support_feature"], episode_vectors["support_bound"],
+                            rows["support_mask"], episode_vectors["candidate_mask"],
+                            temperature=TAU_SUPPORT,
+                        )
+                    else:
+                        output = classifier(query_feature=query,
+                            support_feature=rows["support_feature"], support_mask=rows["support_mask"],
+                            **episode_vectors)
+                        logits, weights = output["logits"], output["support_weight"]
+                    loss = episode_loss(logits, episodes, episode_vectors)["loss"]
+                    marks[4].record()
+                loss.backward()
+                marks[5].record()
                 torch.nn.utils.clip_grad_norm_(parameters, 1., error_if_nonfinite=True)
+                marks[6].record()
                 optimizer.step()
+                marks[7].record()
                 torch.cuda.synchronize()
-                if step > args.warmup:
-                    times.append(time.perf_counter() - started)
-                    waits.append(wait)
-                digest.update(json.dumps([dataclasses.asdict(e) for e in episodes], sort_keys=True).encode())
-            record = {"workers": workers, "episodes": args.episodes,
-                      "mean_step_ms": 1000 * float(np.mean(times)),
-                      "median_step_ms": 1000 * float(np.median(times)),
-                      "mean_loader_wait_ms": 1000 * float(np.mean(waits)),
-                      "peak_allocated_gib": torch.cuda.max_memory_allocated() / 2**30,
-                      "pinned": batch["patches"].is_pinned(), "episode_sha256": digest.hexdigest(),
-                      "loss": float(result["loss"].detach())}
-            print(json.dumps(record), flush=True)
+                finished = time.perf_counter()
+                if trace is not None:
+                    trace.__exit__(None, None, None)
+                    trace.export_chrome_trace(str(args.out.with_suffix(f".w{workers}.trace.json")))
+                    args.out.with_suffix(f".w{workers}.operators.txt").write_text(
+                        trace.key_averages().table(sort_by="self_cuda_time_total", row_limit=40))
+
+                if step > args.warmup and trace is None:
+                    timings["step"].append(1000 * (finished - started))
+                    timings["loader_wait"].append(1000 * (loader_done - started))
+                    for name, left, right in (
+                        ("encode", 0, 1), ("recording_pool", 1, 2),
+                        ("episode_assembly", 2, 3), ("neighbors_loss", 3, 4),
+                        ("backward", 4, 5), ("clip", 5, 6), ("optimizer", 6, 7),
+                    ):
+                        timings[name].append(marks[left].elapsed_time(marks[right]))
+                    dense_batches = batch.batches
+                    shape_samples.append({
+                        "recordings": int(batch.row_count),
+                        "patches": max(int(part["patch_len"].shape[1]) for part in dense_batches),
+                        "channels": max(int(part["compact_data"].shape[-1]) for part in dense_batches),
+                        "queries": len(episodes),
+                        "max_candidates": int(episode_vectors["candidate_mask"].shape[1]),
+                        "zero_support_query_fraction": sum(e.is_zero_shot for e in episodes) / len(episodes),
+                        "support_padding_fraction": (1 - float(rows["support_mask"].float().mean())
+                                                     if rows["support_mask"].numel() else 0.0),
+                        "token_padding_fraction": 1 - float((1 + 2 * rows["support_mask"].sum()
+                            / len(episodes) + episode_vectors["candidate_mask"].sum() / len(episodes))
+                            / (1 + 2 * rows["support_mask"].shape[1] + episode_vectors["candidate_mask"].shape[1])),
+                        "max_support_rows": int(rows["support_mask"].shape[1]),
+                        "valid_support_rows": int(rows["support_mask"].sum()),
+                        "host_batch_mib": sum(
+                            value.numel() * value.element_size()
+                            for part in dense_batches for value in part.values()
+                            if isinstance(value, torch.Tensor)
+                        ) / 2**20,
+                    })
+                digest.update(json.dumps(
+                    [dataclasses.asdict(episode) for episode in episodes], sort_keys=True,
+                ).encode())
+
+            record = {
+                "classifier": args.classifier,
+                "corpus_setup_seconds": corpus_setup_seconds,
+                "draw_kwargs": draw_kwargs,
+                "encoder_params": sum(p.numel() for p in encoder.parameters()),
+                "classifier_params": sum(p.numel() for p in classifier.parameters()) if classifier else 0,
+                "workers": workers,
+                "support_sets": args.support_sets,
+                "queries_per_support_set": args.queries_per_support_set,
+                "resolutions": args.resolutions,
+                "multi_device_probability": args.multi_device_probability,
+                "window_seconds": args.window_seconds,
+                "polarization": args.polarization,
+                "compile_transformer": args.compile_transformer,
+                "timing_notes": {
+                    "encode": "Includes recording pooling, not just patch encoding.",
+                    "recording_pool": "Empty event boundary; pooling is included in encode.",
+                    "neighbors_loss": "Selected classifier forward plus episode loss.",
+                    "compile_transformer": "Requested only; compilation errors are fatal rather than silently eager.",
+                    "optimizer_only_minutes_35k": "Includes loader wait; excludes calibration, validation, checkpointing and telemetry.",
+                    "gradient_norms": "Final step after clipping; encoder includes recording_pool.",
+                },
+                **{f"mean_{name}_ms": _mean(values) for name, values in timings.items()},
+                "median_step_ms": float(np.median(timings["step"])),
+                "p90_step_ms": float(np.percentile(timings["step"], 90)),
+                "optimizer_only_minutes_35k": _mean(timings["step"]) * 35000 / 60000,
+                "peak_allocated_gib": torch.cuda.max_memory_allocated() / 2**30,
+                "episode_sha256": digest.hexdigest(),
+                "mean_shape": {
+                    key: _mean([sample[key] for sample in shape_samples])
+                    for key in shape_samples[0]
+                },
+                "loss": float(loss.detach()),
+                "gradient_norms": {
+                    name: float(torch.stack([p.grad.float().norm().square() for p in module.parameters()
+                                             if p.grad is not None]).sum().sqrt())
+                    for name, module in {
+                        "encoder": encoder, "recording_pool": encoder.recording_pool,
+                        **({"classifier": classifier, "trunk": classifier.metric_stack,
+                            "support_residual": classifier.r_support_head,
+                            "candidate_residual": classifier.r_candidate_head,
+                            "text_bridge": classifier.p_text} if classifier else {}),
+                    }.items()
+                    if any(p.grad is not None for p in module.parameters())
+                },
+                "timing_samples_ms": timings,
+                "shape_samples": shape_samples,
+            }
+            if args.validation_support_sets:
+                val_corpus = support_corpus_from_index(index, split="val")
+                val_dataset = PretrainDataset(
+                    index, index.val, augment=False, two_view=False,
+                    neutral_acquisition_text=False,
+                    multi_device_probability=args.multi_device_probability,
+                    max_devices=args.max_devices,
+                )
+                torch.cuda.synchronize()
+                validation_start = time.perf_counter()
+                with torch.no_grad():
+                    validate(
+                        encoder=encoder, classifier=classifier, classifier_mode=args.classifier,
+                        corpus=val_corpus, dataset=val_dataset, collate=collate, text_of=text,
+                        device=device, episodes_count=args.validation_support_sets,
+                        episodes_per_step=args.support_sets, seed=20260901,
+                        draw_kwargs=draw_kwargs, executor=None, deployment_matched=True,
+                    )
+                torch.cuda.synchronize()
+                record["validation_support_sets"] = args.validation_support_sets
+                record["validation_seconds"] = time.perf_counter() - validation_start
+            print(json.dumps({k:v for k,v in record.items() if k not in ("timing_samples_ms", "shape_samples")}), flush=True)
             results.append(record)
-            del encoder, classifier, optimizer, parameters, result
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(json.dumps(results, indent=2) + "\n")
-    finally:
-        for loader in loaders.values():
+            del encoder, optimizer, parameters, pooled, descriptor, rows, loss
+            torch.cuda.empty_cache()
+        finally:
             loader.close()
+
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(json.dumps(results, indent=2) + "\n")
 
 
 if __name__ == "__main__":
