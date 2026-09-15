@@ -47,7 +47,8 @@ be real. Support sensitivity: removing the top support flips 16.5% of prediction
 0.42% — the vote correctly relies on strong evidence, and the classifier must not diffuse that.
 
 **Not targets.** inclusivehar (flat k-curve 34→38: encoder/data, not readout). Cross-device
-interaction (hierarchical mean already gives +9 to +12 at k=1, above UniMTS's native fusion).
+interaction (the learned recording pool already gives +9 to +12 at k=1, above UniMTS's native
+fusion; see 2026-09-14-multi-device-pooling-correction.md).
 High-k margin over baselines (all encoders converge under NN).
 
 **Why not just ship ridge.** Ridge is the measured ceiling at k≥8 but it is a per-query linear

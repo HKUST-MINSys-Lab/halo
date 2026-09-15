@@ -329,6 +329,16 @@ class NormWearAdapter(BaselineAdapter):
         return predictions, info
 
     def predict_candidates_from_features(self, features, candidates, state, device):
+        scores = self.candidate_scores_from_features(features, candidates, state, device)
+        candidates = list(candidates)
+        idx = scores.argmax(axis=1)
+        preds = [candidates[i] for i in idx]
+        return preds, {
+            "predicted_classes": sorted(set(preds)),
+            "match_metric": "l1_argmin",
+        }
+
+    def candidate_scores_from_features(self, features, candidates, state, device):
         win = np.asarray(features)
 
         candidates = list(candidates)
@@ -344,12 +354,4 @@ class NormWearAdapter(BaselineAdapter):
         # the otherwise very large (windows, labels, 2048) broadcast temporary.
         from scipy.spatial.distance import cdist
 
-        dist = cdist(win, lab, metric="cityblock")                            # (N, L)
-        idx = dist.argmin(axis=1)
-        preds = [candidates[i] for i in idx]
-
-        info = {
-            "predicted_classes": sorted(set(preds)),
-            "match_metric": "l1_argmin",
-        }
-        return preds, info
+        return -cdist(win, lab, metric="cityblock")                           # higher is better

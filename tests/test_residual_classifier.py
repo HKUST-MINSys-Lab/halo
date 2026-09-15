@@ -136,6 +136,22 @@ def test_text_bridge_uses_the_same_raw_query_with_or_without_residual_trunk():
     assert torch.equal(active(**values)["text_score"], inactive(**values)["text_score"])
 
 
+def test_score_components_recompose_logits_exactly():
+    values = _episode()
+    head = ResidualSupportClassifier(
+        AttentionSpec(d_model=12, n_heads=3, dropout=0),
+        ResidualClassifierConfig(centring="support_mean", n_layers=1),
+    )
+    with torch.no_grad():
+        head.r_support_head.weight.normal_()
+        head.r_candidate_head.weight.normal_()
+        head.lambda_table.fill_(0.4)
+    result = head(**values)
+    expected = result["metric_part"] + result["text_part"] + result["r_candidate"]
+    assert torch.equal(result["logits"], expected)
+    assert result["base_part"].shape == result["logits"].shape
+
+
 def test_residual_off_equals_support_centred_neighbor_floor():
     values = _episode()
     head = ResidualSupportClassifier(
@@ -242,3 +258,33 @@ def test_removing_top_support_matches_neighbor_floor_sensitivity():
         temperature=.07,
     )
     assert torch.equal(head_after != baseline, direct.argmax(dim=1) != baseline)
+
+
+def test_regime_split_routes_and_shares_nothing():
+    """Two complete heads, routed by whether an episode retains any support."""
+    from model.support.residual_classifier import (
+        RegimeSplitSupportClassifier, build_support_classifier,
+    )
+    values = _episode()
+    spec = AttentionSpec(d_model=12, n_heads=3, dropout=0)
+    cfg = ResidualClassifierConfig(centring="none", n_layers=1, regime_split=True)
+    head = build_support_classifier(spec, cfg)
+    assert isinstance(head, RegimeSplitSupportClassifier)
+    assert not (set(id(p) for p in head.zero_head.parameters())
+                & set(id(p) for p in head.few_head.parameters()))
+
+    # Row 0 keeps its supports, row 1 is fully masked: they must take different heads.
+    values["support_mask"] = values["support_mask"].clone()
+    values["support_mask"][1] = False
+    got = head(**values)["logits"]
+    enrolled, _ = differentiable_neighbor_logits(
+        values["query_feature"][:1], values["support_feature"][:1], values["support_bound"][:1],
+        values["support_mask"][:1], values["candidate_mask"][:1], temperature=.07,
+    )
+    # Untrained: the enrolled row is still exactly the neighbour floor; the zero row is text only.
+    assert torch.equal(got[:1], enrolled)
+    assert torch.isfinite(got[1]).all()
+    head.zero_head.p_text.weight.data.add_(1.0)
+    moved = head(**values)["logits"]
+    assert not torch.equal(moved[1], got[1])      # zero head owns the zero row
+    assert torch.equal(moved[:1], got[:1])        # and cannot touch the enrolled row

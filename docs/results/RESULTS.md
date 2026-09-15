@@ -61,8 +61,20 @@ shared 1-NN readout; at `k=0` each model uses its disclosed zero-support path.
 * Compare within a window duration, never across: query counts differ, so confidence intervals do.
 
 Multi-device composite cells are reported separately in the combined artifact. At 8 s and k=1,
-HALO's parameter-free hierarchical device mean gains **+11.1** (RealWorld) and **+8.9** (Shoaib)
-over its own single-placement cells, against UniMTS's native skeleton fusion at +3.7 / +4.1.
+HALO gains **+11.1** (RealWorld) and **+8.9** (Shoaib) over its own single-placement cells, against
+UniMTS's native skeleton fusion at +3.7 / +4.1.
+
+**How HALO fuses devices.** One token per `(patch, sensor)`, where a *sensor* is one 3-axis modality
+on one device, so an accelerometer and a gyroscope on the same wrist stay separate tokens. Device,
+modality and placement identity enter through per-sensor **text** conditioning (axis lives in the
+role text, so no fact is injected twice), and a single learned `RecordingAttentionPool` query
+attends over every `patch x sensor` token at once. There is no separate device-fusion stage and no
+placement-specific parameter: an unseen placement is expressible because identity is text. The pool
+is ~0.13M of the 0.789M encoder and is trained end to end with everything else. An earlier version
+of this line credited the gain to a parameter-free hierarchical device mean; that path exists in
+`encoder.py` but is **overridden** by the learned pool in every trained checkpoint, so it produced
+none of the numbers in this file. See
+[docs/journal/2026-09-14-multi-device-pooling-correction.md](../journal/2026-09-14-multi-device-pooling-correction.md).
 
 The narrative behind these numbers — why JEPA and the continuous kernel were dropped, what is and
 is not a controlled comparison, and the open limitations — is in

@@ -12,6 +12,7 @@ from model.support.token_mixer import SupportTokenMixer, TokenMixerConfig
 from training.support_classifier.neighbors import differentiable_neighbor_logits
 from training.support_classifier.sealed_eval import (
     DEFAULT_K,
+    _halo_residual_diagnostic_predictions,
     _halo_token_mixer_predictions,
     _differentiable_neighbor_predictions,
     _readout_predictions,
@@ -181,3 +182,15 @@ def test_v3_evaluator_dispatch_matches_centred_neighbor_floor(tmp_path, monkeypa
         )
         expected.append(stream.eval_labels[int(logits.argmax())])
     assert predicted == expected
+
+    diagnostics = _halo_residual_diagnostic_predictions(
+        features, stream, plans, checkpoint, torch.device("cpu"), batch_size=3,
+    )
+    assert diagnostics["halo-classifier"] == predicted
+    assert diagnostics["halo-classifier-floor"] == expected
+    assert set(diagnostics) == {
+        "halo-classifier", "halo-classifier-floor", "halo-classifier-text-only",
+        "halo-classifier-support-residual-only", "halo-classifier-candidate-residual-only",
+        "halo-classifier-residual-only", "halo-classifier-support-label-shuffled",
+    }
+    assert all(len(values) == len(plans) for values in diagnostics.values())

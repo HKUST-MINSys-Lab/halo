@@ -27,7 +27,10 @@ from data.scripts.curate import deployment_policy
 from model.blocks import AttentionSpec
 from model.tokenizer.multispan_kernel import MS_SPANS_S, MS_FRAME_RATE_HZ
 from model.support.token_mixer import SupportTokenMixer, TokenMixerConfig
-from model.support.residual_classifier import ResidualSupportClassifier, ResidualClassifierConfig
+from model.support.residual_classifier import (
+    RegimeSplitSupportClassifier, ResidualClassifierConfig, ResidualSupportClassifier,
+    build_support_classifier,
+)
 from training.support_classifier.corpus import support_corpus_from_index
 from training.support_classifier.sampling import (
     DEFAULT_ENROLLMENT_K,
@@ -609,7 +612,7 @@ def run_step(
     dataset: PretrainDataset,
     collate,
     encoder,
-    classifier: SupportTokenMixer | ResidualSupportClassifier | None,
+    classifier: SupportTokenMixer | ResidualSupportClassifier | RegimeSplitSupportClassifier | None,
     classifier_mode: str,
     text_of,
     device: torch.device,
@@ -649,7 +652,7 @@ def run_step(
             candidate_slot=text["candidate_slot"],
         )
     elif classifier_mode == "residual":
-        if not isinstance(classifier, ResidualSupportClassifier):
+        if not isinstance(classifier, (ResidualSupportClassifier, RegimeSplitSupportClassifier)):
             raise ValueError("residual mode requires ResidualSupportClassifier")
         output = classifier(
             query_feature=query, support_feature=rows["support_feature"],
@@ -785,7 +788,7 @@ def fit_text_projection(
 
 
 @torch.no_grad()
-def initialise_text_projection(classifier: ResidualSupportClassifier, encoder, dataset, corpus,
+def initialise_text_projection(classifier: ResidualSupportClassifier | RegimeSplitSupportClassifier, encoder, dataset, corpus,
                                collate, text_of, rng, device, *, batches: int, batch_size: int,
                                executor: ThreadPoolExecutor | None) -> dict[str, float]:
     """Closed-form ridge bridge from pooled motion vectors to frozen SBERT label vectors."""
@@ -805,6 +808,8 @@ def initialise_text_projection(classifier: ResidualSupportClassifier, encoder, d
     w, alpha = fit_text_projection(x, t)
     classifier.p_text.weight.copy_(w.T.to(classifier.p_text.weight))
     classifier.p_text.bias.zero_()
+    if hasattr(classifier, "sync_text_projection"):
+        classifier.sync_text_projection()
     classifier.set_corpus_mean(x.mean(dim=0).to(device))
     cosine = F.cosine_similarity(x @ w, t, dim=-1).mean()
     return {"n": float(len(x)), "alpha": float(alpha), "mean_cosine": float(cosine)}
@@ -944,6 +949,15 @@ def main() -> None:
                              "checkpoint on disk actually used")
     parser.add_argument("--allow-retired-jepa-checkpoint", action="store_true",
                         help="allow a future-JEPA checkpoint only to reproduce a historical run")
+    parser.add_argument("--encoder-arch", default="halo", choices=("halo", "limubert", "harnet"),
+                        help="matched-corpus M2 arm: train a baseline architecture under HALO's "
+                             "objective, corpus, episodes and readouts (default: HALO's encoder)")
+    parser.add_argument("--matched-pretrained", action="store_true",
+                        help="load the baseline's released weights instead of random init; this "
+                             "reintroduces the corpus advantage M2 exists to remove, so it is for "
+                             "reproducing an M0-style row only")
+    parser.add_argument("--matched-d-model", type=int, default=128,
+                        help="classifier width for a matched-corpus arm; matches HALO's d_model")
     parser.add_argument("--frontend", choices=("fixed", "learnable", "continuous", "multispan"),
                         default="fixed",
                         help="front end for a from-scratch encoder; the design of record is fixed")
@@ -992,6 +1006,9 @@ def main() -> None:
     parser.add_argument("--p-mask-gt", type=float, default=0.10)
     parser.add_argument("--no-residual", action="store_true")
     parser.add_argument("--no-text-term", action="store_true")
+    parser.add_argument("--regime-split", action="store_true",
+                        help="two complete residual heads, one for zero-support episodes and "
+                             "one for enrolled episodes, sharing no parameter (no-sharing control)")
     parser.add_argument("--separate-trunk", action="store_true")
     parser.add_argument("--text-temperature", type=float, default=0.07)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -1320,7 +1337,7 @@ def main() -> None:
             # because the new normalized composition is now the default.
             if version == "support_classifier_v2":
                 classifier_config.setdefault("normalized_token_composition", False)
-            classifier = ResidualSupportClassifier(
+            classifier = build_support_classifier(
                 spec, ResidualClassifierConfig(**classifier_config),
             ).to(device) if args.classifier == "residual" else None
         elif version == "support_token_mixer_v1":
@@ -1331,6 +1348,30 @@ def main() -> None:
         if classifier is not None:
             classifier.load_state_dict(resume_blob["classifier"])
         print(f"[compare] resuming {args.resume} at step {resume_blob['step']}", flush=True)
+    elif args.encoder_arch != "halo":
+        # Matched-corpus level M2 (docs/design/MATCHED_CORPUS_PLAN_20260915.md §1): a baseline
+        # architecture trained on OUR corpus with OUR objective, episodes, classifier and readouts.
+        # Everything downstream of `pooled` is byte-identical to the HALO arm, so a row difference
+        # here is attributable to the encoder and to nothing else.
+        if args.phase_a is not None:
+            raise SystemExit("--encoder-arch cannot be combined with --phase-a")
+        from model.tokenizer.matched_encoder import build_matched_encoder
+
+        encoder = build_matched_encoder(
+            args.encoder_arch, d_model=args.matched_d_model,
+            pretrained=args.matched_pretrained, device=device,
+        ).train()
+        encoder_config = {
+            "encoder_arch": args.encoder_arch,
+            "matched_pretrained": bool(args.matched_pretrained),
+            "d_model": int(args.matched_d_model),
+            "trunk": "temporal",
+            "token_granularity": "sensor",
+            "train_datasets": list(deployment_policy.SUPERVISED_HEAD_TRAIN_DATASETS),
+        }
+        print(f"[compare] matched-corpus arm: {args.encoder_arch} "
+              f"(pretrained={args.matched_pretrained}, "
+              f"params={sum(p.numel() for p in encoder.parameters())/1e6:.3f}M)", flush=True)
     elif args.phase_a is None:
         # The design-of-record recipe: one stage, everything but the frozen text tower and the
         # filterbank's normalisation statistics starts random.
@@ -1436,10 +1477,11 @@ def main() -> None:
         print(f"[compare] warm-started from {args.phase_a}", flush=True)
     if resume_blob is None:
         spec = AttentionSpec(d_model=encoder.d_model, n_heads=4, ffn_mult=2, dropout=0.1)
-        classifier = (ResidualSupportClassifier(
+        classifier = (build_support_classifier(
             spec, ResidualClassifierConfig(
                 centring=args.centring, residual_enabled=not args.no_residual,
                 text_term_enabled=not args.no_text_term, shared_trunk=not args.separate_trunk,
+                regime_split=args.regime_split,
                 text_temperature=args.text_temperature,
             )).to(device) if args.classifier == "residual" else
             SupportTokenMixer(spec, TokenMixerConfig()).to(device) if args.classifier == "token_mixer" else None)
@@ -1453,7 +1495,11 @@ def main() -> None:
         print("[compare] torch.compile requested for dynamic transformer core", flush=True)
 
     frontend = getattr(encoder, "filterbank", None)
-    if resume_blob is None and args.phase_a is None:
+    if resume_blob is None and args.phase_a is None and frontend is None:
+        # A matched-corpus arm has no filterbank, so there are no normalisation statistics to
+        # estimate. Calibrating would burn forward passes and change nothing.
+        print("[compare] no filterbank on this encoder; skipping frontend calibration", flush=True)
+    elif resume_blob is None and args.phase_a is None:
         print(f"[compare] calibrating frontend on {args.calib_batches} balanced batches", flush=True)
         calibrate_frontend(
             encoder, dataset, corpus, collate, rng, device,
@@ -1467,7 +1513,7 @@ def main() -> None:
         list(corpus.all_labels) + list(val_corpus.all_labels), device,
     )
     p_text_init = None
-    if resume_blob is None and isinstance(classifier, ResidualSupportClassifier):
+    if resume_blob is None and isinstance(classifier, (ResidualSupportClassifier, RegimeSplitSupportClassifier)):
         p_text_init = initialise_text_projection(
             classifier, encoder, dataset, corpus, collate, text_of, rng, device,
             batches=args.calib_batches, batch_size=args.calib_batch_size, executor=executor,
@@ -1531,7 +1577,7 @@ def main() -> None:
             "neutral_acquisition_text": args.neutral_acquisition_text,
             "classifier": args.classifier,
             "classifier_config": (dataclasses.asdict(classifier.cfg)
-                                  if isinstance(classifier, ResidualSupportClassifier) else None),
+                                  if isinstance(classifier, (ResidualSupportClassifier, RegimeSplitSupportClassifier)) else None),
             "freeze_encoder": args.freeze_encoder,
             "lr": args.lr,
             "encoder_lr_scale": args.encoder_lr_scale,
@@ -1588,8 +1634,13 @@ def main() -> None:
         saved_trajectory.setdefault("p_mask_gt", 0.10)
         saved_trajectory.setdefault(
             "classifier_config",
-            dataclasses.asdict(classifier.cfg) if isinstance(classifier, ResidualSupportClassifier) else None,
+            dataclasses.asdict(classifier.cfg) if isinstance(classifier, (ResidualSupportClassifier, RegimeSplitSupportClassifier)) else None,
         )
+        # `regime_split` was added to ResidualClassifierConfig after some snapshots were written;
+        # migrate their classifier_config sub-dict the same way the fields above are migrated,
+        # rather than rejecting an otherwise-identical resume.
+        if saved_trajectory.get("classifier_config") is not None:
+            saved_trajectory["classifier_config"].setdefault("regime_split", False)
         if saved_trajectory != trajectory:
             raise SystemExit("resume trajectory differs from the checkpoint configuration")
         optimizer.load_state_dict(resume_blob["optimizer"])

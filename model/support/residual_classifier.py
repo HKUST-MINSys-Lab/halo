@@ -7,7 +7,7 @@ as the floor, and learns scalar corrections without rewriting the encoder's geom
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.nn as nn
@@ -33,6 +33,11 @@ class ResidualClassifierConfig:
     residual_enabled: bool = True
     text_term_enabled: bool = True
     shared_trunk: bool = True
+    # Two complete, independently parameterised heads routed by episode regime
+    # (zero-support vs enrolled), as in the retired SupportTokenMixer. Nothing is
+    # shared between them. `shared_trunk` splits metric-vs-text WITHIN one head and is
+    # a different axis; the two flags compose.
+    regime_split: bool = False
     normalized_token_composition: bool = True
 
     def __post_init__(self) -> None:
@@ -223,12 +228,88 @@ class ResidualSupportClassifier(nn.Module):
         # is the uniform prior of an uninformative complete vote.  Thus text competes with a
         # defined prior rather than receiving an arbitrary numerical advantage.
         uniform_log_prior = -candidate_mask.sum(dim=1, keepdim=True).to(metric_logits.dtype).log()
+        base_part = torch.where(k_c.eq(0), uniform_log_prior, base_logits)
         metric_part = torch.where(k_c.eq(0), uniform_log_prior, metric_logits)
-        logits = metric_part + lam * text_score + r_candidate
+        text_part = lam * text_score
+        logits = metric_part + text_part + r_candidate
         return {"logits": logits.masked_fill(~candidate_mask, -1e30), "support_weight": weight,
                 "k_c": k_c, "r_support": r_support, "r_candidate": r_candidate,
-                "text_score": text_score, "lambda": lam}
+                "text_score": text_score, "lambda": lam,
+                "base_part": base_part, "metric_part": metric_part,
+                "text_part": text_part}
 
     def telemetry(self) -> dict[str, float]:
         return {f"classifier/lambda_{bucket}": float(self.lambda_table[index].detach())
                 for index, bucket in enumerate(self.cfg.lambda_buckets)}
+
+
+class RegimeSplitSupportClassifier(nn.Module):
+    """Two complete residual heads, routed by whether an episode has any support at all.
+
+    This is the no-sharing control for the unified scorer: the zero-support head and the enrolled
+    head share no parameter, not even the frozen text projection buffer. An episode reaches the
+    enrolled head if any candidate retains support, so a partially masked episode trains the
+    enrolled head's text term rather than the zero-support head.
+    """
+
+    def __init__(self, spec: AttentionSpec, cfg: ResidualClassifierConfig | None = None):
+        super().__init__()
+        self.spec = spec
+        self.cfg = cfg or ResidualClassifierConfig()
+        member = replace(self.cfg, regime_split=False)
+        self.zero_head = ResidualSupportClassifier(spec, member)
+        self.few_head = ResidualSupportClassifier(spec, member)
+
+    def set_corpus_mean(self, value: torch.Tensor) -> None:
+        self.zero_head.set_corpus_mean(value)
+        self.few_head.set_corpus_mean(value)
+
+    @property
+    def p_text(self) -> nn.Linear:
+        """Least-squares initialisation writes here; mirror it into both heads afterwards."""
+        return self.few_head.p_text
+
+    def sync_text_projection(self) -> None:
+        self.zero_head.p_text.load_state_dict(self.few_head.p_text.state_dict())
+
+    def forward(self, *, query_feature: torch.Tensor, support_feature: torch.Tensor,
+                support_mask: torch.Tensor, candidate_mask: torch.Tensor,
+                **kwargs) -> dict[str, torch.Tensor]:
+        enrolled = support_mask.any(dim=1) if support_mask.numel() else \
+            torch.zeros(len(query_feature), dtype=torch.bool, device=query_feature.device)
+        b, c = candidate_mask.shape
+        k = support_feature.shape[1]
+        out = {"logits": query_feature.new_zeros((b, c), dtype=torch.float32),
+               "support_weight": query_feature.new_zeros((b, k), dtype=torch.float32),
+               "k_c": query_feature.new_zeros((b, c)), "r_support": query_feature.new_zeros((b, k)),
+               "r_candidate": query_feature.new_zeros((b, c)),
+               "text_score": query_feature.new_zeros((b, c)),
+               "lambda": query_feature.new_zeros((b, c)),
+               "base_part": query_feature.new_zeros((b, c)),
+               "metric_part": query_feature.new_zeros((b, c)),
+               "text_part": query_feature.new_zeros((b, c))}
+        for head, rows in ((self.few_head, torch.nonzero(enrolled).flatten()),
+                           (self.zero_head, torch.nonzero(~enrolled).flatten())):
+            if not len(rows):
+                continue
+            part = head(
+                query_feature=query_feature.index_select(0, rows),
+                support_feature=support_feature.index_select(0, rows),
+                support_mask=support_mask.index_select(0, rows),
+                candidate_mask=candidate_mask.index_select(0, rows),
+                **{name: value.index_select(0, rows) if torch.is_tensor(value) and value.shape[:1] == (b,)
+                   else value for name, value in kwargs.items()},
+            )
+            for name, value in out.items():
+                value.index_copy_(0, rows, part[name].to(value.dtype))
+        return out
+
+    def telemetry(self) -> dict[str, float]:
+        return {**{f"{key}_zero": value for key, value in self.zero_head.telemetry().items()},
+                **{f"{key}_few": value for key, value in self.few_head.telemetry().items()}}
+
+
+def build_support_classifier(spec: AttentionSpec, cfg: ResidualClassifierConfig):
+    """One construction path for the trainer and the evaluator."""
+    return RegimeSplitSupportClassifier(spec, cfg) if cfg.regime_split \
+        else ResidualSupportClassifier(spec, cfg)

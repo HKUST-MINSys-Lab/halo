@@ -96,6 +96,9 @@ class EvalStream:
     # for the grid as converted. Retained diagnostic views must give it a unique name; adapters that cache per
     # stream must key on it so a perturbed and an unperturbed view of one grid never collide.
     perturbation: Optional[str] = None
+    # Highest physical sampling rate at which this view contains measured information. A derived
+    # upsampled view keeps its original ceiling so consumers do not treat interpolation as new data.
+    effective_source_rate_hz: Optional[float] = None
     lengths: Optional[np.ndarray] = None
     execution_identity_known: bool = True
 
@@ -161,7 +164,8 @@ def source_slice_fingerprint(stream: EvalStream | MultiDeviceEvalStream) -> str:
         digest.update(str(float(member.rate_hz)).encode())
         digest.update("\0".join(member.channels).encode())
         digest.update(np.asarray(member.mask, dtype=np.bool_).tobytes())
-        for field in ("source_rate_hz", "gravity_state", "config_text", "device_ids"):
+        for field in ("source_rate_hz", "effective_source_rate_hz", "gravity_state", "config_text",
+                      "device_ids", "perturbation"):
             if hasattr(member, field):
                 digest.update(field.encode())
                 digest.update(repr(getattr(member, field)).encode())

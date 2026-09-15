@@ -124,6 +124,16 @@ def build_encoder(
     learnable_recording_pool: bool | None = None,
 ) -> torch.nn.Module:
     c = ckpt["config"]
+    arch = c.get("encoder_arch", "halo")
+    if arch != "halo":
+        # Matched-corpus M2 arm (docs/design/MATCHED_CORPUS_PLAN_20260915.md). The trunk's weights
+        # live in the checkpoint like any other encoder, so evaluation needs no special casing
+        # beyond rebuilding the right architecture.
+        from model.tokenizer.matched_encoder import build_matched_encoder
+
+        enc = build_matched_encoder(arch, d_model=int(c.get("d_model", 128)), device=device)
+        enc.load_state_dict(ckpt["encoder"])
+        return enc.train() if training else enc.eval()
     backbone = c.get("encoder_backbone")
     if backbone in {"harnet", "unimts"}:
         from model.tokenizer.baseline_backbone import BaselineRowEncoder

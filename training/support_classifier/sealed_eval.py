@@ -30,9 +30,10 @@ from data.scripts.curate.deployment_policy import (
     assert_no_retired_sources,
     stream_specs,
 )
+from data.scripts.labels.canonical_labels import canonicalize
 from model.blocks import AttentionSpec
 from model.support.token_mixer import SupportTokenMixer, TokenMixerConfig
-from model.support.residual_classifier import ResidualSupportClassifier, ResidualClassifierConfig
+from model.support.residual_classifier import ResidualClassifierConfig, build_support_classifier
 from training.support_classifier.train import make_label_text
 from training.support_classifier.neighbors import differentiable_neighbor_logits
 from training.support_classifier.representation_diagnostics import write_embedding_diagnostics
@@ -112,7 +113,7 @@ def _parameter_count_m(
             classifier_config = dict(blob["classifier_config"])
             if blob.get("architecture_version") == "support_classifier_v2":
                 classifier_config.setdefault("normalized_token_composition", False)
-            head = ResidualSupportClassifier(
+            head = build_support_classifier(
                 AttentionSpec(**blob["attention_spec"]),
                 ResidualClassifierConfig(**classifier_config),
             )
@@ -497,6 +498,17 @@ def _metric_row(
     truth = _aligned_labels(stream)[indices].tolist()
     subjects = np.asarray(stream.subjects)[indices]
     metrics = scoring.classification_metrics(truth, list(predictions))
+    per_label = scoring.per_class_f1(truth, list(predictions))
+    training_concepts = {canonicalize(label) for label in load_global_labels()}
+    seen = {label: canonicalize(label) in training_concepts for label in per_label}
+    seen_scores = [score for label, score in per_label.items() if seen[label]]
+    unseen_scores = [score for label, score in per_label.items() if not seen[label]]
+    metrics.update({
+        "per_label_f1": per_label,
+        "label_seen_in_training": seen,
+        "f1_macro_seen": float(np.mean(seen_scores)) if seen_scores else None,
+        "f1_macro_unseen": float(np.mean(unseen_scores)) if unseen_scores else None,
+    })
     metrics.update(scoring.subject_bootstrap_ci(
         truth, list(predictions), subjects, metric="f1_macro", B=bootstrap,
     ))
@@ -550,6 +562,8 @@ def _halo_features(
             encoder, stream.windows, stream_channel_descriptions(stream.dataset, stream.stream), device,
             stream.rate_hz, _stream_gravity_state(stream.dataset, stream.stream),
             channel_mask=stream.mask, dataset=stream.dataset, stream=stream.stream,
+            source_rate=(stream.effective_source_rate_hz
+                         if stream.effective_source_rate_hz is not None else None),
             lengths=stream.lengths, amp_dtype=torch.bfloat16 if device.type == "cuda" else None,
         )
     return np.asarray(features.cpu(), dtype=np.float32), fingerprint
@@ -570,7 +584,7 @@ def _halo_residual_predictions(
         classifier_config.setdefault("normalized_token_composition", False)
     cfg = ResidualClassifierConfig(**classifier_config)
     cfg = replace(cfg, residual_enabled=residual_enabled, text_term_enabled=text_term_enabled)
-    head = ResidualSupportClassifier(AttentionSpec(**blob["attention_spec"]), cfg).to(device).eval()
+    head = build_support_classifier(AttentionSpec(**blob["attention_spec"]), cfg).to(device).eval()
     head.load_state_dict(blob["classifier"], strict=True)
     candidates = tuple(stream.eval_labels)
     table = make_label_text(candidates, device)
@@ -607,6 +621,91 @@ def _halo_residual_predictions(
             candidate_slot=torch.arange(1, c + 1, device=device).unsqueeze(0).expand(b, -1),
         )
         output.extend(candidates[index] for index in result["logits"].argmax(dim=1).cpu().tolist())
+    return output
+
+
+@torch.no_grad()
+def _halo_residual_diagnostic_predictions(
+    features: np.ndarray, stream: EvalStream, plans: Sequence[QueryPlan], checkpoint: Path,
+    device: torch.device, *, batch_size: int = 64,
+) -> dict[str, list[str]]:
+    """Decompose one residual-head forward and perturb only support-label text bindings."""
+    blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if blob.get("architecture_version") not in {"support_classifier_v2", "support_classifier_v3"}:
+        raise ValueError("classifier diagnostics require a residual support-classifier checkpoint")
+    classifier_config = dict(blob["classifier_config"])
+    if blob.get("architecture_version") == "support_classifier_v2":
+        classifier_config.setdefault("normalized_token_composition", False)
+    head = build_support_classifier(
+        AttentionSpec(**blob["attention_spec"]), ResidualClassifierConfig(**classifier_config),
+    ).to(device).eval()
+    head.load_state_dict(blob["classifier"], strict=True)
+    candidates = tuple(stream.eval_labels)
+    table = make_label_text(candidates, device)
+    candidate_text = table.matrix[torch.as_tensor(table.ids(candidates), device=device)].unsqueeze(0)
+    label_to_slot = {label: slot for slot, label in enumerate(candidates)}
+    names = (
+        "halo-classifier", "halo-classifier-floor", "halo-classifier-text-only",
+        "halo-classifier-support-residual-only", "halo-classifier-candidate-residual-only",
+        "halo-classifier-residual-only", "halo-classifier-support-label-shuffled",
+    )
+    output = {name: [] for name in names}
+    for start in range(0, len(plans), batch_size):
+        chunk = plans[start:start + batch_size]
+        b, c = len(chunk), len(candidates)
+        width = max((len(plan.support) for plan in chunk), default=0)
+        rows = np.zeros((b, width), dtype=np.int64)
+        bound = torch.full((b, width), -1, dtype=torch.long, device=device)
+        support_mask = torch.zeros((b, width), dtype=torch.bool, device=device)
+        for row, plan in enumerate(chunk):
+            if plan.support:
+                rows[row, :len(plan.support)] = plan.support
+                bound[row, :len(plan.support)] = torch.as_tensor(
+                    [label_to_slot[label] for label in plan.support_labels], device=device,
+                )
+                support_mask[row, :len(plan.support)] = True
+        support_feature = torch.as_tensor(features[rows], dtype=torch.float32, device=device)
+        support_feature = support_feature * support_mask.unsqueeze(-1)
+        safe_bound = bound.clamp_min(0)
+        expanded_text = candidate_text.expand(b, -1, -1)
+        support_text = expanded_text.gather(
+            1, safe_bound.unsqueeze(-1).expand(-1, -1, candidate_text.shape[-1]),
+        ) * support_mask.unsqueeze(-1)
+        common = {
+            "query_feature": torch.as_tensor(
+                features[[plan.query for plan in chunk]], dtype=torch.float32, device=device,
+            ),
+            "support_feature": support_feature,
+            "support_bound": bound,
+            "support_mask": support_mask,
+            "support_pair_slot": torch.arange(1, width + 1, device=device).unsqueeze(0).expand(b, -1),
+            "candidate_text": expanded_text,
+            "candidate_mask": torch.ones((b, c), dtype=torch.bool, device=device),
+            "candidate_slot": torch.arange(1, c + 1, device=device).unsqueeze(0).expand(b, -1),
+        }
+        result = head(support_label_text=support_text, **common)
+        component_logits = {
+            "halo-classifier": result["logits"],
+            "halo-classifier-floor": result["base_part"],
+            "halo-classifier-text-only": result["base_part"] + result["text_part"],
+            "halo-classifier-support-residual-only": result["metric_part"],
+            "halo-classifier-candidate-residual-only": result["base_part"] + result["r_candidate"],
+            "halo-classifier-residual-only": result["metric_part"] + result["r_candidate"],
+        }
+        for name, logits in component_logits.items():
+            output[name].extend(candidates[index] for index in logits.argmax(dim=1).cpu().tolist())
+
+        if width:
+            shuffled_bound = torch.where(support_mask, (safe_bound + 1) % c, safe_bound)
+            shuffled_text = expanded_text.gather(
+                1, shuffled_bound.unsqueeze(-1).expand(-1, -1, candidate_text.shape[-1]),
+            ) * support_mask.unsqueeze(-1)
+        else:
+            shuffled_text = support_text
+        shuffled = head(support_label_text=shuffled_text, **common)["logits"]
+        output["halo-classifier-support-label-shuffled"].extend(
+            candidates[index] for index in shuffled.argmax(dim=1).cpu().tolist()
+        )
     return output
 
 
@@ -897,6 +996,10 @@ def main() -> None:
     parser.add_argument("--embedding-diagnostics", action="store_true",
                         help="write opt-in representation figures beside each encoded stream; this never "
                              "changes predictions, manifests, or checkpoint selection")
+    parser.add_argument(
+        "--classifier-isolation", action="store_true",
+        help="add HALO-only component and support-label-binding diagnostics",
+    )
     args = parser.parse_args()
     if not args.k or min(args.k) < 0:
         parser.error("--k must contain non-negative support counts")
@@ -1039,6 +1142,24 @@ def main() -> None:
                                            "feature_fingerprint": fingerprint,
                                            "manifest": manifests[manifest_id]["fingerprint"]})
                             all_rows.append(metric)
+                            if is_v2 and args.classifier_isolation:
+                                diagnostic_predictions = _halo_residual_diagnostic_predictions(
+                                    features, stream, plans, args.halo_checkpoint, device,
+                                )
+                                for readout, diagnostic_prediction in diagnostic_predictions.items():
+                                    if readout in {"halo-classifier", "halo-classifier-floor"}:
+                                        continue
+                                    diagnostic_metric = _metric_row(
+                                        stream, plans, diagnostic_prediction,
+                                        bootstrap=args.bootstrap,
+                                    )
+                                    diagnostic_metric.update({
+                                        "model": name, "readout": readout, "k": k,
+                                        "status": "ok", "feature_fingerprint": fingerprint,
+                                        "manifest": manifests[manifest_id]["fingerprint"],
+                                        "diagnostic_only": True,
+                                    })
+                                    all_rows.append(diagnostic_metric)
                             # v2's raw-query text bridge and the historical training-bank ConSE
                             # bridge answer the same k=0 question differently. Keep both as named,
                             # disclosed comparison rows; v1 retains its historical single row.
@@ -1167,6 +1288,25 @@ def main() -> None:
                                            "k": k, "status": "ok", "feature_fingerprint": fingerprint,
                                            "manifest": manifests[manifest_id]["fingerprint"]})
                             all_rows.append(metric)
+                            if args.classifier_isolation:
+                                diagnostic_predictions = _halo_residual_diagnostic_predictions(
+                                    features, stream, plans, args.halo_checkpoint, device,
+                                )
+                                for readout, diagnostic_prediction in diagnostic_predictions.items():
+                                    # Canonical full and floor-equivalent rows were written above.
+                                    if readout in {"halo-classifier", "halo-classifier-floor"}:
+                                        continue
+                                    diagnostic_metric = _metric_row(
+                                        stream, plans, diagnostic_prediction,
+                                        bootstrap=args.bootstrap,
+                                    )
+                                    diagnostic_metric.update({
+                                        "model": name, "readout": readout, "k": k,
+                                        "status": "ok", "feature_fingerprint": fingerprint,
+                                        "manifest": manifests[manifest_id]["fingerprint"],
+                                        "diagnostic_only": True,
+                                    })
+                                    all_rows.append(diagnostic_metric)
         # Attach model-input disclosures uniformly, including N/A rows. This is deliberately done
         # once at the cell boundary so no readout can forget the duration/device fairness fields.
         for row in all_rows[cell_row_start:]:
@@ -1174,6 +1314,9 @@ def main() -> None:
             row.update(_native_capabilities(name))
             learned_head = name == "halo" and row.get("readout") in {
                 "halo-classifier", "halo-classifier-residual-off",
+                "halo-classifier-text-only", "halo-classifier-support-residual-only",
+                "halo-classifier-candidate-residual-only", "halo-classifier-residual-only",
+                "halo-classifier-support-label-shuffled",
             }
             row["parameters_m"] = round(_parameter_count_m(
                 name, halo_state, halo_checkpoint=args.halo_checkpoint,

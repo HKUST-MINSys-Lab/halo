@@ -424,21 +424,18 @@ def subject_bootstrap_ci(
     # Accumulate one frozen-label confusion matrix per subject, then resample and sum those
     # matrices. This is algebraically identical to concatenating each sampled subject's windows
     # and calling sklearn B times, but avoids thousands of estimator setup calls per k/method.
-    classes = f1_classes if metric == "f1_macro" else recall_classes
+    # Keep every predicted label in the confusion matrix. In a conditional split (for example,
+    # truth is an unenrolled candidate), predicting an enrolled label is an ordinary error, not an
+    # invalid sample. Balanced accuracy still averages recall over true classes only below.
+    classes = f1_classes
     if metric not in {"f1_macro", "balanced_accuracy", "accuracy"}:
         raise ValueError(f"unsupported bootstrap metric: {metric}")
     class_to_slot = {label: slot for slot, label in enumerate(classes)}
     truth = np.asarray([class_to_slot[label] for label in gt], dtype=np.int64)
-    prediction = np.asarray([class_to_slot.get(label, -1) for label in pred], dtype=np.int64)
+    prediction = np.asarray([class_to_slot[label] for label in pred], dtype=np.int64)
     subject_slot = np.searchsorted(uniq, subjects)
     confusion = np.zeros((len(uniq), len(classes), len(classes)), dtype=np.int64)
-    valid_prediction = prediction >= 0
-    np.add.at(confusion, (subject_slot[valid_prediction], truth[valid_prediction],
-                          prediction[valid_prediction]), 1)
-    # A predicted class outside the frozen F1 class set is impossible because that set is GT union
-    # prediction. The explicit guard keeps a future caller from silently changing the estimand.
-    if not bool(valid_prediction.all()):
-        raise RuntimeError("prediction fell outside the frozen bootstrap class set")
+    np.add.at(confusion, (subject_slot, truth, prediction), 1)
     rng = np.random.RandomState(seed)
     draws = rng.randint(0, len(uniq), size=(B, len(uniq)))
     multiplicity = np.zeros((B, len(uniq)), dtype=np.int64)
@@ -450,7 +447,8 @@ def subject_bootstrap_ci(
     if metric == "f1_macro":
         stats = (2.0 * true_positive / np.maximum(true_count + predicted_count, 1)).mean(axis=1) * 100
     elif metric == "balanced_accuracy":
-        stats = (true_positive / np.maximum(true_count, 1)).mean(axis=1) * 100
+        true_slots = np.asarray([class_to_slot[label] for label in recall_classes], dtype=np.int64)
+        stats = (true_positive[:, true_slots] / np.maximum(true_count[:, true_slots], 1)).mean(axis=1) * 100
     else:
         stats = true_positive.sum(axis=1) / np.maximum(sampled.sum(axis=(1, 2)), 1) * 100
     lo, hi = np.percentile(stats, [2.5, 97.5])

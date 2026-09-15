@@ -181,6 +181,17 @@ class BaselineAdapter:
         """Predict from :meth:`window_features` without re-encoding the signal."""
         raise NotImplementedError(f"{self.name} cannot predict from cached window features")
 
+    def candidate_scores_from_features(
+        self, features: np.ndarray, candidates: Sequence[str], state, device
+    ) -> np.ndarray:
+        """Native candidate scores with rows=features and columns=candidates, higher is better.
+
+        This deliberately has a stricter contract than ``predict_candidates_from_features``. A
+        scenario hybrid may consume scores only when its ordering agrees with the released native
+        decision rule; adapters with no such exported score surface stay inapplicable.
+        """
+        raise NotImplementedError(f"{self.name} does not expose native candidate scores")
+
     def supports_native_enrollment(self) -> bool:
         """Whether this model has a deployment-time enrollment mechanism of its own.
 
@@ -311,6 +322,11 @@ class CosineAdapter(BaselineAdapter):
         return self.predict_candidates_from_features(emb, candidates, state, device)
 
     def predict_candidates_from_features(self, features, candidates, state, device):
+        scores = self.candidate_scores_from_features(features, candidates, state, device)
+        preds = scoring.predict_from_similarity(scores, list(candidates))
+        return preds, {"predicted_classes": sorted(set(preds))}
+
+    def candidate_scores_from_features(self, features, candidates, state, device):
         emb = np.asarray(features)
         candidates = list(candidates)
         cache = state.setdefault("_candidate_embedding_cache", {})
@@ -320,9 +336,7 @@ class CosineAdapter(BaselineAdapter):
                 self.encode_labels(candidates, state, device), dtype=np.float32
             )
         lab = cache[cache_key]                                                # (L, D)
-        sims = emb @ lab.T                                                    # (N, L)
-        preds = scoring.predict_from_similarity(sims, candidates)
-        return preds, {"predicted_classes": sorted(set(preds))}
+        return emb @ lab.T                                                     # (N, L)
 
     def window_features(self, stream, state, device) -> np.ndarray:
         return np.asarray(self.window_embeddings(stream, state, device), dtype=np.float32)

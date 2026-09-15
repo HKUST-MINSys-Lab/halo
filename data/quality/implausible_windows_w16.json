@@ -1,9 +1,13 @@
 {
   "alignment": "native",
   "window_seconds": 16.0,
-  "grid_fingerprint": "2bfabe1e1bde265120ab16424163f09564fe73b4668ffcb97d282ef69c63ba5c",
+  "grid_fingerprint": "99c3d4d8f3b02f7b9f3f54e77b5aad485537e3597df1743ce362d02b677ce0a2",
   "stream_fingerprints": {
     "inclusivehar/phone_waist": "6f6c13b9bf96a2292e858eda28c1634ab35129500a6e0fee4c9221e251941f7c",
+    "mmfit/left_ear": "a0784b40ba625c53c6bdbe1258bb2201ffe3039d39b726f7ab154c05c5783a81",
+    "mmfit/left_wrist": "78793e276ec6a3660c52405bd04f89abe3e1e6b85d3691d98417afb71ac20d9c",
+    "mmfit/right_pocket": "d867dada5f9de3a672291b9008130ed3a662adfa31aa5edd53bceb001594bdc2",
+    "mmfit/right_wrist": "70b8bd8d97a5dde2ee771940887451af2305214b69e73e63c87bf8fb9d836e91",
     "motionsense/phone_front_pocket": "6410862aa39e004c99fe7832259432ff9e83ed54e6c0ffe4320eac5cc08c929f",
     "realworld/phone_forearm": "d48bac30a273969acadceed476e852cd7d29af5e657f7bcd0517e51407f6fc5a",
     "realworld/phone_thigh": "04c2121b846714e6c11fcb3b47854aa0be50cc129e45e2b569d75cdca0b70b3c",
@@ -12,6 +16,12 @@
     "shoaib/phone_left_pocket": "c9f648986cfa1a1af2bc64d188399c4030e137bffaca4d35050fe41ca14364aa",
     "shoaib/phone_right_pocket": "2a93b247f94374904c4f5345d79b01d60061c8e5d6d2e43afe8176e430dfbceb",
     "shoaib/watch_wrist_proxy": "32e46614ed680fe76f8d0ff8d30dddd928e27e6cd1e8343d9e2970eeb192b554",
+    "spar/watch_left_wrist": "03185d7d0bb5821cb20405564a4a806f8eb920a7c33eb6b7c8779cec0b4eb103",
+    "spar/watch_right_wrist": "9d65aff2bf8e4ab24cbf66213dbd51836882ae69790cf16ffed16ab8bb845ee0",
+    "upper_limb_use/control_left_wrist": "36716c25f7a376425b681fec473f75b4a2bca2bee0a51f757d1ab95bdfe36e83",
+    "upper_limb_use/control_right_wrist": "478accaec117ce1994fc200ce61e4ae3fd8bdac73bbf287758157e3fecbadcdb",
+    "upper_limb_use/patient_affected_wrist": "91ad63aced7c6053cf4200a6d66a8d966e0180498e48dcf93aed80def63afd21",
+    "upper_limb_use/patient_unaffected_wrist": "c586545002b1cca1234addcefaf41cfe6087bc6f80a9e931ac4fce8b374f5c32",
     "usc_had/phone_hip": "f146ad8fd00b6531c2a3043c0a2ef8792952423af74204891ec56d3e31097c88",
     "ut_complex/watch_wrist": "40e6b777697f7f2acd9f4f17f934092f53d05150f87bed5c63109c5e1450fd26"
   },
