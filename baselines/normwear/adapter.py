@@ -297,8 +297,11 @@ class NormWearAdapter(BaselineAdapter):
         # Keep that product bounded so six-channel cells can fill the 4090 while native
         # multi-device cells automatically use a safe batch. An explicit environment override is
         # retained for reproduction on different hardware.
+        # RTX 4090 profiling over the released CWT/backbone path found that filling all available
+        # memory was slower than a moderate batch (six channels: 32 beat 64/128).  Keep a roughly
+        # constant 192 channel-windows per launch; this also scales down naturally for composites.
         batch = (int(configured_batch) if configured_batch is not None
-                 else min(128, max(1, 768 // n_channels)))
+                 else min(64, max(1, 192 // n_channels)))
         if batch <= 0:
             raise ValueError("NORMWEAR_BATCH must be positive")
         for start in range(0, len(inputs), batch):

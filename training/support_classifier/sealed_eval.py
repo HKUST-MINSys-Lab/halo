@@ -10,7 +10,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import weakref
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -62,6 +65,64 @@ TRAINING_BANK_ZERO_SHOT = frozenset({"halo", "harnet", "limubert_x"})
 # treating an old embedding array as valid after a code-only correction.
 FEATURE_CACHE_SCHEMA = "sealed-feature-v4-20260913"
 MAX_EXACT_RIDGE_SYSTEM = 512
+
+
+class FeatureMemoryCache:
+    """Bounded process-local cache for repeatedly referenced feature matrices.
+
+    Scenario cells intentionally reuse the same immutable stream under several perturbation and
+    support conditions.  Keeping recently used arrays avoids repeated ``np.load`` calls without
+    making evaluation memory grow with the complete experiment.
+    """
+
+    def __init__(self, max_bytes: int = 2 * 1024**3):
+        if max_bytes < 0:
+            raise ValueError("feature memory-cache size must be non-negative")
+        self.max_bytes = int(max_bytes)
+        self._bytes = 0
+        self._values: OrderedDict[str, np.ndarray] = OrderedDict()
+        self._stream_fingerprints: dict[int, tuple[weakref.ReferenceType, str]] = {}
+
+    def stream_fingerprint(self, stream) -> str:
+        identity = id(stream)
+        cached = self._stream_fingerprints.get(identity)
+        if cached is not None and cached[0]() is stream:
+            return cached[1]
+        value = source_slice_fingerprint(stream)
+        try:
+            reference = weakref.ref(
+                stream,
+                lambda ref, key=identity: self._drop_stream_fingerprint(key, ref),
+            )
+        except TypeError:
+            # Extension-owned stream wrappers need not support weak references. Recomputing their
+            # fingerprint is preferable to retaining an unbounded strong-reference side cache.
+            return value
+        self._stream_fingerprints[identity] = (reference, value)
+        return value
+
+    def _drop_stream_fingerprint(self, identity: int, reference: weakref.ReferenceType) -> None:
+        cached = self._stream_fingerprints.get(identity)
+        if cached is not None and cached[0] is reference:
+            del self._stream_fingerprints[identity]
+
+    def get(self, key: str) -> np.ndarray | None:
+        value = self._values.pop(key, None)
+        if value is not None:
+            self._values[key] = value
+        return value
+
+    def put(self, key: str, value: np.ndarray) -> None:
+        if self.max_bytes == 0 or value.nbytes > self.max_bytes:
+            return
+        previous = self._values.pop(key, None)
+        if previous is not None:
+            self._bytes -= previous.nbytes
+        self._values[key] = value
+        self._bytes += value.nbytes
+        while self._bytes > self.max_bytes:
+            _, evicted = self._values.popitem(last=False)
+            self._bytes -= evicted.nbytes
 
 
 def _native_capabilities(name: str) -> dict[str, bool]:
@@ -525,19 +586,34 @@ def _metric_row(
     return metrics
 
 
-def _cache_key(name: str, stream: EvalStream, fingerprint: str) -> str:
+def _cache_key(
+    name: str,
+    stream: EvalStream,
+    fingerprint: str,
+    *,
+    source_fingerprint: str | None = None,
+) -> str:
     devices = tuple(getattr(stream, "device_ids", (stream.stream,)))
+    source_fingerprint = source_fingerprint or source_slice_fingerprint(stream)
     text = (f"{FEATURE_CACHE_SCHEMA}|{name}|{stream.dataset}|{stream.stream}|{stream.alignment}|"
-            f"{stream.window_seconds:g}|{devices}|{fingerprint}|{source_slice_fingerprint(stream)}")
+            f"{stream.window_seconds:g}|{devices}|{fingerprint}|{source_fingerprint}")
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
-def _file_hash(path: Path) -> str:
+@lru_cache(maxsize=128)
+def _file_hash_for_stat(path_text: str, size: int, mtime_ns: int) -> str:
+    del size, mtime_ns  # They are cache-key material; the digest still covers the complete file.
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
+    with Path(path_text).open("rb") as handle:
         for block in iter(lambda: handle.read(1 << 20), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _file_hash(path: Path) -> str:
+    path = Path(path).resolve()
+    stat = path.stat()
+    return _file_hash_for_stat(str(path), stat.st_size, stat.st_mtime_ns)
 
 
 def _halo_features(
@@ -565,6 +641,7 @@ def _halo_features(
             source_rate=(stream.effective_source_rate_hz
                          if stream.effective_source_rate_hz is not None else None),
             lengths=stream.lengths, amp_dtype=torch.bfloat16 if device.type == "cuda" else None,
+            batch_size=512 if device.type == "cuda" else 256,
         )
     return np.asarray(features.cpu(), dtype=np.float32), fingerprint
 
@@ -793,11 +870,15 @@ def _baseline_feature_state(
     if reason is not None:
         raise baselines.UnsupportedEvaluationCell(reason)
     state = adapter.setup_features(device) if state is None else state
-    artifacts = adapter.feature_artifacts(state)
-    fingerprint = hashlib.sha256(json.dumps({
-        "artifacts": {key: _file_hash(Path(path)) for key, path in artifacts.items()},
-        "config": adapter.feature_config(state),
-    }, sort_keys=True, default=str).encode()).hexdigest()
+    fingerprint_key = f"_feature_fingerprint_{FEATURE_CACHE_SCHEMA}"
+    fingerprint = state.get(fingerprint_key)
+    if fingerprint is None:
+        artifacts = adapter.feature_artifacts(state)
+        fingerprint = hashlib.sha256(json.dumps({
+            "artifacts": {key: _file_hash(Path(path)) for key, path in artifacts.items()},
+            "config": adapter.feature_config(state),
+        }, sort_keys=True, default=str).encode()).hexdigest()
+        state[fingerprint_key] = fingerprint
     return adapter, state, fingerprint
 
 
@@ -805,6 +886,8 @@ def _load_or_encode(
     *, name: str, stream: EvalStream, device: torch.device, cache_dir: Path,
     halo_checkpoint: Path | None, baseline_state: dict | None = None,
     halo_state: tuple[torch.nn.Module, str] | None = None,
+    cache_read_dirs: Sequence[Path] = (),
+    memory_cache: FeatureMemoryCache | None = None,
 ) -> tuple[np.ndarray, str]:
     if name == "halo":
         if halo_checkpoint is None:
@@ -816,17 +899,32 @@ def _load_or_encode(
         adapter, state, probe = _baseline_feature_state(
             name, stream, device, state=baseline_state,
         )
-    key = _cache_key(name, stream, probe)
-    array_path = cache_dir / f"{stream.dataset}__{stream.stream}__{name}__{key}.npy"
-    meta_path = array_path.with_suffix(".json")
-    if array_path.exists() and meta_path.exists():
-        meta = json.loads(meta_path.read_text())
-        if (meta.get("cache_schema") == FEATURE_CACHE_SCHEMA and meta.get("cache_key") == key
-                and meta.get("n_windows") == stream.n_windows
-                and meta.get("source_slice_fingerprint") == source_slice_fingerprint(stream)):
-            cached = np.load(array_path)
-            if cached.ndim == 2 and cached.shape[0] == stream.n_windows and np.isfinite(cached).all():
-                return cached, str(meta["artifact_fingerprint"])
+    source_fingerprint = (memory_cache.stream_fingerprint(stream) if memory_cache is not None
+                          else source_slice_fingerprint(stream))
+    key = _cache_key(name, stream, probe, source_fingerprint=source_fingerprint)
+    filename = f"{stream.dataset}__{stream.stream}__{name}__{key}.npy"
+    memory_key = f"{name}:{key}"
+    if memory_cache is not None:
+        cached = memory_cache.get(memory_key)
+        if cached is not None:
+            return cached, probe
+
+    roots = (Path(cache_dir), *(Path(root) for root in cache_read_dirs if Path(root) != Path(cache_dir)))
+    for root in roots:
+        candidate = root / filename
+        candidate_meta = candidate.with_suffix(".json")
+        if not candidate.exists() or not candidate_meta.exists():
+            continue
+        meta = json.loads(candidate_meta.read_text())
+        if (meta.get("cache_schema") != FEATURE_CACHE_SCHEMA or meta.get("cache_key") != key
+                or meta.get("n_windows") != stream.n_windows
+                or meta.get("source_slice_fingerprint") != source_fingerprint):
+            continue
+        cached = np.load(candidate)
+        if cached.ndim == 2 and cached.shape[0] == stream.n_windows and np.isfinite(cached).all():
+            if memory_cache is not None:
+                memory_cache.put(memory_key, cached)
+            return cached, str(meta["artifact_fingerprint"])
     if name == "halo":
         values, fingerprint = _halo_features(
             stream, halo_checkpoint, device, state=halo_state,
@@ -837,11 +935,15 @@ def _load_or_encode(
     if values.shape[0] != stream.n_windows or values.ndim != 2 or not np.isfinite(values).all():
         raise ValueError(f"{name}: invalid feature matrix {values.shape} for {stream.dataset}/{stream.stream}")
     cache_dir.mkdir(parents=True, exist_ok=True)
+    array_path = cache_dir / filename
+    meta_path = array_path.with_suffix(".json")
     np.save(array_path, values)
     meta_path.write_text(json.dumps({"cache_schema": FEATURE_CACHE_SCHEMA, "cache_key": key, "n_windows": stream.n_windows,
                                      "artifact_fingerprint": fingerprint,
-                                     "source_slice_fingerprint": source_slice_fingerprint(stream)},
+                                     "source_slice_fingerprint": source_fingerprint},
                                     indent=2) + "\n")
+    if memory_cache is not None:
+        memory_cache.put(memory_key, values)
     return values, fingerprint
 
 
@@ -853,6 +955,8 @@ def _build_training_reference_bank(
     halo_checkpoint: Path | None,
     halo_state: tuple[torch.nn.Module, str] | None = None,
     baseline_state: dict | None = None,
+    cache_read_dirs: Sequence[Path] = (),
+    memory_cache: FeatureMemoryCache | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[str], str]:
     """Encode the active labelled training roster for zero-target-enrollment scoring."""
     assert_no_retired_sources(SUPERVISED_HEAD_TRAIN_DATASETS)
@@ -926,6 +1030,8 @@ def _build_training_reference_bank(
                     halo_checkpoint=halo_checkpoint,
                     halo_state=halo_state,
                     baseline_state=baseline_state,
+                    cache_read_dirs=cache_read_dirs,
+                    memory_cache=memory_cache,
                 )
             except baselines.UnsupportedEvaluationCell as error:
                 excluded.append({"dataset": dataset, "stream": stream_id, "reason": str(error)})

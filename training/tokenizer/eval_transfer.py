@@ -637,7 +637,8 @@ def encode_dataset(enc, data, texts, device, rate: float, gravity_state=None,
                    lengths=None,
                    neutral_text: bool = False,
                    eval_patching: str = "checkpoint",
-                   amp_dtype: torch.dtype | None = None) -> torch.Tensor:
+                   amp_dtype: torch.dtype | None = None,
+                   batch_size: int = 256) -> torch.Tensor:
     """Compatibility API: raw windows at native rate -> pooled embeddings only."""
     return encode_dataset_detailed(
         enc, data, texts, device, rate, gravity_state=gravity_state,
@@ -646,6 +647,7 @@ def encode_dataset(enc, data, texts, device, rate: float, gravity_state=None,
         neutral_text=neutral_text,
         eval_patching=eval_patching,
         amp_dtype=amp_dtype,
+        batch_size=batch_size,
         _require_patches=False,
     )["pooled"]
 

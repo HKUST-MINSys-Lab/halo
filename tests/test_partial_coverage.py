@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import torch
 
 from training.support_classifier.partial_coverage import (
     CoverageCell,
@@ -157,6 +158,17 @@ def test_full_coverage_reproduces_the_sealed_readouts_exactly():
     mine = support_only_predictions(features, CANDIDATES, plans, cell)
     for readout in ("1nn", "prototype", "ridge"):
         assert mine[readout] == reference[readout], readout
+
+
+def test_batched_support_only_readouts_match_the_reference_path():
+    cell = choose_hidden_candidates(CANDIDATES, coverage=0.5, seed_parts=("batched",))
+    plans = hide_supports(_plans(k=2, n_queries=17), cell)
+    features = _features(seed=19)
+    reference = support_only_predictions(features, CANDIDATES, plans, cell)
+    batched = support_only_predictions(
+        features, CANDIDATES, plans, cell, device=torch.device("cpu"),
+    )
+    assert batched == reference
 
 
 def test_support_only_refuses_an_episode_with_no_enrolment_left():

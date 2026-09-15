@@ -471,7 +471,14 @@ def paired_subject_bootstrap_difference(
     B: int = BOOTSTRAP_B,
     seed: int = BOOTSTRAP_SEED,
 ) -> Dict[str, float]:
-    """Paired subject-bootstrap interval for a model-minus-control metric difference."""
+    """Paired subject-bootstrap interval for a model-minus-control metric difference.
+
+    Each subject contributes one confusion matrix for the scenario and one for the matched
+    control.  Bootstrap multiplicities can therefore be applied to all replicates in one tensor
+    contraction.  This is exactly the same estimator and uses the same seeded subject draws as
+    the historical row-concatenation loop, without rebuilding arrays or sklearn estimators for
+    every replicate.
+    """
     gt = np.asarray(gt_names)
     pred = np.asarray(pred_names)
     control = np.asarray(control_names)
@@ -479,27 +486,37 @@ def paired_subject_bootstrap_difference(
     if not (len(gt) == len(pred) == len(control) == len(subjects)):
         raise ValueError("ground truth, predictions, control, and subjects must have equal length")
     uniq = np.unique(subjects)
-    if metric == "f1_macro":
-        classes = sorted(set(gt.tolist()) | set(pred.tolist()) | set(control.tolist()))
-
-        def score(target, estimate):
-            return f1_score(
-                target, estimate, labels=classes, average="macro", zero_division=0
-            ) * 100
-    elif metric == "balanced_accuracy":
-        classes = sorted(set(gt.tolist()))
-
-        def score(target, estimate):
-            return recall_score(
-                target, estimate, labels=classes, average="macro", zero_division=0
-            ) * 100
-    elif metric == "accuracy":
-        def score(target, estimate):
-            return accuracy_score(target, estimate) * 100
-    else:
+    if metric not in {"f1_macro", "balanced_accuracy", "accuracy"}:
         raise ValueError(f"unsupported bootstrap metric: {metric}")
 
-    point = float(score(gt, pred) - score(gt, control))
+    classes = sorted(set(gt.tolist()) | set(pred.tolist()) | set(control.tolist()))
+    class_to_slot = {label: slot for slot, label in enumerate(classes)}
+    truth = np.asarray([class_to_slot[label] for label in gt], dtype=np.int64)
+    prediction = np.asarray([class_to_slot[label] for label in pred], dtype=np.int64)
+    control_prediction = np.asarray(
+        [class_to_slot[label] for label in control], dtype=np.int64,
+    )
+
+    def aggregate_score(confusion: np.ndarray) -> np.ndarray:
+        true_count = confusion.sum(axis=2)
+        predicted_count = confusion.sum(axis=1)
+        true_positive = np.diagonal(confusion, axis1=1, axis2=2)
+        if metric == "f1_macro":
+            return (
+                2.0 * true_positive / np.maximum(true_count + predicted_count, 1)
+            ).mean(axis=1) * 100.0
+        if metric == "balanced_accuracy":
+            true_slots = np.unique(truth)
+            return (
+                true_positive[:, true_slots] / np.maximum(true_count[:, true_slots], 1)
+            ).mean(axis=1) * 100.0
+        return true_positive.sum(axis=1) / np.maximum(confusion.sum(axis=(1, 2)), 1) * 100.0
+
+    scenario_total = np.zeros((1, len(classes), len(classes)), dtype=np.int64)
+    control_total = np.zeros_like(scenario_total)
+    np.add.at(scenario_total, (0, truth, prediction), 1)
+    np.add.at(control_total, (0, truth, control_prediction), 1)
+    point = float(aggregate_score(scenario_total)[0] - aggregate_score(control_total)[0])
     if len(uniq) < 2:
         return {
             f"{metric}_difference": point,
@@ -509,13 +526,25 @@ def paired_subject_bootstrap_difference(
             "n_subjects": int(len(uniq)),
             "ci_degenerate": True,
         }
-    subject_rows = {subject: np.flatnonzero(subjects == subject) for subject in uniq}
+    subject_slot = np.searchsorted(uniq, subjects)
+    scenario_confusion = np.zeros(
+        (len(uniq), len(classes), len(classes)), dtype=np.int64,
+    )
+    control_confusion = np.zeros_like(scenario_confusion)
+    np.add.at(scenario_confusion, (subject_slot, truth, prediction), 1)
+    np.add.at(control_confusion, (subject_slot, truth, control_prediction), 1)
+
     rng = np.random.RandomState(seed)
-    statistics = []
-    for _ in range(B):
-        sampled = rng.choice(uniq, size=len(uniq), replace=True)
-        rows = np.concatenate([subject_rows[subject] for subject in sampled])
-        statistics.append(score(gt[rows], pred[rows]) - score(gt[rows], control[rows]))
+    draws = rng.choice(len(uniq), size=(B, len(uniq)), replace=True)
+    multiplicity = np.zeros((B, len(uniq)), dtype=np.int64)
+    np.add.at(multiplicity, (np.arange(B)[:, None], draws), 1)
+    scenario_sampled = np.einsum(
+        "bs,sij->bij", multiplicity, scenario_confusion, optimize=True,
+    )
+    control_sampled = np.einsum(
+        "bs,sij->bij", multiplicity, control_confusion, optimize=True,
+    )
+    statistics = aggregate_score(scenario_sampled) - aggregate_score(control_sampled)
     lower, upper = np.percentile(statistics, [2.5, 97.5])
     return {
         f"{metric}_difference": point,
@@ -615,29 +644,14 @@ def fit_temperature(logits, labels, max_iter: int = 100) -> float:
 # SBERT encoder + ConSE bridge (Norouzi et al., 2014)
 # =============================================================================
 
-_SBERT_CACHE: dict = {}
-_SBERT_EMBED_CACHE: dict[tuple[str, tuple[str, ...]], np.ndarray] = {}
-
-
 def get_sbert_encoder(model_name: str = "all-MiniLM-L6-v2") -> Callable[[Sequence[str]], np.ndarray]:
-    """Frozen SBERT mean-pool encoder used by the ConSE bridge (the SAME encoder
-    for every bridged model). Labels are de-underscored before encoding and the
-    returned embeddings are L2-normalized."""
-    if model_name not in _SBERT_CACHE:
-        from sentence_transformers import SentenceTransformer
-        _SBERT_CACHE[model_name] = SentenceTransformer(model_name)
-    sbert = _SBERT_CACHE[model_name]
+    """Frozen SBERT encoder shared by ConSE and HALO label-token construction."""
+    # Keep this compatibility entry point because published evaluation code imports it from
+    # ``scoring``. The implementation lives in one module so an evaluation process cannot load two
+    # identical 22M-parameter sentence encoders or maintain divergent embedding caches.
+    from .text import get_sbert_encoder as shared_sbert_encoder
 
-    def encode(labels: Sequence[str]) -> np.ndarray:
-        key = (model_name, tuple(labels))
-        if key not in _SBERT_EMBED_CACHE:
-            texts = [label.replace("_", " ") for label in labels]
-            _SBERT_EMBED_CACHE[key] = np.asarray(
-                sbert.encode(texts, normalize_embeddings=True), dtype=np.float32
-            )
-        return _SBERT_EMBED_CACHE[key]
-
-    return encode
+    return shared_sbert_encoder(model_name)
 
 
 def conse_embeddings(

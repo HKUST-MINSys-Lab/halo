@@ -33,6 +33,7 @@ import platform
 import subprocess
 import traceback
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -66,6 +67,8 @@ from .scenarios import (
     stream_rows,
 )
 from .sealed_eval import (
+    FEATURE_CACHE_SCHEMA,
+    FeatureMemoryCache,
     PRIMARY_BASELINES,
     SEED,
     TRAINING_BANK_ZERO_SHOT,
@@ -122,6 +125,10 @@ NEW_DOMAIN_CELLS = (
 )
 
 RATE_TARGETS = (20.0, 25.0, 100.0)
+EVALUATION_ROOT = Path(__file__).resolve().parent / "evaluations"
+DEFAULT_SHARED_FEATURE_CACHE = EVALUATION_ROOT / f"shared_{FEATURE_CACHE_SCHEMA}"
+_WITHIN_PLAN_CACHE: dict[tuple, tuple] = {}
+_WITHIN_CROSS_SUBJECT_CACHE: dict[tuple, tuple] = {}
 
 _REGION = {
     "wrist": "arm", "forearm": "arm", "upper_arm": "arm", "hand": "arm", "ear": "head",
@@ -131,6 +138,25 @@ _REGION = {
     "ankle": "leg", "gastrocnemius": "leg", "hamstrings": "leg", "tibialis": "leg",
     "rectus_femoris": "leg",
 }
+
+
+def _existing_feature_cache_dirs(write_dir: Path) -> tuple[Path, ...]:
+    """Find prior compatible cache directories; individual entries remain fully validated.
+
+    Historical evaluations stored their content-addressed arrays below each result directory.
+    Searching those directories lets a scenario run reuse exact checkpoint/stream matches without
+    copying files or trusting a stale filename.  ``_load_or_encode`` still verifies schema, cache
+    key, source fingerprint, row count, shape, and finiteness before accepting an entry.
+    """
+    if not EVALUATION_ROOT.exists():
+        return ()
+    write_dir = write_dir.resolve()
+    roots = {
+        meta.parent.resolve()
+        for meta in EVALUATION_ROOT.rglob("*.json")
+        if meta.with_suffix(".npy").is_file() and meta.parent.resolve() != write_dir
+    }
+    return tuple(sorted(roots, key=str))
 
 
 def _region(dataset: str, stream_id: str) -> str:
@@ -179,31 +205,42 @@ class Task:
         return self.support_stream is not self.query_stream
 
 
+@lru_cache(maxsize=64)
 def _load(dataset: str, stream_id: str, window_seconds: float):
     return load_eval_stream(dataset, stream_id, alignment="native",
                             window_seconds=window_seconds, apply_quality_screen=True)
 
 
+@lru_cache(maxsize=32)
 def _composite(dataset: str, device_ids, window_seconds: float):
     return load_multi_device_stream(dataset, tuple(device_ids), alignment="native",
                                     window_seconds=window_seconds, apply_quality_screen=True)
 
 
 def _within(stream, k: int, seed: int) -> tuple:
-    return tuple(build_manifest(stream, k, seed=seed))
+    key = (source_slice_fingerprint(stream), int(k), int(seed))
+    if key not in _WITHIN_PLAN_CACHE:
+        _WITHIN_PLAN_CACHE[key] = tuple(build_manifest(stream, k, seed=seed))
+    return _WITHIN_PLAN_CACHE[key]
 
 
 def _within_cross_subject(stream, k: int, seed: int) -> tuple:
     if k == 0:
         return _within(stream, k, seed)
+    key = (source_slice_fingerprint(stream), int(k), int(seed))
+    cached = _WITHIN_CROSS_SUBJECT_CACHE.get(key)
+    if cached is not None:
+        return cached
     cross = build_cross_manifest(
         stream, stream, k, seed=seed, relation="within_cross_subject", same_subject=False,
     )
-    return tuple(QueryPlan(
+    plans = tuple(QueryPlan(
         query=plan.query,
         support=tuple(row - cross.offset for row in plan.support),
         support_labels=plan.support_labels,
     ) for plan in cross.plans)
+    _WITHIN_CROSS_SUBJECT_CACHE[key] = plans
+    return plans
 
 
 def _mmfit_new_domain_plans(stream, k: int, seed: int) -> tuple[tuple[QueryPlan, ...], str]:
@@ -314,9 +351,14 @@ def _mmfit_split_rows(stream, split_names: tuple[str, ...]) -> np.ndarray:
 
 
 def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
-                coverage: float) -> list[Task]:
+                coverage: float, limit: int | None = None) -> list[Task]:
     """Every cell of one scenario at one evidence budget and one enrolment size."""
+    if limit is not None and limit < 1:
+        return []
     tasks: list[Task] = []
+
+    def complete() -> bool:
+        return limit is not None and len(tasks) >= limit
 
     if scenario == "s1_partial_coverage":
         if k == 0:
@@ -333,6 +375,8 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                 tuple(hide_supports(plans, cell)), tuple(stream.eval_labels),
                 stream_rows(stream), {"L": 0, "S": 2, "P": 0, "C": 0}, coverage=cell,
                 meta={"subject_relation": "cross_subject"}))
+            if complete():
+                return tasks
 
     elif scenario == "s2_cross_placement":
         for dataset, streams in CROSS_PLACEMENT_STREAMS.items():
@@ -351,6 +395,8 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                                 {"L": 0, "S": 3, "P": 0, "C": 0},
                                 meta={"distance": anatomical_distance(dataset, query_id, support_id),
                                       "subject_relation": "not_applicable_zero_support"}))
+                            if complete():
+                                return tasks
                         continue
                     for relation, same_subject, severity in (
                             ("same_subject", True, 1), ("cross_subject", False, 2)):
@@ -371,6 +417,8 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                             meta={"matched_group": matched_group, "condition": "control",
                                   "subject_relation": relation},
                         ))
+                        if complete():
+                            return tasks
                         tasks.append(Task(
                             scenario, f"{dataset}/{query_id}<-{support_id}/{relation}",
                             query, support, cross_plans, cross.candidates, cross.offset,
@@ -378,6 +426,8 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                             meta={"distance": anatomical_distance(dataset, query_id, support_id),
                                   "subject_relation": relation, "matched_group": matched_group,
                                   "condition": "scenario"}))
+                        if complete():
+                            return tasks
 
     elif scenario == "s3_cross_dataset":
         for (q_ds, q_id), (s_ds, s_id), region in CROSS_DATASET_PAIRS:
@@ -392,6 +442,8 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                         {"L": 0, "S": 3, "P": 3, "C": 0},
                         meta={"region_match": region, "support_dataset": s_ds,
                               "subject_relation": "not_applicable_zero_support"}))
+                    if complete():
+                        return tasks
                 continue
             cross = build_cross_manifest(query, support, k, seed=seed,
                                          relation="cross_dataset", same_subject=None)
@@ -409,6 +461,8 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                 meta={"matched_group": matched_group, "condition": "control",
                       "subject_relation": "cross_subject"},
             ))
+            if complete():
+                return tasks
             tasks.append(Task(
                 scenario, f"{q_ds}/{q_id}<-{s_ds}/{s_id}", query, support,
                 cross_plans, cross.candidates, cross.offset,
@@ -416,6 +470,8 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                 meta={"region_match": region, "support_dataset": s_ds,
                       "subject_relation": "cross_dataset_identity_unmapped",
                       "matched_group": matched_group, "condition": "scenario"}))
+            if complete():
+                return tasks
 
     elif scenario == "s4_missing_modality":
         if k == 0:
@@ -429,6 +485,8 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                 tasks.append(Task(scenario, f"{dataset}/{stream_id}", full, full, (), (), 0,
                                   {"L": 0, "S": 0, "P": 0, "C": 1},
                                   meta={"skipped": str(exc)}))
+                if complete():
+                    return tasks
                 continue
             tasks.append(Task(
                 scenario, f"{dataset}/{stream_id}/matched_full_control", full, full,
@@ -437,6 +495,8 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                 meta={"matched_parent": f"{dataset}/{stream_id}/modality",
                       "condition": "control", "subject_relation": "cross_subject"},
             ))
+            if complete():
+                return tasks
             for variant, query, support in (
                     ("query_accel_only", accel, full),
                     ("support_accel_only", full, accel),
@@ -455,6 +515,8 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                     meta={"perturbation": variant,
                           "matched_parent": f"{dataset}/{stream_id}/modality",
                           "condition": "scenario", "subject_relation": "cross_subject"}))
+                if complete():
+                    return tasks
 
     elif scenario == "s5_rate_mismatch":
         if k == 0:
@@ -469,6 +531,8 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                 meta={"matched_parent": f"{dataset}/{stream_id}/rate", "condition": "control",
                       "subject_relation": "cross_subject"},
             ))
+            if complete():
+                return tasks
             for target in RATE_TARGETS:
                 if abs(target - float(full.rate_hz)) < 1e-9:
                     continue
@@ -483,6 +547,8 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                     meta={"query_rate_hz": target, "support_rate_hz": float(full.rate_hz),
                           "matched_parent": f"{dataset}/{stream_id}/rate",
                           "condition": "scenario", "subject_relation": "cross_subject"}))
+                if complete():
+                    return tasks
 
     elif scenario == "s6_new_domain":
         for dataset, stream_id in NEW_DOMAIN_CELLS:
@@ -501,6 +567,8 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                 tuple(stream.eval_labels), stream_rows(stream),
                 {"L": 3, "S": 0, "P": 0, "C": 0},
                 meta={"subject_relation": subject_relation}))
+            if complete():
+                return tasks
             if k > 0:
                 cell = _coverage_cell(stream.eval_labels, seed=seed, dataset=dataset, stream=stream_id,
                                       window_seconds=window_seconds, coverage=coverage)
@@ -509,6 +577,8 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                     tuple(hide_supports(plans, cell)), tuple(stream.eval_labels),
                     stream_rows(stream), {"L": 3, "S": 2, "P": 0, "C": 0}, coverage=cell,
                     meta={"subject_relation": subject_relation}))
+                if complete():
+                    return tasks
 
     elif scenario == "s7_device_set":
         for cell_spec in MULTI_DEVICE_EVAL_CELLS:
@@ -524,6 +594,8 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                         candidates, stream_rows(composite), {"L": 0, "S": 3, "P": 0, "C": 3},
                         meta={"device_variant": "zero_support",
                               "subject_relation": "not_applicable_zero_support"}))
+                    if complete():
+                        return tasks
                 continue
             for variant, query, support in (
                     ("support_single_query_composite", composite, single),
@@ -546,6 +618,8 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                     meta={"device_variant": variant, "condition": "control",
                           "matched_group": matched_group, "subject_relation": "cross_subject"},
                 ))
+                if complete():
+                    return tasks
                 tasks.append(Task(
                     scenario, f"{dataset}/{variant}", query, support, cross_plans,
                     cross.candidates, cross.offset, {"L": 0, "S": 0, "P": 0, "C": 3},
@@ -554,6 +628,8 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                           "support_devices": len(getattr(support, "devices", [1])),
                           "condition": "scenario", "matched_group": matched_group,
                           "subject_relation": "cross_subject"}))
+                if complete():
+                    return tasks
 
     elif scenario == "s8_cold_start":
         if k == 0:
@@ -576,6 +652,8 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                 meta={"support_stream": "right_wrist", "query_devices": 2,
                       "provenance_unit": "published_mmfit_workout_partition",
                       "bootstrap_unit": "workout"}))
+            if complete():
+                return tasks
     else:
         raise ValueError(f"unknown scenario {scenario!r}")
     return tasks
@@ -586,7 +664,8 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
 
 def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootstrap,
                banks, k: int, window_seconds: float, halo_state=None,
-               provider_states=None, prediction_sink=None) -> list[dict]:
+               provider_states=None, prediction_sink=None, cache_read_dirs=(),
+               feature_memory_cache=None) -> list[dict]:
     """Every readout for every model on one task's episodes."""
     if not task.plans:
         return [{"scenario": task.scenario, "variant": task.variant, "status": "n/a",
@@ -651,12 +730,14 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
             query_features, fingerprint = _load_or_encode(
                 name=name, stream=task.query_stream, device=device, cache_dir=cache_dir,
                 halo_checkpoint=halo_checkpoint, baseline_state=provider_states.get(name),
-                halo_state=halo_state)
+                halo_state=halo_state, cache_read_dirs=cache_read_dirs,
+                memory_cache=feature_memory_cache)
             if task.cross:
                 support_features, _ = _load_or_encode(
                     name=name, stream=task.support_stream, device=device, cache_dir=cache_dir,
                     halo_checkpoint=halo_checkpoint, baseline_state=provider_states.get(name),
-                    halo_state=halo_state)
+                    halo_state=halo_state, cache_read_dirs=cache_read_dirs,
+                    memory_cache=feature_memory_cache)
                 features = np.concatenate([query_features, support_features], axis=0)
             else:
                 features = query_features
@@ -669,7 +750,7 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
 
             if k > 0:
                 for readout, predicted in support_only_predictions(
-                        features, task.candidates, task.plans, coverage).items():
+                        features, task.candidates, task.plans, coverage, device=device).items():
                     append_emitted(predicted, readout=readout)
 
             text = None
@@ -680,7 +761,9 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
                             name=name, device=device,
                             cache_dir=Path("training/support_classifier/evaluations/zero_shot_feature_cache"),
                             halo_checkpoint=halo_checkpoint, halo_state=halo_state,
-                            baseline_state=provider_states.get(name))
+                            baseline_state=provider_states.get(name),
+                            cache_read_dirs=cache_read_dirs,
+                            memory_cache=feature_memory_cache)
                     bank_features, bank_labels, train_labels, _ = banks[name]
                     text = conse_scores(query_features, bank_features, bank_labels, train_labels,
                                         task.candidates, device)
@@ -890,6 +973,65 @@ def _paired_deltas(predictions: list[dict], *, bootstrap: int) -> list[dict]:
     return output
 
 
+class _PairedDeltaTracker:
+    """Compute matched deltas while one control/scenario group is still local.
+
+    The audit JSONL retains every decision.  This tracker only changes working memory: controls are
+    released immediately after their final associated scenario instead of retaining every paired
+    prediction from the complete experiment.
+    """
+
+    def __init__(self, tasks: list[Task], *, bootstrap: int):
+        self.bootstrap = int(bootstrap)
+        self.remaining: dict[str, int] = {}
+        for task in tasks:
+            parent = task.meta.get("matched_group") or task.meta.get("matched_parent")
+            if parent and task.meta.get("condition") == "scenario":
+                self.remaining[parent] = self.remaining.get(parent, 0) + 1
+        self.controls: dict[str, list[dict]] = {}
+        self.output: list[dict] = []
+
+    def consume(self, rows: list[dict]) -> None:
+        if not rows:
+            return
+        grouped: dict[tuple[str, str], list[dict]] = {}
+        for row in rows:
+            parent = row.get("matched_group") or row.get("matched_parent")
+            condition = row.get("condition")
+            if parent and condition in {"control", "scenario"}:
+                grouped.setdefault((parent, condition), []).append(row)
+        for (parent, condition), values in grouped.items():
+            compact = [{
+                key: row.get(key)
+                for key in (
+                    "matched_group", "matched_parent", "condition", "model", "readout",
+                    "k", "window_seconds", "variant", "query_event_id", "query_group_id",
+                    "truth", "prediction",
+                )
+            } for row in values]
+            if condition == "control":
+                if self.remaining.get(parent, 0) > 0:
+                    if parent in self.controls:
+                        raise RuntimeError(f"duplicate matched control for {parent}")
+                    self.controls[parent] = compact
+                continue
+            control = self.controls.get(parent)
+            if control is None:
+                raise RuntimeError(f"matched scenario appeared before its control: {parent}")
+            self.output.extend(_paired_deltas(control + compact, bootstrap=self.bootstrap))
+            self.remaining[parent] -= 1
+            if self.remaining[parent] == 0:
+                del self.controls[parent]
+
+    def finish(self) -> list[dict]:
+        incomplete = {key: count for key, count in self.remaining.items() if count > 0}
+        if incomplete:
+            raise RuntimeError(f"matched scenarios were not consumed: {incomplete}")
+        if self.controls:
+            raise RuntimeError(f"unused matched controls remain: {sorted(self.controls)}")
+        return self.output
+
+
 def _model_artifacts(models, provider_states, halo_checkpoint) -> dict:
     output = {}
     for name in models:
@@ -963,9 +1105,17 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--bootstrap", type=int, default=scoring.BOOTSTRAP_B)
     parser.add_argument("--feature-cache", type=Path, default=None)
+    parser.add_argument(
+        "--feature-memory-cache-gib", type=float, default=2.0,
+        help="bounded RAM cache for repeatedly referenced feature arrays (default: 2 GiB)",
+    )
+    parser.add_argument(
+        "--no-prior-feature-cache-reuse", action="store_true",
+        help="do not search prior evaluation directories for independently validated cache hits",
+    )
     parser.add_argument("--max-tasks-per-scenario", type=int, default=None)
     parser.add_argument("--smoke", action="store_true",
-                        help="one task per scenario, one k, no bootstrap: wiring check only")
+                        help="up to two tasks per scenario, one k, no bootstrap: wiring check only")
     args = parser.parse_args()
 
     if any(value < 0 for value in args.k):
@@ -974,6 +1124,8 @@ def main() -> None:
         parser.error("--window-seconds values must be finite and positive")
     if not 0.0 < args.coverage < 1.0:
         parser.error("--coverage must lie strictly between zero and one")
+    if not np.isfinite(args.feature_memory_cache_gib) or args.feature_memory_cache_gib < 0:
+        parser.error("--feature-memory-cache-gib must be finite and non-negative")
     unknown = sorted(set(args.models) - set(PRIMARY_BASELINES) - {"halo"})
     if unknown:
         parser.error(f"models outside the registered primary roster: {unknown}")
@@ -989,19 +1141,26 @@ def main() -> None:
         blob = torch.load(args.halo_checkpoint, map_location="cpu", weights_only=False)
         halo_state = (build_encoder(blob, device).eval(), _file_hash(args.halo_checkpoint))
     args.out.mkdir(parents=True, exist_ok=True)
-    cache_dir = args.feature_cache or (args.out / "feature_cache")
+    cache_dir = args.feature_cache or DEFAULT_SHARED_FEATURE_CACHE
     cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_read_dirs = (() if args.no_prior_feature_cache_reuse
+                       else _existing_feature_cache_dirs(cache_dir))
+    feature_memory_cache = FeatureMemoryCache(
+        int(args.feature_memory_cache_gib * 1024**3),
+    )
     ks = sorted(set(args.k))
     windows = sorted(set(args.window_seconds))
     bootstrap = 0 if args.smoke else args.bootstrap
-    limit = 1 if args.smoke else args.max_tasks_per_scenario
+    # Matched scenarios emit control then perturbation. Two tasks exercise the actual comparison;
+    # the historical one-task smoke only scored the control and could not catch scenario failures.
+    limit = 2 if args.smoke else args.max_tasks_per_scenario
     if args.smoke:
         ks, windows = ks[:1], windows[:1]
 
     rows: list[dict] = []
     banks: dict[str, tuple] = {}
     failures: list[dict] = []
-    paired_predictions: list[dict] = []
+    paired_delta_rows: list[dict] = []
     provider_states: dict[str, dict] = {}
     manifest_path = args.out / "manifests.jsonl"
     prediction_path = args.out / "predictions.jsonl"
@@ -1010,12 +1169,19 @@ def main() -> None:
     _atomic_json(args.out / "run_provenance.json", _run_provenance(
         list(os.sys.argv), device=device, halo_checkpoint=args.halo_checkpoint,
     ))
+    _atomic_json(args.out / "feature_cache_provenance.json", {
+        "schema": FEATURE_CACHE_SCHEMA,
+        "write_directory": str(cache_dir.resolve()),
+        "prior_cache_reuse": not args.no_prior_feature_cache_reuse,
+        "read_directories": [str(path) for path in cache_read_dirs],
+        "memory_cache_gib": float(args.feature_memory_cache_gib),
+    })
     for scenario in args.scenarios:
         for window_seconds in windows:
             for k in ks:
                 try:
                     tasks = build_tasks(scenario, k, window_seconds,
-                                        seed=args.seed, coverage=args.coverage)
+                                        seed=args.seed, coverage=args.coverage, limit=limit)
                 except Exception as exc:  # noqa: BLE001
                     failures.append({"scenario": scenario, "k": k,
                                      "window_seconds": window_seconds,
@@ -1042,7 +1208,9 @@ def main() -> None:
                                          "window_seconds": window_seconds, "stage": "build_tasks",
                                          "error": "scenario produced no evaluable cell"})
                         _atomic_json(args.out / "failures.json", failures)
-                for task in tasks[:limit]:
+                selected_tasks = tasks
+                paired_tracker = _PairedDeltaTracker(selected_tasks, bootstrap=bootstrap)
+                for task in selected_tasks:
                     _append_jsonl(
                         manifest_path,
                         [_task_artifact(task, k=k, window_seconds=window_seconds)],
@@ -1056,26 +1224,37 @@ def main() -> None:
                             halo_checkpoint=args.halo_checkpoint, bootstrap=bootstrap,
                             banks=banks, k=k, window_seconds=window_seconds,
                             halo_state=halo_state, provider_states=provider_states,
-                            prediction_sink=task_predictions))
+                            prediction_sink=task_predictions,
+                            cache_read_dirs=cache_read_dirs,
+                            feature_memory_cache=feature_memory_cache))
                     except Exception as exc:  # noqa: BLE001
                         failures.append({"scenario": scenario, "variant": task.variant, "k": k,
                                          "window_seconds": window_seconds, "stage": "score_task",
                                          "error": f"{type(exc).__name__}: {exc}",
                                          "traceback": traceback.format_exc()})
                     _append_jsonl(prediction_path, task_predictions)
-                    paired_predictions.extend(
-                        row for row in task_predictions
-                        if row.get("matched_group") or row.get("matched_parent")
-                    )
+                    try:
+                        paired_tracker.consume(task_predictions)
+                    except RuntimeError as exc:
+                        failures.append({"scenario": scenario, "variant": task.variant,
+                                         "k": k, "window_seconds": window_seconds,
+                                         "stage": "paired_deltas", "error": str(exc)})
                     _atomic_json(args.out / "results.json", rows)
                     _atomic_json(args.out / "failures.json", failures)
                     _write_tabular_results(args.out, rows)
+                try:
+                    paired_delta_rows.extend(paired_tracker.finish())
+                except RuntimeError as exc:
+                    failures.append({"scenario": scenario, "k": k,
+                                     "window_seconds": window_seconds,
+                                     "stage": "paired_deltas",
+                                     "error": str(exc)})
+                    _atomic_json(args.out / "failures.json", failures)
+                _atomic_json(args.out / "paired_deltas.json", paired_delta_rows)
 
     _atomic_json(args.out / "results.json", rows)
     _atomic_json(args.out / "failures.json", failures)
-    _atomic_json(args.out / "paired_deltas.json", _paired_deltas(
-        paired_predictions, bootstrap=bootstrap,
-    ))
+    _atomic_json(args.out / "paired_deltas.json", paired_delta_rows)
     _atomic_json(args.out / "model_artifacts.json", _model_artifacts(
         args.models, provider_states, args.halo_checkpoint,
     ))

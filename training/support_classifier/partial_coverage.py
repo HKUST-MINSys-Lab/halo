@@ -141,13 +141,21 @@ def zscore(scores: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
         raise ValueError("mask must match the score matrix")
     out = np.zeros_like(scores)
     counts = mask.sum(axis=1)
-    for row in np.flatnonzero(counts >= 2):
-        live = scores[row][mask[row]]
-        spread = float(live.std())
-        scale = max(1.0, float(np.abs(live).max()))
-        if spread <= np.finfo(scores.dtype).eps * scale * 16.0:
-            continue
-        out[row][mask[row]] = (live - live.mean()) / spread
+    eligible = counts >= 2
+    if not np.any(eligible):
+        return out
+
+    safe_counts = np.maximum(counts, 1)
+    finite = np.where(mask, scores, 0.0)
+    means = finite.sum(axis=1) / safe_counts
+    centered = np.where(mask, scores - means[:, None], 0.0)
+    spreads = np.sqrt(np.square(centered).sum(axis=1) / safe_counts)
+    scales = np.maximum(1.0, np.abs(finite).max(axis=1))
+    stable = eligible & (spreads > np.finfo(scores.dtype).eps * scales * 16.0)
+    if np.any(stable):
+        out[stable] = np.where(
+            mask[stable], centered[stable] / spreads[stable, None], 0.0,
+        )
     return out
 
 
@@ -158,6 +166,7 @@ def support_only_predictions(
     cell: CoverageCell,
     *,
     ridge_alpha: float = 1.0,
+    device=None,
 ) -> dict[str, list[str]]:
     """1-NN, prototype and ridge restricted to the candidates that actually carry enrolment.
 
@@ -166,6 +175,20 @@ def support_only_predictions(
     """
     if not cell.supported:
         raise ValueError("a partial-coverage cell must support at least one candidate")
+    if device is not None:
+        # Hiding is cell-wide, so every surviving plan still carries the same k examples for each
+        # supported class.  The sealed evaluator's batched implementation is therefore exactly the
+        # same readout over a smaller candidate roster, including the same ridge system.
+        from .sealed_eval import _readout_predictions
+
+        return _readout_predictions(
+            features,
+            np.empty(len(features), dtype=object),
+            tuple(cell.supported),
+            plans,
+            ridge_alpha=ridge_alpha,
+            device=device,
+        )
     z = _normalise(features)
     supported = list(cell.supported)
     slot_of = {label: index for index, label in enumerate(supported)}
@@ -224,16 +247,32 @@ def hybrid_predictions(
     rows = np.asarray([plan.query for plan in plans], dtype=np.int64)
     text_component = zscore(text_scores[rows])
 
+    if not plans:
+        return []
+    support_counts = {len(plan.support) for plan in plans}
+    if len(support_counts) != 1 or not next(iter(support_counts)):
+        raise ValueError("hybrid readout requires a uniform, non-empty support set per query")
+    support_rows = np.asarray([plan.support for plan in plans], dtype=np.int64)
+    query_rows = np.asarray([plan.query for plan in plans], dtype=np.int64)
+    similarities = np.einsum(
+        "nsd,nd->ns", z[support_rows], z[query_rows], optimize=True,
+    )
+    candidate_index = {label: index for index, label in enumerate(roster)}
+    try:
+        support_slots = np.asarray([
+            [candidate_index[label] for label in plan.support_labels] for plan in plans
+        ], dtype=np.int64)
+    except KeyError as error:
+        raise ValueError(f"support label is absent from the candidate roster: {error.args[0]}") from error
     similarity = np.full((len(plans), len(roster)), -np.inf)
-    for row, plan in enumerate(plans):
-        if not plan.support:
-            continue
-        x = z[np.asarray(plan.support, dtype=np.int64)]
-        sims = x @ z[plan.query]
-        for label in set(plan.support_labels):
-            index = roster.index(label)
-            member = np.asarray([value == label for value in plan.support_labels], dtype=bool)
-            similarity[row, index] = float(sims[member].max())
+    episode_rows = np.broadcast_to(
+        np.arange(len(plans), dtype=np.int64)[:, None], support_slots.shape,
+    )
+    np.maximum.at(
+        similarity,
+        (episode_rows.ravel(), support_slots.ravel()),
+        similarities.ravel(),
+    )
 
     live = np.isfinite(similarity) & support_mask
     finite = np.where(live, similarity, 0.0)

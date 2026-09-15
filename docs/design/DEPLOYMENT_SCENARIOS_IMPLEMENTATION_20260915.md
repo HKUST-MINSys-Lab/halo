@@ -1,8 +1,8 @@
 # Deployment-heterogeneity scenarios — implementation handoff (2026-09-15)
 
-**Status:** repaired after the 2026-09-15 implementation review. Focused regression tests and
-bounded real-data integration checks pass for HALO, HARNet, LiMU-BERT-X, UniMTS, and NormWear;
-**no full comparison run has been made.** Implements
+**Status:** repaired and performance-audited after the 2026-09-15 implementation review. Focused
+regression tests and an all-scenario real-data smoke pass for HALO, HARNet, LiMU-BERT-X, UniMTS,
+and NormWear; **no full comparison run has been made.** Implements
 `DEPLOYMENT_SCENARIOS_PLAN_20260915.md`. Written for another agent to review and debug.
 
 ## 1. What was added
@@ -30,11 +30,19 @@ cd /home/alex/code/HALO/halo
   --k 1 8 --window-seconds 8
 ```
 
-`--smoke` runs one cell per scenario, one k, no bootstrap. `--scenarios` selects a subset.
+`--smoke` runs up to two cells per scenario, one k, no bootstrap. Two cells are necessary for
+matched scenarios because they exercise both the control and perturbation. `--scenarios` selects a subset.
 `--max-tasks-per-scenario` bounds a long sweep. Output includes `results.json`, `failures.json`,
 `manifests.jsonl`, `predictions.jsonl`, `paired_deltas.json`, `model_artifacts.json`,
 `run_provenance.json`, `results.csv`, and `RESULTS.md`;
 a scenario that produces no evaluable cell is written to `failures.json` rather than skipped.
+
+Feature arrays are content-addressed by provider artifacts, source slice, and extraction config.
+The default shared cache is
+`training/support_classifier/evaluations/shared_sealed-feature-v4-20260913`; individually validated
+entries from older evaluation directories are reused automatically. Use
+`--no-prior-feature-cache-reuse` only for a deliberate cold-cache diagnostic. A bounded 2 GiB RAM
+LRU avoids repeated disk loads within a run and is adjustable with `--feature-memory-cache-gib`.
 
 ## 3. Design decisions a reviewer should check
 
@@ -89,7 +97,7 @@ pre-existing stream**, only the ten new streams were added, and no shared finger
 sealed protocol is unaffected. Backups of both files are in this session's scratchpad. **Re-verify
 this independently** — it is the one change that touches sealed evaluation inputs.
 
-## 6. Smoke results (one cell per scenario, HALO only, k=4, 8 s, no bootstrap)
+## 6. Smoke results (historical one-cell HALO check, k=4, 8 s, no bootstrap)
 
 Not results. A wiring check, single cell, no baselines except where noted. Severity is `L/S/P/C`.
 
@@ -139,3 +147,32 @@ is preserved in `NORMWEAR_READOUT_FINDING_20260915.md`.
   RealWorld/Shoaib placements remain outside the current roster.
 * The runner writes JSON, CSV, Markdown, per-query decisions, matched deltas, manifests, and model
   provenance. Figure generation remains a post-run reporting step.
+
+## 9. Performance audit
+
+The 2026-09-15 optimization pass made no changes to episodes, predictions, metrics, or model
+semantics:
+
+* Paired subject bootstrap now accumulates per-subject confusion matrices and vectorizes the same
+  seeded resamples. It is bit-for-bit equivalent to the former per-replicate sklearn estimator in
+  parity tests, reducing a typical 1,000-replicate comparison from about 4.1 s to 0.006 s.
+* Partial-coverage support readouts and the fixed hybrid combiner are batched. The support roster,
+  max-over-enrolments rule, z-score definition, and predictions are unchanged.
+* Scenario task limiting now stops construction at the requested limit instead of constructing and
+  discarding the full suite. A two-task rate-mismatch smoke fell from 12.4 s to 1.6 s in task setup.
+* Repeated immutable manifests, composite views, source fingerprints, model-artifact hashes, and
+  feature matrices are cached with bounded memory and content validation.
+* ConSE and HALO label tokens now use one process-wide frozen MiniLM instance and embedding cache
+  instead of loading the same 22M-parameter model twice.
+* HALO extraction uses a measured-safe CUDA batch of 512. NormWear uses 32 six-channel chunks on
+  this RTX 4090; that was the fastest measured point and stays below 8 GiB peak VRAM.
+* Matched controls are released after their final perturbation instead of retaining every
+  per-query prediction in memory until the end.
+
+An all-model smoke over all eight scenarios produced 407 result rows, 71 matched-delta rows, and
+zero failures in 10.6 minutes from a partly cold cache. Six cells were explicitly `unsupported`
+because LiMU-BERT-X requires measured six-axis IMU and the relevant streams lacked gyroscope data;
+none were silently scored. With those one-time features materialized, a two-cell HALO partial-
+coverage smoke took 17.5 s. First-use feature extraction, especially NormWear and the labelled
+training reference banks, remains the dominant cold-run cost; later runs reuse exact validated
+artifacts.
