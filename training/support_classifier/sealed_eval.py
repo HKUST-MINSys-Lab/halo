@@ -371,10 +371,15 @@ def _readout_predictions(
     *,
     ridge_alpha: float = 1.0,
     device: torch.device | None = None,
+    readouts: frozenset[str] | None = None,
 ) -> dict[str, list[str]]:
     """Matched enrollment readouts over one frozen representation matrix."""
     z = _normalise(features)
-    result = {"1nn": [], "prototype": [], "ridge": []}
+    requested = frozenset(("1nn", "prototype", "ridge")) if readouts is None else readouts
+    unknown = requested - {"1nn", "prototype", "ridge"}
+    if unknown:
+        raise ValueError(f"unknown support-only readouts: {sorted(unknown)}")
+    result = {name: [] for name in requested}
     candidate_index = {label: index for index, label in enumerate(candidates)}
     if device is None:
         for plan in plans:
@@ -384,34 +389,43 @@ def _readout_predictions(
                 continue
             x = z[support]
             y = np.asarray([candidate_index[label] for label in plan.support_labels], dtype=np.int64)
-            result["1nn"].append(str(plan.support_labels[int(np.argmax(x @ query))]))
-            prototypes = np.stack([
-                x[y == slot].mean(axis=0) for slot in range(len(candidates))
-            ])
-            result["prototype"].append(str(candidates[int(np.argmax(_normalise(prototypes) @ query))]))
-            # Reference path used by unit tests and CPU-only callers.
-            target = np.eye(len(candidates), dtype=np.float64)[y]
-            if len(x) <= x.shape[1]:
-                gram = x @ x.T + ridge_alpha * np.eye(len(x), dtype=np.float64)
-                coefficient = np.linalg.solve(gram, target)
-                ridge_scores = query @ x.T @ coefficient
-            else:
-                gram = x.T @ x + ridge_alpha * np.eye(x.shape[1], dtype=np.float64)
-                coefficient = np.linalg.solve(gram, x.T @ target)
-                ridge_scores = query @ coefficient
-            result["ridge"].append(str(candidates[int(np.argmax(ridge_scores))]))
+            if "1nn" in requested:
+                result["1nn"].append(str(plan.support_labels[int(np.argmax(x @ query))]))
+            if "prototype" in requested:
+                prototypes = np.stack([
+                    x[y == slot].mean(axis=0) for slot in range(len(candidates))
+                ])
+                result["prototype"].append(
+                    str(candidates[int(np.argmax(_normalise(prototypes) @ query))])
+                )
+            if "ridge" in requested:
+                # Reference path used by unit tests and CPU-only callers.
+                target = np.eye(len(candidates), dtype=np.float64)[y]
+                if len(x) <= x.shape[1]:
+                    gram = x @ x.T + ridge_alpha * np.eye(len(x), dtype=np.float64)
+                    coefficient = np.linalg.solve(gram, target)
+                    ridge_scores = query @ x.T @ coefficient
+                else:
+                    gram = x.T @ x + ridge_alpha * np.eye(x.shape[1], dtype=np.float64)
+                    coefficient = np.linalg.solve(gram, x.T @ target)
+                    ridge_scores = query @ coefficient
+                result["ridge"].append(str(candidates[int(np.argmax(ridge_scores))]))
     else:
-        result.update(_neighbor_prototype_predictions_batched(z, candidates, plans, device))
+        neighbor_readouts = requested & {"1nn", "prototype"}
+        if neighbor_readouts:
+            result.update(_neighbor_prototype_predictions_batched(
+                z, candidates, plans, device, readouts=neighbor_readouts,
+            ))
         support_count = len(plans[0].support) if plans else 0
         # Ridge needs one query-specific solve because every immutable episode has different
         # enrolled rows. Beyond this exact-system order, especially for 2,048-D NormWear features,
         # the requested high-k control takes hours. High-k 1-NN/prototype remain exact and are the
         # primary parameter-free enrollment controls; disclose ridge as N/A rather than approximate it.
-        if min(support_count, z.shape[1]) <= MAX_EXACT_RIDGE_SYSTEM:
+        if "ridge" in requested and min(support_count, z.shape[1]) <= MAX_EXACT_RIDGE_SYSTEM:
             result["ridge"] = _ridge_predictions_batched(
                 z, candidates, plans, device, ridge_alpha=ridge_alpha,
             )
-        else:
+        elif "ridge" in requested:
             result.pop("ridge", None)
     return result
 
@@ -422,10 +436,12 @@ def _neighbor_prototype_predictions_batched(
     candidates: Sequence[str],
     plans: Sequence[QueryPlan],
     device: torch.device,
+    *,
+    readouts: frozenset[str] = frozenset(("1nn", "prototype")),
 ) -> dict[str, list[str]]:
     """GPU-batch exact 1-NN and prototype scoring for query-specific episodes."""
     if not plans:
-        return {"1nn": [], "prototype": []}
+        return {name: [] for name in readouts}
     candidate_index = {label: index for index, label in enumerate(candidates)}
     support_count = len(plans[0].support)
     if not support_count or any(len(plan.support) != support_count for plan in plans):
@@ -447,20 +463,27 @@ def _neighbor_prototype_predictions_batched(
         x = torch.as_tensor(normalized_features[support_rows], dtype=torch.float32, device=device)
         query = torch.as_tensor(normalized_features[query_rows], dtype=torch.float32, device=device)
 
-        similarities = torch.einsum("bsd,bd->bs", x, query)
-        selected = similarities.argmax(dim=1)
-        selected_labels = bindings.gather(1, selected[:, None]).squeeze(1)
-        nearest.extend(candidates[index] for index in selected_labels.cpu().tolist())
+        if "1nn" in readouts:
+            similarities = torch.einsum("bsd,bd->bs", x, query)
+            selected = similarities.argmax(dim=1)
+            selected_labels = bindings.gather(1, selected[:, None]).squeeze(1)
+            nearest.extend(candidates[index] for index in selected_labels.cpu().tolist())
 
-        sums = torch.zeros((len(chunk), len(candidates), dim), dtype=x.dtype, device=device)
-        sums.scatter_add_(1, bindings.unsqueeze(-1).expand(-1, -1, dim), x)
-        counts = torch.zeros((len(chunk), len(candidates)), dtype=x.dtype, device=device)
-        counts.scatter_add_(1, bindings, torch.ones_like(bindings, dtype=x.dtype))
-        means = sums / counts.clamp_min(1).unsqueeze(-1)
-        means = torch.nn.functional.normalize(means, dim=-1)
-        scores = torch.einsum("bcd,bd->bc", means, query)
-        prototype.extend(candidates[index] for index in scores.argmax(dim=1).cpu().tolist())
-    return {"1nn": nearest, "prototype": prototype}
+        if "prototype" in readouts:
+            sums = torch.zeros((len(chunk), len(candidates), dim), dtype=x.dtype, device=device)
+            sums.scatter_add_(1, bindings.unsqueeze(-1).expand(-1, -1, dim), x)
+            counts = torch.zeros((len(chunk), len(candidates)), dtype=x.dtype, device=device)
+            counts.scatter_add_(1, bindings, torch.ones_like(bindings, dtype=x.dtype))
+            means = sums / counts.clamp_min(1).unsqueeze(-1)
+            means = torch.nn.functional.normalize(means, dim=-1)
+            scores = torch.einsum("bcd,bd->bc", means, query)
+            prototype.extend(candidates[index] for index in scores.argmax(dim=1).cpu().tolist())
+    output = {}
+    if "1nn" in readouts:
+        output["1nn"] = nearest
+    if "prototype" in readouts:
+        output["prototype"] = prototype
+    return output
 
 
 @torch.no_grad()

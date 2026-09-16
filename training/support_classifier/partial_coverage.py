@@ -167,6 +167,7 @@ def support_only_predictions(
     *,
     ridge_alpha: float = 1.0,
     device=None,
+    readouts: frozenset[str] | None = None,
 ) -> dict[str, list[str]]:
     """1-NN, prototype and ridge restricted to the candidates that actually carry enrolment.
 
@@ -188,11 +189,13 @@ def support_only_predictions(
             plans,
             ridge_alpha=ridge_alpha,
             device=device,
+            readouts=readouts,
         )
     z = _normalise(features)
     supported = list(cell.supported)
     slot_of = {label: index for index, label in enumerate(supported)}
-    result: dict[str, list[str]] = {"1nn": [], "prototype": [], "ridge": []}
+    requested = frozenset(("1nn", "prototype", "ridge")) if readouts is None else readouts
+    result: dict[str, list[str]] = {name: [] for name in requested}
     for plan in plans:
         if not plan.support:
             raise ValueError("partial coverage still requires at least one enrolled support row")
@@ -200,25 +203,28 @@ def support_only_predictions(
         x = z[np.asarray(plan.support, dtype=np.int64)]
         y = np.asarray([slot_of[label] for label in plan.support_labels], dtype=np.int64)
 
-        result["1nn"].append(str(plan.support_labels[int(np.argmax(x @ query))]))
+        if "1nn" in requested:
+            result["1nn"].append(str(plan.support_labels[int(np.argmax(x @ query))]))
 
         present = [slot for slot in range(len(supported)) if np.any(y == slot)]
-        prototypes = np.stack([x[y == slot].mean(axis=0) for slot in present])
-        best = int(np.argmax(_normalise(prototypes) @ query))
-        result["prototype"].append(str(supported[present[best]]))
+        if "prototype" in requested:
+            prototypes = np.stack([x[y == slot].mean(axis=0) for slot in present])
+            best = int(np.argmax(_normalise(prototypes) @ query))
+            result["prototype"].append(str(supported[present[best]]))
 
-        target = np.eye(len(supported), dtype=np.float64)[y]
-        if len(x) <= x.shape[1]:
-            gram = x @ x.T + ridge_alpha * np.eye(len(x), dtype=np.float64)
-            scores = query @ x.T @ np.linalg.solve(gram, target)
-        else:
-            gram = x.T @ x + ridge_alpha * np.eye(x.shape[1], dtype=np.float64)
-            scores = query @ np.linalg.solve(gram, x.T @ target)
-        # Only classes with enrolment may be named; an empty column would otherwise win on ties.
-        live = np.full(len(supported), -np.inf)
-        for slot in present:
-            live[slot] = scores[slot]
-        result["ridge"].append(str(supported[int(np.argmax(live))]))
+        if "ridge" in requested:
+            target = np.eye(len(supported), dtype=np.float64)[y]
+            if len(x) <= x.shape[1]:
+                gram = x @ x.T + ridge_alpha * np.eye(len(x), dtype=np.float64)
+                scores = query @ x.T @ np.linalg.solve(gram, target)
+            else:
+                gram = x.T @ x + ridge_alpha * np.eye(x.shape[1], dtype=np.float64)
+                scores = query @ np.linalg.solve(gram, x.T @ target)
+            # Only classes with enrolment may be named; an empty column would otherwise win on ties.
+            live = np.full(len(supported), -np.inf)
+            for slot in present:
+                live[slot] = scores[slot]
+            result["ridge"].append(str(supported[int(np.argmax(live))]))
     return result
 
 

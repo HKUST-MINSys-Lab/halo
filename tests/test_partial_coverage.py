@@ -171,6 +171,20 @@ def test_batched_support_only_readouts_match_the_reference_path():
     assert batched == reference
 
 
+def test_selected_support_readout_is_identical_without_computing_other_controls():
+    cell = choose_hidden_candidates(CANDIDATES, coverage=0.5, seed_parts=("selected",))
+    plans = hide_supports(_plans(k=2, n_queries=17), cell)
+    features = _features(seed=23)
+    full = support_only_predictions(
+        features, CANDIDATES, plans, cell, device=torch.device("cpu"),
+    )
+    selected = support_only_predictions(
+        features, CANDIDATES, plans, cell, device=torch.device("cpu"),
+        readouts=frozenset(("1nn",)),
+    )
+    assert selected == {"1nn": full["1nn"]}
+
+
 def test_support_only_refuses_an_episode_with_no_enrolment_left():
     cell = CoverageCell(supported=("walking",), hidden=tuple(c for c in CANDIDATES if c != "walking"),
                         coverage=0.25, requested_coverage=0.25)

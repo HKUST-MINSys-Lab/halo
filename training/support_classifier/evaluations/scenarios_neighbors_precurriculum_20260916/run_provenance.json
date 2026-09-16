@@ -1,0 +1,28 @@
+{
+  "argv": [
+    "/home/alex/code/HALO/halo/training/support_classifier/run_scenarios.py",
+    "--out",
+    "training/support_classifier/evaluations/scenarios_neighbors_precurriculum_20260916",
+    "--models",
+    "halo",
+    "--readouts",
+    "1nn",
+    "--halo-checkpoint",
+    "training/support_classifier/outputs/halo_fixed_mr_neighbors_8s_4res_e2e_20260913_continue95k/best_internal.pt",
+    "--k",
+    "1",
+    "8",
+    "--window-seconds",
+    "8"
+  ],
+  "device": "cuda",
+  "dirty_diff_sha256": "3beb0fee3c8229ff41c299d26c5822ca9ebcab8c955ab2c0b25bb77650b66a81",
+  "git_revision": "7c5a73cdc7b8739a7bad4b6f906d98cd642d29f9",
+  "halo_checkpoint": "/home/alex/code/HALO/halo/training/support_classifier/outputs/halo_fixed_mr_neighbors_8s_4res_e2e_20260913_continue95k/best_internal.pt",
+  "halo_checkpoint_sha256": "c7354e6d0f8b3a401c7655c8788cc350651914c8538169dd066e4f7c37ac42fb",
+  "numpy": "1.25.2",
+  "protocol": "deployment-scenarios-v2-20260915",
+  "python": "3.11.14",
+  "seed_policy": "fixed seed; partial-coverage candidate split is invariant across k",
+  "torch": "2.9.0+cu128"
+}

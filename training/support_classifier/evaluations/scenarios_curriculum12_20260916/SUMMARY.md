@@ -63,6 +63,31 @@ readout. `N/A` is an explicit incompatibility.
 | device-set mismatch | 71.3 | 70.9 | 60.7 | **85.9** | 63.0 | 29.1 |
 | cold start | 26.2 | **29.6** | 20.0 | 4.8 | 25.7 | 9.1 |
 
+## Historical DN-trained encoder comparison
+
+The historical differentiable-neighbours checkpoint was trained before the deployment curriculum
+with `k in {1, 2, 4, 8}` and then evaluated here using a plain 1-NN readout on the same scenario
+protocol. The Stage A column is the encoder trained jointly through the learned classifier with
+curriculum changes 1–2. Positive deltas favor Stage A.
+
+| scenario | historical DN k1 | Stage A k1 | delta | historical DN k8 | Stage A k8 | delta |
+|---|---:|---:|---:|---:|---:|---:|
+| partial enrollment | 27.5 | 27.7 | +0.2 | 30.6 | 30.6 | +0.0 |
+| cross placement | 55.1 | 54.5 | -0.6 | 61.0 | 60.7 | -0.3 |
+| cross dataset | 60.7 | 65.4 | +4.7 | 68.4 | 72.0 | +3.6 |
+| missing modality | 53.1 | 53.8 | +0.7 | 62.0 | 63.6 | +1.6 |
+| rate mismatch | 56.8 | 56.0 | -0.8 | 65.7 | 66.4 | +0.7 |
+| new domain | 36.7 | 39.9 | +3.2 | 45.9 | 47.8 | +1.9 |
+| device-set mismatch | 64.3 | 62.7 | -1.6 | 72.8 | 70.9 | -1.9 |
+| cold start | 16.8 | 23.8 | +7.0 | 19.6 | 29.6 | +10.0 |
+
+This comparison does not isolate the curriculum: the objectives and training budgets differ. A
+40k-step curriculum-matched DN arm is smoke-tested but deliberately not launched pending approval.
+Its support-only objective uses the same acquisition mixture and conditional complete/partial
+ratio, but excludes zero-support queries because no differentiable neighbour target exists there.
+The exhaustive historical rows are in
+[`../scenarios_neighbors_precurriculum_20260916/RESULTS.md`](../scenarios_neighbors_precurriculum_20260916/RESULTS.md).
+
 ## Per-dataset macro-F1
 
 `Best external` is the strongest valid released-model 1-NN result in that cell; the exhaustive

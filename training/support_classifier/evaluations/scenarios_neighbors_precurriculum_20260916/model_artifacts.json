@@ -1,0 +1,6 @@
+{
+  "halo": {
+    "checkpoint": "/home/alex/code/HALO/halo/training/support_classifier/outputs/halo_fixed_mr_neighbors_8s_4res_e2e_20260913_continue95k/best_internal.pt",
+    "checkpoint_sha256": "c7354e6d0f8b3a401c7655c8788cc350651914c8538169dd066e4f7c37ac42fb"
+  }
+}

@@ -664,6 +664,8 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
 
 def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootstrap,
                banks, k: int, window_seconds: float, halo_state=None,
+               halo_has_classifier: bool = False,
+               selected_readouts: frozenset[str] | None = None,
                provider_states=None, prediction_sink=None, cache_read_dirs=(),
                feature_memory_cache=None) -> list[dict]:
     """Every readout for every model on one task's episodes."""
@@ -749,12 +751,21 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
                           ), 6), **_native_capabilities(name)}
 
             if k > 0:
+                support_readouts = None if selected_readouts is None else frozenset(
+                    selected_readouts & {"1nn", "prototype", "ridge"}
+                )
                 for readout, predicted in support_only_predictions(
-                        features, task.candidates, task.plans, coverage, device=device).items():
+                        features, task.candidates, task.plans, coverage, device=device,
+                        readouts=support_readouts).items():
                     append_emitted(predicted, readout=readout)
 
             text = None
-            if k == 0 or task.coverage is not None:
+            needs_text = (
+                selected_readouts is None
+                or "zero-shot-native-or-bridge" in selected_readouts
+                or "hybrid-text-support" in selected_readouts
+            )
+            if needs_text and (k == 0 or task.coverage is not None):
                 if name in TRAINING_BANK_ZERO_SHOT and (name != "halo" or task.coverage is not None):
                     if name not in banks:
                         banks[name] = _build_training_reference_bank(
@@ -772,28 +783,33 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
                     text = native_text_scores(name, query_features, task.candidates, state, device)
 
             if k == 0:
-                if name == "halo" and halo_checkpoint is not None:
+                if (name == "halo" and halo_checkpoint is not None and halo_has_classifier
+                        and (selected_readouts is None or "halo-classifier" in selected_readouts)):
                     predicted = _halo_residual_predictions(features, roster, task.plans,
                                                           halo_checkpoint, device)
                     append_emitted(predicted, readout="halo-classifier")
-                elif text is not None:
+                elif (text is not None and (selected_readouts is None
+                                             or "zero-shot-native-or-bridge" in selected_readouts)):
                     predicted = [task.candidates[index] for index in text.argmax(axis=1).tolist()]
                     append_emitted(predicted, readout="zero-shot-native-or-bridge")
-                else:
+                elif selected_readouts is None or "zero-shot-native-or-bridge" in selected_readouts:
                     rows.append({"model": name, "readout": "zero-shot", "status": "inapplicable",
                                  "reason": "model exposes neither a native nor configured bridge zero-shot path",
                                  **extra_base, **common})
             elif task.coverage is not None:
-                if text is not None:
+                if (text is not None and (selected_readouts is None
+                                          or "hybrid-text-support" in selected_readouts)):
                     hybrid = hybrid_predictions(text, features, task.candidates, task.plans, coverage)
                     append_emitted(hybrid, readout="hybrid-text-support")
-                elif name != "halo":
+                elif (name != "halo" and (selected_readouts is None
+                                           or "hybrid-text-support" in selected_readouts)):
                     rows.extend(cannot_attempt_rows(
                         task.query_stream, coverage, model=name, readout="hybrid-text-support",
                         k=k, window_seconds=window_seconds,
                         reason="no native or configured text-score path: hidden candidates are unreachable"))
 
-            if name == "halo" and halo_checkpoint is not None and k > 0:
+            if (name == "halo" and halo_checkpoint is not None and halo_has_classifier and k > 0
+                    and (selected_readouts is None or "halo-classifier" in selected_readouts)):
                 predicted = _halo_residual_predictions(features, roster, task.plans, halo_checkpoint, device)
                 append_emitted(predicted, readout="halo-classifier")
         except baselines.UnsupportedEvaluationCell as exc:
@@ -1098,6 +1114,13 @@ def main() -> None:
         "s5_rate_mismatch", "s6_new_domain", "s7_device_set", "s8_cold_start"])
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--models", nargs="+", default=["halo", *PRIMARY_BASELINES])
+    parser.add_argument(
+        "--readouts", nargs="+", choices=(
+            "1nn", "prototype", "ridge", "hybrid-text-support",
+            "zero-shot-native-or-bridge", "halo-classifier",
+        ), default=None,
+        help="optional readout subset for a controlled diagnostic; omitted runs every applicable readout",
+    )
     parser.add_argument("--halo-checkpoint", type=Path, default=None)
     parser.add_argument("--k", nargs="+", type=int, default=[1, 8])
     parser.add_argument("--window-seconds", nargs="+", type=float, default=[8.0])
@@ -1131,15 +1154,21 @@ def main() -> None:
         parser.error(f"models outside the registered primary roster: {unknown}")
     if len(set(args.models)) != len(args.models):
         parser.error("--models must not repeat a provider")
+    if args.readouts is not None and len(set(args.readouts)) != len(args.readouts):
+        parser.error("--readouts must not repeat a readout")
     if "halo" in args.models and args.halo_checkpoint is None:
         parser.error("--halo-checkpoint is required when model list includes halo")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         parser.error("CUDA was requested but is unavailable")
     device = torch.device(args.device)
     halo_state = None
+    halo_has_classifier = False
     if "halo" in args.models:
         blob = torch.load(args.halo_checkpoint, map_location="cpu", weights_only=False)
         halo_state = (build_encoder(blob, device).eval(), _file_hash(args.halo_checkpoint))
+        halo_has_classifier = blob.get("architecture_version") in {
+            "support_classifier_v2", "support_classifier_v3",
+        }
     args.out.mkdir(parents=True, exist_ok=True)
     cache_dir = args.feature_cache or DEFAULT_SHARED_FEATURE_CACHE
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1223,7 +1252,10 @@ def main() -> None:
                             task, models=args.models, device=device, cache_dir=cache_dir,
                             halo_checkpoint=args.halo_checkpoint, bootstrap=bootstrap,
                             banks=banks, k=k, window_seconds=window_seconds,
-                            halo_state=halo_state, provider_states=provider_states,
+                            halo_state=halo_state, halo_has_classifier=halo_has_classifier,
+                            selected_readouts=(None if args.readouts is None
+                                               else frozenset(args.readouts)),
+                            provider_states=provider_states,
                             prediction_sink=task_predictions,
                             cache_read_dirs=cache_read_dirs,
                             feature_memory_cache=feature_memory_cache))
