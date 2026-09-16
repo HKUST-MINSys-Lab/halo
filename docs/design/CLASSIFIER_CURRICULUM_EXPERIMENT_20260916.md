@@ -32,12 +32,17 @@ Each support set requests one acquisition condition:
 | condition | target share | contract |
 |---|---:|---|
 | compatible | 0.50 | query and support acquisition keys are identical |
-| cross placement | 0.25 | same device family, channels, and gravity convention; different body site |
+| cross placement | 0.25 | same dataset, device family, channels, and gravity convention; different anatomical site group |
 | cross dataset | 0.25 | identical acquisition key, but every support execution comes from another dataset |
 
 Only real recordings form mismatched pairs. If a dataset cannot form a requested condition, the
 sampler draws from the feasible conditions using the declared weights and reports both requested
 and realized shares. It never duplicates executions or relaxes subject/execution separation.
+
+These are requested shares, not quotas. Corpus feasibility determines the realized mixture and the
+logged realized shares are authoritative. Cross-placement excludes left/right/unspecified variants
+of one anatomical site and never substitutes another dataset. Cross-dataset coverage is limited to
+the acquisition keys genuinely shared by the eight-source corpus.
 
 ### Enrollment mixture
 
@@ -65,10 +70,22 @@ On 2026-09-16 this ablation was stopped around step 20,000 so reporting could pr
 completed Stage A results and matched neighbour controls. No Stage B checkpoint is promoted into
 the primary results. Its partial run remains a diagnostic artifact only.
 
+The stopped Stage B run predates the 2026-09-16 sampler corrections and is not a valid matched
+ablation of the current curriculum. A new comparison must train both arms from scratch on the
+current sampler and score both on `deployment-scenarios-v3-20260916` manifests.
+
+The command line does not infer an experiment stage. A Stage B run must explicitly include
+`--rate-augmentation-probability 0.25 --modality-dropout-probability 0.20
+--adaptive-text-gate`; omitting them is Stage A. Persisted `run_config.json`, trajectory fields,
+and telemetry are the authority, not an output-directory name.
+
 ### Acquisition perturbations
 
 - Anti-aliased rate resampling is applied independently to recording occurrences with probability
-  0.25. Physical duration, achieved rate, source-rate observability, and metadata remain truthful.
+  0.25. Half of applicable draws are sampled at or below the hardware rate to include bandwidth
+  loss; the other half retains the full 15--100 Hz range. Physical duration, achieved rate,
+  source-rate observability, and metadata remain truthful. Training and evaluation use the same
+  line-edge polyphase padding.
 - Complete gyroscope removal is applied independently with probability 0.20 where a gyroscope is
   present. Channel masks and acquisition descriptions are updated by the existing augmentation
   implementation.

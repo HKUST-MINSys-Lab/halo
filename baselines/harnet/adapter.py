@@ -13,9 +13,8 @@ Two things are carried over verbatim, one is fixed:
   * INPUT CONTRACT (verified in BASELINES.md + the cached hubconf): harnet5 wants
     ``(N, 3, 150)`` = 5 s @ 30 Hz, accelerometer only, g WITH gravity. Each grid
     window (native rate/length, in g) is resampled to 30 Hz and center-crop/wrap-
-    padded to 150 samples. harnet10 (300 samples / 10 s) is NOT used: our eval
-    grids are <=6 s and would need >=4 s of padding that breaks the 30 Hz kernel
-    timing — the same reason the legacy adapter ran harnet5.
+    padded to 150 samples. The primary roster also reports the released harnet10 trunk
+    independently under its own 300-sample contract; the two rows are never conflated.
 
   * The released weights load ONLY into ``feature_extractor``; the EvaClassifier
     head is randomly initialized. We freeze the trunk and fit the head on the
@@ -44,7 +43,6 @@ from __future__ import annotations
 
 import json
 import os
-from fractions import Fraction
 from pathlib import Path
 from typing import List
 
@@ -52,7 +50,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from scipy.signal import resample_poly
 
 from baselines.base import ConSEAdapter, InputContract, fit_fingerprint, global_labels, register
 from data.scripts.labels.canonical_labels import canonicalize
@@ -134,8 +131,8 @@ def _hub_dir() -> Path:
     return Path(torch.hub.get_dir()) / _hub_ref().replace("/", "_").replace(":", "_")
 
 
-def _load_harnet(num_classes: int, device) -> nn.Module:
-    """Pretrained harnet5 (frozen trunk + fresh EvaClassifier head of `num_classes`).
+def _load_harnet(num_classes: int, device, model_name: str = HARNET_NAME) -> nn.Module:
+    """Pretrained HARNet trunk plus a fresh EvaClassifier head.
 
     H4: the classifier head is freshly constructed here, so torch's global RNG determines its init.
     Seed BEFORE construction or two runs get different heads (measured max init weight delta 0.971)
@@ -146,13 +143,13 @@ def _load_harnet(num_classes: int, device) -> nn.Module:
         torch.cuda.manual_seed_all(FIT_SEED)
     hubdir = _hub_dir()
     if hubdir.exists():
-        model = torch.hub.load(str(hubdir), HARNET_NAME, class_num=num_classes,
+        model = torch.hub.load(str(hubdir), model_name, class_num=num_classes,
                                pretrained=True, source="local")
     else:  # offline cache miss -> fetch once from GitHub
         # H5: pin the TAG on the cache-miss path too. Using the bare repo here fetched the
         # default branch on a fresh pod, so a remote run could silently use different code/weights
         # than the local v1.0.0 cache.
-        model = torch.hub.load(_hub_ref(), HARNET_NAME, class_num=num_classes,
+        model = torch.hub.load(_hub_ref(), model_name, class_num=num_classes,
                                pretrained=True, source="github", trust_repo=True)
     model.to(device)
     for p in model.feature_extractor.parameters():
@@ -161,31 +158,39 @@ def _load_harnet(num_classes: int, device) -> nn.Module:
     return model
 
 
-def _to_30hz_150(windows: np.ndarray, rate_hz: float,
-                  lengths: np.ndarray | None = None) -> np.ndarray:
-    """(N, T, 3) at `rate_hz` -> (N, 3, 150) at 30 Hz for harnet5.
+def _to_30hz_fixed(windows: np.ndarray, rate_hz: float, target_len: int,
+                   lengths: np.ndarray | None = None) -> np.ndarray:
+    """Resample then center-crop/wrap-pad to a released HARNet input length.
 
-    Resample to 30 Hz (polyphase, anti-aliased), then center-crop to 150 samples
-    if longer or wrap-pad if shorter (wrap matches harnet's circular conv padding
-    and preserves the gravity DC; only the <5 s train sets ever need padding — the
-    <=6 s eval grids are always cropped).
+    Resample to 30 Hz with the release's linear interpolation, then center-crop to the
+    requested fixed input if longer or wrap-pad if shorter.
     """
-    frac = Fraction(int(round(TARGET_HZ)), int(round(rate_hz))).limit_denominator(1000)
     valid = (np.asarray(lengths, dtype=np.int64) if lengths is not None
              else np.full(len(windows), windows.shape[1], dtype=np.int64))
     out = []
     for window, length in zip(windows, valid):
-        y = resample_poly(window[:int(length)].astype(np.float64), frac.numerator,
-                          frac.denominator, axis=0)
-        if len(y) > TARGET_LEN:
-            off = (len(y) - TARGET_LEN) // 2
-            y = y[off:off + TARGET_LEN]
-        elif len(y) < TARGET_LEN:
-            total = TARGET_LEN - len(y)
+        source = window[:int(length)].astype(np.float64)
+        output_length = max(1, int(round(len(source) * TARGET_HZ / float(rate_hz))))
+        source_clock = np.arange(len(source), dtype=np.float64) / float(rate_hz)
+        target_clock = np.arange(output_length, dtype=np.float64) / TARGET_HZ
+        y = np.stack([
+            np.interp(target_clock, source_clock, source[:, channel])
+            for channel in range(source.shape[1])
+        ], axis=1)
+        if len(y) > target_len:
+            off = (len(y) - target_len) // 2
+            y = y[off:off + target_len]
+        elif len(y) < target_len:
+            total = target_len - len(y)
             left = total // 2
             y = np.pad(y, ((left, total - left), (0, 0)), mode="wrap")
         out.append(y)
     return np.transpose(np.asarray(out), (0, 2, 1)).astype(np.float32)
+
+
+def _to_30hz_150(windows: np.ndarray, rate_hz: float,
+                  lengths: np.ndarray | None = None) -> np.ndarray:
+    return _to_30hz_fixed(windows, rate_hz, TARGET_LEN, lengths)
 
 
 def _select_accel(windows: np.ndarray, channels: List[str]) -> np.ndarray:
@@ -200,40 +205,23 @@ def _select_accel(windows: np.ndarray, channels: List[str]) -> np.ndarray:
 
 @torch.no_grad()
 def _extract_feats(model: nn.Module, x_n3l: np.ndarray, device) -> np.ndarray:
-    """Variable-length input -> one frozen-trunk vector via temporal global mean."""
+    """Published fixed input -> the exact tensor consumed by ``EvaClassifier``.
+
+    The released classifiers flatten the trunk output. Their published input lengths reduce the
+    temporal axis to one. This assertion prevents an architecture or preprocessing change from
+    silently introducing an evaluation-only pooling rule.
+    """
     feats = []
     for s in range(0, len(x_n3l), EMBED_BATCH):
         b = torch.from_numpy(x_n3l[s:s + EMBED_BATCH]).float().to(device)
         f = model.feature_extractor(b)              # (B, C, T')
-        feats.append(f.flatten(2).mean(dim=2).cpu().numpy())
+        if f.ndim != 3 or f.shape[-1] != 1:
+            raise RuntimeError(
+                "HARNet published input must produce (B,C,1) trunk features; "
+                f"received {tuple(f.shape)}"
+            )
+        feats.append(f.squeeze(-1).cpu().numpy())
     return np.concatenate(feats, axis=0).astype(np.float32)
-
-
-def _window_chunk_features(model: nn.Module, windows: np.ndarray, rate_hz: float,
-                           lengths: np.ndarray | None, device) -> np.ndarray:
-    """Encode each complete window in one pass; pad only tails shorter than the 4 s trunk floor."""
-    valid = (np.asarray(lengths, dtype=np.int64) if lengths is not None
-             else np.full(len(windows), windows.shape[1], dtype=np.int64))
-    output: np.ndarray | None = None
-    for length in np.unique(valid):
-        owners = np.flatnonzero(valid == length)
-        frac = Fraction(int(round(TARGET_HZ)), int(round(rate_hz))).limit_denominator(1000)
-        values = resample_poly(
-            windows[owners, :int(length)].astype(np.float64),
-            frac.numerator, frac.denominator, axis=1,
-        )
-        min_samples = int(round(4.0 * TARGET_HZ))
-        if values.shape[1] < min_samples:
-            values = np.pad(values, ((0, 0), (0, min_samples - values.shape[1]), (0, 0)), mode="wrap")
-        encoded = _extract_feats(
-            model, np.transpose(values, (0, 2, 1)).astype(np.float32), device,
-        )
-        if output is None:
-            output = np.empty((len(windows), encoded.shape[1]), dtype=np.float32)
-        output[owners] = encoded
-    if output is None:
-        raise ValueError("HARNet received an empty evaluation stream")
-    return output
 
 
 # =============================================================================
@@ -286,7 +274,7 @@ class HarnetAdapter(ConSEAdapter):
     # B1: the two corpus modes must have DISTINCT experiment identities. Results are written to
     # `{name}__{dataset}__{stream}.json`, so sharing the name meant a matched run silently
     # overwrote the legacy results and the table could never show both rows.
-    name = "harnet" if CORPUS_MODE == "legacy" else "harnet_matched"
+    name = "harnet5" if CORPUS_MODE == "legacy" else "harnet5_matched"
     contract = InputContract(channels=list(ACC_CHANNELS), rate_hz=TARGET_HZ,
                              native_window_sec=TARGET_LEN / TARGET_HZ)
 
@@ -295,28 +283,42 @@ class HarnetAdapter(ConSEAdapter):
         lengths = (np.asarray(member.lengths, dtype=np.float64) if member.lengths is not None
                    else np.full(member.n_windows, member.windows.shape[1], dtype=np.float64))
         durations = lengths / float(member.rate_hz)
-        consumed = np.maximum(durations, 4.0)
-        padded = consumed - durations
-        fraction = float(padded.sum() / consumed.sum()) if consumed.size else 0.0
-        return {"padded": bool(np.any(padded > 1e-9)), "padded_fraction": fraction}
+        target = TARGET_LEN / TARGET_HZ
+        padded = np.maximum(target - durations, 0.0)
+        truncated = np.maximum(durations - target, 0.0)
+        fraction = float(padded.sum() / (target * len(durations))) if durations.size else 0.0
+        return {"padded": bool(np.any(padded > 1e-9)), "padded_fraction": fraction,
+                "truncated": bool(np.any(truncated > 1e-9)),
+                "truncated_fraction": float(truncated.sum() / durations.sum()) if durations.sum() else 0.0,
+                "consumed_samples": TARGET_LEN, "published_window_contract": True}
 
     # ---- gravity compatibility (disclosed N/A instead of a bad number) --------
     def is_incompatible(self, dataset: str):
-        streams = eval_data.list_streams(dataset, alignment="native")
-        if not streams:
-            return None
-        try:
-            windows, _, _, channels, _, _ = _load_grid(dataset, streams[0])
-        except FileNotFoundError:
-            return None
-        dc = _gravity_dc(windows, channels)
+        return None
+
+    def is_stream_incompatible(self, stream):
+        members = stream.devices if isinstance(stream, eval_data.MultiDeviceEvalStream) else [stream]
+        values = []
+        for member in members:
+            dc = _gravity_dc(member.windows, member.channels)
+            values.append((member.stream, dc))
+        incompatible = [(name, dc) for name, dc in values if dc < GRAVITY_MIN_G]
+        if incompatible:
+            name, dc = incompatible[0]
+            return (f"{name}: gravity-removed accelerometer (median |DC|={dc:.3f} g); "
+                    "HARNet requires gravity retained")
+        dc = values[0][1]
         if dc < GRAVITY_MIN_G:
-            return (f"gravity-removed accelerometer (median |DC|={dc:.3f} g); harnet "
+            return (f"gravity-removed accelerometer (median |DC|={dc:.3f} g); HARNet "
                     "requires gravity retained")
         return None
 
     def evaluation_artifacts(self, state):
-        return {"conse_head": _HEAD_CACHE}
+        # The primary matched protocol calls ``setup_features`` and never fits or consumes the
+        # historical local ConSE head.  Do not make that unrelated artifact part of a frozen
+        # representation result's provenance.  Historical native/ConSE reproduction calls
+        # ``setup`` and records the fitted head through its temperature-bearing state.
+        return {"conse_head": _HEAD_CACHE} if "temperature" in state else {}
 
     def setup_features(self, device):
         """Load the released trunk without fitting the unused ConSE head."""
@@ -338,9 +340,15 @@ class HarnetAdapter(ConSEAdapter):
             "input_rate_hz": TARGET_HZ,
             "input_samples": TARGET_LEN,
             "feature_layer": "feature_extractor",
+            "feature_readout": "exact tensor consumed by released EvaClassifier (squeeze T=1)",
+            "window_policy": "published_center_crop_or_wrap_pad",
+            "resampler": "linear interpolation matching released preprocessing",
+            "metadata_inputs": "none",
         }
 
     def evaluation_config(self, state):
+        if "temperature" not in state:
+            return self.feature_config(state)
         return {
             "released_model": HARNET_NAME,
             "released_source": f"{SSL_HUB_REPO}:{SSL_HUB_TAG}",
@@ -428,9 +436,11 @@ class HarnetAdapter(ConSEAdapter):
                 # The fitted classifier must see exactly the representation used at inference.
                 # The old centre-cropped 5 s helper made a cached head distributionally stale
                 # on 4/8/16 s evaluation windows.
-                feats.append(_window_chunk_features(
-                    model, _select_accel(windows[keep_idx], channels), rate,
-                    lengths[keep_idx], fit_device,
+                feats.append(_extract_feats(
+                    model,
+                    _to_30hz_150(_select_accel(windows[keep_idx], channels), rate,
+                                  lengths[keep_idx]),
+                    fit_device,
                 ))
                 labs.append(gl[keep_idx])
                 subjs.append(np.array([f"{ds}:{s}" for s in np.asarray(subjects)[keep_idx]]))
@@ -521,9 +531,11 @@ class HarnetAdapter(ConSEAdapter):
         return np.concatenate(probs, axis=0)
 
     def window_features(self, stream, state, device) -> np.ndarray:
-        return _window_chunk_features(
-            state["model"], _select_accel(stream.windows, stream.channels), stream.rate_hz,
-            stream.lengths, device,
+        return _extract_feats(
+            state["model"],
+            _to_30hz_150(_select_accel(stream.windows, stream.channels), stream.rate_hz,
+                          stream.lengths),
+            device,
         )
 
     def predict_candidates_from_features(self, features, candidates, state, device):
@@ -535,3 +547,61 @@ class HarnetAdapter(ConSEAdapter):
                 batch = torch.from_numpy(features[start:start + EMBED_BATCH]).float().to(device)
                 values.append(F.softmax(model.classifier(batch) / temperature, dim=1).cpu().numpy())
         return scoring.conse_predict(np.concatenate(values), global_labels(), list(candidates))
+
+
+@register
+class Harnet10Adapter(HarnetAdapter):
+    """Released headline HARNet-10 trunk under its published 10 s / 300-sample contract."""
+
+    name = "harnet10"
+    contract = InputContract(channels=list(ACC_CHANNELS), rate_hz=TARGET_HZ,
+                             native_window_sec=10.0)
+
+    def setup_features(self, device):
+        model = _load_harnet(1, device, model_name="harnet10")
+        model.train(False)
+        return {"model": model}
+
+    def setup(self, device):
+        # No released open-set classifier is claimed. The common support protocol uses the trunk.
+        return self.setup_features(device)
+
+    def feature_artifacts(self, state):
+        return {"released_checkpoint": _hub_dir() / "model_check_point/mtl_best.mdl"}
+
+    def feature_config(self, state):
+        return {
+            "released_model": "harnet10",
+            "released_source": f"{SSL_HUB_REPO}:{SSL_HUB_TAG}",
+            "input_rate_hz": TARGET_HZ,
+            "input_samples": 300,
+            "feature_layer": "feature_extractor",
+            "feature_readout": "exact tensor consumed by released EvaClassifier (squeeze T=1)",
+            "window_policy": "published_center_crop_or_wrap_pad",
+            "resampler": "linear interpolation matching released preprocessing",
+            "metadata_inputs": "none",
+        }
+
+    def evaluation_config(self, state):
+        return self.feature_config(state)
+
+    def input_accounting(self, stream) -> dict:
+        member = stream.devices[0] if isinstance(stream, eval_data.MultiDeviceEvalStream) else stream
+        lengths = (np.asarray(member.lengths, dtype=np.float64) if member.lengths is not None
+                   else np.full(member.n_windows, member.windows.shape[1], dtype=np.float64))
+        durations = lengths / float(member.rate_hz)
+        padded = np.maximum(10.0 - durations, 0.0)
+        truncated = np.maximum(durations - 10.0, 0.0)
+        return {"padded": bool(np.any(padded > 1e-9)),
+                "padded_fraction": float(padded.sum() / (10.0 * len(durations))) if durations.size else 0.0,
+                "truncated": bool(np.any(truncated > 1e-9)),
+                "truncated_fraction": float(truncated.sum() / durations.sum()) if durations.sum() else 0.0,
+                "consumed_samples": 300, "published_window_contract": True}
+
+    def window_features(self, stream, state, device) -> np.ndarray:
+        return _extract_feats(
+            state["model"],
+            _to_30hz_fixed(_select_accel(stream.windows, stream.channels), stream.rate_hz,
+                            300, stream.lengths),
+            device,
+        )

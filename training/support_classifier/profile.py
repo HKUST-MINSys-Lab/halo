@@ -40,6 +40,12 @@ from training.support_classifier.train import (
     initialise_text_projection,
     split_encoded,
     validate,
+    draw_kwargs_from_args,
+)
+from training.support_classifier.sampling import (
+    DEFAULT_ACQUISITION_MIX, DEFAULT_ENROLLMENT_K, DEFAULT_ENROLLMENT_MIX,
+    DEFAULT_LABEL_SUBSET, DEFAULT_PARTIAL_COVERAGE, DEFAULT_P_GT_PRESENT,
+    DEFAULT_SAME_SUBJECT_PROBABILITY, DEFAULT_VARIABLE_SUPPORT_PROBABILITY,
 )
 from training.tokenizer.pretrain_data import CorpusIndex, MultiResolutionCollate, PretrainDataset
 
@@ -54,7 +60,7 @@ def _mean(values: list[float]) -> float:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--workers", type=int, nargs="+", default=[2, 4, 6, 8])
+    parser.add_argument("--workers", type=int, nargs="+", default=[8, 12, 16])
     parser.add_argument("--classifier", choices=("residual", "neighbors"), default="residual")
     parser.add_argument("--support-sets", type=int, default=4,
                         help="independent support sets per optimizer step")
@@ -71,6 +77,9 @@ def main() -> None:
     parser.add_argument("--polarization", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--compile-transformer", action=argparse.BooleanOptionalAction,
                         default=False)
+    parser.add_argument("--encoder-arch", default="halo",
+                        choices=("halo", "limubert", "harnet", "unimts"),
+                        help="profile a matched-corpus M2 arm instead of HALO's encoder")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     if args.support_sets < 1 or min(args.workers) < 1 \
@@ -81,8 +90,8 @@ def main() -> None:
 
     torch.set_num_threads(2)
     device = torch.device("cuda")
-    torch.backends.cuda.matmul.fp32_precision = "tf32"
-    torch.backends.cudnn.conv.fp32_precision = "tf32"
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     setup_started = time.perf_counter()
     index = CorpusIndex(
         datasets=SUPERVISED_HEAD_TRAIN_DATASETS, alignment="native",
@@ -93,24 +102,31 @@ def main() -> None:
         neutral_acquisition_text=False,
         multi_device_probability=args.multi_device_probability,
         max_devices=args.max_devices,
+        rate_augmentation_probability=0.0,
+        modality_dropout_probability=0.0,
     )
     dataset = build_dataset(index, dataset_args)
     collate = SupportCollate(MultiResolutionCollate(
         fixed_patch_seconds=tuple(args.resolutions),
     ))
-    draw_kwargs = {
-        "p_gt_present": 0.5 if args.classifier == "residual" else 1.0,
-        "p_mask_candidate": 0.25 if args.classifier == "residual" else 0.0,
-        "p_mask_gt": 0.10 if args.classifier == "residual" else 0.0,
-        "same_subject_probability": 0.5,
-        "label_subset": (2, 32),
-        "mode": "compatible",
-        "semantic_zero_shot": True,
-        "deployment_matched": True,
-        "enrollment_k": (1, 2, 4, 8),
-        "queries_per_support_set": args.queries_per_support_set,
-        "windows_per_execution": 2,
-    }
+    recipe_args = argparse.Namespace(
+        classifier=args.classifier,
+        p_gt_present=(DEFAULT_P_GT_PRESENT if args.classifier == "residual" else 1.0),
+        p_mask_candidate=0.25,
+        p_mask_gt=0.10,
+        same_subject_probability=DEFAULT_SAME_SUBJECT_PROBABILITY,
+        label_subset=DEFAULT_LABEL_SUBSET,
+        mode="compatible",
+        enrollment_k=DEFAULT_ENROLLMENT_K,
+        acquisition_mix=DEFAULT_ACQUISITION_MIX,
+        enrollment_mix=(DEFAULT_ENROLLMENT_MIX if args.classifier == "residual"
+                        else (2.0 / 3.0, 1.0 / 3.0, 0.0)),
+        partial_coverage=DEFAULT_PARTIAL_COVERAGE,
+        variable_support_probability=DEFAULT_VARIABLE_SUPPORT_PROBABILITY,
+        queries_per_support_set=args.queries_per_support_set,
+        windows_per_execution=2,
+    )
+    draw_kwargs = draw_kwargs_from_args(recipe_args)
 
     corpus_setup_seconds = time.perf_counter() - setup_started
     print(f"[profile] full training corpus ready in {corpus_setup_seconds:.1f}s", flush=True)
@@ -124,23 +140,30 @@ def main() -> None:
         )
         try:
             torch.manual_seed(7)
-            encoder, _ = build_random_encoder(
-                device, "fixed", neutral_acquisition_text=False,
-                duration_range=(min(args.resolutions), max(args.resolutions)),
-                num_resolutions=len(args.resolutions),
-                frontend_kwargs={
-                    "use_polarization": args.polarization,
-                    "polarization_energy_kappa": 0.05,
-                },
-            )
+            if args.encoder_arch != "halo":
+                from model.tokenizer.matched_encoder import build_matched_encoder
+
+                encoder = build_matched_encoder(args.encoder_arch, device=device).train()
+            else:
+                encoder, _ = build_random_encoder(
+                    device, "fixed", neutral_acquisition_text=False,
+                    duration_range=(min(args.resolutions), max(args.resolutions)),
+                    num_resolutions=len(args.resolutions),
+                    frontend_kwargs={
+                        "use_polarization": args.polarization,
+                        "polarization_energy_kappa": 0.05,
+                    },
+                )
             encoder.train()
-            encoder.mask_token.requires_grad_(False)
-            if args.compile_transformer:
+            if hasattr(encoder, "mask_token"):
+                encoder.mask_token.requires_grad_(False)
+            if args.compile_transformer and args.encoder_arch == "halo":
                 install_compiled_transformer(encoder)
-            calibrate_frontend(
-                encoder, dataset, corpus, collate, np.random.default_rng(7), device,
-                batches=1, batch_size=64, executor=None,
-            )
+            if getattr(encoder, "filterbank", None) is not None:
+                calibrate_frontend(
+                    encoder, dataset, corpus, collate, np.random.default_rng(7), device,
+                    batches=1, batch_size=64, executor=None,
+                )
             text = make_label_text(corpus.all_labels, device)
             classifier = (ResidualSupportClassifier(
                 AttentionSpec(d_model=encoder.d_model, n_heads=4, ffn_mult=2, dropout=0.1),
@@ -286,7 +309,9 @@ def main() -> None:
                     name: float(torch.stack([p.grad.float().norm().square() for p in module.parameters()
                                              if p.grad is not None]).sum().sqrt())
                     for name, module in {
-                        "encoder": encoder, "recording_pool": encoder.recording_pool,
+                        "encoder": encoder,
+                        **({"recording_pool": encoder.recording_pool}
+                           if getattr(encoder, "recording_pool", None) is not None else {}),
                         **({"classifier": classifier, "trunk": classifier.metric_stack,
                             "support_residual": classifier.r_support_head,
                             "candidate_residual": classifier.r_candidate_head,

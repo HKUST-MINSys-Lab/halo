@@ -58,13 +58,14 @@ model. The ordered device list and exact raw-slice fingerprint are stored in the
 
 For each eligible representation, report these readouts on exactly the same episodes:
 
-1. **1-NN:** nearest labelled support, the deployment-simple floor.
-2. **Differentiable neighbours:** parameter-free, temperature-scaled soft cosine voting over every
-   enrolled support. This is the exact scoring rule used by the encoder-only adaptation control.
-3. **Prototype:** class mean of enrolled supports, clearly labelled as a batch-enrollment method.
-4. **Ridge:** an adapted linear readout fit only from the episode's enrolled support data, clearly
-   labelled as fitted adaptation.
-5. **HALO retrieve-mix-vote:** its learned semantic token mixer. For `k > 0`, it jointly attends
+1. **Equal-weight normalized fusion:** the single primary adaptation rule for external encoders.
+   It combines each model's declared native-or-ConSE semantic scores with class-wise maximum cosine
+   support scores using independently normalized `1 + 1` weights and no fitted parameter.
+2. **Cosine 1-NN:** a mandatory representation-only companion row for every enrolled external
+   baseline cell. Prototype and ridge remain optional diagnostic controls.
+3. **Differentiable neighbours:** HALO encoder-development objective only; it is not reported as an
+   adaptation mechanism for released baseline models.
+4. **HALO retrieve-mix-vote:** its learned semantic token mixer. For `k > 0`, it jointly attends
    to query, support, support-label, and candidate-label tokens before a soft support vote. For
    `k = 0`, it jointly attends to the query and candidate-label tokens before direct cosine
    scoring. The two paths use separately trained head weights and one shared encoder.
@@ -76,6 +77,32 @@ training label into a one-hot training-vocabulary prediction, and use ConSE to b
 to the sealed dataset's candidate strings. Models with a released native text-aligned prediction
 path retain it. Report the readout as `training-bank-1nn-conse` or `native_zero_support`; do not call
 the former native zero-shot. No sealed recording may enter the training bank.
+
+### Enrollment fusion
+
+For every `k > 0` baseline cell, including both complete and partial enrollment, every model makes
+one deployable prediction with the fixed **equal-weight normalized fusion** rule:
+
+1. Obtain semantic scores over every candidate from the model's declared `k=0` route: its released
+   native candidate scorer where available, otherwise training-bank 1-NN plus ConSE.
+2. For each enrolled candidate, take the maximum cosine similarity between the query and that
+   candidate's support recordings. In partial-coverage cells, unenrolled candidates have no
+   neighbour score.
+3. Per query, z-score semantic scores over the full candidate roster and z-score neighbour scores
+   over the enrolled candidates. Degenerate components with fewer than two live values or no
+   spread contribute zero rather than amplified noise.
+4. Add the two components with coefficients `1 + 1` and take one argmax. No parameter, threshold or
+   model-specific fusion weight is fitted.
+
+Semantic-only, prototype, and ridge controls are opt-in diagnostics. Cosine 1-NN is always retained
+beside the primary fusion row; neither is selected per cell. An "either prediction was correct"
+oracle may be reported only as a clearly
+labelled diagnostic ceiling; it is not deployed accuracy. Partial-coverage results are split into
+truth-enrolled, truth-unenrolled and combined queries, because a support-only method cannot name an
+unenrolled candidate.
+
+The sealed runner always computes external 1-NN. `--baseline-diagnostic-readouts` additionally
+enables prototype and ridge; omitting it avoids their repeated ridge work.
 
 ## Baseline fairness
 

@@ -8,7 +8,7 @@ open-vocabulary head, or source-specific task head is not substituted into the c
 protocol. The adapter preserves the model's published input contract and exports an embedding for
 the same query/support recordings used by HALO.
 
-Primary roster: `harnet`, `limubert_x`, `unimts`, and `normwear`.
+Primary roster: `harnet5`, `harnet10`, `limubert_x`, `unimts`, and `normwear`.
 
 The original locally pretrained LiMU-BERT, CrossHAR, and ImageBind are retained only as historical
 or optional diagnostic assets. LiMU-BERT-X is distinct: its primary row uses the authors' released

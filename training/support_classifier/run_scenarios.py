@@ -8,7 +8,7 @@ Scenarios
 ---------
 =========================  ===================================================================
 ``s1_partial_coverage``    only some candidates carry enrolment; the truth is sometimes one of
-                           the others (also available standalone in ``run_partial_coverage``)
+                           the others
 ``s2_cross_placement``     enrol at one body site, deploy at another, within a dataset
 ``s3_cross_dataset``       enrol from a different public corpus over shared labels
 ``s4_missing_modality``    the gyroscope is absent from the query, the support, or both
@@ -50,7 +50,8 @@ from .partial_coverage import (
     CoverageCell,
     choose_hidden_candidates,
     hide_supports,
-    hybrid_predictions,
+    equal_weight_normalized_fusion_predictions,
+    classwise_neighbor_scores,
     support_only_predictions,
 )
 from .run_partial_coverage import (
@@ -351,20 +352,51 @@ def _mmfit_split_rows(stream, split_names: tuple[str, ...]) -> np.ndarray:
 
 
 def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
-                coverage: float, limit: int | None = None) -> list[Task]:
+                coverage: float, limit: int | None = None,
+                failures: list[dict] | None = None) -> list[Task]:
     """Every cell of one scenario at one evidence budget and one enrolment size."""
     if limit is not None and limit < 1:
         return []
     tasks: list[Task] = []
 
+    def safe_load(dataset: str, stream_id: str):
+        try:
+            return _load(dataset, stream_id, window_seconds)
+        except Exception as exc:  # one unavailable stream must not erase sibling scenario cells
+            if failures is not None:
+                failures.append({
+                    "scenario": scenario, "k": int(k),
+                    "window_seconds": float(window_seconds), "stage": "load_stream",
+                    "dataset": dataset, "stream": stream_id,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+            return None
+
+    def safe_composite(dataset: str, device_ids: tuple[str, ...]):
+        try:
+            return _composite(dataset, device_ids, window_seconds)
+        except Exception as exc:
+            if failures is not None:
+                failures.append({
+                    "scenario": scenario, "k": int(k),
+                    "window_seconds": float(window_seconds), "stage": "load_stream",
+                    "dataset": dataset, "stream": "+".join(device_ids),
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+            return None
+
     def complete() -> bool:
-        return limit is not None and len(tasks) >= limit
+        # Disclosure-only unavailable rungs do not consume the smoke/task budget; the limit must
+        # still exercise real scoring work (and, for matched scenarios, control plus perturbation).
+        return limit is not None and sum(bool(task.plans) for task in tasks) >= limit
 
     if scenario == "s1_partial_coverage":
         if k == 0:
             return tasks
         for dataset, stream_id in SEALED_SINGLE_CELLS:
-            stream = _load(dataset, stream_id, window_seconds)
+            stream = safe_load(dataset, stream_id)
+            if stream is None:
+                continue
             plans = _within_cross_subject(stream, k, seed)
             if not plans:
                 continue
@@ -384,8 +416,10 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                 for support_id in streams:
                     if query_id == support_id:
                         continue
-                    query = _load(dataset, query_id, window_seconds)
-                    support = _load(dataset, support_id, window_seconds)
+                    query = safe_load(dataset, query_id)
+                    support = safe_load(dataset, support_id)
+                    if query is None or support is None:
+                        continue
                     if k == 0:
                         plans, candidates = _zero_support_cross_plans(query, support)
                         if plans:
@@ -408,6 +442,25 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                             relation=f"s2_reference_{relation}",
                         )
                         if not cross_plans:
+                            # Absence of a planned severity rung is itself a result. Persist it so
+                            # a report cannot silently look like only cross-subject deployment was
+                            # intended.
+                            tasks.append(Task(
+                                scenario,
+                                f"{dataset}/{query_id}<-{support_id}/{relation}/unavailable",
+                                query, support, (), cross.candidates, cross.offset,
+                                {"L": 0, "S": 0, "P": severity, "C": 0},
+                                meta={
+                                    "distance": anatomical_distance(dataset, query_id, support_id),
+                                    "subject_relation": relation,
+                                    "skipped": (
+                                        "no execution-disjoint supports satisfy the requested "
+                                        f"{relation} relation for every candidate"
+                                    ),
+                                },
+                            ))
+                            if complete():
+                                return tasks
                             continue
                         matched_group = f"{dataset}/{query_id}<-{support_id}/{relation}/k{k}"
                         tasks.append(Task(
@@ -431,8 +484,10 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
 
     elif scenario == "s3_cross_dataset":
         for (q_ds, q_id), (s_ds, s_id), region in CROSS_DATASET_PAIRS:
-            query = _load(q_ds, q_id, window_seconds)
-            support = _load(s_ds, s_id, window_seconds)
+            query = safe_load(q_ds, q_id)
+            support = safe_load(s_ds, s_id)
+            if query is None or support is None:
+                continue
             if k == 0:
                 plans, candidates = _zero_support_cross_plans(query, support)
                 if plans:
@@ -477,7 +532,9 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
         if k == 0:
             return tasks
         for dataset, stream_id in SEALED_SINGLE_CELLS:
-            full = _load(dataset, stream_id, window_seconds)
+            full = safe_load(dataset, stream_id)
+            if full is None:
+                continue
             base_plans = _within_cross_subject(full, k, seed)
             try:
                 accel = derive_accel_only(full)
@@ -522,7 +579,9 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
         if k == 0:
             return tasks
         for dataset, stream_id in SEALED_SINGLE_CELLS:
-            full = _load(dataset, stream_id, window_seconds)
+            full = safe_load(dataset, stream_id)
+            if full is None:
+                continue
             base_plans = _within_cross_subject(full, k, seed)
             tasks.append(Task(
                 scenario, f"{dataset}/{stream_id}/matched_full_control", full, full,
@@ -536,7 +595,22 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
             for target in RATE_TARGETS:
                 if abs(target - float(full.rate_hz)) < 1e-9:
                     continue
-                query = derive_resampled(full, target)
+                try:
+                    query = derive_resampled(full, target)
+                except (ValueError, RuntimeError) as exc:
+                    tasks.append(Task(
+                        scenario, f"{dataset}/{stream_id}/query@{target:g}Hz/unavailable",
+                        full, full, (), tuple(full.eval_labels), stream_rows(full),
+                        {"L": 0, "S": 0, "P": 0, "C": 2},
+                        meta={
+                            "query_rate_hz": target,
+                            "support_rate_hz": float(full.rate_hz),
+                            "condition": "scenario",
+                            "subject_relation": "cross_subject",
+                            "skipped": f"rate perturbation unavailable: {type(exc).__name__}: {exc}",
+                        },
+                    ))
+                    continue
                 if not base_plans:
                     continue
                 tasks.append(Task(
@@ -552,7 +626,9 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
 
     elif scenario == "s6_new_domain":
         for dataset, stream_id in NEW_DOMAIN_CELLS:
-            stream = _load(dataset, stream_id, window_seconds)
+            stream = safe_load(dataset, stream_id)
+            if stream is None:
+                continue
             if dataset == "mmfit":
                 plans, subject_relation = _mmfit_new_domain_plans(stream, k, seed)
             else:
@@ -583,9 +659,13 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
     elif scenario == "s7_device_set":
         for cell_spec in MULTI_DEVICE_EVAL_CELLS:
             dataset, device_ids = cell_spec.dataset, tuple(cell_spec.stream_ids)
-            composite = _composite(dataset, device_ids, window_seconds)
-            single = _load(dataset, device_ids[0], window_seconds)
-            partial = _composite(dataset, device_ids[:2], window_seconds)
+            composite = safe_composite(dataset, device_ids)
+            single = safe_load(dataset, device_ids[0])
+            if composite is None or single is None:
+                continue
+            partial = safe_composite(dataset, device_ids[:2])
+            if partial is None:
+                continue
             if k == 0:
                 plans, candidates = _zero_support_cross_plans(composite, single)
                 if plans:
@@ -636,7 +716,9 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
             return tasks
         dataset = "mmfit"
         query = _composite(dataset, ("left_wrist", "right_pocket"), window_seconds)
-        support = _load(dataset, "right_wrist", window_seconds)
+        support = safe_load(dataset, "right_wrist")
+        if support is None:
+            return tasks
         query_rows = _mmfit_split_rows(query, ("cross_subject_test",))
         support_rows = _mmfit_split_rows(support, ("train", "validation"))
         cross = build_cross_manifest(query, support, k, seed=seed,
@@ -667,17 +749,21 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
                halo_has_classifier: bool = False,
                selected_readouts: frozenset[str] | None = None,
                provider_states=None, prediction_sink=None, cache_read_dirs=(),
-               feature_memory_cache=None) -> list[dict]:
+               feature_memory_cache=None, manifest: str | None = None) -> list[dict]:
     """Every readout for every model on one task's episodes."""
     if not task.plans:
-        return [{"scenario": task.scenario, "variant": task.variant, "status": "n/a",
-                 "reason": task.meta.get("skipped", "no honest episode could be formed"),
-                 "k": k, "window_seconds": float(window_seconds), **task.severity}]
+        severity = {f"severity_{axis}": value for axis, value in task.severity.items()}
+        return [{
+            "scenario": task.scenario, "variant": task.variant, "model": name,
+            "readout": "all", "status": "n/a",
+            "reason": task.meta.get("skipped", "no honest episode could be formed"),
+            "k": k, "window_seconds": float(window_seconds), **severity, **task.meta,
+        } for name in models]
 
     coverage = task.coverage or CoverageCell(
         supported=tuple(task.candidates), hidden=(), coverage=1.0, requested_coverage=1.0)
     roster = SimpleNamespace(eval_labels=list(task.candidates))
-    manifest = manifest_fingerprint(task.plans)
+    manifest = manifest or manifest_fingerprint(task.plans)
     common = dict(k=k, window_seconds=window_seconds, bootstrap=bootstrap, manifest=manifest)
     severity_meta = {**{f"severity_{axis}": value for axis, value in task.severity.items()},
                      **task.meta, "scenario": task.scenario, "variant": task.variant,
@@ -727,60 +813,100 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
 
     for name in models:
         try:
+            default_baseline_fusion = selected_readouts is None and name != "halo"
+            baseline_fusion_requested = name != "halo" and (
+                default_baseline_fusion
+                or "equal-weight-normalized-fusion" in (selected_readouts or ())
+            )
             if name != "halo" and name not in provider_states:
                 provider_states[name] = baselines.REGISTRY[name].setup_features(device)
-            query_features, fingerprint = _load_or_encode(
+            query_features, query_fingerprint = _load_or_encode(
                 name=name, stream=task.query_stream, device=device, cache_dir=cache_dir,
                 halo_checkpoint=halo_checkpoint, baseline_state=provider_states.get(name),
                 halo_state=halo_state, cache_read_dirs=cache_read_dirs,
                 memory_cache=feature_memory_cache)
             if task.cross:
-                support_features, _ = _load_or_encode(
+                support_features, support_fingerprint = _load_or_encode(
                     name=name, stream=task.support_stream, device=device, cache_dir=cache_dir,
                     halo_checkpoint=halo_checkpoint, baseline_state=provider_states.get(name),
                     halo_state=halo_state, cache_read_dirs=cache_read_dirs,
                     memory_cache=feature_memory_cache)
+                if query_features.ndim != 2 or support_features.ndim != 2:
+                    raise baselines.UnsupportedEvaluationCell(
+                        "query and support encoders must return rank-2 representations"
+                    )
+                if query_features.shape[1] != support_features.shape[1]:
+                    raise baselines.UnsupportedEvaluationCell(
+                        "query and support acquisition configurations produce incompatible "
+                        f"representation dimensions ({query_features.shape[1]} versus "
+                        f"{support_features.shape[1]})"
+                    )
                 features = np.concatenate([query_features, support_features], axis=0)
             else:
                 features = query_features
+                support_fingerprint = query_fingerprint
             extra_base = {**severity_meta, "n_candidates": len(task.candidates),
-                          "feature_fingerprint": fingerprint,
+                          # Keep the legacy field for readers that predate cross-stream scoring,
+                          # but record both sides explicitly so a result is fully auditable.
+                          "feature_fingerprint": query_fingerprint,
+                          "query_feature_fingerprint": query_fingerprint,
+                          "support_feature_fingerprint": support_fingerprint,
                           "parameters_m": round(_parameter_count_m(
                               name, halo_state, halo_checkpoint=halo_checkpoint,
                               include_classifier=False,
                           ), 6), **_native_capabilities(name)}
 
-            if k > 0:
-                support_readouts = None if selected_readouts is None else frozenset(
-                    selected_readouts & {"1nn", "prototype", "ridge"}
+            neighbor_scores = None
+            if k > 0 and (selected_readouts is None or bool(
+                    {"1nn", "equal-weight-normalized-fusion"} & selected_readouts)):
+                neighbor_scores = classwise_neighbor_scores(
+                    features, task.candidates, task.plans, device=device,
                 )
-                for readout, predicted in support_only_predictions(
-                        features, task.candidates, task.plans, coverage, device=device,
-                        readouts=support_readouts).items():
-                    append_emitted(predicted, readout=readout)
+
+            if k > 0:
+                support_readouts = (
+                    # Fusion remains the declared baseline deployment readout, but 1-NN is always
+                    # reported beside it. Hiding the representation-only floor can handicap a
+                    # model whose native semantic score is noisy and can dilute severity deltas.
+                    frozenset(("1nn",)) if default_baseline_fusion else
+                    None if selected_readouts is None else
+                    frozenset(selected_readouts & {"1nn", "prototype", "ridge"})
+                )
+                if support_readouts is None or support_readouts:
+                    for readout, predicted in support_only_predictions(
+                            features, task.candidates, task.plans, coverage, device=device,
+                            readouts=support_readouts, classwise_scores=neighbor_scores).items():
+                        append_emitted(predicted, readout=readout)
 
             text = None
             needs_text = (
                 selected_readouts is None
                 or "zero-shot-native-or-bridge" in selected_readouts
-                or "hybrid-text-support" in selected_readouts
+                or baseline_fusion_requested
             )
-            if needs_text and (k == 0 or task.coverage is not None):
+            if needs_text and (k == 0 or task.coverage is not None or baseline_fusion_requested):
                 if name in TRAINING_BANK_ZERO_SHOT and (name != "halo" or task.coverage is not None):
                     if name not in banks:
                         banks[name] = _build_training_reference_bank(
                             name=name, device=device,
-                            cache_dir=Path("training/support_classifier/evaluations/zero_shot_feature_cache"),
+                            cache_dir=EVALUATION_ROOT / "zero_shot_feature_cache",
                             halo_checkpoint=halo_checkpoint, halo_state=halo_state,
                             baseline_state=provider_states.get(name),
                             cache_read_dirs=cache_read_dirs,
-                            memory_cache=feature_memory_cache)
+                            memory_cache=feature_memory_cache,
+                            window_seconds=window_seconds)
                     bank_features, bank_labels, train_labels, _ = banks[name]
                     text = conse_scores(query_features, bank_features, bank_labels, train_labels,
                                         task.candidates, device)
                 elif name != "halo" and baselines.REGISTRY[name].supports_native_zero_shot():
                     state = provider_states[name]
-                    text = native_text_scores(name, query_features, task.candidates, state, device)
+                    native_features, _ = _load_or_encode(
+                        name=name, stream=task.query_stream, device=device, cache_dir=cache_dir,
+                        halo_checkpoint=halo_checkpoint, baseline_state=state,
+                        cache_read_dirs=cache_read_dirs, memory_cache=feature_memory_cache,
+                        feature_role="native_zero_shot",
+                    )
+                    text = native_text_scores(name, native_features, task.candidates, state, device)
 
             if k == 0:
                 if (name == "halo" and halo_checkpoint is not None and halo_has_classifier
@@ -796,17 +922,22 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
                     rows.append({"model": name, "readout": "zero-shot", "status": "inapplicable",
                                  "reason": "model exposes neither a native nor configured bridge zero-shot path",
                                  **extra_base, **common})
-            elif task.coverage is not None:
+            elif task.coverage is not None or baseline_fusion_requested:
                 if (text is not None and (selected_readouts is None
-                                          or "hybrid-text-support" in selected_readouts)):
-                    hybrid = hybrid_predictions(text, features, task.candidates, task.plans, coverage)
-                    append_emitted(hybrid, readout="hybrid-text-support")
+                                          or "equal-weight-normalized-fusion" in selected_readouts)):
+                    fused = equal_weight_normalized_fusion_predictions(
+                        text, features, task.candidates, task.plans, coverage,
+                        classwise_scores=neighbor_scores,
+                    )
+                    append_emitted(fused, readout="equal-weight-normalized-fusion")
                 elif (name != "halo" and (selected_readouts is None
-                                           or "hybrid-text-support" in selected_readouts)):
+                                           or "equal-weight-normalized-fusion" in selected_readouts)):
                     rows.extend(cannot_attempt_rows(
-                        task.query_stream, coverage, model=name, readout="hybrid-text-support",
+                        task.query_stream, coverage, model=name,
+                        readout="equal-weight-normalized-fusion",
                         k=k, window_seconds=window_seconds,
-                        reason="no native or configured text-score path: hidden candidates are unreachable"))
+                        reason="no native or configured semantic-score path: hidden candidates are unreachable",
+                        scenario=task.scenario, variant=task.variant, extra=extra_base))
 
             if (name == "halo" and halo_checkpoint is not None and halo_has_classifier and k > 0
                     and (selected_readouts is None or "halo-classifier" in selected_readouts)):
@@ -824,7 +955,10 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
 # ------------------------------------------------------------------------ main
 
 
-def _task_artifact(task: Task, *, k: int, window_seconds: float) -> dict:
+def _task_artifact(
+    task: Task, *, k: int, window_seconds: float, compact: bool = False,
+    manifest: str | None = None,
+) -> dict:
     """Persist enough episode provenance to reproduce a scored cell exactly."""
     return {
         "scenario": task.scenario,
@@ -846,7 +980,9 @@ def _task_artifact(task: Task, *, k: int, window_seconds: float) -> dict:
         "support_rate_hz": getattr(task.support_stream, "rate_hz", None),
         "query_devices": list(getattr(task.query_stream, "device_ids", ())),
         "support_devices": list(getattr(task.support_stream, "device_ids", ())),
-        "plans": [_plan_artifact(task, plan) for plan in task.plans],
+        "manifest_fingerprint": manifest or manifest_fingerprint(task.plans),
+        "n_plans": len(task.plans),
+        "plans": None if compact else [_plan_artifact(task, plan) for plan in task.plans],
         "meta": task.meta,
     }
 
@@ -925,7 +1061,8 @@ def _run_provenance(argv: list[str], *, device: torch.device, halo_checkpoint: P
     except (OSError, subprocess.CalledProcessError):
         dirty_digest = None
     return {
-        "protocol": "deployment-scenarios-v2-20260915",
+        "protocol": "deployment-scenarios-v3-20260916",
+        "manifest_generator": "numpy-choice-json-fingerprint-v1",
         "argv": argv,
         "git_revision": revision,
         "dirty_diff_sha256": dirty_digest,
@@ -969,8 +1106,15 @@ def _paired_deltas(predictions: list[dict], *, bootstrap: int) -> list[dict]:
             control_prediction = [right["prediction"] for _, right in paired]
             if any(left["truth"] != right["truth"] for left, right in paired):
                 raise RuntimeError("matched scenario/control rows disagree on ground truth")
-            metrics = scoring.classification_metrics(truth, scenario_prediction)
-            reference = scoring.classification_metrics(truth, control_prediction)
+            # Both sides must use one estimand. Otherwise a scenario that introduces a new
+            # false-positive class changes its own macro-F1 denominator relative to the control.
+            f1_classes = sorted(set(truth) | set(scenario_prediction) | set(control_prediction))
+            metrics = scoring.classification_metrics(
+                truth, scenario_prediction, f1_classes=f1_classes,
+            )
+            reference = scoring.classification_metrics(
+                truth, control_prediction, f1_classes=f1_classes,
+            )
             row = {
                 "matched_group": key[0], "model": key[1], "readout": key[2],
                 "k": key[3], "window_seconds": key[4], "variant": variant,
@@ -1076,8 +1220,13 @@ def _write_tabular_results(out: Path, rows: list[dict]) -> None:
         "scenario", "variant", "condition", "matched_group", "matched_parent", "dataset",
         "stream", "model", "readout", "window_seconds", "k", "coverage_split", "status",
         "n_queries", "n_candidates", "accuracy", "f1_macro", "balanced_accuracy",
+        "primary_metric", "truth_label_set", "f1_scored_classes",
+        "coverage", "requested_coverage", "supported_candidates", "hidden_candidates",
+        "severity_L", "severity_S", "severity_P", "severity_C",
+        "query_feature_fingerprint", "support_feature_fingerprint",
         "f1_macro_seen", "f1_macro_unseen", "false_enrollment_pull", "parameters_m",
-        "native_open_set_labels", "native_few_shot_adaptation", "reason",
+        "native_open_set_labels", "native_support_conditioning",
+        "published_few_label_finetuning", "reason",
     ]
     with (out / "results.csv").open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
@@ -1086,8 +1235,10 @@ def _write_tabular_results(out: Path, rows: list[dict]) -> None:
     shown = rows
     header = [
         "scenario", "variant", "split", "model", "readout", "w", "k", "parameters (M)",
-        "native open set", "native few shot", "status", "macro F1", "accuracy",
-        "seen F1", "unseen F1", "false enrollment pull",
+        "native open set", "native support conditioning", "published few-label finetuning",
+        "status", "macro F1", "accuracy",
+        "primary metric", "balanced accuracy", "truth labels", "seen F1", "unseen F1",
+        "false enrollment pull",
     ]
     lines = ["# Deployment scenario results", "", "Generated by `run_scenarios`; no result selects a checkpoint.", "",
              "| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
@@ -1097,8 +1248,10 @@ def _write_tabular_results(out: Path, rows: list[dict]) -> None:
             row.get("model", ""),
             row.get("readout", ""), row.get("window_seconds", ""), row.get("k", ""),
             row.get("parameters_m", ""), row.get("native_open_set_labels", ""),
-            row.get("native_few_shot_adaptation", ""), row.get("status", ""),
-            row.get("f1_macro", ""), row.get("accuracy", ""),
+            row.get("native_support_conditioning", ""),
+            row.get("published_few_label_finetuning", ""), row.get("status", ""),
+            row.get("f1_macro", ""), row.get("accuracy", ""), row.get("primary_metric", ""),
+            row.get("balanced_accuracy", ""), ", ".join(row.get("truth_label_set", [])),
             row.get("f1_macro_seen", ""), row.get("f1_macro_unseen", ""),
             row.get("false_enrollment_pull", ""),
         ]
@@ -1116,14 +1269,15 @@ def main() -> None:
     parser.add_argument("--models", nargs="+", default=["halo", *PRIMARY_BASELINES])
     parser.add_argument(
         "--readouts", nargs="+", choices=(
-            "1nn", "prototype", "ridge", "hybrid-text-support",
+            "1nn", "prototype", "ridge", "equal-weight-normalized-fusion",
             "zero-shot-native-or-bridge", "halo-classifier",
         ), default=None,
-        help="optional readout subset for a controlled diagnostic; omitted runs every applicable readout",
+        help=("optional readout subset for a controlled diagnostic; omitted reports equal-weight "
+              "normalized fusion plus 1-NN for baselines and the deployment classifier for HALO"),
     )
     parser.add_argument("--halo-checkpoint", type=Path, default=None)
-    parser.add_argument("--k", nargs="+", type=int, default=[1, 8])
-    parser.add_argument("--window-seconds", nargs="+", type=float, default=[8.0])
+    parser.add_argument("--k", nargs="+", type=int, default=[0, 1, 2, 4, 8, 16, 32, 64])
+    parser.add_argument("--window-seconds", nargs="+", type=float, default=[4.0, 8.0, 16.0])
     parser.add_argument("--coverage", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--bootstrap", type=int, default=scoring.BOOTSTRAP_B)
@@ -1137,6 +1291,14 @@ def main() -> None:
         help="do not search prior evaluation directories for independently validated cache hits",
     )
     parser.add_argument("--max-tasks-per-scenario", type=int, default=None)
+    parser.add_argument(
+        "--compact-audit", action="store_true",
+        help="deprecated compatibility flag; compact audit is now the default",
+    )
+    parser.add_argument(
+        "--full-audit", action="store_true",
+        help="also persist expanded plans and per-query predictions (substantially larger/slower)",
+    )
     parser.add_argument("--smoke", action="store_true",
                         help="up to two tasks per scenario, one k, no bootstrap: wiring check only")
     args = parser.parse_args()
@@ -1147,6 +1309,8 @@ def main() -> None:
         parser.error("--window-seconds values must be finite and positive")
     if not 0.0 < args.coverage < 1.0:
         parser.error("--coverage must lie strictly between zero and one")
+    if args.compact_audit and args.full_audit:
+        parser.error("--compact-audit and --full-audit are mutually exclusive")
     if not np.isfinite(args.feature_memory_cache_gib) or args.feature_memory_cache_gib < 0:
         parser.error("--feature-memory-cache-gib must be finite and non-negative")
     unknown = sorted(set(args.models) - set(PRIMARY_BASELINES) - {"halo"})
@@ -1195,6 +1359,7 @@ def main() -> None:
     prediction_path = args.out / "predictions.jsonl"
     manifest_path.write_text("")
     prediction_path.write_text("")
+    completed_tasks = 0
     _atomic_json(args.out / "run_provenance.json", _run_provenance(
         list(os.sys.argv), device=device, halo_checkpoint=args.halo_checkpoint,
     ))
@@ -1210,7 +1375,8 @@ def main() -> None:
             for k in ks:
                 try:
                     tasks = build_tasks(scenario, k, window_seconds,
-                                        seed=args.seed, coverage=args.coverage, limit=limit)
+                                        seed=args.seed, coverage=args.coverage, limit=limit,
+                                        failures=failures)
                 except Exception as exc:  # noqa: BLE001
                     failures.append({"scenario": scenario, "k": k,
                                      "window_seconds": window_seconds,
@@ -1240,9 +1406,13 @@ def main() -> None:
                 selected_tasks = tasks
                 paired_tracker = _PairedDeltaTracker(selected_tasks, bootstrap=bootstrap)
                 for task in selected_tasks:
+                    task_manifest = manifest_fingerprint(task.plans)
                     _append_jsonl(
                         manifest_path,
-                        [_task_artifact(task, k=k, window_seconds=window_seconds)],
+                        [_task_artifact(
+                            task, k=k, window_seconds=window_seconds,
+                            compact=not args.full_audit, manifest=task_manifest,
+                        )],
                     )
                     print(f"[scenarios] {scenario} k={k} w={window_seconds:g} {task.variant}",
                           flush=True)
@@ -1258,25 +1428,35 @@ def main() -> None:
                             provider_states=provider_states,
                             prediction_sink=task_predictions,
                             cache_read_dirs=cache_read_dirs,
-                            feature_memory_cache=feature_memory_cache))
+                            feature_memory_cache=feature_memory_cache,
+                            manifest=task_manifest))
                     except Exception as exc:  # noqa: BLE001
                         failures.append({"scenario": scenario, "variant": task.variant, "k": k,
                                          "window_seconds": window_seconds, "stage": "score_task",
                                          "error": f"{type(exc).__name__}: {exc}",
                                          "traceback": traceback.format_exc()})
-                    _append_jsonl(prediction_path, task_predictions)
+                    completed_tasks += 1
+                    if args.full_audit:
+                        _append_jsonl(prediction_path, task_predictions)
                     try:
                         paired_tracker.consume(task_predictions)
                     except RuntimeError as exc:
                         failures.append({"scenario": scenario, "variant": task.variant,
                                          "k": k, "window_seconds": window_seconds,
                                          "stage": "paired_deltas", "error": str(exc)})
-                    _atomic_json(args.out / "results.json", rows)
                     _atomic_json(args.out / "failures.json", failures)
-                    _write_tabular_results(args.out, rows)
+                    # Manifests and predictions are append-only per task. Rewriting the growing
+                    # JSON/CSV/Markdown result set after every cell is quadratic I/O and dominated
+                    # cached evaluation runs; checkpoint it periodically and always at completion.
+                    if completed_tasks % 25 == 0:
+                        _atomic_json(args.out / "results.json", rows)
+                        _write_tabular_results(args.out, rows)
                 try:
                     paired_delta_rows.extend(paired_tracker.finish())
                 except RuntimeError as exc:
+                    # Keep every completed matched pair. One unavailable provider/cell must not
+                    # discard valid deltas already computed for the rest of this scenario.
+                    paired_delta_rows.extend(paired_tracker.output)
                     failures.append({"scenario": scenario, "k": k,
                                      "window_seconds": window_seconds,
                                      "stage": "paired_deltas",
@@ -1291,7 +1471,25 @@ def main() -> None:
         args.models, provider_states, args.halo_checkpoint,
     ))
     _write_tabular_results(args.out, rows)
-    print(f"wrote {len(rows)} rows and {len(failures)} failures to {args.out}")
+    failed_rows = [row for row in rows if row.get("status") == "failed"]
+    complete = not failures and not failed_rows
+    _atomic_json(args.out / "run_metadata.json", {
+        "schema": "deployment-scenarios-results-v3-20260916",
+        "complete": complete,
+        "n_rows": len(rows),
+        "n_task_failures": len(failures),
+        "n_failed_rows": len(failed_rows),
+        "models": list(args.models),
+        "scenarios": list(args.scenarios),
+        "k": ks,
+        "window_seconds": windows,
+    })
+    print(f"wrote {len(rows)} rows and {len(failures)} task failures to {args.out}")
+    if not complete:
+        raise SystemExit(
+            f"scenario evaluation incomplete: {len(failures)} task failures and "
+            f"{len(failed_rows)} failed result rows; inspect {args.out}"
+        )
 
 
 if __name__ == "__main__":

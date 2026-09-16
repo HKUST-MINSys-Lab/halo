@@ -44,8 +44,19 @@ BACKBONE_CONTRACTS = {
     # LiMU-BERT: 20 Hz, 6-axis, one-second clips (20 samples), acceleration in g.
     "limubert": {"rate_hz": 20.0, "clip": 20, "channels": 6, "dim": 72, "crop": "clip"},
     # harnet5: 30 Hz, accelerometer triad, 5 s (150 samples).
-    "harnet": {"rate_hz": 30.0, "clip": 150, "channels": 3, "dim": 512, "crop": "centre"},
+    # ``min_clip`` is the shortest input the trunk tolerates. harnet5's ResNet pads circularly and
+    # raises on a signal shorter than its 5 s contract, so it never shortens; UniMTS's ST-GCN is
+    # fully convolutional in time and accepts the real window length.
+    "harnet": {"rate_hz": 30.0, "clip": 150, "min_clip": 150, "channels": 3, "dim": 512,
+               "crop": "centre"},
+    # UniMTS: 20 Hz, accelerometer triad, 10 s (200 samples), placed on a 22-node SMPL skeleton.
+    "unimts": {"rate_hz": 20.0, "clip": 200, "min_clip": 64, "channels": 3, "dim": 512,
+               "crop": "start", "trunk_chunk": 64},
 }
+
+#: UniMTS fuses placements inside its graph, so it consumes every device in one forward pass
+#: instead of being pooled afterwards.
+NATIVE_DEVICE_FUSION = {"unimts"}
 
 
 def reconstruct_native_window(patches, patch_len, patch_padding_mask):
@@ -69,6 +80,32 @@ def reconstruct_native_window(patches, patch_len, patch_padding_mask):
     flat = patches.reshape(B, P * S, C)
     window = flat.gather(1, (patch_of * S + offset).unsqueeze(-1).expand(-1, -1, C))
     return window, total.long()
+
+
+_JOINT_CACHE: dict[str, int] = {}
+
+
+def sensor_joint(text: str) -> int:
+    """SMPL joint index for one sensor description, using UniMTS's own placement tables.
+
+    Matching on the *sensor* text rather than the stream key is what makes multi-device work: a
+    composite recording has one stream key but one placement per device, and UniMTS's whole design
+    is that different placements are different graph nodes.
+    """
+    from baselines.unimts.adapter import (
+        DEFAULT_JOINT, _PLACEMENT_KEYWORDS, _SIDE_PLACEMENT_JOINTS,
+    )
+
+    key = str(text).lower()
+    if key in _JOINT_CACHE:
+        return _JOINT_CACHE[key]
+    joint = DEFAULT_JOINT
+    for keyword, value in list(_SIDE_PLACEMENT_JOINTS) + list(_PLACEMENT_KEYWORDS):
+        if str(keyword).replace("_", " ").lower() in key:
+            joint = int(value)
+            break
+    _JOINT_CACHE[key] = int(joint)
+    return int(joint)
 
 
 def _reinitialise(module: nn.Module) -> None:
@@ -142,6 +179,59 @@ class _HarnetTrunk(nn.Module):
         return feature.flatten(1) if feature.dim() > 2 else feature
 
 
+class _UniMTSTrunk(nn.Module):
+    """UniMTS's ST-GCN over a 22-node SMPL skeleton, randomly initialised by default.
+
+    Constructed directly from the vendored repository rather than by loading the released
+    checkpoint, because M2 asks what the *architecture* is worth on our corpus and the released
+    weights carry the synthetic-mocap corpus this arm exists to remove. The surrounding CLIP text
+    tower is never built: all arms use HALO's shared label-text path.
+    """
+
+    def __init__(self, pretrained: bool = False):
+        super().__init__()
+        import sys
+
+        from baselines.unimts.adapter import UNIMTS_REPO
+
+        # UniMTS imports ``from model import ST_GCN_18`` and HALO also owns a package named
+        # ``model``. Whichever is imported first poisons the other through sys.modules, so snapshot
+        # HALO's package, import against the repo-local module, then restore. Same isolation the
+        # released adapter uses; the instantiated class keeps its own module object afterwards.
+        saved = {name: module for name, module in list(sys.modules.items())
+                 if name == "model" or name.startswith("model.")}
+        for name in saved:
+            sys.modules.pop(name, None)
+        added = str(UNIMTS_REPO) not in sys.path
+        if added:
+            sys.path.insert(0, str(UNIMTS_REPO))
+        try:
+            from model import ST_GCN_18  # noqa: E402  (repo-local import)
+
+            self.net = ST_GCN_18(in_channels=3, edge_importance_weighting=True)
+        finally:
+            for name in list(sys.modules):
+                if name == "model" or name.startswith("model."):
+                    sys.modules.pop(name, None)
+            sys.modules.update(saved)
+            if added and str(UNIMTS_REPO) in sys.path:
+                sys.path.remove(str(UNIMTS_REPO))
+        if pretrained:
+            from baselines.unimts.adapter import UniMTSAdapter
+
+            loaded = UniMTSAdapter().setup(torch.device("cpu"))["model"]
+            self.net.load_state_dict(loaded.model.acc.state_dict())
+            del loaded
+        self.net.requires_grad_(True)
+        self.net.train()
+        self.out_dim = BACKBONE_CONTRACTS["unimts"]["dim"]
+
+    def forward(self, grid: torch.Tensor) -> torch.Tensor:
+        """``(n, T, 22, 3)`` accelerations in m/s^2 -> ``(n, dim)``."""
+        x = grid.permute(0, 3, 1, 2).unsqueeze(-1)      # (n, 3, T, 22, 1)
+        return self.net(x).squeeze(-1).squeeze(-1)
+
+
 class MatchedCorpusEncoder(nn.Module):
     """A baseline trunk presented to the support classifier as a recording encoder.
 
@@ -159,7 +249,7 @@ class MatchedCorpusEncoder(nn.Module):
     requires_stream_metadata = False
 
     def __init__(self, backbone: str, *, d_model: int = 128, pretrained: bool = False,
-                 dropout: float = 0.1):
+                 dropout: float = 0.1, compile_trunk: bool = False):
         super().__init__()
         if backbone not in BACKBONE_CONTRACTS:
             raise ValueError(f"backbone must be one of {sorted(BACKBONE_CONTRACTS)}")
@@ -169,10 +259,19 @@ class MatchedCorpusEncoder(nn.Module):
         self.clip = int(contract["clip"])
         self.n_channels = int(contract["channels"])
         self.crop_rule = contract["crop"]
+        self.min_clip = int(contract.get("min_clip", contract["clip"]))
         self.d_model = int(d_model)
         self.pretrained = bool(pretrained)
 
+        self.fuses_devices_natively = backbone in NATIVE_DEVICE_FUSION
+        # A 22-joint x 200-frame graph at full episode batch exceeds 24 GB of activations. Gradient
+        # checkpointing recomputes each chunk's activations in the backward pass instead of storing
+        # them: numerically identical, roughly 30% more compute, and it keeps the RECIPE intact.
+        # Shrinking episodes-per-step instead would change the objective and void the comparison.
+        self.trunk_chunk = int(contract.get("trunk_chunk", 0))
+        self.n_joints = 22
         self.net = (_LiMUBertTrunk(pretrained) if backbone == "limubert"
+                    else _UniMTSTrunk(pretrained) if backbone == "unimts"
                     else _HarnetTrunk(pretrained))
         # A trainable projection to the classifier's width. Without it the comparison would be
         # decided by whichever trunk happens to emit the classifier's dimension.
@@ -182,6 +281,23 @@ class MatchedCorpusEncoder(nn.Module):
         )
         self.row_norm = nn.LayerNorm(self.d_model)
         object.__setattr__(self, "_resamplers", {})
+        # Compilation is opt-in: measured 1.28x on the UniMTS graph, but it costs a warm-up and it
+        # recompiles per input shape. Chunking already fixes the shape except for the final partial
+        # chunk, which ``_run_trunk`` pads so only one graph is ever built.
+        if compile_trunk and backbone == "unimts":
+            # UniMTS's ST-GCN is defined in a repo-local module also called ``model``. The adapter
+            # restores HALO's package after import, so TorchDynamo cannot resolve the class's
+            # globals and fails with "module 'model' has no attribute 'torch'". Compilation works
+            # on the other trunks, which have no name collision.
+            raise ValueError(
+                "compile_trunk is unsupported for unimts: its repo-local 'model' module collides "
+                "with HALO's package and TorchDynamo cannot resolve the class globals"
+            )
+        self.compile_trunk = bool(compile_trunk)
+        object.__setattr__(
+            self, "_compiled_net",
+            torch.compile(self.net, dynamic=False) if compile_trunk else None,
+        )
 
     # ------------------------------------------------------------------ helpers
     def _resample(self, x: torch.Tensor, source_hz: float) -> torch.Tensor:
@@ -197,31 +313,76 @@ class MatchedCorpusEncoder(nn.Module):
             self._resamplers[key] = resampler
         return resampler(x.transpose(1, 2).contiguous()).transpose(1, 2)
 
-    def _prepare(self, signal: torch.Tensor) -> torch.Tensor:
-        """Crop or wrap-pad to the trunk's clip length, by that model's own rule."""
+    def _clip_length(self, groups) -> int:
+        """One clip length for the whole call, so groups concatenate into a single trunk batch.
+
+        Real batches share a window duration, so after resampling every group has the same length;
+        taking the minimum is a guard for the mixed-duration case rather than the normal path.
+        """
+        if self.pretrained or self.crop_rule == "clip":
+            return self.clip
+        shortest = min(int(part.shape[1]) for part in groups)
+        return int(max(min(self.clip, shortest), self.min_clip))
+
+    def _prepare(self, signal: torch.Tensor, length: int | None = None) -> torch.Tensor:
+        """Crop or wrap-pad to the trunk's clip length, by that model's own rule.
+
+        When the real signal is shorter than the released clip convention and there is no released
+        weight to match (a random-init M2 arm), the *real* length is used instead of wrap-padding.
+        Repeating 40 frames of an 8 s window to reach UniMTS's 10 s training convention fabricates
+        a quarter of the input; the graph is fully convolutional in time, so the shorter clip is
+        both faithful and 1.3x faster. A ``--matched-pretrained`` arm keeps the released length so
+        it can reproduce that model's own contract.
+        """
+        length = self.clip if length is None else int(length)
         if self.crop_rule == "centre":
-            return _center_crop_or_wrap(signal, self.clip)
-        return _start_crop_or_wrap(signal, self.clip)
+            return _center_crop_or_wrap(signal, length)
+        return _start_crop_or_wrap(signal, length)
 
     def _encode_signal(self, signal: torch.Tensor) -> torch.Tensor:
-        """``(n, T, C)`` at the trunk's rate -> ``(n, out_dim)``.
+        """One homogeneous group ``(n, T, C)`` at the trunk's rate -> ``(n, out_dim)``."""
+        return self._encode_groups([signal])
 
-        LiMU-BERT has a 20-sample positional-embedding contract, so a longer window is split into
-        non-overlapping one-second clips and averaged — the same rule its evaluation adapter uses.
-        Any other trunk consumes one clip.
+    def _encode_groups(self, groups: list[torch.Tensor]) -> torch.Tensor:
+        """Encode several homogeneous groups in one trunk call, each cut by its own length.
+
+        Single-clip trunks (harnet, UniMTS) crop or wrap each group to the clip length and then
+        concatenate. LiMU-BERT has a 20-sample positional-embedding contract, so a longer window
+        becomes several non-overlapping one-second clips whose features are averaged -- the rule its
+        released adapter uses. Groups may yield different clip counts, so they are padded to a
+        common count and the average is taken over each row's REAL clips only.
         """
         if self.backbone_name != "limubert":
-            return self.net(self._prepare(signal))
-        n, length, channels = signal.shape
-        count = max(1, length // self.clip)
-        usable = count * self.clip
-        if usable < length:
-            signal = signal[:, :usable]
-        elif usable > length:
-            signal = self._prepare(signal)
-            usable, count = self.clip, 1
-        clips = signal.reshape(n * count, self.clip, channels)
-        return self.net(clips).reshape(n, count, -1).mean(dim=1)
+            length = self._clip_length(groups)
+            return self._run_trunk(
+                torch.cat([self._prepare(part, length) for part in groups], dim=0))
+
+        counts, usable = [], []
+        for part in groups:
+            if part.shape[1] < self.clip:
+                part = self._prepare(part)
+            count = max(1, part.shape[1] // self.clip)
+            usable.append(part[:, :count * self.clip])
+            counts.append(count)
+        widest = max(counts)
+        padded = []
+        for part, count in zip(usable, counts):
+            if count < widest:
+                filler = part.new_zeros(
+                    (part.shape[0], (widest - count) * self.clip, part.shape[2]))
+                part = torch.cat([part, filler], dim=1)
+            padded.append(part)
+        batch = torch.cat(padded, dim=0)
+        n, _, channels = batch.shape
+        features = self._run_trunk(batch.reshape(n * widest, self.clip, channels))
+        features = features.reshape(n, widest, -1)
+        live = torch.cat([
+            torch.full((part.shape[0],), count, device=batch.device)
+            for part, count in zip(padded, counts)
+        ])
+        keep = (torch.arange(widest, device=batch.device).unsqueeze(0) < live.unsqueeze(1))
+        keep = keep.to(features.dtype).unsqueeze(-1)
+        return (features * keep).sum(dim=1) / keep.sum(dim=1).clamp_min(1.0)
 
     # ------------------------------------------------------- the encoder contract
     def forward(self, patches, rates, patch_len, role_texts, positions, *,
@@ -245,6 +406,12 @@ class MatchedCorpusEncoder(nn.Module):
         present = torch.zeros((B, n_devices), dtype=torch.bool, device=device)
         rates_host = rates.detach().cpu().tolist()
         lengths_host = lengths.detach().cpu().tolist()
+
+        if self.fuses_devices_natively:
+            return self._forward_native_fusion(
+                window, lengths, rates, channel_mask, sensor_id, device_of_sensor,
+                sensor_texts, n_devices, n_sensors, patches,
+            )
 
         prepared, destinations = [], []
         # A composite recording carries more than the six canonical channels: each device
@@ -278,12 +445,14 @@ class MatchedCorpusEncoder(nn.Module):
                 destinations.append(torch.stack([group, torch.full_like(group, slot)], dim=1))
 
         if prepared:
-            # One trunk call per (rate, length, device) group would be thousands of tiny kernels per
-            # step. Lengths differ after resampling, so pad to the longest and let the clip rule cut.
-            longest = max(part.shape[1] for part in prepared)
-            batch = torch.cat([self._prepare_to(part, longest) for part in prepared], dim=0)
+            # Every group is cut to the trunk's own clip contract FIRST, using its own length, and
+            # only then concatenated into one call. Padding groups to the batch's longest signal
+            # before cutting (an earlier version) fabricated samples that the trunk consumed: for
+            # LiMU-BERT they became extra one-second clips that diluted the mean, and for harnet
+            # they shifted the centre crop into repeated data. Cutting per group and batching once
+            # is both correct and a single kernel launch.
+            feature = self._encode_groups(prepared)
             destination = torch.cat(destinations, dim=0)
-            feature = self._encode_signal(batch)
             with torch.autocast(device_type=device.type, enabled=False):
                 projected = self.row_norm(self.proj(feature.float()))
             rows[destination[:, 0], destination[:, 1]] = projected.to(rows.dtype)
@@ -314,6 +483,119 @@ class MatchedCorpusEncoder(nn.Module):
             "retrieval_tokens": None,
         }
 
+
+
+    def _run_trunk(self, x: torch.Tensor) -> torch.Tensor:
+        """Trunk forward, gradient-checkpointed in chunks when the contract asks for it."""
+        if not self.trunk_chunk or not torch.is_grad_enabled() or not self.training:
+            if not self.trunk_chunk:
+                return self.net(x)
+            return torch.cat([self.net(x[i:i + self.trunk_chunk])
+                              for i in range(0, len(x), self.trunk_chunk)], dim=0)
+        from torch.utils.checkpoint import checkpoint
+
+        runner = self._compiled_net or self.net
+        out = []
+        for start in range(0, len(x), self.trunk_chunk):
+            chunk = x[start:start + self.trunk_chunk]
+            valid = len(chunk)
+            if self._compiled_net is not None and valid < self.trunk_chunk:
+                # One compiled graph instead of one per trailing-chunk size. The padding rows are
+                # discarded immediately and cannot influence real rows.
+                chunk = torch.cat([chunk, chunk[-1:].expand(self.trunk_chunk - valid, *chunk.shape[1:])], dim=0)
+            out.append(checkpoint(runner, chunk, use_reentrant=False)[:valid])
+        return torch.cat(out, dim=0)
+
+    # --------------------------------------------------- native multi-placement fusion
+    def _forward_native_fusion(self, window, lengths, rates, channel_mask, sensor_id,
+                               device_of_sensor, sensor_texts, n_devices, n_sensors, patches):
+        """One skeleton grid per window, every device placed at its own joint.
+
+        UniMTS fuses placements *inside* its graph, so pooling per device afterwards would replace
+        its own contribution with ours. Feeding every device into one forward pass is both faithful
+        to the model and the setting most favourable to it (matched-corpus plan §5.4).
+        """
+        device = window.device
+        B = window.shape[0]
+        channel_device = device_of_sensor.gather(
+            1, sensor_id.clamp(max=device_of_sensor.shape[1] - 1),
+        )
+        rates_host = rates.detach().cpu().tolist()
+        lengths_host = lengths.detach().cpu().tolist()
+
+        # Joint per (window, device), read from the device's own sensor description.
+        # Resolve joints on the host. Reading ``device_of_sensor[row, sensor]`` inside the loop
+        # forced a GPU synchronisation per sensor -- roughly a thousand stalls per step -- so the
+        # whole assignment is done on one CPU copy and transferred once.
+        joints_host = [[0] * n_devices for _ in range(B)]
+        if sensor_texts:
+            device_host = device_of_sensor.detach().cpu().tolist()
+            for row, texts in enumerate(sensor_texts):
+                for sensor, text in enumerate(texts):
+                    if text is None or sensor >= len(device_host[row]):
+                        continue
+                    slot = int(device_host[row][sensor])
+                    if 0 <= slot < n_devices:
+                        joints_host[row][slot] = sensor_joint(text)
+        joints = torch.tensor(joints_host, dtype=torch.long, device=device)
+
+        present = torch.zeros((B, n_devices), dtype=torch.bool, device=device)
+        groups: dict[tuple[float, int], list[int]] = {}
+        for row in range(B):
+            groups.setdefault(
+                (float(rates_host[row]), int(lengths_host[row])), []).append(row)
+
+        features, owners = [], []
+        for (rate, length), indices in groups.items():
+            group = torch.tensor(indices, dtype=torch.long, device=device)
+            signal = window.index_select(0, group)[:, :length]
+            resampled = self._resample(signal.float(), rate)
+            resampled = self._prepare(resampled, self._clip_length([resampled]))
+            clip = resampled.shape[1]
+            grid = resampled.new_zeros((len(group), clip, self.n_joints, 3))
+            used = torch.zeros((len(group), n_devices), dtype=torch.bool, device=device)
+            for slot in range(n_devices):
+                live = channel_mask.index_select(0, group).bool() & \
+                    channel_device.index_select(0, group).eq(slot)
+                complete = live.sum(dim=1) >= 3
+                if not bool(complete.any()):
+                    continue
+                order = torch.argsort((~live).to(torch.int8), dim=1, stable=True)[:, :3]
+                triad = torch.gather(
+                    resampled, 2, order.unsqueeze(1).expand(-1, clip, -1),
+                )
+                # UniMTS trains on m/s^2; our grids store g.
+                triad = triad * 9.80665 * complete.view(-1, 1, 1).to(triad.dtype)
+                node = joints.index_select(0, group)[:, slot]
+                rows = torch.arange(len(group), device=device)
+                grid[rows, :, node, :] = grid[rows, :, node, :] + triad
+                used[:, slot] = complete
+            features.append(self._run_trunk(grid))
+            owners.append(group)
+            present[group] = used
+
+        if not bool(present.any()):
+            raise ValueError("no window in this batch satisfied the backbone's channel contract")
+        feature = torch.cat(features, dim=0)
+        owner = torch.cat(owners, dim=0)
+        with torch.autocast(device_type=device.type, enabled=False):
+            projected = self.row_norm(self.proj(feature.float()))
+        pooled = projected.new_zeros((B, self.d_model))
+        # A window whose devices never met the channel contract was encoded from an all-zero
+        # skeleton. Zero it rather than letting an empty grid's embedding look like evidence.
+        pooled[owner] = (projected * present.index_select(0, owner).any(dim=1, keepdim=True)
+                         .to(projected.dtype)).to(pooled.dtype)
+
+        descriptor = patches.new_ones((B, max(n_sensors, 1), 1))
+        sensor_present = torch.zeros((B, max(n_sensors, 1)), dtype=torch.bool, device=device)
+        for sensor in range(max(n_sensors, 1)):
+            sensor_present[:, sensor] = ((sensor_id == sensor) & channel_mask).any(dim=1)
+        return {
+            "pooled": pooled, "descriptor": descriptor, "sensor_present": sensor_present,
+            "device_present": present.unsqueeze(1), "per_patch": None, "tokens": None,
+            "sensor_context": None, "descriptor_pred": None, "retrieval_tokens": None,
+        }
+
     @staticmethod
     def _prepare_to(signal: torch.Tensor, length: int) -> torch.Tensor:
         """Right-pad a resampled group to a shared length by edge repetition."""
@@ -324,6 +606,8 @@ class MatchedCorpusEncoder(nn.Module):
 
 
 def build_matched_encoder(backbone: str, *, d_model: int = 128, pretrained: bool = False,
-                          device: torch.device | None = None) -> MatchedCorpusEncoder:
-    encoder = MatchedCorpusEncoder(backbone, d_model=d_model, pretrained=pretrained)
+                          device: torch.device | None = None,
+                          compile_trunk: bool = False) -> MatchedCorpusEncoder:
+    encoder = MatchedCorpusEncoder(backbone, d_model=d_model, pretrained=pretrained,
+                                   compile_trunk=compile_trunk)
     return encoder.to(device) if device is not None else encoder

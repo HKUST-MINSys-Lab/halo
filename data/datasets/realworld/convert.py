@@ -30,7 +30,7 @@ import shutil
 import sys
 import zipfile
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -42,6 +42,7 @@ DS_DIR = Path(__file__).resolve().parent
 DOWNLOADS_DIR = DS_DIR / "downloads"
 OUTPUT_DIR = DS_DIR
 SESSIONS_DIR = OUTPUT_DIR / "sessions"
+STAGING_SESSIONS_DIR = OUTPUT_DIR / ".sessions_converting"
 LEGACY_SESSIONS_DIR = OUTPUT_DIR / "sessions_legacy_pre_clock_v1"
 
 # Body position for the phone_waist deployment stream.
@@ -99,43 +100,53 @@ def _parse_waist_csv(fileobj, sensor_out: str) -> Optional[pd.DataFrame]:
     return out
 
 
-def load_sensor_parts(outer_zip_path: Path, sensor_out: str,
-                      position: str = "waist") -> List[Optional[pd.DataFrame]]:
-    """Return the ordered list of per-recording-part position DataFrames for one sensor.
+def _inner_part_id(name: str) -> int:
+    """Return RealWorld's physical recording-part id.
 
-    Single-recording zips yield a 1-element list; multi-part (nested-zip) activities yield one
-    entry per part, ordered by part index. Entries may be None if a part lacks a waist CSV.
+    The raw release numbers accelerometer part one as ``_1_csv.zip`` but leaves gyroscope
+    part one unnumbered.  Treating the latter as part zero and joining sorted lists shifts every
+    multi-part gyroscope recording.  An unnumbered inner archive is therefore explicitly part 1.
+    """
+    match = re.search(r"_(\d+)_csv\.zip$", name.lower())
+    return int(match.group(1)) if match else 1
+
+
+def load_sensor_parts(outer_zip_path: Path, sensor_out: str,
+                      position: str = "waist") -> Dict[int, Optional[pd.DataFrame]]:
+    """Return ``physical_part_id -> position DataFrame`` for one sensor.
+
+    Single-recording zips use part id 1. Entries may be ``None`` when that physical part does not
+    contain the requested placement. Duplicate part ids are rejected instead of being paired by
+    archive order.
     """
     if not outer_zip_path.exists():
-        return []
+        return {}
 
-    parts: List[Optional[pd.DataFrame]] = []
+    parts: Dict[int, Optional[pd.DataFrame]] = {}
     with zipfile.ZipFile(outer_zip_path) as z:
         names = z.namelist()
         inner_zips = [n for n in names if n.lower().endswith(".zip")]
 
         if inner_zips:
-            # Multi-part: order inner zips by their trailing part number. Part 1 for gyro has no
-            # number (gyr_<act>_csv.zip); treat missing number as part 0 so it sorts first. acc/gyro
-            # are then paired by list position (acc parts 1,2,3 ; gyro parts 0/1,2,3).
-            def part_key(n: str) -> int:
-                m = re.search(r"_(\d+)_csv\.zip$", n.lower())
-                return int(m.group(1)) if m else 0
-
-            for inner_name in sorted(inner_zips, key=part_key):
+            for inner_name in inner_zips:
+                part_id = _inner_part_id(inner_name)
+                if part_id in parts:
+                    raise ValueError(
+                        f"{outer_zip_path}: duplicate physical part id {part_id}: {inner_name}"
+                    )
                 inner_bytes = z.read(inner_name)
                 with zipfile.ZipFile(io.BytesIO(inner_bytes)) as zi:
                     member = _position_member(zi.namelist(), position)
                     if member is None:
-                        parts.append(None)
+                        parts[part_id] = None
                         continue
                     with zi.open(member) as f:
-                        parts.append(_parse_waist_csv(f, sensor_out))
+                        parts[part_id] = _parse_waist_csv(f, sensor_out)
         else:
             member = _position_member(names, position)
             if member is not None:
                 with z.open(member) as f:
-                    parts.append(_parse_waist_csv(f, sensor_out))
+                    parts[1] = _parse_waist_csv(f, sensor_out)
 
     return parts
 
@@ -154,7 +165,40 @@ def resample_part(acc_df: pd.DataFrame, gyro_df: Optional[pd.DataFrame],
     if not np.all(np.isfinite(src_t)) or np.any(np.diff(src_t) <= 0):
         return None
     origin = float(src_t[0])
-    duration = float(src_t[-1] - origin)
+    end = float(src_t[-1])
+
+    def clock(frame: pd.DataFrame | None) -> np.ndarray | None:
+        if frame is None or len(frame) < 10:
+            return None
+        value = frame["timestamp_sec"].values.astype(float)
+        return value if np.all(np.isfinite(value)) and np.all(np.diff(value) > 0) else None
+
+    def include(value: np.ndarray | None) -> bool:
+        nonlocal origin, end
+        if value is None:
+            return False
+        overlap_start = max(origin, float(value[0]))
+        overlap_end = min(end, float(value[-1]))
+        if overlap_end - overlap_start < 9.0 / rate:
+            return False
+        origin, end = overlap_start, overlap_end
+        return True
+
+    gyro_clock = clock(gyro_df)
+    if not include(gyro_clock):
+        gyro_clock = None
+    active_extra: dict[str, tuple[pd.DataFrame, np.ndarray, pd.DataFrame | None, np.ndarray | None]] = {}
+    for position, (position_acc, position_gyro) in (extra_positions or {}).items():
+        acc_clock = clock(position_acc)
+        if position_acc is None or not include(acc_clock):
+            continue
+        gyro_extra_clock = clock(position_gyro)
+        if not include(gyro_extra_clock):
+            position_gyro, gyro_extra_clock = None, None
+        active_extra[position] = (
+            position_acc, acc_clock, position_gyro, gyro_extra_clock,
+        )
+    duration = end - origin
     if duration <= 0:
         return None
 
@@ -164,18 +208,18 @@ def resample_part(acc_df: pd.DataFrame, gyro_df: Optional[pd.DataFrame],
     # Integer sample ticks avoid stretching the recording with linspace.  The final source
     # remainder is retained as a partial grid interval by build_grids.
     t = origin + np.arange(n, dtype=float) / rate
-    t = t[t <= src_t[-1] + 1e-9]
+    t = t[t <= end + 1e-9]
 
     out = pd.DataFrame()
     out["timestamp_sec"] = t - origin
     for axis in "xyz":
         out[f"acc_{axis}"] = np.interp(t, src_t, acc_df[f"acc_{axis}"].values)
 
-    if gyro_df is not None and len(gyro_df) >= 10:
-        g_t = gyro_df["timestamp_sec"].values.astype(float)
+    if gyro_clock is not None:
+        g_t = gyro_clock
         gyro_cols = {}
         if (np.all(np.isfinite(g_t)) and np.all(np.diff(g_t) > 0)
-                and g_t[0] <= t[0] and g_t[-1] >= t[-1]):
+                and g_t[0] <= t[0] + 1e-9 and g_t[-1] >= t[-1] - 1e-9):
             for axis in "xyz":
                 gyro_cols[f"gyro_{axis}"] = np.interp(t, g_t, gyro_df[f"gyro_{axis}"].values)
         # Retain gyro only when the converted triad is complete and finite.
@@ -183,22 +227,12 @@ def resample_part(acc_df: pd.DataFrame, gyro_df: Optional[pd.DataFrame],
             for col, vals in gyro_cols.items():
                 out[col] = vals
 
-    for position, (position_acc, position_gyro) in (extra_positions or {}).items():
-        if position_acc is None or len(position_acc) < 10:
-            continue
-        p_t = position_acc["timestamp_sec"].values.astype(float)
-        if (not np.all(np.isfinite(p_t)) or np.any(np.diff(p_t) <= 0)
-                or p_t[0] > t[0] or p_t[-1] < t[-1]):
-            continue
+    for position, (position_acc, p_t, position_gyro, g_t) in active_extra.items():
         for axis in "xyz":
             out[f"{position}_acc_{axis}"] = np.interp(
                 t, p_t, position_acc[f"acc_{axis}"].values,
             )
-        if position_gyro is not None and len(position_gyro) >= 10:
-            g_t = position_gyro["timestamp_sec"].values.astype(float)
-            if (not np.all(np.isfinite(g_t)) or np.any(np.diff(g_t) <= 0)
-                    or g_t[0] > t[0] or g_t[-1] < t[-1]):
-                continue
+        if position_gyro is not None and g_t is not None:
             values = {
                 f"{position}_gyro_{axis}": np.interp(
                     t, g_t, position_gyro[f"gyro_{axis}"].values,
@@ -222,14 +256,11 @@ def convert_realworld() -> bool:
         print(f"ERROR: Raw data not found at {DOWNLOADS_DIR}")
         return False
 
-    if SESSIONS_DIR.exists():
-        # Retain the prior materialization for historical result reproduction.  A corrected
-        # multi-device clock must not overwrite the evidence used by an earlier protocol.
-        if LEGACY_SESSIONS_DIR.exists():
-            shutil.rmtree(SESSIONS_DIR)
-        else:
-            SESSIONS_DIR.replace(LEGACY_SESSIONS_DIR)
-    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    # Build beside the live materialization. A parse/write failure must leave the last complete
+    # corpus usable by training and evaluation.
+    if STAGING_SESSIONS_DIR.exists():
+        shutil.rmtree(STAGING_SESSIONS_DIR)
+    STAGING_SESSIONS_DIR.mkdir(parents=True)
 
     subject_folders = sorted(
         [d for d in DOWNLOADS_DIR.iterdir() if d.is_dir() and d.name.startswith("proband")],
@@ -237,6 +268,7 @@ def convert_realworld() -> bool:
     )
     print(f"\nFound {len(subject_folders)} subjects")
     if not subject_folders:
+        shutil.rmtree(STAGING_SESSIONS_DIR, ignore_errors=True)
         print("ERROR: No proband folders found")
         return False
 
@@ -274,15 +306,15 @@ def convert_realworld() -> bool:
                 # No waist accelerometer for this (subject, activity) — cannot emit.
                 continue
 
-            for idx, acc_df in enumerate(acc_parts):
+            for part_id in sorted(acc_parts):
+                acc_df = acc_parts[part_id]
                 if acc_df is None:
                     skipped_no_acc += 1
                     continue
-                gyro_df = gyro_parts[idx] if idx < len(gyro_parts) else None
+                gyro_df = gyro_parts.get(part_id)
 
                 extra_part = {
-                    position: (parts[0][idx] if idx < len(parts[0]) else None,
-                               parts[1][idx] if idx < len(parts[1]) else None)
+                    position: (parts[0].get(part_id), parts[1].get(part_id))
                     for position, parts in extra.items()
                 }
                 # Single-placement streams remain valid when another placement is absent.
@@ -295,10 +327,10 @@ def convert_realworld() -> bool:
                 frame["subject"] = subject
 
                 multi = len(acc_parts) > 1
-                session_id = (f"{subject}_{activity}_part{idx + 1}" if multi
+                session_id = (f"{subject}_{activity}_part{part_id}" if multi
                               else f"{subject}_{activity}")
 
-                session_dir = SESSIONS_DIR / session_id
+                session_dir = STAGING_SESSIONS_DIR / session_id
                 session_dir.mkdir(exist_ok=True)
                 frame.to_parquet(session_dir / "data.parquet", index=False)
 
@@ -307,6 +339,17 @@ def convert_realworld() -> bool:
                 subjects_seen.add(subject)
                 subjects_with_acc.add(subject)
                 has_gyro = "gyro_x" in frame.columns
+                if gyro_df is not None and len(gyro_df) >= 10 and not has_gyro:
+                    a_start, a_end = acc_df["timestamp_sec"].iloc[[0, -1]]
+                    g_start, g_end = gyro_df["timestamp_sec"].iloc[[0, -1]]
+                    co_covered = min(a_end, g_end) - max(a_start, g_start) >= 9.0 / TARGET_SAMPLE_RATE
+                else:
+                    co_covered = False
+                if co_covered and not has_gyro:
+                    raise RuntimeError(
+                        f"{subject}/{activity}/part{part_id}: a paired waist gyroscope archive "
+                        "exists but does not cover the accelerometer interval"
+                    )
                 if has_gyro:
                     gyro_session_count += 1
                     subjects_with_gyro.add(subject)
@@ -318,8 +361,18 @@ def convert_realworld() -> bool:
         print(f"  {subject}: {subject_sessions} sessions")
 
     if session_count == 0:
+        shutil.rmtree(STAGING_SESSIONS_DIR, ignore_errors=True)
         print("ERROR: no waist accelerometer sessions produced — STOP.")
         return False
+
+    # Atomically publish the complete session tree. Preserve the first historical materialization
+    # for result reproduction; subsequent corrected rebuilds replace only the active tree.
+    if SESSIONS_DIR.exists():
+        if LEGACY_SESSIONS_DIR.exists():
+            shutil.rmtree(SESSIONS_DIR)
+        else:
+            SESSIONS_DIR.replace(LEGACY_SESSIONS_DIR)
+    STAGING_SESSIONS_DIR.replace(SESSIONS_DIR)
 
     # labels.json
     with open(OUTPUT_DIR / "labels.json", "w") as f:

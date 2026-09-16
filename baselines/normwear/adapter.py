@@ -31,11 +31,13 @@ from __future__ import annotations
 
 import os
 import sys
+import types
 from pathlib import Path
 from typing import List, Sequence, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from baselines import data as eval_data
 
@@ -62,7 +64,6 @@ CLINICAL_LM_REF = CLINICAL_LM_CACHE.parents[1] / "refs" / "main"
 
 EMB_DIM = 2048
 TARGET_HZ = 65                # NormWear native rate; ricker-CWT scales are tuned for it.
-WINDOW_65 = TARGET_HZ * 6     # 390 samples = 6 s @ 65 Hz.
 QUERY = "What is the current activity?"            # native 'activity' question_template[0]
 ANSWER_TEMPLATE = "This subject is presently {}."  # native 'activity' answer_template[0]
 
@@ -92,10 +93,64 @@ def _load_normwear_model(device):
     if (not CLINICAL_LM_CACHE.is_dir()
             or CLINICAL_LM_REF.read_text().strip() != CLINICAL_LM_REVISION):
         raise RuntimeError("NormWear text-model revision changed during setup")
-    model.sensor_model.optimized_cwt = True   # avoid the removed scipy.signal.cwt path
+    # SciPy removed signal.cwt, while the release's fixed-length torch approximation is not
+    # numerically equivalent. Install a batched torch implementation of the released variable
+    # wavelet-length rule instead.
+    model.sensor_model.calc_cwt = types.MethodType(_released_calc_cwt, model.sensor_model)
     for p in model.parameters():
         p.requires_grad_(False)
     return model
+
+
+def _ricker(points: int, width: float, *, device, dtype) -> torch.Tensor:
+    positions = torch.arange(points, device=device, dtype=dtype) - (points - 1.0) / 2.0
+    width_t = torch.as_tensor(width, device=device, dtype=dtype)
+    amplitude = 2.0 / (torch.sqrt(3.0 * width_t) * torch.pi ** 0.25)
+    ratio = positions.square() / width_t.square()
+    return amplitude * (1.0 - ratio) * torch.exp(-0.5 * ratio)
+
+
+def _released_cwt_torch(values: torch.Tensor) -> torch.Tensor:
+    """SciPy ``signal.cwt(..., ricker, arange(.1, 65))`` in batched torch.
+
+    SciPy chooses ``min(10 * width, signal_length)`` independently at each scale. Grouping equal
+    lengths keeps the implementation batched without replacing that defining rule by one oversized
+    kernel. Output is ``(batch, time, 65)`` with exactly the input temporal length.
+    """
+    if values.ndim != 2:
+        raise ValueError("NormWear CWT expects (batch,time)")
+    length = int(values.shape[1])
+    if length <= 0:
+        raise ValueError("NormWear CWT received an empty time axis")
+    scales = [0.1 + index for index in range(65)]
+    groups: dict[int, list[tuple[int, float]]] = {}
+    for index, scale in enumerate(scales):
+        points = max(1, min(int(10.0 * scale), length))
+        groups.setdefault(points, []).append((index, scale))
+    result = torch.empty(
+        (values.shape[0], len(scales), length), device=values.device, dtype=values.dtype,
+    )
+    signal = values.unsqueeze(1)
+    for points, entries in groups.items():
+        kernels = torch.stack([
+            _ricker(points, scale, device=values.device, dtype=values.dtype)
+            for _, scale in entries
+        ]).unsqueeze(1)
+        convolved = F.conv1d(signal, kernels.flip(-1), padding="same")
+        # CUDA autocast may emit fp16 while ``values`` and the destination are fp32. Keep CWT
+        # storage in the input dtype, matching the released path's explicit ``.float()`` boundary.
+        result[:, [index for index, _ in entries]] = convolved.to(result.dtype)
+    return result.transpose(1, 2)
+
+
+def _released_calc_cwt(self, x, device=torch.device("cpu")):
+    values = torch.as_tensor(x, dtype=torch.float32, device=device)
+    batch, channels, length = values.shape
+    first = values[:, :, 1:] - values[:, :, :-1]
+    second = first[:, :, 1:] - first[:, :, :-1]
+    aligned = torch.stack((values[:, :, 2:], first[:, :, 1:], second), dim=2)
+    transformed = _released_cwt_torch(aligned.reshape(batch * channels * 3, length - 2))
+    return transformed.reshape(batch, channels, 3, length - 2, 65)
 
 
 @torch.no_grad()
@@ -138,6 +193,24 @@ def _signal_encode_np(model, x_np, query, device):
 
 
 @torch.no_grad()
+def _backbone_encode_np(model, x_np, device):
+    """Released downstream representation: patch-mean, then flatten real channels."""
+    precision = os.environ.get("NORMWEAR_PRECISION", "fp16").lower()
+    use_amp = torch.device(device).type == "cuda" and precision == "fp16"
+    with torch.autocast(
+        device_type=torch.device(device).type,
+        dtype=torch.float16,
+        enabled=use_amp,
+    ):
+        tokens = model.sensor_model.get_embedding(x_np, sampling_rate=TARGET_HZ, device=device)
+        # Upstream downstream tasks pool patches and preserve every real channel. Do not average
+        # channels merely to manufacture cross-configuration compatibility: that changes the
+        # representation and previously cost substantial enrolled accuracy.
+        pooled = tokens.mean(dim=2)
+        return pooled.reshape(pooled.shape[0], -1)
+
+
+@torch.no_grad()
 def _encode_labels(label_strings: Sequence[str], model, device) -> np.ndarray:
     """(L, 2048) TinyLlama embeddings of the candidate labels in NormWear's answer template."""
     # De-underscore to match the shared baseline text convention.
@@ -148,47 +221,15 @@ def _encode_labels(label_strings: Sequence[str], model, device) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Preprocessing (folds in preprocess_normwear.py's 65 Hz resample, per-window).
 # ---------------------------------------------------------------------------
-def _to_normwear_input(windows: np.ndarray, mask: np.ndarray, rate_hz: float) -> np.ndarray:
-    """(N, T, C) native windows -> (N, Creal, 390) NormWear-ready float32.
-
-    Drops zero-pad/phantom channels (channel-independent model), resamples each window to
-    65 Hz via anti-aliased polyphase filtering, de-trends (removes the static gravity DC),
-    and amplitude-normalizes by mean|x| — NormWear's native per-channel preprocessing.
-    """
-    from scipy import signal as _sig
-
-    mask = np.asarray(mask, dtype=bool)
-    X = np.asarray(windows, dtype=np.float64)[:, :, mask]   # (N, T, Creal) real channels only
-    if X.shape[2] == 0:
-        raise ValueError("NormWear: no real channels after masking — nothing to encode.")
-
-    # Resample each 6 s window to exactly 390 samples (65 Hz). resample_poly is exact when the
-    # native rate divides evenly; pad/truncate a tiny rounding drift to lock the length.
-    orig = int(round(rate_hz))
-    if orig != TARGET_HZ:
-        g = np.gcd(TARGET_HZ, orig)
-        X = _sig.resample_poly(X, TARGET_HZ // g, orig // g, axis=1)
-    if X.shape[1] < WINDOW_65:
-        X = np.pad(X, ((0, 0), (0, WINDOW_65 - X.shape[1]), (0, 0)), mode="edge")
-    X = X[:, :WINDOW_65, :]
-
-    X = np.transpose(X, (0, 2, 1))                          # (N, Creal, 390)
-    X = _sig.detrend(X, axis=2, type="linear")             # remove linear trend incl. gravity DC
-    X = X / (np.mean(np.abs(X), axis=2, keepdims=True) + 1e-6)
-    return np.ascontiguousarray(X, dtype=np.float32)       # C-contiguous: calc_cwt uses .view()
-
-
-def _normwear_chunks(stream) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-    """Prepare native 6 s chunks while retaining every declared device and sample.
+def _normwear_groups(stream) -> tuple[list[tuple[np.ndarray, np.ndarray]], int]:
+    """Prepare one released variable-length input per recording.
 
     Rows are grouped by their valid-length tuple before resampling.  Evaluation grids usually
     contain thousands of equal-length rows; batching them turns thousands of tiny SciPy calls into
     one polyphase operation per device and length group without changing the physical-time rule.
     """
     members = stream.devices if isinstance(stream, eval_data.MultiDeviceEvalStream) else [stream]
-    chunks: list[np.ndarray] = []
-    owners: list[np.ndarray] = []
-    weights: list[np.ndarray] = []
+    prepared_groups: list[tuple[np.ndarray, np.ndarray]] = []
     n_rows = members[0].n_windows
     if any(member.n_windows != n_rows for member in members):
         raise ValueError("aligned NormWear devices disagree on window count")
@@ -210,8 +251,7 @@ def _normwear_chunks(stream) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
         target_length = None
         for member, valid in zip(members, length_tuple):
             raw = member.windows[rows, :valid]
-            # Reuse the released preprocessing one physical 6 s chunk at a time below; here only
-            # resample to its native 65 Hz clock and retain real channels in declared order.
+            # Resample to the model's 65 Hz clock and retain real channels in declared order.
             mask = np.asarray(member.mask, dtype=bool)
             values = np.asarray(raw[:, :, mask], dtype=np.float64)
             source = int(round(member.rate_hz))
@@ -226,25 +266,12 @@ def _normwear_chunks(stream) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
         assert target_length is not None
         combined = np.concatenate(prepared, axis=2)
         total_channels = combined.shape[2]
-        chunk_count = int(np.ceil(target_length / WINDOW_65))
-        padded_length = chunk_count * WINDOW_65
-        if padded_length != target_length:
-            combined = np.pad(
-                combined, ((0, 0), (0, padded_length - target_length), (0, 0)), mode="edge",
-            )
-        chunks.append(combined.reshape(len(rows) * chunk_count, WINDOW_65, total_channels))
-        owners.append(np.repeat(rows, chunk_count))
-        chunk_weights = np.ones(chunk_count, dtype=np.float32)
-        remainder = target_length % WINDOW_65
-        if remainder:
-            chunk_weights[-1] = remainder / WINDOW_65
-        weights.append(np.tile(chunk_weights, len(rows)))
+        values = np.transpose(combined, (0, 2, 1))
+        values = _sig.detrend(values, axis=2, type="linear")
+        values /= np.mean(np.abs(values), axis=2, keepdims=True) + 1e-6
+        prepared_groups.append((np.ascontiguousarray(values, dtype=np.float32), rows))
 
-    values = np.transpose(np.concatenate(chunks, axis=0), (0, 2, 1))
-    values = _sig.detrend(values, axis=2, type="linear")
-    values /= np.mean(np.abs(values), axis=2, keepdims=True) + 1e-6
-    return (np.ascontiguousarray(values, dtype=np.float32), np.concatenate(owners),
-            np.concatenate(weights).astype(np.float32, copy=False), total_channels)
+    return prepared_groups, total_channels
 
 
 @register
@@ -254,7 +281,7 @@ class NormWearAdapter(BaselineAdapter):
 
     name = "normwear"
     tier = "bespoke"
-    contract = InputContract(channels=None, rate_hz=float(TARGET_HZ), native_window_sec=6.0)
+    contract = InputContract(channels=None, rate_hz=float(TARGET_HZ), native_window_sec=None)
     supports_multi_device = True
 
     def supports_native_zero_shot(self) -> bool:
@@ -274,12 +301,16 @@ class NormWearAdapter(BaselineAdapter):
     def evaluation_config(self, state):
         return {
             "input_rate_hz": TARGET_HZ,
-            "input_samples": WINDOW_65,
+            "input_samples": "variable, full evaluation interval",
             "real_channels_only": True,
             "native_metric": "manhattan_l1",
             "text_model": CLINICAL_LM_ID,
             "text_model_revision": CLINICAL_LM_REVISION,
             "inference_precision": os.environ.get("NORMWEAR_PRECISION", "fp16").lower(),
+            "cwt_implementation": "released-variable-length-ricker-torch-v1",
+            "window_policy": "released variable-length single pass",
+            "native_zero_shot_feature": "MSiTF_query_conditioned_2048",
+            "enrollment_feature": "backbone_mean_patch_then_channel_768",
         }
 
     def setup(self, device):
@@ -289,9 +320,35 @@ class NormWearAdapter(BaselineAdapter):
 
     @torch.no_grad()
     def window_features(self, stream: eval_data.EvalStream, state, device) -> np.ndarray:
+        return self._encode_stream(stream, state, device, native=False)
+
+    @torch.no_grad()
+    def native_zero_shot_features_for_stream(self, stream, state, device) -> np.ndarray:
+        return self._encode_stream(stream, state, device, native=True)
+
+    def feature_config(self, state):
+        return {
+            **self.evaluation_config(state),
+            "feature_role": "common_enrollment",
+            "feature_dim": "768 x real sensor channels",
+            "feature_layer": "released backbone patch tokens",
+            "feature_readout": "mean patches then flatten real channels",
+            "feature_readout_provenance": "released downstream recipe",
+            "metadata_inputs": "none",
+        }
+
+    def native_feature_config(self, state):
+        return {
+            **self.evaluation_config(state),
+            "feature_role": "native_zero_shot",
+            "feature_dim": EMB_DIM,
+            "feature_layer": "released MSiTF query-conditioned aggregator",
+            "metadata_inputs": "fixed activity query text; candidate label text in TinyLlama bridge",
+        }
+
+    def _encode_stream(self, stream, state, device, *, native: bool) -> np.ndarray:
         model, query_emb = state["model"], state["query_emb"]
-        inputs, owners, weights, n_channels = _normwear_chunks(stream)
-        outputs = []
+        groups, n_channels = _normwear_groups(stream)
         configured_batch = os.environ.get("NORMWEAR_BATCH")
         # CWT/backbone activation memory scales approximately with batch * measured channels.
         # Keep that product bounded so six-channel cells can fill the 4090 while native
@@ -304,19 +361,27 @@ class NormWearAdapter(BaselineAdapter):
                  else min(64, max(1, 192 // n_channels)))
         if batch <= 0:
             raise ValueError("NORMWEAR_BATCH must be positive")
-        for start in range(0, len(inputs), batch):
-            embedding = _signal_encode_np(
-                model, inputs[start:start + batch], query_emb, device
-            )
-            outputs.append(embedding.float().cpu().numpy())
-        encoded = np.concatenate(outputs, axis=0).astype(np.float32, copy=False)
-        result = np.zeros((stream.n_windows, encoded.shape[1]), dtype=np.float32)
-        denom = np.zeros(stream.n_windows, dtype=np.float32)
-        for feature, owner, weight in zip(encoded, owners, weights):
-            result[owner] += feature * weight
-            denom[owner] += weight
+        result = None
+        for inputs, owners in groups:
+            outputs = []
+            for start in range(0, len(inputs), batch):
+                if native:
+                    embedding = _signal_encode_np(
+                        model, inputs[start:start + batch], query_emb, device
+                    )
+                else:
+                    embedding = _backbone_encode_np(model, inputs[start:start + batch], device)
+                outputs.append(embedding.float().cpu().numpy())
+            encoded = np.concatenate(outputs, axis=0).astype(np.float32, copy=False)
+            if result is None:
+                result = np.empty((stream.n_windows, encoded.shape[1]), dtype=np.float32)
+            elif result.shape[1] != encoded.shape[1]:
+                raise RuntimeError("NormWear feature dimension changed between length groups")
+            result[owners] = encoded
+        if result is None:
+            raise ValueError("NormWear received an empty evaluation stream")
         state["_last_n_channels_used"] = int(n_channels)
-        return result / denom[:, None]
+        return result
 
     @torch.no_grad()
     def predict(self, stream: eval_data.EvalStream, state, device) -> Tuple[List[str], dict]:
@@ -324,7 +389,7 @@ class NormWearAdapter(BaselineAdapter):
 
     @torch.no_grad()
     def predict_candidates(self, stream, candidates, state, device) -> Tuple[List[str], dict]:
-        win = self.window_features(stream, state, device)                      # (N, 2048)
+        win = self.native_zero_shot_features_for_stream(stream, state, device)  # (N, 2048)
         predictions, info = self.predict_candidates_from_features(
             win, candidates, state, device
         )

@@ -1,0 +1,43 @@
+{
+  "schema": "unimts-sealed-label-dictionary-v1",
+  "method": "Each value joins the activity strings documented by the sealed dataset. No HALO training paraphrases are added.",
+  "sources": {
+    "motionsense": "data/datasets/motionsense/eval_labels.json",
+    "shoaib": "data/datasets/shoaib/eval_labels.json",
+    "usc_had": "data/datasets/usc_had/eval_labels.json",
+    "ut_complex": "data/datasets/ut_complex/eval_labels.json",
+    "inclusivehar": "data/datasets/inclusivehar/eval_labels.json",
+    "realworld": "data/datasets/realworld/eval_labels.json"
+  },
+  "joined_text": {
+    "biking": "biking",
+    "climbingdown": "climbing down",
+    "climbingup": "climbing up",
+    "cycling": "cycling",
+    "drinking_coffee": "drinking coffee",
+    "eating": "eating",
+    "elevator_down": "elevator down",
+    "elevator_up": "elevator up",
+    "jogging": "jogging",
+    "jumping": "jumping",
+    "jumping_up": "jumping up",
+    "lying": "lying",
+    "ramp_ascent": "ramp ascent",
+    "ramp_descent": "ramp descent",
+    "running": "running",
+    "running_forward": "running forward",
+    "sitting": "sitting",
+    "sleeping": "sleeping",
+    "smoking": "smoking",
+    "standing": "standing",
+    "talking": "talking",
+    "typing": "typing",
+    "walking": "walking",
+    "walking_downstairs": "walking downstairs",
+    "walking_forward": "walking forward",
+    "walking_left": "walking left",
+    "walking_right": "walking right",
+    "walking_upstairs": "walking upstairs",
+    "writing": "writing"
+  }
+}

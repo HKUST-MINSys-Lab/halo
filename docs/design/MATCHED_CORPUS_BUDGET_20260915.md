@@ -26,11 +26,19 @@ therefore attributable to the encoder.
 
 ## 2. Input contracts (each model's own, deliberately not matched)
 
-| arm | rate | clip | channels | long windows | trunk params |
-|---|---:|---:|---|---|---:|
-| HALO | native | 0.5/1/2/4 s patches | acc + gyro | native | 0.789 M |
-| LiMU-BERT | 20 Hz | 20 samples (1 s) | acc + gyro | non-overlapping 1 s clips, mean-pooled | 0.107 M |
-| harnet5 | 30 Hz | 150 samples (5 s) | acc only | centre crop | 4.392 M |
+| arm | rate | clip | channels | long windows | device fusion | trunk params |
+|---|---:|---:|---|---|---|---:|
+| HALO | native | 0.5/1/2/4 s patches | acc + gyro | native | learned attention pool | 0.789 M |
+| LiMU-BERT | 20 Hz | 20 samples (1 s) | acc + gyro | non-overlapping 1 s clips, mean-pooled | mean over devices | 0.107 M |
+| harnet5 | 30 Hz | 150 samples (5 s) | acc only | centre crop | mean over devices | 4.392 M |
+| UniMTS | 20 Hz | 200 samples (10 s) | acc only | start crop | **native**: every device placed at its own SMPL joint in one graph | 5.344 M |
+
+UniMTS is the exception to mean pooling. Its whole design is that different placements are
+different graph nodes, so pooling per device afterwards would replace its own contribution with
+ours. Each device is placed at the joint its **sensor description** names (UniMTS's own placement
+tables, matched against our sensor text rather than the stream key, which is what makes composite
+recordings work), and the graph fuses them. This is also the setting most favourable to the
+baseline, per fairness rule §5.4.
 
 Capacity is reported, never matched (plan §5.6). The 1 s clip rule for LiMU-BERT is its released
 positional-embedding contract and is the same rule its evaluation adapter uses.
@@ -65,13 +73,28 @@ so the first trainability check reported a false failure. Tests now use a random
 | HALO (reference) | 19.4 | **34 min** | 1.00x |
 | harnet5 | 13.4 | **50 min** | 1.45x |
 | LiMU-BERT | 10.5 | **64 min** | 1.85x |
+| UniMTS | 1.5 | **7.4 h** | 13x |
+| NormWear | — | **~183 h** (not run) | ~320x |
 
 LiMU-BERT is the *smallest* model and the *slowest* arm. The cost is not its 0.107 M parameters, it
 is that an 8 s window becomes eight separate 1 s transformer calls. That is its published contract,
 so the cost is real and must not be optimised away by feeding it longer clips.
 
-**The whole M2 block is about 2.5 GPU-hours.** Reproducing other people's models is not the expense
-here; deciding what to run is.
+**LiMU-BERT plus harnet5 is about 2 GPU-hours; adding UniMTS makes it about 9.5.** Reproducing
+other people's models is not the expense; deciding what to run is.
+
+**UniMTS needs gradient checkpointing to fit at all.** A 22-joint by 200-frame graph at the full
+episode batch exceeds 24 GB of activations and the first attempt died with a CUDA out-of-memory.
+Checkpointing recomputes each 32-window chunk in the backward pass instead of storing it:
+numerically identical, roughly 30% more compute, and it keeps the **recipe** intact. Shrinking
+episodes-per-step would have fitted too, but it would have changed the objective and voided the
+comparison, so it was rejected.
+
+**NormWear is declined on measured cost, not opinion.** Its sensor backbone is 136 M parameters
+(not the 1.29 B often quoted, which includes the frozen TinyLlama text tower) and emits 560 patch
+tokens per channel. Measured forward-only throughput is 46.6 windows/s, so one training step of
+~256 windows with backward is about 16.5 s, and 40k steps is **~183 GPU-hours**. That is 320x the
+HALO arm for one row. Decline it and report this number.
 
 ## 5. Hyperparameters: what to hold and what to allow
 
@@ -127,8 +150,12 @@ Publish the loss curve and the selected step for every arm.
 | 2 | harnet5 M2 | `--encoder-arch harnet` | 50 min |
 | 3 | sealed evaluation of both | `--models halo --halo-checkpoint <run>` | ~36 min |
 | 4 | lr-scale retry for whichever arm fails §6 | `--encoder-lr-scale` | up to 64 min |
+| 5 | UniMTS M2 (overnight) | `--encoder-arch unimts` | 7.4 h |
+| 6 | sealed evaluation of UniMTS | as above | ~18 min |
 
-**Under four hours** for a defensible M2 block, against the promoted HALO run as the comparison.
+**Under four hours** for a two-architecture M2 block against the promoted HALO run; **one extra
+overnight** adds the graph encoder, which is the most architecturally distant of the three and
+therefore the most informative if the first two are inconclusive.
 The existing sealed comparison already supplies every baseline's released-checkpoint row, so no
 baseline needs re-evaluating.
 
@@ -138,6 +165,8 @@ baseline needs re-evaluating.
   LiMU-BERT M1 is the cheap one and is portable: its architecture is already vendored in this repo,
   so its masked-reconstruction objective can be implemented here without the external checkout.
   UniMTS M1 needs the 22-joint placement export described in plan §4.3.
-* **UniMTS M2.** Its ST-GCN is reachable through `baseline_backbone.py` but expects a 22-joint
-  tensor, so it needs the joint-placement path before it can be an M2 arm.
-* **NormWear.** Blocked behind the readout defect in `NORMWEAR_READOUT_FINDING_20260915.md`.
+* **NormWear M2.** Declined on the measured 183 GPU-hour cost above. Its readout defect
+  (`NORMWEAR_READOUT_FINDING_20260915.md`) is a separate and much cheaper fix that should still
+  happen, because it affects its released-checkpoint rows everywhere.
+* **Mantis.** Not in the registry; `MANTIS_BASELINE_PLAN.md` specifies the adapter. M2 only, and
+  only if the frontend question is still open after the three arms above.

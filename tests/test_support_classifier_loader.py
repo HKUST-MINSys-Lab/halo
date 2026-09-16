@@ -6,7 +6,7 @@ import torch
 
 from training.support_classifier.collate import SupportCollate
 from training.support_classifier.encoding import materialize_deferred_patches
-from training.support_classifier.train import PrefetchLoader, episode_rng
+from training.support_classifier.train import PrefetchLoader, build_dataset, episode_rng
 from training.tokenizer.pretrain_data import (
     MultiResolutionCollate,
     _bounded_analysis_view,
@@ -37,6 +37,31 @@ def _item(samples: int, channels: int, value: float) -> dict:
         "window_index": 0,
         "subject": "synthetic_subject",
     }
+
+
+def test_build_dataset_returns_the_configured_pretrain_dataset(monkeypatch):
+    captured = {}
+
+    class FakeDataset:
+        def __init__(self, *args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr("training.support_classifier.train.PretrainDataset", FakeDataset)
+    monkeypatch.setattr(
+        "training.support_classifier.train.AugmentationConfig.phase_a",
+        lambda **kwargs: ("augmentation", kwargs),
+    )
+    index = SimpleNamespace(train=[1, 2])
+    args = SimpleNamespace(
+        rate_augmentation_probability=0.0, modality_dropout_probability=0.0,
+        neutral_acquisition_text=False, multi_device_probability=0.25, max_devices=3,
+    )
+    dataset = build_dataset(index, args)
+    assert isinstance(dataset, FakeDataset)
+    assert captured["args"] == (index, index.train)
+    assert captured["kwargs"]["multi_device_probability"] == 0.25
+    assert captured["kwargs"]["max_devices"] == 3
 
 
 def test_deferred_patch_materialization_is_exact():

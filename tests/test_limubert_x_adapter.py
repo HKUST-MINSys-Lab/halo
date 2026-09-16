@@ -11,7 +11,7 @@ from baselines.data import EvalStream
 CHANNELS = ["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"]
 
 
-def _stream(windows: np.ndarray, *, rate_hz: float = 20.0, lengths=None, mask=None) -> EvalStream:
+def _stream(windows: np.ndarray, *, rate_hz: float = 10.0, lengths=None, mask=None) -> EvalStream:
     count = len(windows)
     return EvalStream(
         dataset="synthetic",
@@ -38,7 +38,8 @@ def adapter_state():
 def test_released_adapter_contract(adapter_state):
     adapter, state = adapter_state
     assert adapter.supports_native_zero_shot() is False
-    assert adapter.contract.rate_hz == 20.0
+    assert adapter.contract.rate_hz == 10.0
+    assert adapter.contract.native_window_sec == 2.0
     assert tuple(adapter.contract.channels) == tuple(CHANNELS)
     assert sum(parameter.numel() for parameter in state["backbone"].parameters()) == 55_446
 

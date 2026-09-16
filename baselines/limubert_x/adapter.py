@@ -1,12 +1,12 @@
 """LiMU-BERT-X frozen representation adapter.
 
-The released ``base_v4`` checkpoint consumes 20 samples of six-axis IMU at 20 Hz. HALO's grids
+The released ``base_v4`` checkpoint consumes 20 samples of six-axis IMU at 10 Hz. HALO's grids
 store acceleration in g, which is already the result of the authors' ``acc / 9.8`` preprocessing;
 applying that normalization again would suppress acceleration by another factor of 9.8. Gyroscope
 values are passed through in rad/s, as in the source HHAR preprocessing.
 
-Evaluation windows are usually six seconds rather than one. We encode every non-overlapping
-one-second clip and take a duration-weighted mean of the released transformer's hidden states. The
+Evaluation windows are longer than the native two-second clip. We encode every non-overlapping
+two-second clip and take a duration-weighted mean of the released transformer's hidden states. The
 last partial clip is edge padded but weighted only by its real duration. This preserves the complete
 window while keeping the published 20-sample positional-embedding contract.
 """
@@ -30,7 +30,7 @@ HIDDEN = 72
 HIDDEN_FF = 144
 N_LAYERS = 4
 N_HEADS = 4
-TARGET_HZ = 20.0
+TARGET_HZ = 10.0
 SEQ_LEN = 20
 EMBED_BATCH = 4096
 SIX_CHANNELS = ("acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z")
@@ -215,7 +215,7 @@ class LiMUBERTXAdapter(BaselineAdapter):
 
     name = "limubert_x"
     tier = "representation"
-    contract = InputContract(channels=SIX_CHANNELS, rate_hz=TARGET_HZ, native_window_sec=1.0)
+    contract = InputContract(channels=SIX_CHANNELS, rate_hz=TARGET_HZ, native_window_sec=2.0)
 
     def setup(self, device):
         if not CHECKPOINT.exists():
@@ -246,4 +246,6 @@ class LiMUBERTXAdapter(BaselineAdapter):
             "feature_layer": "transformer hidden states",
             "within_clip_pool": "mean",
             "across_clip_pool": "duration-weighted mean",
+            "pooling_provenance": "HALO evaluation choice; released downstream classifier is GRU-based",
+            "metadata_inputs": "none",
         }

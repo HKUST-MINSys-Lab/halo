@@ -308,7 +308,12 @@ def _grid_dir(dataset: str, stream: str, alignment: str, window_seconds: float =
 
 
 def list_streams(dataset: str, alignment: str = "non_harmonised", *, window_seconds: float = 6.0) -> List[str]:
-    """Stream ids available for a dataset under the given alignment."""
+    """Stream ids with a materialized grid for the exact requested duration.
+
+    The only unqualified layout accepted here is the documented historical 6-second schema,
+    matching :func:`_grid_dir`.  An unqualified 6-second grid must never make a 4- or 16-second
+    stream appear available during discovery and then fail later during loading.
+    """
     root = DATASETS_DIR / dataset / "grids" / alignment
     if not root.exists():
         return []
@@ -317,7 +322,11 @@ def list_streams(dataset: str, alignment: str = "non_harmonised", *, window_seco
     for stream_dir in root.iterdir():
         if not stream_dir.is_dir():
             continue
-        if (stream_dir / "meta.json").exists() or (stream_dir / duration_dir / "meta.json").exists():
+        qualified = stream_dir / duration_dir / "meta.json"
+        legacy_six_second = (
+            np.isclose(float(window_seconds), 6.0) and (stream_dir / "meta.json").exists()
+        )
+        if qualified.exists() or legacy_six_second:
             result.append(stream_dir.name)
     return sorted(result)
 
@@ -406,11 +415,49 @@ def load_global_labels() -> List[str]:
 @lru_cache(maxsize=12)
 def _quality_exclusion_cache(alignment: str, window_seconds: float = 6.0) -> dict[str, set[int]]:
     """Validate each corpus-wide quality artifact once per process."""
-    from data.scripts.scan_duplicates import load as load_duplicates
-    from data.scripts.scan_implausible import load as load_implausible
+    from data.scripts import scan_duplicates, scan_implausible
+    from data.scripts.eda.grid_io import discover_grids
 
-    duplicate = load_duplicates(alignment, require=True, window_seconds=window_seconds)
-    implausible = load_implausible(alignment, require=True, window_seconds=window_seconds)
+    refs = discover_grids(alignment, window_seconds=window_seconds)
+    artifact_paths = [
+        scan_duplicates.cache_path(alignment, window_seconds),
+        scan_implausible.cache_path(alignment, window_seconds),
+    ]
+    for path in artifact_paths:
+        if not path.exists():
+            raise FileNotFoundError(f"missing quality artifact: {path}")
+    stat_rows = []
+    for ref in refs:
+        for name in ("data.npy", "meta.json", "mask.npy", "lengths.npy"):
+            path = ref.grid_dir / name
+            if path.exists():
+                stat = path.stat()
+                stat_rows.append((str(path.resolve()), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns))
+    artifact_stats = []
+    for path in artifact_paths:
+        stat = path.stat()
+        artifact_stats.append((str(path.resolve()), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns))
+    stamp_digest = hashlib.sha256(json.dumps(
+        {"schema": 1, "alignment": alignment, "window_seconds": float(window_seconds),
+         "grids": stat_rows, "artifacts": artifact_stats}, sort_keys=True,
+    ).encode()).hexdigest()
+    stamp_path = artifact_paths[0].parent / (
+        f"validated_{alignment}_{str(float(window_seconds)).replace('.', 'p')}.json"
+    )
+    stamp = json.loads(stamp_path.read_text()) if stamp_path.exists() else {}
+    if stamp.get("digest") == stamp_digest:
+        blobs = [json.loads(path.read_text()) for path in artifact_paths]
+        if all(blob.get("alignment") == alignment
+               and np.isclose(float(blob.get("window_seconds", 6.0)), float(window_seconds))
+               for blob in blobs):
+            duplicate = {key: set(value) for key, value in blobs[0].get("windows", {}).items()}
+            implausible = {key: set(value) for key, value in blobs[1].get("windows", {}).items()}
+        else:
+            stamp = {}
+    if stamp.get("digest") != stamp_digest:
+        duplicate = scan_duplicates.load(alignment, require=True, window_seconds=window_seconds)
+        implausible = scan_implausible.load(alignment, require=True, window_seconds=window_seconds)
+        stamp_path.write_text(json.dumps({"schema": 1, "digest": stamp_digest}, indent=2) + "\n")
     return {
         key: set(duplicate.get(key, ())) | set(implausible.get(key, ()))
         for key in set(duplicate) | set(implausible)
@@ -534,8 +581,11 @@ def load_eval_stream(
     screen = "not requested"
     n_excluded = 0
     if apply_quality_screen:
-        actual_window = float(meta.get("window_seconds", window_seconds))
-        excluded, screen = _quality_excluded(dataset, stream, alignment, actual_window)
+        # Quality artifacts are indexed by the requested evidence budget (and therefore by the
+        # grid directory name).  A native rate may only approximate that budget exactly: for
+        # example 1,025 samples at 256 Hz is 4.00390625 seconds.  Looking up the artifact by that
+        # realised duration invents a cache name which can never have been generated.
+        excluded, screen = _quality_excluded(dataset, stream, alignment, window_seconds)
         if len(excluded):
             keep = np.ones(n, dtype=bool)
             keep[excluded[excluded < n]] = False

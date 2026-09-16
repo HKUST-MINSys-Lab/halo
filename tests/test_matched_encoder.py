@@ -219,3 +219,153 @@ def test_contracts_match_each_models_published_preprocessing():
     assert BACKBONE_CONTRACTS["harnet"]["rate_hz"] == 30.0
     assert BACKBONE_CONTRACTS["harnet"]["clip"] == 150       # 5 s
     assert BACKBONE_CONTRACTS["harnet"]["channels"] == 3     # accelerometer only
+
+
+# --------------------------------------------------- UniMTS: native skeleton fusion
+
+def _multi_device_batch(B=3, C=12):
+    batch = _batch(B=B, C=C)
+    batch["sensor_id"] = torch.tensor([[0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3]] * B)
+    batch["device_id"] = torch.tensor([[0, 0, 1, 1]] * B)
+    batch["channel_mask"] = torch.ones(B, C, dtype=torch.bool)
+    batch["sensor_texts"] = [[
+        "a phone accelerometer on the right wrist", "a phone gyroscope on the right wrist",
+        "a phone accelerometer on the thigh", "a phone gyroscope on the thigh",
+    ]] * B
+    return batch
+
+
+def _forward_texts(encoder, batch):
+    return encoder(
+        batch["patches"], batch["rates"], batch["patch_len"], None, None,
+        channel_mask=batch["channel_mask"], patch_padding_mask=batch["patch_padding_mask"],
+        sensor_id=batch["sensor_id"], device_id=batch["device_id"],
+        sensor_texts=batch.get("sensor_texts"),
+    )
+
+
+def test_sensor_joint_reads_placement_from_the_sensor_description():
+    from model.tokenizer.matched_encoder import sensor_joint
+    wrist = sensor_joint("a phone accelerometer on the right wrist")
+    thigh = sensor_joint("a phone accelerometer on the thigh")
+    left = sensor_joint("a wearable device accelerometer on the left wrist")
+    assert wrist != thigh, "different placements must be different graph nodes"
+    assert left != wrist, "side must be distinguished"
+
+
+def test_unimts_places_every_device_on_the_skeleton():
+    encoder = build_matched_encoder("unimts").eval()
+    batch = _multi_device_batch()
+    out = _forward_texts(encoder, batch)
+    assert out["pooled"].shape == (3, encoder.d_model)
+    assert bool(out["device_present"].all()), "both placements must reach the graph"
+
+
+def test_unimts_output_moves_when_the_second_placement_changes():
+    encoder = build_matched_encoder("unimts").eval()
+    batch = _multi_device_batch()
+    before = _forward_texts(encoder, batch)["pooled"].clone()
+    batch["patches"][:, :, :, 6:] += 5.0          # second device only
+    after = _forward_texts(encoder, batch)["pooled"]
+    assert not torch.allclose(before, after, atol=1e-5)
+
+
+def test_unimts_fuses_devices_natively_rather_than_pooling_them():
+    """The graph does the fusion; pooling per device afterwards would replace its contribution."""
+    encoder = build_matched_encoder("unimts")
+    assert encoder.fuses_devices_natively
+    assert not build_matched_encoder("limubert").fuses_devices_natively
+
+
+def test_unimts_trunk_is_trainable():
+    encoder = build_matched_encoder("unimts")
+    out = _forward_texts(encoder, _multi_device_batch())
+    torch.manual_seed(0)
+    (out["pooled"] * torch.randn_like(out["pooled"])).sum().backward()
+    grads = [p.grad for p in encoder.net.parameters()]
+    moved = sum(1 for g in grads if g is not None and float(g.abs().sum()) > 0)
+    assert moved > len(grads) // 2, f"only {moved}/{len(grads)} trunk parameters received gradient"
+
+
+def test_unimts_is_accelerometer_only():
+    encoder = build_matched_encoder("unimts").eval()
+    batch = _multi_device_batch()
+    before = _forward_texts(encoder, batch)["pooled"].clone()
+    # Gyroscope channels of device 0 are columns 3:6; device 1's are 9:12.
+    batch["patches"][:, :, :, 3:6] += 5.0
+    batch["patches"][:, :, :, 9:12] += 5.0
+    after = _forward_texts(encoder, batch)["pooled"]
+    assert torch.allclose(before, after, atol=1e-5)
+
+
+# ------------------------------------------- regressions found by the 2026-09-15 sweep
+
+def test_mixed_rate_groups_are_encoded_at_their_own_length():
+    """Padding every group to the longest in the batch fabricated data the trunk then consumed.
+
+    For LiMU-BERT the padding became extra one-second clips that diluted the mean; for harnet it
+    shifted the centre crop into repeated samples. Each group must be encoded at its own length.
+    """
+    encoder = build_matched_encoder("limubert").eval()
+    slow = _batch(B=2, rate=20.0)
+    # A batch whose rows resample to different lengths: same patches, different acquisition rates.
+    mixed = _batch(B=4, rate=20.0)
+    mixed["rates"] = torch.tensor([20.0, 20.0, 50.0, 50.0])
+    mixed["patches"][:2] = slow["patches"]
+    out_mixed = _forward(encoder, mixed)["pooled"]
+    out_alone = _forward(encoder, slow)["pooled"]
+    assert torch.allclose(out_mixed[:2], out_alone, atol=1e-4), (
+        "a row's embedding changed because of the acquisition rate of other rows in its batch"
+    )
+
+
+def test_unimts_joint_lookup_needs_no_per_element_device_read():
+    """Regression for a synchronisation stall, asserted behaviourally: joints must still be right."""
+    from model.tokenizer.matched_encoder import sensor_joint
+    encoder = build_matched_encoder("unimts").eval()
+    batch = _multi_device_batch()
+    out = _forward_texts(encoder, batch)
+    assert bool(out["device_present"].all())
+    # Swapping the two devices' placement text must change the representation.
+    swapped = _multi_device_batch()
+    swapped["sensor_texts"] = [[
+        "a phone accelerometer on the thigh", "a phone gyroscope on the thigh",
+        "a phone accelerometer on the right wrist", "a phone gyroscope on the right wrist",
+    ]] * 3
+    assert sensor_joint("a phone accelerometer on the thigh") != \
+        sensor_joint("a phone accelerometer on the right wrist")
+    assert not torch.allclose(out["pooled"], _forward_texts(encoder, swapped)["pooled"], atol=1e-5)
+
+
+def test_unimts_window_with_no_usable_device_is_not_given_an_embedding():
+    """An all-zero skeleton must not produce a vector that looks like evidence."""
+    encoder = build_matched_encoder("unimts").eval()
+    batch = _multi_device_batch(B=2)
+    batch["channel_mask"] = torch.zeros_like(batch["channel_mask"])
+    batch["channel_mask"][0, :] = True          # only the first window is usable
+    out = _forward_texts(encoder, batch)
+    assert bool(out["device_present"][0].any())
+    assert not bool(out["device_present"][1].any())
+    assert float(out["pooled"][1].abs().sum()) == 0.0
+    assert float(out["pooled"][0].abs().sum()) > 0.0
+
+
+def test_a_trunk_that_cannot_take_a_short_input_is_never_given_one():
+    """harnet5's ResNet pads circularly and raises below its 5 s contract; UniMTS's graph does not."""
+    from model.tokenizer.matched_encoder import BACKBONE_CONTRACTS
+    assert BACKBONE_CONTRACTS["harnet"]["min_clip"] == BACKBONE_CONTRACTS["harnet"]["clip"]
+    assert BACKBONE_CONTRACTS["unimts"]["min_clip"] < BACKBONE_CONTRACTS["unimts"]["clip"]
+    # A two-second window at 100 Hz resamples well below harnet's 150 samples; it must wrap-pad up.
+    encoder = build_matched_encoder("harnet").eval()
+    short = _batch(rate=100.0)
+    out = _forward(encoder, short)
+    assert torch.isfinite(out["pooled"]).all()
+
+
+def test_unimts_uses_the_real_window_rather_than_fabricating_padding():
+    """Wrap-padding an 8 s window to the released 10 s convention invents a quarter of the input."""
+    encoder = build_matched_encoder("unimts").eval()
+    assert encoder.min_clip < encoder.clip
+    pretrained_rule = build_matched_encoder("unimts", pretrained=False)
+    assert pretrained_rule._clip_length([torch.zeros(2, 160, 3)]) == 160
+    assert pretrained_rule._clip_length([torch.zeros(2, 400, 3)]) == 200, "still capped at the contract"

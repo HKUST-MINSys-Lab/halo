@@ -24,6 +24,7 @@ import torch
 import torch.nn.functional as F
 
 from data.scripts.curate import deployment_policy
+from data.scripts.augmentations import AugmentationConfig
 from model.blocks import AttentionSpec
 from model.tokenizer.multispan_kernel import MS_SPANS_S, MS_FRAME_RATE_HZ
 from model.support.token_mixer import SupportTokenMixer, TokenMixerConfig
@@ -34,12 +35,16 @@ from model.support.residual_classifier import (
 from training.support_classifier.corpus import support_corpus_from_index
 from training.support_classifier.sampling import (
     DEFAULT_ENROLLMENT_K,
+    DEFAULT_ACQUISITION_MIX,
+    DEFAULT_ENROLLMENT_MIX,
     DEFAULT_LABEL_SUBSET,
+    DEFAULT_PARTIAL_COVERAGE,
     DEFAULT_P_GT_PRESENT,
     DEFAULT_QUERIES_PER_SUPPORT_SET,
     DEFAULT_SAME_SUBJECT_PROBABILITY,
     DEFAULT_SUPPORT,
     DEFAULT_WINDOWS_PER_EXECUTION,
+    DEFAULT_VARIABLE_SUPPORT_PROBABILITY,
     Episode,
     SupportCorpus,
     balanced_query_indices,
@@ -355,8 +360,8 @@ def encode_recording_rows(
     return pooled, descriptor, device_count
 
 
-def episode_positions(episodes: list[Episode], corpus: SupportCorpus) -> list[int]:
-    """Unique dataset positions required by a batch, including execution-pooling windows."""
+def episode_recording_indices(episodes: list[Episode]) -> list[int]:
+    """Unique corpus rows required by a batch, in encoder/collate order."""
     recording_indices: list[int] = []
     seen: set[int] = set()
     for episode in episodes:
@@ -365,6 +370,12 @@ def episode_positions(episodes: list[Episode], corpus: SupportCorpus) -> list[in
             if index not in seen:
                 seen.add(index)
                 recording_indices.append(index)
+    return recording_indices
+
+
+def episode_positions(episodes: list[Episode], corpus: SupportCorpus) -> list[int]:
+    """Unique dataset positions required by a batch, including execution-pooling windows."""
+    recording_indices = episode_recording_indices(episodes)
     return [corpus.recordings[index].window_index for index in recording_indices]
 
 
@@ -378,14 +389,7 @@ def split_encoded(
     device = pooled.device
     B = len(episodes)
     K = max((len(episode.support) for episode in episodes), default=0)
-    recording_indices: list[int] = []
-    seen: set[int] = set()
-    for episode in episodes:
-        groups = episode.support_window_groups or tuple((index,) for index in episode.support)
-        for index in (episode.query, *(value for group in groups for value in group)):
-            if index not in seen:
-                seen.add(index)
-                recording_indices.append(index)
+    recording_indices = episode_recording_indices(episodes)
     if len(recording_indices) != pooled.shape[0]:
         raise RuntimeError(
             f"batch references {len(recording_indices)} unique windows but encoder returned "
@@ -595,16 +599,78 @@ def _macro_f1_names(truth: list[str], prediction: list[str]) -> float:
     return float(np.mean(scores)) if scores else 0.0
 
 
+def weighted_present_metrics(
+    rows: list[dict[str, float]], weights: list[int],
+) -> dict[str, float]:
+    """Weight telemetry over groups where a conditional scenario metric is defined."""
+    if len(rows) != len(weights):
+        raise ValueError("telemetry rows and weights must have equal length")
+    output: dict[str, float] = {}
+    for key in sorted({key for row in rows for key in row}):
+        # Conditional scenario metrics summarize only the selected rows in each group. Weighting
+        # them by the complete group size biases a rare condition in a large group exactly as much
+        # as a common condition. Its sibling fraction recovers the honest selected-row count.
+        suffix = key.rsplit("/", 1)[-1]
+        conditional = key.startswith("scenario/") and suffix in {
+            "loss", "accuracy", "semantic_weight",
+        }
+        fraction_key = f"{key.rsplit('/', 1)[0]}/fraction" if conditional else None
+        present = []
+        for row, weight in zip(rows, weights):
+            if key not in row:
+                continue
+            effective_weight = float(weight)
+            if fraction_key is not None and fraction_key in row:
+                effective_weight *= float(row[fraction_key])
+            if effective_weight > 0:
+                present.append((row[key], effective_weight))
+        if not present:
+            continue
+        output[key] = float(np.average(
+            [value for value, _ in present], weights=[weight for _, weight in present],
+        ))
+    return output
+
+
 # ------------------------------------------------------------------ training
 def build_dataset(index: CorpusIndex, args) -> PretrainDataset:
+    augmentation = AugmentationConfig.phase_a(
+        rate_p=args.rate_augmentation_probability,
+        channel_dropout_p=args.modality_dropout_probability,
+    )
     return PretrainDataset(
-        index, index.train, augment=False, two_view=False,
+        index, index.train,
+        augment=(args.rate_augmentation_probability > 0
+                 or args.modality_dropout_probability > 0),
+        two_view=False, augmentation_config=augmentation,
         neutral_acquisition_text=args.neutral_acquisition_text,
         multi_device_probability=args.multi_device_probability,
         max_devices=args.max_devices,
     )
 
 
+def draw_kwargs_from_args(args) -> dict:
+    """Single source of truth for the deployment-shaped episode curriculum."""
+    return {
+        "p_gt_present": args.p_gt_present,
+        "same_subject_probability": args.same_subject_probability,
+        "label_subset": tuple(args.label_subset),
+        "mode": args.mode,
+        "semantic_zero_shot": True,
+        "deployment_matched": True,
+        "enrollment_k": tuple(args.enrollment_k),
+        "acquisition_mix": (tuple(args.acquisition_mix)
+                            if args.acquisition_mix is not None else None),
+        "enrollment_mix": (tuple(args.enrollment_mix)
+                           if args.enrollment_mix is not None else None),
+        "partial_coverage": tuple(args.partial_coverage),
+        "variable_support_probability": args.variable_support_probability,
+        "require_query_support": args.classifier == "neighbors",
+        "queries_per_support_set": args.queries_per_support_set,
+        "windows_per_execution": args.windows_per_execution,
+        "p_mask_candidate": args.p_mask_candidate if args.classifier == "residual" else 0.0,
+        "p_mask_gt": args.p_mask_gt if args.classifier == "residual" else 0.0,
+    }
 def run_step(
     *,
     episodes: list[Episode],
@@ -624,6 +690,36 @@ def run_step(
     if batch is None:
         positions = episode_positions(episodes, corpus)
         batch = collate.bucketed(_load_items(dataset, positions, executor))
+    if isinstance(batch, BucketedSupportBatch):
+        flattened_augmentations = [
+            value for dense in batch.batches for value in dense.get("augmentations", ())
+        ]
+        augmentation_rows = [
+            flattened_augmentations[index] for index in batch.restore_order.tolist()
+        ] if flattened_augmentations else [()] * batch.row_count
+    else:
+        augmentation_rows = list(batch.get("augmentations", [()] * len(batch["data"])))
+    recording_indices = episode_recording_indices(episodes)
+    if len(recording_indices) != len(augmentation_rows):
+        raise RuntimeError("augmentation telemetry rows do not match encoded recording rows")
+    augmentation_by_recording = dict(zip(recording_indices, augmentation_rows))
+    episode_perturbations = []
+    episode_support_perturbation_fractions = []
+    for episode in episodes:
+        groups = episode.support_window_groups or tuple((index,) for index in episode.support)
+        query_applied = frozenset(augmentation_by_recording[episode.query])
+        support_applied = frozenset(
+            name for group in groups for index in group
+            for name in augmentation_by_recording[index]
+        )
+        episode_perturbations.append((query_applied, support_applied))
+        support_rows = [index for group in groups for index in group]
+        episode_support_perturbation_fractions.append({
+            name: (float(np.mean([
+                name in augmentation_by_recording[index] for index in support_rows
+            ])) if support_rows else 0.0)
+            for name in ("rate", "channel_dropout")
+        })
     pooled, descriptor, device_count = encode_recording_rows(encoder, batch, device)
 
     rows = split_encoded(pooled, descriptor, episodes, corpus)
@@ -665,7 +761,10 @@ def run_step(
         raise ValueError(f"unknown classifier mode {classifier_mode!r}")
     loss = episode_loss(output["logits"], episodes, text)
     return {**loss, **output, "pooled": pooled, "text": text, "rows": rows,
-            "device_count": device_count, "readout": classifier_mode}
+            "device_count": device_count, "readout": classifier_mode,
+            "augmentation_rows": augmentation_rows,
+            "episode_perturbations": episode_perturbations,
+            "episode_support_perturbation_fractions": episode_support_perturbation_fractions}
 
 
 def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, float]:
@@ -697,6 +796,55 @@ def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, flo
         "batch/mean_device_count": float(result["device_count"].mean()),
         "batch/multi_device_fraction": float(result["device_count"].gt(1).float().mean()),
     }
+    per_row_loss = F.cross_entropy(result["logits"].float(), target, reduction="none").detach()
+    correct = learned.eq(target).float()
+
+    def add_scenario(axis: str, values: list[str], names: tuple[str, ...]) -> None:
+        for name in names:
+            selected = torch.tensor(
+                [value == name for value in values], dtype=torch.bool, device=target.device,
+            )
+            metrics[f"scenario/{axis}/{name}/fraction"] = float(selected.float().mean())
+            if bool(selected.any()):
+                metrics[f"scenario/{axis}/{name}/loss"] = float(per_row_loss[selected].mean())
+                metrics[f"scenario/{axis}/{name}/accuracy"] = float(correct[selected].mean())
+
+    add_scenario(
+        "acquisition", [episode.acquisition_regime for episode in episodes],
+        ("compatible", "cross_placement", "cross_dataset"),
+    )
+    add_scenario(
+        "enrollment", [episode.enrollment_regime for episode in episodes],
+        ("complete", "partial", "zero"),
+    )
+    truth_enrollment = []
+    for episode in episodes:
+        supported = (
+            episode.gt_slot < len(episode.support_counts)
+            and episode.support_counts[episode.gt_slot] > 0
+        )
+        truth_enrollment.append("enrolled" if supported else "unenrolled")
+    add_scenario("truth", truth_enrollment, ("enrolled", "unenrolled"))
+
+    augmentation_rows = result.get("augmentation_rows", ())
+    episode_perturbations = result.get("episode_perturbations", ())
+    support_perturbation_fractions = result.get("episode_support_perturbation_fractions", ())
+    for augmentation, scenario_name in (("rate", "rate_resampled"),
+                                         ("channel_dropout", "modality_dropped")):
+        metrics[f"scenario/perturbation/{scenario_name}/recording_fraction"] = float(np.mean([
+            augmentation in applied for applied in augmentation_rows
+        ])) if augmentation_rows else 0.0
+        if episode_perturbations:
+            add_scenario(
+                "perturbation",
+                [f"{scenario_name}_query" if augmentation in applied[0] else "clean"
+                 for applied in episode_perturbations],
+                (f"{scenario_name}_query",),
+            )
+        if support_perturbation_fractions:
+            metrics[f"scenario/perturbation/{scenario_name}_support/recording_fraction"] = float(
+                np.mean([row[augmentation] for row in support_perturbation_fractions])
+            )
     if "r_support" in result:
         metrics.update({
             "classifier/mean_abs_r_support": (
@@ -707,7 +855,62 @@ def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, flo
                 [len(episode.masked_candidates) / max(1, len(episode.candidates)) for episode in episodes],
                 device=weights.device,
             ).mean()),
+            "classifier/semantic_weight_mean": float(
+                result["lambda"].detach().masked_select(mask).mean()
+            ),
         })
+        for name in ("complete", "partial", "zero"):
+            selected = torch.tensor(
+                [episode.enrollment_regime == name for episode in episodes],
+                dtype=torch.bool, device=target.device,
+            ).unsqueeze(1) & mask
+            if bool(selected.any()):
+                metrics[f"scenario/enrollment/{name}/semantic_weight_fraction"] = float(
+                    selected.float().mean()
+                )
+                metrics[f"scenario/enrollment/{name}/semantic_weight"] = float(
+                    result["lambda"].detach().masked_select(selected).mean()
+                )
+        counts = result["k_c"].detach()
+        configured = tuple(int(value) for value in DEFAULT_ENROLLMENT_K)
+        for lower, upper in zip((0, *configured), (*configured, None)):
+            if upper is None:
+                selected = counts.ge(lower) & mask
+                name = f"ge_{lower}"
+            elif lower == 0:
+                selected = counts.eq(0) & mask
+                name = "0"
+            else:
+                selected = counts.ge(lower) & counts.lt(upper) & mask
+                name = f"{lower}_to_{upper - 1}"
+            if bool(selected.any()):
+                metrics[f"scenario/support_count/{name}/fraction"] = float(
+                    selected.float().mean()
+                )
+                metrics[f"scenario/support_count/{name}/semantic_weight"] = float(
+                    result["lambda"].detach().masked_select(selected).mean()
+                )
+        gate_features = result.get("text_gate_features")
+        if gate_features is not None:
+            feature_names = ("log_count", "strongest", "mean", "spread", "margin", "disagreement")
+            for index, name in enumerate(feature_names):
+                metrics[f"classifier/text_gate_{name}_mean"] = float(
+                    gate_features[..., index].detach().masked_select(mask).mean()
+                )
+            margin = gate_features[..., 4].detach()
+            for name, selected in (
+                ("negative", margin.lt(-0.25)),
+                ("ambiguous", margin.ge(-0.25) & margin.le(0.25)),
+                ("positive", margin.gt(0.25)),
+            ):
+                selected &= mask
+                if bool(selected.any()):
+                    metrics[f"scenario/sensor_margin/{name}/fraction"] = float(
+                        selected.float().mean()
+                    )
+                    metrics[f"scenario/sensor_margin/{name}/semantic_weight"] = float(
+                        result["lambda"].detach().masked_select(selected).mean()
+                    )
         target_text = result["text_score"].gather(1, target[:, None]).squeeze(1)
         other_text = result["text_score"].detach().clone()
         other_text.scatter_(1, target[:, None], float("-inf"))
@@ -902,7 +1105,7 @@ def validate(
         encoder.train()
     if was_classifier_training:
         classifier.train()
-    keys = sorted({key for row in rows for key in row})
+    aggregate_telemetry = weighted_present_metrics(rows, group_sizes)
     learned_dataset_f1 = {
         regime: {
             dataset: _macro_f1_names(truth, prediction)
@@ -935,8 +1138,7 @@ def validate(
             f"validation/zero_shot/dataset/{dataset}/learned_macro_f1": value
             for dataset, value in zero_f1.items()
         },
-        **{f"validation/{key}": float(np.average([row[key] for row in rows], weights=group_sizes))
-           for key in keys},
+        **{f"validation/{key}": value for key, value in aggregate_telemetry.items()},
         **{f"validation/{key}": value for key, value in sampler.items()},
     }
 
@@ -949,13 +1151,16 @@ def main() -> None:
                              "checkpoint on disk actually used")
     parser.add_argument("--allow-retired-jepa-checkpoint", action="store_true",
                         help="allow a future-JEPA checkpoint only to reproduce a historical run")
-    parser.add_argument("--encoder-arch", default="halo", choices=("halo", "limubert", "harnet"),
+    parser.add_argument("--encoder-arch", default="halo", choices=("halo", "limubert", "harnet", "unimts"),
                         help="matched-corpus M2 arm: train a baseline architecture under HALO's "
                              "objective, corpus, episodes and readouts (default: HALO's encoder)")
     parser.add_argument("--matched-pretrained", action="store_true",
                         help="load the baseline's released weights instead of random init; this "
                              "reintroduces the corpus advantage M2 exists to remove, so it is for "
                              "reproducing an M0-style row only")
+    parser.add_argument("--matched-compile", action="store_true",
+                        help="torch.compile the matched-corpus trunk; measured 1.27x on the UniMTS "
+                             "graph, at the cost of a warm-up and a recompile per input shape")
     parser.add_argument("--matched-d-model", type=int, default=128,
                         help="classifier width for a matched-corpus arm; matches HALO's d_model")
     parser.add_argument("--frontend", choices=("fixed", "learnable", "continuous", "multispan"),
@@ -977,11 +1182,28 @@ def main() -> None:
                         help="independently sampled support sets per optimizer step")
     parser.add_argument("--support-size", type=int, default=DEFAULT_SUPPORT,
                         help="legacy non-deployment sampler only; the paper path uses C * k rows")
-    parser.add_argument("--p-gt-present", type=float, default=None)
+    parser.add_argument("--p-gt-present", type=float, default=None,
+                        help="legacy single-regime sampler control; ignored when enrollment mix is active")
     parser.add_argument("--same-subject-probability", type=float, default=None,
-                        help="requested same-user share when feasible; staged default 0.2")
+                        help="requested same-user share when feasible; default 0.5")
     parser.add_argument("--enrollment-k", type=int, nargs="+", default=list(DEFAULT_ENROLLMENT_K),
                         help="deployment enrollment executions per candidate sampled by training")
+    parser.add_argument("--acquisition-mix", type=float, nargs=3,
+                        default=list(DEFAULT_ACQUISITION_MIX), metavar=("MATCH", "PLACE", "DATASET"),
+                        help="training shares for compatible, cross-placement and cross-dataset support")
+    parser.add_argument("--enrollment-mix", type=float, nargs=3,
+                        default=list(DEFAULT_ENROLLMENT_MIX), metavar=("COMPLETE", "PARTIAL", "ZERO"),
+                        help="training shares for complete, partial and zero enrollment")
+    parser.add_argument("--partial-coverage", type=float, nargs=2,
+                        default=list(DEFAULT_PARTIAL_COVERAGE), metavar=("LOW", "HIGH"),
+                        help="range of enrolled-candidate fractions in partial episodes")
+    parser.add_argument("--variable-support-probability", type=float,
+                        default=DEFAULT_VARIABLE_SUPPORT_PROBABILITY,
+                        help="share of enrolled support sets with unequal per-candidate counts")
+    parser.add_argument("--rate-augmentation-probability", type=float, default=0.0,
+                        help="independent anti-aliased rate perturbation probability per recording")
+    parser.add_argument("--modality-dropout-probability", type=float, default=0.0,
+                        help="independent whole-gyroscope dropout probability per recording")
     parser.add_argument("--queries-per-support-set", type=int,
                         default=DEFAULT_QUERIES_PER_SUPPORT_SET)
     parser.add_argument("--windows-per-execution", type=int,
@@ -989,8 +1211,11 @@ def main() -> None:
                         help="maximum windows averaged into each training support execution")
     parser.add_argument("--label-subset", type=int, nargs=2, default=None,
                         help="candidate-count range; defaults to the support sampler's balanced range")
-    parser.add_argument("--mode", choices=("compatible", "near_miss", "unfiltered"),
-                        default="compatible")
+    parser.add_argument("--mode", choices=(
+                            "compatible", "near_miss", "cross_placement", "cross_dataset",
+                            "unfiltered"),
+                        default="compatible",
+                        help="legacy single-regime acquisition mode; ignored when acquisition mix is active")
     parser.add_argument("--neutral-acquisition-text", action=argparse.BooleanOptionalAction,
                         default=None,
                         help="override checkpoint acquisition-text mode; omitted inherits Phase-A")
@@ -1002,8 +1227,10 @@ def main() -> None:
                              "neighbors is the parameter-free control")
     parser.add_argument("--centring", choices=("none", "support_mean", "corpus_mean"),
                         default="support_mean")
-    parser.add_argument("--p-mask-candidate", type=float, default=0.25)
-    parser.add_argument("--p-mask-gt", type=float, default=0.10)
+    parser.add_argument("--p-mask-candidate", type=float, default=0.25,
+                        help="legacy per-query masking; ignored when enrollment mix is active")
+    parser.add_argument("--p-mask-gt", type=float, default=0.10,
+                        help="legacy per-query masking; ignored when enrollment mix is active")
     parser.add_argument("--no-residual", action="store_true")
     parser.add_argument("--no-text-term", action="store_true")
     parser.add_argument("--regime-split", action="store_true",
@@ -1011,6 +1238,8 @@ def main() -> None:
                              "one for enrolled episodes, sharing no parameter (no-sharing control)")
     parser.add_argument("--separate-trunk", action="store_true")
     parser.add_argument("--text-temperature", type=float, default=0.07)
+    parser.add_argument("--adaptive-text-gate", action=argparse.BooleanOptionalAction, default=False,
+                        help="replace the support-count text weight with an evidence-dependent gate")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--encoder-lr-scale", type=float, default=None,
                         help="encoder LR multiplier on --lr; default 1.0 for the from-scratch "
@@ -1047,7 +1276,7 @@ def main() -> None:
                              "updated at --checkpoint-every")
     parser.add_argument("--calib-batches", type=int, default=20)
     parser.add_argument("--calib-batch-size", type=int, default=256)
-    parser.add_argument("--loader-workers", type=int, default=8,
+    parser.add_argument("--loader-workers", type=int, default=16,
                         help="forked worker PROCESSES that draw, load and collate upcoming steps "
                              "while the GPU trains (PrefetchLoader). 0 = synchronous on the main "
                              "thread. The episode sequence is identical for any value. Thread "
@@ -1085,6 +1314,7 @@ def main() -> None:
     parser.add_argument("--smoke", action="store_true",
                         help="three steps on capped real data with telemetry; launches nothing long")
     args = parser.parse_args()
+    automatic_val_episodes = args.val_episodes is None
     if args.resolutions is None and args.frontend in {"fixed", "learnable"} \
             and args.phase_a is None and args.resume is None:
         args.resolutions = [0.5, 1.0, 2.0, 4.0]
@@ -1117,6 +1347,12 @@ def main() -> None:
         # A neighbor vote has no candidate-only k=0 path.  Make the control honest rather than
         # quietly giving it the semantic token mixer's zero-shot machinery.
         args.p_gt_present = 1.0
+        if "--enrollment-mix" not in sys.argv:
+            # Preserve complete and partial enrollment challenges while removing the zero-support
+            # regime that has no differentiable-neighbor objective.
+            args.enrollment_mix = [2.0 / 3.0, 1.0 / 3.0, 0.0]
+        elif args.enrollment_mix[2] > 0:
+            parser.error("differentiable neighbors requires zero weight for ZERO enrollment")
     if not 0.0 <= args.p_mask_candidate <= 1.0 or not 0.0 <= args.p_mask_gt <= 1.0:
         parser.error("support-mask probabilities must be in [0, 1]")
     if args.text_temperature <= 0:
@@ -1155,6 +1391,18 @@ def main() -> None:
         parser.error("frontend-lr-scale and frontend-reg-weight must be nonnegative")
     if not args.enrollment_k or any(value < 1 for value in args.enrollment_k):
         parser.error("enrollment-k values must be positive")
+    for option, values in (("acquisition-mix", args.acquisition_mix),
+                           ("enrollment-mix", args.enrollment_mix)):
+        if len(values) != 3 or any(not math.isfinite(value) or value < 0 for value in values) \
+                or sum(values) <= 0:
+            parser.error(f"{option} requires three finite nonnegative weights with positive sum")
+    if not (0 <= args.partial_coverage[0] <= args.partial_coverage[1] <= 1):
+        parser.error("partial-coverage must be LOW HIGH within [0,1]")
+    if not 0 <= args.variable_support_probability <= 1:
+        parser.error("variable-support-probability must be in [0,1]")
+    if not 0 <= args.rate_augmentation_probability <= 1 \
+            or not 0 <= args.modality_dropout_probability <= 1:
+        parser.error("acquisition augmentation probabilities must be in [0,1]")
     if args.label_subset[0] < 2 or args.label_subset[1] < args.label_subset[0]:
         parser.error("label-subset must be LOW HIGH with 2 <= LOW <= HIGH")
     if args.label_subset[1] > TokenMixerConfig().max_candidates:
@@ -1192,8 +1440,10 @@ def main() -> None:
     rng = np.random.default_rng(args.seed)
     device = torch.device(args.device)
     if device.type == "cuda":
-        torch.backends.cuda.matmul.fp32_precision = "tf32"
-        torch.backends.cudnn.conv.fp32_precision = "tf32"
+        # PyTorch 2.9 Inductor still reads these switches. Mixing them with the new
+        # fp32_precision API in one process raises an internal configuration error.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     prepare_output_dir(
         args.out, force=args.force, smoke=args.smoke, resume=args.resume is not None,
     )
@@ -1209,11 +1459,29 @@ def main() -> None:
         # that determines its trajectory.  Only --steps and operational settings such as output,
         # worker count and logging cadence may differ.  Explicit incompatible overrides fail
         # instead of silently drawing a different curriculum after the checkpoint is restored.
-        saved = dict(resume_blob.get("trajectory") or {})
+        if not resume_blob.get("trajectory"):
+            parser.error(
+                "resume checkpoint has no trajectory contract; reproduce it explicitly instead "
+                "of silently selecting a current or legacy sampler"
+            )
+        saved = dict(resume_blob["trajectory"])
+        # Checkpoints predating the deployment-challenge curriculum reproduce their historical
+        # single-mode sampler when resumed.
+        saved.setdefault("acquisition_mix", None)
+        saved.setdefault("enrollment_mix", None)
+        saved.setdefault("partial_coverage", list(DEFAULT_PARTIAL_COVERAGE))
+        saved.setdefault("variable_support_probability", 0.0)
+        saved.setdefault("rate_augmentation_probability", 0.0)
+        saved.setdefault("modality_dropout_probability", 0.0)
         resume_fields = {
             "frontend": "--frontend", "patch_seconds": "--patch-seconds",
             "window_seconds": "--window-seconds", "resolutions": "--resolutions",
             "support_size": "--support-size", "enrollment_k": "--enrollment-k",
+            "acquisition_mix": "--acquisition-mix", "enrollment_mix": "--enrollment-mix",
+            "partial_coverage": "--partial-coverage",
+            "variable_support_probability": "--variable-support-probability",
+            "rate_augmentation_probability": "--rate-augmentation-probability",
+            "modality_dropout_probability": "--modality-dropout-probability",
             "queries_per_support_set": "--queries-per-support-set",
             "windows_per_execution": "--windows-per-execution",
             "p_gt_present": "--p-gt-present", "p_mask_candidate": "--p-mask-candidate",
@@ -1241,7 +1509,8 @@ def main() -> None:
         # run flag. Reject attempts to pretend they can be changed on an existing optimizer.
         if resume_blob.get("architecture_version") in {"support_classifier_v2", "support_classifier_v3"}:
             for option in ("--centring", "--no-residual", "--no-text-term", "--separate-trunk",
-                           "--text-temperature"):
+                           "--text-temperature", "--adaptive-text-gate",
+                           "--no-adaptive-text-gate"):
                 if option in sys.argv:
                     parser.error(f"{option} cannot change a resumed residual classifier")
         if args.steps < 1 or not 0 <= args.warmup_steps < args.steps:
@@ -1278,6 +1547,10 @@ def main() -> None:
     print(f"[compare] corpus: {index.summary()}", flush=True)
     corpus = support_corpus_from_index(index)
     val_corpus = support_corpus_from_index(index, split="val")
+    if automatic_val_episodes and not args.smoke:
+        args.val_episodes = args.val_repeats_per_dataset * len(
+            val_corpus.query_labels_by_dataset
+        )
     print(f"[compare] support corpus: {corpus.summary()}", flush=True)
     print(f"[compare] validation corpus: {val_corpus.summary()}", flush=True)
 
@@ -1300,19 +1573,15 @@ def main() -> None:
     # Calibration and validation load on this thread; training steps come from the prefetcher.
     executor = None
 
-    draw_kwargs = {
-        "p_gt_present": args.p_gt_present,
-        "same_subject_probability": args.same_subject_probability,
-        "label_subset": tuple(args.label_subset),
-        "mode": args.mode,
-        "semantic_zero_shot": True,
-        "deployment_matched": True,
-        "enrollment_k": tuple(args.enrollment_k),
-        "queries_per_support_set": args.queries_per_support_set,
-        "windows_per_execution": args.windows_per_execution,
-        "p_mask_candidate": args.p_mask_candidate if args.classifier == "residual" else 0.0,
-        "p_mask_gt": args.p_mask_gt if args.classifier == "residual" else 0.0,
-    }
+    draw_kwargs = draw_kwargs_from_args(args)
+    if args.loader_workers:
+        # Eligibility depends only on the immutable corpus indexes and curriculum config. Build it
+        # once before fork so every loader process inherits the cache copy-on-write instead of
+        # repeating the same source/key/execution scan at startup.
+        print("[compare] preparing curriculum feasibility index", flush=True)
+        draw_batch(
+            corpus, episode_rng(args.data_seed, 0), batch_size=1, **draw_kwargs,
+        )
     # Fork the prefetch workers NOW, before the encoder, the text tower or any library thread
     # exists: forking a process that has live threads can deadlock the child on a lock a thread
     # held at fork time. The workers only need the corpus, the dataset and the collate.
@@ -1360,10 +1629,12 @@ def main() -> None:
         encoder = build_matched_encoder(
             args.encoder_arch, d_model=args.matched_d_model,
             pretrained=args.matched_pretrained, device=device,
+            compile_trunk=args.matched_compile,
         ).train()
         encoder_config = {
             "encoder_arch": args.encoder_arch,
             "matched_pretrained": bool(args.matched_pretrained),
+            "matched_compile": bool(args.matched_compile),
             "d_model": int(args.matched_d_model),
             "trunk": "temporal",
             "token_granularity": "sensor",
@@ -1483,6 +1754,7 @@ def main() -> None:
                 text_term_enabled=not args.no_text_term, shared_trunk=not args.separate_trunk,
                 regime_split=args.regime_split,
                 text_temperature=args.text_temperature,
+                adaptive_text_gate=args.adaptive_text_gate,
             )).to(device) if args.classifier == "residual" else
             SupportTokenMixer(spec, TokenMixerConfig()).to(device) if args.classifier == "token_mixer" else None)
     print(f"[compare] classifier={args.classifier}", flush=True)
@@ -1563,6 +1835,14 @@ def main() -> None:
             "resolutions": args.resolutions,
             "support_size": args.support_size,
             "enrollment_k": list(args.enrollment_k),
+            "acquisition_mix": (list(args.acquisition_mix)
+                                if args.acquisition_mix is not None else None),
+            "enrollment_mix": (list(args.enrollment_mix)
+                               if args.enrollment_mix is not None else None),
+            "partial_coverage": list(args.partial_coverage),
+            "variable_support_probability": args.variable_support_probability,
+            "rate_augmentation_probability": args.rate_augmentation_probability,
+            "modality_dropout_probability": args.modality_dropout_probability,
             "queries_per_support_set": args.queries_per_support_set,
             "windows_per_execution": args.windows_per_execution,
             "p_gt_present": args.p_gt_present,
@@ -1632,6 +1912,16 @@ def main() -> None:
         # residual snapshots predate explicit trajectory fields but used these initial defaults.
         saved_trajectory.setdefault("p_mask_candidate", 0.25)
         saved_trajectory.setdefault("p_mask_gt", 0.10)
+        saved_args = resume_blob.get("args") or {}
+        for field, default in (
+            ("acquisition_mix", None),
+            ("enrollment_mix", None),
+            ("partial_coverage", list(DEFAULT_PARTIAL_COVERAGE)),
+            ("variable_support_probability", 0.0),
+            ("rate_augmentation_probability", 0.0),
+            ("modality_dropout_probability", 0.0),
+        ):
+            saved_trajectory.setdefault(field, saved_args.get(field, default))
         saved_trajectory.setdefault(
             "classifier_config",
             dataclasses.asdict(classifier.cfg) if isinstance(classifier, (ResidualSupportClassifier, RegimeSplitSupportClassifier)) else None,
@@ -1640,7 +1930,9 @@ def main() -> None:
         # migrate their classifier_config sub-dict the same way the fields above are migrated,
         # rather than rejecting an otherwise-identical resume.
         if saved_trajectory.get("classifier_config") is not None:
-            saved_trajectory["classifier_config"].setdefault("regime_split", False)
+            defaults = dataclasses.asdict(classifier.cfg)
+            for field in ("regime_split", "adaptive_text_gate", "text_gate_hidden"):
+                saved_trajectory["classifier_config"].setdefault(field, defaults[field])
         if saved_trajectory != trajectory:
             raise SystemExit("resume trajectory differs from the checkpoint configuration")
         optimizer.load_state_dict(resume_blob["optimizer"])

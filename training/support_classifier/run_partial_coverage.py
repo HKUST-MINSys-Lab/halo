@@ -5,7 +5,7 @@ cached features as ``sealed_eval``, then hides the supports of a fixed candidate
 scores every model three ways:
 
 * **support-only readouts** (1-NN / prototype / ridge) restricted to enrolled candidates,
-* **hybrid** text + support for every model that has a text path, using one fixed untrained rule,
+* **equal-weight normalized fusion** of semantic + cosine 1-NN evidence, using one fixed rule,
 * **HALO's own classifier**, which handles unenrolled candidates natively because it was trained to.
 
 Rows are emitted three times per readout: over all queries, over queries whose ground truth is
@@ -33,7 +33,8 @@ from .partial_coverage import (
     CoverageCell,
     choose_hidden_candidates,
     hide_supports,
-    hybrid_predictions,
+    equal_weight_normalized_fusion_predictions,
+    classwise_neighbor_scores,
     support_only_predictions,
     truth_split,
 )
@@ -46,10 +47,11 @@ from .sealed_eval import (
     _build_training_reference_bank,
     _file_hash,
     _load_or_encode,
-    build_manifest,
     evaluation_cells,
     manifest_fingerprint,
+    QueryPlan,
 )
+from .scenarios import build_cross_manifest
 from training.tokenizer.eval_transfer import build_encoder
 
 DEFAULT_K = (1, 4, 8)
@@ -70,7 +72,7 @@ def conse_scores(
     """ConSE bridge similarities, ``(n_queries, n_candidates)``.
 
     Reproduces the score matrix that :func:`baselines.scoring.conse_predict` takes its arg-max over,
-    so the hybrid readout ranks a text-bridge model exactly as its own zero-support path would.
+    so fusion ranks a text-bridge model exactly as its own zero-support path would.
     """
     query = query_features / np.maximum(
         np.linalg.norm(query_features, axis=1, keepdims=True), 1e-12)
@@ -90,13 +92,9 @@ def conse_scores(
     probs = np.zeros((len(query), len(train_labels)), dtype=np.float32)
     probs[np.arange(len(query)), label_ids[nearest.numpy()]] = 1.0
 
-    encode = scoring.get_sbert_encoder()
-    train_embs = encode(list(train_labels))
-    target_embs = encode(list(target_labels))
-    vectors = scoring.conse_embeddings(probs, train_embs, top_T=1)
-    vectors = vectors - train_embs.mean(axis=0, keepdims=True)
-    vectors = vectors / np.maximum(np.linalg.norm(vectors, axis=1, keepdims=True), 1e-9)
-    return np.asarray(vectors @ target_embs.T, dtype=np.float64)
+    return scoring.conse_score_matrix(
+        probs, list(train_labels), list(target_labels), top_T=1,
+    )
 
 
 def native_text_scores(name: str, features: np.ndarray, candidates, state, device) -> np.ndarray:
@@ -133,6 +131,8 @@ def _split_row(stream, plans, predictions, rows: np.ndarray, *, bootstrap: int,
     predicted = [predictions[i] for i in rows]
     subjects = np.asarray(stream.subjects)[indices]
     metrics = scoring.classification_metrics(truth, predicted)
+    metrics["truth_label_set"] = sorted(set(truth))
+    metrics["f1_scored_classes"] = scoring.macro_f1_classes(truth, predicted)
     per_label = scoring.per_class_f1(truth, predicted)
     training_concepts = {canonicalize(label) for label in load_global_labels()}
     seen_scores = [score for label, score in per_label.items()
@@ -160,6 +160,7 @@ def _split_row(stream, plans, predictions, rows: np.ndarray, *, bootstrap: int,
 
 def emit_rows(stream, plans, predictions, cell: CoverageCell, *, model: str, readout: str,
               k: int, window_seconds: float, bootstrap: int, manifest: str,
+              scenario: str = "s1_partial_coverage", variant: str | None = None,
               extra: dict | None = None) -> list[dict]:
     """One row per truth split, each carrying the coverage configuration."""
     truth = _aligned_labels(stream)[
@@ -183,8 +184,10 @@ def emit_rows(stream, plans, predictions, cell: CoverageCell, *, model: str, rea
             "hidden_candidates": list(cell.hidden),
             "coverage_fingerprint": cell.fingerprint,
             "manifest": manifest,
-            "scenario": "partial_coverage_v1",
+            "scenario": scenario,
         })
+        if variant is not None:
+            row["variant"] = variant
         if extra:
             row.update(extra)
         if split == "truth_unenrolled" and len(rows):
@@ -196,16 +199,25 @@ def emit_rows(stream, plans, predictions, cell: CoverageCell, *, model: str, rea
     return out
 
 
-def cannot_attempt_rows(stream, cell, *, model, readout, k, window_seconds, reason) -> list[dict]:
+def cannot_attempt_rows(stream, cell, *, model, readout, k, window_seconds, reason,
+                        scenario: str = "s1_partial_coverage", variant: str | None = None,
+                        extra: dict | None = None) -> list[dict]:
     """A model with no text path cannot name an unenrolled candidate; say so, do not score it."""
-    return [{
+    row = {
         "model": model, "readout": readout, "k": k, "coverage_split": "truth_unenrolled",
         "dataset": stream.dataset,
         "stream": getattr(stream, "stream", None) or getattr(stream, "cell_id", ""),
         "window_seconds": float(window_seconds), "status": "cannot_attempt", "reason": reason,
         "coverage": cell.coverage, "coverage_fingerprint": cell.fingerprint,
-        "scenario": "partial_coverage_v1",
-    }]
+        "supported_candidates": list(cell.supported),
+        "hidden_candidates": list(cell.hidden),
+        "scenario": scenario,
+    }
+    if variant is not None:
+        row["variant"] = variant
+    if extra:
+        row.update(extra)
+    return [row]
 
 
 # --------------------------------------------------------------------------- main
@@ -274,6 +286,7 @@ def main() -> None:
                   load_eval_stream(dataset, stream_id, alignment="native",
                                    window_seconds=window_seconds, apply_quality_screen=True))
         features: dict[str, tuple[np.ndarray, str]] = {}
+        native_features: dict[str, np.ndarray] = {}
         errors: dict[str, str] = {}
         for name in args.models:
             try:
@@ -286,7 +299,16 @@ def main() -> None:
                 errors[name] = str(exc)
 
         for k in ks:
-            plans = build_manifest(stream, k, seed=args.seed)
+            # Match the unified scenario runner: partial-enrolment supports are cross-subject.
+            cross = build_cross_manifest(
+                stream, stream, k, seed=args.seed, relation="within_cross_subject",
+                same_subject=False,
+            )
+            plans = [QueryPlan(
+                query=plan.query,
+                support=tuple(row - cross.offset for row in plan.support),
+                support_labels=plan.support_labels,
+            ) for plan in cross.plans]
             if not plans:
                 continue
             cell = choose_hidden_candidates(
@@ -304,15 +326,19 @@ def main() -> None:
                 if name in errors:
                     rows.append({"model": name, "readout": "all", "k": k, "status": "n/a",
                                  "reason": errors[name], "dataset": dataset, "stream": stream_id,
-                                 "scenario": "partial_coverage_v1"})
+                                 "scenario": "s1_partial_coverage"})
                     continue
                 matrix, feature_fingerprint = features[name]
+                neighbor_scores = classwise_neighbor_scores(
+                    matrix, stream.eval_labels, covered, device=device,
+                )
                 shared = dict(k=k, window_seconds=window_seconds, bootstrap=bootstrap,
                               manifest=fingerprint,
                               extra={"feature_fingerprint": feature_fingerprint})
 
                 for readout, predicted in support_only_predictions(
-                        matrix, stream.eval_labels, covered, cell).items():
+                        matrix, stream.eval_labels, covered, cell,
+                        classwise_scores=neighbor_scores).items():
                     rows.extend(emit_rows(stream, covered, predicted, cell,
                                           model=name, readout=readout, **shared))
 
@@ -323,23 +349,35 @@ def main() -> None:
                             name=name, device=device, cache_dir=args.zero_shot_bank_cache,
                             halo_checkpoint=args.halo_checkpoint,
                             halo_state=halo_state,
-                            baseline_state=provider_states.get(name))
+                            baseline_state=provider_states.get(name),
+                            window_seconds=window_seconds)
                     bank_features, bank_labels, train_labels, _ = banks[name]
                     text = conse_scores(matrix, bank_features, bank_labels, train_labels,
                                         stream.eval_labels, device)
                 elif baselines.REGISTRY.get(name) is not None and \
                         baselines.REGISTRY[name].supports_native_zero_shot():
                     state = provider_states[name]
-                    text = native_text_scores(name, matrix, stream.eval_labels, state, device)
+                    if name not in native_features:
+                        native_features[name], _ = _load_or_encode(
+                            name=name, stream=stream, device=device, cache_dir=cache_dir,
+                            halo_checkpoint=args.halo_checkpoint, baseline_state=state,
+                            halo_state=halo_state, feature_role="native_zero_shot",
+                        )
+                    text = native_text_scores(
+                        name, native_features[name], stream.eval_labels, state, device,
+                    )
 
                 if text is not None:
                     rows.extend(emit_rows(
                         stream, covered,
-                        hybrid_predictions(text, matrix, stream.eval_labels, covered, cell),
-                        cell, model=name, readout="hybrid-text-support", **shared))
+                        equal_weight_normalized_fusion_predictions(
+                            text, matrix, stream.eval_labels, covered, cell,
+                            classwise_scores=neighbor_scores,
+                        ),
+                        cell, model=name, readout="equal-weight-normalized-fusion", **shared))
                 elif name != "halo":
                     rows.extend(cannot_attempt_rows(
-                        stream, cell, model=name, readout="hybrid-text-support", k=k,
+                        stream, cell, model=name, readout="equal-weight-normalized-fusion", k=k,
                         window_seconds=window_seconds,
                         reason="no text path: unenrolled candidates are unreachable"))
 

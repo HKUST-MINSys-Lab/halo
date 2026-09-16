@@ -89,7 +89,14 @@ def _append_perturbation(existing: str | None, current: str) -> str:
 
 def _effective_source_rate(stream: EvalStream) -> float:
     value = stream.effective_source_rate_hz
-    rate = float(stream.rate_hz if value is None else value)
+    if value is None:
+        # Some converters preserve a denser storage grid than the physical acquisition clock.
+        # Reuse the encoder's authoritative table so resampling cannot invent observability.
+        from training.tokenizer.pretrain_data import STREAM_SOURCE_RATE_HZ
+        value = STREAM_SOURCE_RATE_HZ.get(
+            f"{stream.dataset}/{stream.stream}", stream.rate_hz,
+        )
+    rate = float(value)
     if not np.isfinite(rate) or rate <= 0:
         raise ValueError("effective source rate must be finite and positive")
     return rate
@@ -306,25 +313,51 @@ def build_cross_manifest(
         if len(np.unique(rows)) != len(rows):
             raise ValueError(f"{name} rows contain duplicates")
     rows_by_label = {label: allowed_support[support_mapped[allowed_support] == label] for label in roster}
+    subject_by_label = {
+        label: support_subjects[rows] for label, rows in rows_by_label.items()
+    }
+    execution_by_label = {
+        label: support_exec[rows] for label, rows in rows_by_label.items()
+    }
+    filtered_pools: dict[tuple[str, object, object, bool | None], np.ndarray] = {}
     offset = stream_rows(query_stream)
     plans: list[QueryPlan] = []
     # A query whose ground truth falls outside the shared roster cannot be answered by any model and
     # would silently depress every score by the same amount. Exclude it and report the exclusion.
-    answerable = np.asarray([label in set(roster) for label in query_labels], dtype=bool)
+    roster_set = set(roster)
+    answerable = np.asarray([label in roster_set for label in query_labels], dtype=bool)
     eligible_query = allowed_query[(query_labels[allowed_query] != None) & answerable[allowed_query]]  # noqa: E711
     for query in eligible_query.tolist():
         support: list[int] = []
         labels: list[str] = []
         possible = True
         for label in roster:
-            pool = rows_by_label[label]
-            if same_subject is not None and len(pool):
-                same = support_subjects[pool] == query_subjects[query]
-                pool = pool[same if same_subject else ~same]
-            # Execution identifiers identify rows only within one dataset. Across independent
-            # corpora equal local strings do not imply a shared physical capture.
-            if not allow_same_execution and query_stream.dataset == support_stream.dataset and len(pool):
-                pool = pool[support_exec[pool] != query_exec[query]]
+            # Cache only by values that can alter the filtered pool. Cross-dataset manifests with
+            # unknown subject relation reuse one pool for every query; cross-subject same-dataset
+            # manifests depend on subject but not execution because the whole query subject is
+            # already excluded.
+            subject_key = query_subjects[query] if same_subject is not None else None
+            execution_key = (
+                query_exec[query]
+                if (not allow_same_execution and query_stream.dataset == support_stream.dataset
+                    and same_subject is not False)
+                else None
+            )
+            pool_key = (label, subject_key, execution_key, same_subject)
+            pool = filtered_pools.get(pool_key)
+            if pool is None:
+                rows = rows_by_label[label]
+                keep = np.ones(len(rows), dtype=bool)
+                if same_subject is not None and len(rows):
+                    same = subject_by_label[label] == query_subjects[query]
+                    keep &= same if same_subject else ~same
+                # Execution identifiers identify rows only within one dataset. Across independent
+                # corpora equal local strings do not imply a shared physical capture.
+                if (not allow_same_execution and query_stream.dataset == support_stream.dataset
+                        and len(rows)):
+                    keep &= execution_by_label[label] != query_exec[query]
+                pool = rows[keep]
+                filtered_pools[pool_key] = pool
             if len(pool) < k:
                 possible = False
                 break

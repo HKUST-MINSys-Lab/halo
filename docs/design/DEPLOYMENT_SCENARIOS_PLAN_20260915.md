@@ -70,22 +70,22 @@ asks the system to recognise a longer list.*
   (1b) true label among the **unsupported**. Coverage fraction 50 % of candidates, drawn with the
   same stable hashing the manifests use; the hidden set is recorded in the manifest so every model
   sees the same one.
-- **Fair baseline readout:** unsupported candidates cannot be scored by 1-NN. Give every model with a
-  text path (HALO, UniMTS, HARNet-bridge) a fixed **untrained hybrid**: per query, z-score the text
-  scores over the candidate set and the 1-NN similarities over the supported subset, then take the
-  arg-max over the union. Models without a text path (LiMU-BERT-X, NormWear, Mantis) are scored on
-  1-NN over supported candidates only and their 1b cell is reported as "cannot attempt", not as a
-  number.
+- **Fair baseline readout:** unsupported candidates cannot be scored by 1-NN. Every model reuses its
+  protocol-declared zero-support route (released native candidate scores, or training-bank 1-NN plus
+  ConSE) and combines it with cosine 1-NN through fixed **equal-weight normalized fusion**. Per
+  query, z-score semantic scores over the full candidate set, z-score class-wise maximum cosine
+  similarities over the supported subset, add with weights `1 + 1`, and take one argmax. A model
+  with neither a native route nor the configured bridge is `cannot_attempt`, never scored as zero.
 - **Report:** macro F1 for 1a, 1b, and the union, per k, per dataset, plus the 8 s dataset-balanced
   aggregate; also the confusion mass flowing from unsupported-truth queries into supported
   candidates (the "false enrolment pull").
 - **Prediction and mechanism:** large lead on 1b and a smaller one on the union. HALO's head was
   trained with the true label absent from the support half the time (`p_gt_present=0.5`) and with
   candidate supports randomly hidden; its λ-weighted text term is calibrated against its own vote.
-  No baseline has a trained rule for mixing text and support evidence; the hybrid is the fairest
-  untrained one. If the lead is small here, the "partial-information curriculum" clause is not a
+  No baseline has a trained rule for mixing text and support evidence; equal-weight normalized
+  fusion is the shared untrained control. If the lead is small here, the "partial-information curriculum" clause is not a
   contribution.
-- **Cost:** manifest variant + hybrid readout, ~1 day build; evaluation ~2 h all models.
+- **Cost:** manifest variant + equal-weight normalized fusion, ~1 day build; evaluation ~2 h all models.
 
 ### Scenario 2 — Enrol on one body site, deploy on another
 **Severity `0/0/1–2/0`.** *The user enrolled with the phone in a pocket; today it is in a belt
@@ -231,7 +231,7 @@ half of the exercises it recognises; the rest are recognised from their names.*
 
 | # | scenario | L | S | P | C | new build | predicted lead |
 |---|---|:-:|:-:|:-:|:-:|---|---|
-| 1 | enrol some, ask about all | 0 | 2 | 0 | 0 | hidden-support manifests; hybrid readout | **large** (curriculum) |
+| 1 | enrol some, ask about all | 0 | 2 | 0 | 0 | hidden-support manifests; equal-weight normalized fusion | **large** (curriculum) |
 | 2 | cross-placement enrolment | 0 | 0 | 1–2 | 0 | A/B stream manifests; 5 sites to grid | uncertain |
 | 3 | public-corpus enrolment | 0 | 0 | 3 | 0* | cross-dataset manifests; label intersection | moderate (frontend, centring) |
 | 4 | missing modality | 0 | 0 | 0 | 1 | gyro-drop flag | moderate (sensor-as-token) |

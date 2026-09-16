@@ -3,6 +3,11 @@
 This is the promoted result record for the current support-conditioned HAR design. Retired
 future-JEPA variants are archived separately and are not mixed into this table.
 
+> **Protocol boundary (2026-09-16):** historical tables retain their original artifacts but must
+> not be extended with new checkpoints. Current runs use `deployment-scenarios-v3-20260916` and
+> `sealed-manifest-v2-20260916`, with the restored NumPy manifest draw, corrected k=0 filtering,
+> and current sampler. Matched comparisons must re-score every checkpoint under one protocol.
+
 ## Deployment-scenario diagnostics - 2026-09-16
 
 The Stage A acquisition/enrollment curriculum is reported separately from the ordinary sealed
@@ -59,6 +64,137 @@ shared 1-NN readout; at `k=0` each model uses its disclosed zero-support path.
 | 16 s | LiMU-BERT-X / 1-NN | - | 51.0 | 67.2 | 74.0 | 91.7 |
 | 16 s | HARNet / 1-NN | 36.9 | 47.8 | 60.2 | 66.0 | 86.3 |
 | 16 s | NormWear / 1-NN | - | 23.1 | 31.1 | 38.3 | 54.3 |
+
+### Per-dataset decomposition
+
+These are the existing single-device rows underlying the aggregate table above, not a new
+evaluation. Where a dataset has multiple eligible placements, its entry is the mean across those
+placements, matching the aggregate calculation. `—` means that the cell was unavailable. These
+2026-09-14 baseline rows predate the 2026-09-16 baseline-fidelity repairs and will be replaced after
+the next full baseline evaluation; they are retained here only to decompose the reported aggregate.
+
+#### 4-second windows: macro F1
+
+| dataset | model / readout | k=0 | k=1 | k=8 | k=32 | k=128 |
+|---|---|---:|---:|---:|---:|---:|
+| MotionSense | HALO / classifier | 67.8 | 71.5 | 79.2 | 82.4 | 83.5 |
+| MotionSense | HALO / centred neighbours | — | 66.0 | 79.7 | 85.6 | 88.7 |
+| MotionSense | UniMTS / 1-NN | 38.0 | 64.5 | 80.3 | 85.2 | 89.6 |
+| MotionSense | LiMU-BERT-X / 1-NN | 40.9 | 53.1 | 74.6 | 81.6 | 86.6 |
+| MotionSense | HARNet / 1-NN | 46.7 | 49.4 | 62.3 | 70.4 | 75.7 |
+| MotionSense | NormWear / 1-NN | 6.3 | 23.9 | 31.0 | 37.6 | 44.1 |
+| RealWorld | HALO / classifier | 43.7 | 50.7 | 62.9 | 64.4 | 63.5 |
+| RealWorld | HALO / centred neighbours | — | 48.8 | 65.2 | 69.6 | 71.7 |
+| RealWorld | UniMTS / 1-NN | 29.2 | 49.4 | 62.4 | 64.4 | 67.0 |
+| RealWorld | LiMU-BERT-X / 1-NN | — | — | — | — | — |
+| RealWorld | HARNet / 1-NN | 25.4 | 33.4 | 43.5 | 48.6 | 51.9 |
+| RealWorld | NormWear / 1-NN | 3.5 | 21.2 | 26.7 | 30.1 | 32.4 |
+| Shoaib | HALO / classifier | 67.7 | 79.0 | 85.5 | 86.3 | 87.0 |
+| Shoaib | HALO / centred neighbours | — | 73.5 | 85.9 | 88.5 | 89.5 |
+| Shoaib | UniMTS / 1-NN | 36.8 | 71.6 | 86.1 | 89.5 | 91.4 |
+| Shoaib | LiMU-BERT-X / 1-NN | 28.6 | 64.5 | 79.8 | 82.3 | 83.2 |
+| Shoaib | HARNet / 1-NN | 48.0 | 54.3 | 69.1 | 75.0 | 80.5 |
+| Shoaib | NormWear / 1-NN | 3.6 | 23.6 | 34.1 | 43.0 | 50.4 |
+| InclusiveHAR | HALO / classifier | 36.5 | 34.8 | 37.6 | 36.1 | 36.4 |
+| InclusiveHAR | HALO / centred neighbours | — | 31.0 | 36.4 | 37.6 | 38.5 |
+| InclusiveHAR | UniMTS / 1-NN | 25.3 | 33.8 | 41.9 | 40.6 | 43.0 |
+| InclusiveHAR | LiMU-BERT-X / 1-NN | 27.8 | 22.8 | 27.2 | 28.6 | 28.1 |
+| InclusiveHAR | HARNet / 1-NN | 25.0 | 30.2 | 29.5 | 28.7 | 30.2 |
+| InclusiveHAR | NormWear / 1-NN | 4.8 | 23.3 | 25.4 | 24.2 | 27.4 |
+| USC-HAD | HALO / classifier | 34.8 | 50.7 | 57.8 | 59.8 | 60.4 |
+| USC-HAD | HALO / centred neighbours | — | 50.4 | 64.7 | 70.1 | 72.9 |
+| USC-HAD | UniMTS / 1-NN | 24.9 | 40.8 | 55.3 | 62.5 | 69.2 |
+| USC-HAD | LiMU-BERT-X / 1-NN | 12.8 | 44.6 | 64.9 | 74.3 | 79.7 |
+| USC-HAD | HARNet / 1-NN | 23.6 | 29.9 | 42.3 | 49.8 | 57.2 |
+| USC-HAD | NormWear / 1-NN | 1.4 | 15.0 | 21.9 | 26.4 | 31.0 |
+| UT-Complex | HALO / classifier | 38.1 | 58.8 | 70.7 | 73.6 | 74.5 |
+| UT-Complex | HALO / centred neighbours | — | 56.1 | 72.0 | 77.9 | 79.7 |
+| UT-Complex | UniMTS / 1-NN | 21.8 | 42.6 | 55.8 | 60.9 | 65.2 |
+| UT-Complex | LiMU-BERT-X / 1-NN | 9.6 | 48.9 | 65.5 | 72.5 | 76.2 |
+| UT-Complex | HARNet / 1-NN | 34.0 | 39.9 | 53.4 | 60.3 | 64.3 |
+| UT-Complex | NormWear / 1-NN | 1.1 | 18.2 | 28.9 | 36.1 | 41.6 |
+
+#### 8-second windows: macro F1
+
+| dataset | model / readout | k=0 | k=1 | k=8 | k=32 | k=128 |
+|---|---|---:|---:|---:|---:|---:|
+| MotionSense | HALO / classifier | 69.9 | 74.6 | 84.1 | 85.2 | 86.2 |
+| MotionSense | HALO / centred neighbours | — | 70.3 | 85.6 | 90.1 | 91.8 |
+| MotionSense | UniMTS / 1-NN | 36.1 | 67.6 | 83.0 | 88.8 | 90.7 |
+| MotionSense | LiMU-BERT-X / 1-NN | 43.1 | 53.3 | 78.8 | 85.9 | 89.3 |
+| MotionSense | HARNet / 1-NN | 51.7 | 58.4 | 71.4 | 78.5 | 82.8 |
+| MotionSense | NormWear / 1-NN | 6.2 | 20.9 | 31.3 | 40.9 | 48.5 |
+| RealWorld | HALO / classifier | 44.3 | 51.7 | 65.0 | 67.0 | 73.5 |
+| RealWorld | HALO / centred neighbours | — | 51.1 | 68.8 | 72.1 | 80.6 |
+| RealWorld | UniMTS / 1-NN | 30.5 | 51.3 | 66.0 | 68.4 | 77.2 |
+| RealWorld | LiMU-BERT-X / 1-NN | — | — | — | — | — |
+| RealWorld | HARNet / 1-NN | 28.3 | 37.7 | 48.5 | 53.4 | 61.9 |
+| RealWorld | NormWear / 1-NN | 3.6 | 18.9 | 25.0 | 28.7 | 32.3 |
+| Shoaib | HALO / classifier | 68.7 | 82.6 | 88.1 | 89.4 | 89.6 |
+| Shoaib | HALO / centred neighbours | — | 78.6 | 89.7 | 91.6 | 92.1 |
+| Shoaib | UniMTS / 1-NN | 37.6 | 73.8 | 88.9 | 91.8 | 93.5 |
+| Shoaib | LiMU-BERT-X / 1-NN | 28.9 | 69.7 | 85.5 | 87.5 | 87.2 |
+| Shoaib | HARNet / 1-NN | 46.3 | 61.3 | 76.6 | 82.1 | 86.6 |
+| Shoaib | NormWear / 1-NN | 3.6 | 25.3 | 38.4 | 47.8 | 54.3 |
+| InclusiveHAR | HALO / classifier | 36.6 | 35.2 | 37.6 | 36.8 | 36.5 |
+| InclusiveHAR | HALO / centred neighbours | — | 32.2 | 38.7 | 41.0 | 40.9 |
+| InclusiveHAR | UniMTS / 1-NN | 31.6 | 32.1 | 37.6 | 39.1 | 41.3 |
+| InclusiveHAR | LiMU-BERT-X / 1-NN | 28.0 | 23.8 | 27.0 | 27.9 | 27.1 |
+| InclusiveHAR | HARNet / 1-NN | 26.2 | 28.6 | 30.3 | 30.5 | 29.5 |
+| InclusiveHAR | NormWear / 1-NN | 4.8 | 23.5 | 23.4 | 23.6 | 26.0 |
+| USC-HAD | HALO / classifier | 35.4 | 53.1 | 59.3 | 61.5 | 62.3 |
+| USC-HAD | HALO / centred neighbours | — | 53.9 | 68.2 | 73.7 | 75.1 |
+| USC-HAD | UniMTS / 1-NN | 26.5 | 38.9 | 55.2 | 66.7 | 74.8 |
+| USC-HAD | LiMU-BERT-X / 1-NN | 12.6 | 45.4 | 66.5 | 77.7 | 82.0 |
+| USC-HAD | HARNet / 1-NN | 27.4 | 33.1 | 48.7 | 58.3 | 64.4 |
+| USC-HAD | NormWear / 1-NN | 1.4 | 16.2 | 24.7 | 28.9 | 35.3 |
+| UT-Complex | HALO / classifier | 40.8 | 65.5 | 76.7 | 79.4 | 79.8 |
+| UT-Complex | HALO / centred neighbours | — | 63.9 | 78.4 | 83.9 | 84.7 |
+| UT-Complex | UniMTS / 1-NN | 21.8 | 50.3 | 65.5 | 68.9 | 73.1 |
+| UT-Complex | LiMU-BERT-X / 1-NN | 9.5 | 53.7 | 71.6 | 78.2 | 81.7 |
+| UT-Complex | HARNet / 1-NN | 33.6 | 47.5 | 63.2 | 69.1 | 72.6 |
+| UT-Complex | NormWear / 1-NN | 1.1 | 23.5 | 33.5 | 39.3 | 44.9 |
+
+#### 16-second windows: macro F1
+
+| dataset | model / readout | k=0 | k=1 | k=8 | k=32 | k=128 |
+|---|---|---:|---:|---:|---:|---:|
+| MotionSense | HALO / classifier | 70.0 | 76.3 | 83.7 | 86.1 | 87.3 |
+| MotionSense | HALO / centred neighbours | — | 72.6 | 85.8 | 90.6 | 92.2 |
+| MotionSense | UniMTS / 1-NN | 43.3 | 68.4 | 84.1 | 87.4 | 90.6 |
+| MotionSense | LiMU-BERT-X / 1-NN | 42.7 | 56.0 | 78.4 | 87.6 | 91.7 |
+| MotionSense | HARNet / 1-NN | 50.4 | 61.3 | 75.6 | 83.9 | 86.3 |
+| MotionSense | NormWear / 1-NN | 6.1 | 24.8 | 32.6 | 43.6 | 54.3 |
+| RealWorld | HALO / classifier | 44.3 | 54.2 | 67.0 | 67.3 | — |
+| RealWorld | HALO / centred neighbours | — | 54.0 | 70.7 | 70.1 | — |
+| RealWorld | UniMTS / 1-NN | 31.2 | 53.5 | 67.6 | 67.3 | — |
+| RealWorld | LiMU-BERT-X / 1-NN | — | — | — | — | — |
+| RealWorld | HARNet / 1-NN | 29.3 | 41.4 | 52.1 | 56.3 | — |
+| RealWorld | NormWear / 1-NN | 3.6 | 19.2 | 26.0 | 30.3 | — |
+| Shoaib | HALO / classifier | 68.5 | 83.9 | 89.4 | 90.6 | — |
+| Shoaib | HALO / centred neighbours | — | 80.9 | 91.4 | 92.8 | — |
+| Shoaib | UniMTS / 1-NN | 38.2 | 72.9 | 88.7 | 92.1 | — |
+| Shoaib | LiMU-BERT-X / 1-NN | 28.8 | 69.8 | 86.3 | 89.1 | — |
+| Shoaib | HARNet / 1-NN | 48.8 | 65.6 | 81.6 | 87.0 | — |
+| Shoaib | NormWear / 1-NN | 3.6 | 26.4 | 40.9 | 50.5 | — |
+| InclusiveHAR | HALO / classifier | 36.8 | 38.0 | 35.7 | 36.0 | — |
+| InclusiveHAR | HALO / centred neighbours | — | 34.2 | 37.8 | 40.0 | — |
+| InclusiveHAR | UniMTS / 1-NN | 26.7 | 34.7 | 36.3 | 40.7 | — |
+| InclusiveHAR | LiMU-BERT-X / 1-NN | 28.0 | 24.5 | 27.4 | 31.3 | — |
+| InclusiveHAR | HARNet / 1-NN | 27.6 | 28.7 | 29.7 | 27.5 | — |
+| InclusiveHAR | NormWear / 1-NN | 4.9 | 24.3 | 23.4 | 24.8 | — |
+| USC-HAD | HALO / classifier | 35.8 | 53.6 | 60.1 | 64.2 | — |
+| USC-HAD | HALO / centred neighbours | — | 56.6 | 69.6 | 75.8 | — |
+| USC-HAD | UniMTS / 1-NN | 25.5 | 39.2 | 57.4 | 68.4 | — |
+| USC-HAD | LiMU-BERT-X / 1-NN | 12.8 | 45.6 | 67.5 | 78.8 | — |
+| USC-HAD | HARNet / 1-NN | 28.3 | 34.5 | 52.4 | 64.3 | — |
+| USC-HAD | NormWear / 1-NN | 2.2 | 17.6 | 25.5 | 33.8 | — |
+| UT-Complex | HALO / classifier | 39.9 | 74.8 | 81.9 | 84.2 | — |
+| UT-Complex | HALO / centred neighbours | — | 72.2 | 85.1 | 88.1 | — |
+| UT-Complex | UniMTS / 1-NN | 18.8 | 57.1 | 71.8 | 76.3 | — |
+| UT-Complex | LiMU-BERT-X / 1-NN | 9.1 | 59.3 | 76.4 | 83.5 | — |
+| UT-Complex | HARNet / 1-NN | 37.2 | 55.2 | 70.1 | 76.7 | — |
+| UT-Complex | NormWear / 1-NN | 1.1 | 26.4 | 37.9 | 46.9 | — |
 
 ### Reading this table
 

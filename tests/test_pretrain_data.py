@@ -186,6 +186,29 @@ def test_two_views_share_every_acquisition_configuration(index):
         assert item["sensor_target_texts"] == other["sensor_target_texts"]
 
 
+def test_item_with_rng_replays_acquisition_perturbations(index):
+    from data.scripts.augmentations import AugmentationConfig
+
+    key = next(key for key in index.train if all(index.refs[key.stream_i].mask))
+    config = AugmentationConfig.phase_a(rate_p=1.0, channel_dropout_p=1.0)
+    dataset = PretrainDataset(index, [key], augment=True, augmentation_config=config)
+    first = dataset.item_with_rng(0, np.random.default_rng(91))
+    second = dataset.item_with_rng(0, np.random.default_rng(91))
+    assert torch.equal(first["data"], second["data"])
+    assert first["rate"] == second["rate"]
+    assert first["augmentations"] == second["augmentations"]
+    assert first["sensor_texts"] == second["sensor_texts"]
+
+
+def test_augmentation_replay_does_not_consume_structural_rng_without_peers(index):
+    key = index.train[0]
+    dataset = PretrainDataset(index, [key], augment=False, multi_device_probability=0.0)
+    actual = np.random.default_rng(314)
+    expected = np.random.default_rng(314)
+    dataset.item_with_rng(0, actual)
+    assert actual.integers(0, 2**31) == expected.integers(0, 2**31)
+
+
 def test_rotation_pairing_is_explicit(index):
     from data.scripts.augmentations import AugmentationConfig
 

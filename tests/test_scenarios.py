@@ -92,6 +92,12 @@ def test_resampling_to_the_same_rate_is_an_identity():
     assert derive_resampled(stream, 50.0) is stream
 
 
+def test_resampling_preserves_known_physical_source_rate_below_grid_rate():
+    stream = make_stream(dataset="xrf_v2", stream="airpods_ear", rate_hz=50.0)
+    derived = derive_resampled(stream, 100.0)
+    assert derived.effective_source_rate_hz == 25.0
+
+
 def test_resampling_preserves_each_window_duration_and_updates_lengths():
     stream = make_stream(rate_hz=50.0, window_len=100)
     stream.lengths = np.asarray([100, 75, 50, 100, 80, 60, 100, 90, 70, 100, 85, 65])

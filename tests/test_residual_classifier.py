@@ -5,7 +5,9 @@ from model.blocks import AttentionSpec
 from model.support.residual_classifier import ResidualClassifierConfig, ResidualSupportClassifier
 from training.support_classifier.neighbors import differentiable_neighbor_logits
 from training.support_classifier.sampling import Episode
-from training.support_classifier.train import episode_loss, fit_text_projection
+from training.support_classifier.train import (
+    episode_loss, fit_text_projection, weighted_present_metrics,
+)
 from training.support_classifier.encoding import build_random_encoder
 from training.tokenizer.eval_transfer import build_encoder
 
@@ -105,6 +107,33 @@ def test_mixed_regime_loss_is_invariant_to_query_order():
     assert torch.equal(first, second)
 
 
+def test_validation_telemetry_aggregates_conditional_scenarios_only_where_present():
+    got = weighted_present_metrics(
+        [{"always": 1.0, "scenario": 2.0}, {"always": 3.0}], [2, 6],
+    )
+    assert got == {"always": 2.5, "scenario": 2.0}
+
+
+def test_validation_telemetry_weights_scenarios_by_selected_rows():
+    got = weighted_present_metrics([
+        {"scenario/enrollment/partial/fraction": 0.1,
+         "scenario/enrollment/partial/loss": 0.0},
+        {"scenario/enrollment/partial/fraction": 0.9,
+         "scenario/enrollment/partial/loss": 1.0},
+    ], [10, 10])
+    assert got["scenario/enrollment/partial/loss"] == pytest.approx(0.9)
+
+
+def test_validation_telemetry_keeps_conditional_gate_metrics_with_explicit_fraction():
+    got = weighted_present_metrics([
+        {"scenario/support_count/0/fraction": 0.25,
+         "scenario/support_count/0/semantic_weight": 0.2},
+        {"scenario/support_count/0/fraction": 0.75,
+         "scenario/support_count/0/semantic_weight": 0.6},
+    ], [8, 8])
+    assert got["scenario/support_count/0/semantic_weight"] == pytest.approx(0.5)
+
+
 def test_mixed_support_backward_reaches_every_trainable_parameter():
     values = _episode()
     values["support_mask"][:, values["support_bound"][0] == 1] = False
@@ -123,6 +152,41 @@ def test_mixed_support_backward_reaches_every_trainable_parameter():
     assert head.r_support_head.weight.grad.abs().sum() > 0
     assert head.r_candidate_head.weight.grad.abs().sum() > 0
     assert head.p_text.weight.grad.abs().sum() > 0
+
+
+def test_adaptive_text_gate_is_finite_evidence_dependent_and_fully_trainable():
+    values = _episode(k=6, c=3)
+    values["candidate_mask"] = values["candidate_mask"].clone()
+    values["candidate_mask"][1, 2] = False
+    values["support_mask"] = values["support_mask"].clone()
+    values["support_mask"][0, 3:] = False  # exact k=1 exercises the zero-variance boundary
+    values["support_mask"][1, values["support_bound"][1] == 2] = False
+    head = ResidualSupportClassifier(
+        AttentionSpec(d_model=12, n_heads=3, dropout=0),
+        ResidualClassifierConfig(
+            centring="none", n_layers=1, adaptive_text_gate=True, text_gate_hidden=8,
+        ),
+    )
+    first = head(**values)
+    assert torch.isfinite(first["logits"]).all()
+    assert torch.isfinite(first["lambda"]).all()
+    assert torch.isfinite(first["text_gate_features"]).all()
+    assert (first["lambda"][values["candidate_mask"]] >= 0).all()
+
+    changed = {key: value.clone() if torch.is_tensor(value) else value
+               for key, value in values.items()}
+    changed["support_feature"][:, 0] = changed["query_feature"]
+    second = head(**changed)
+    assert not torch.equal(first["lambda"], second["lambda"])
+
+    torch.nn.functional.cross_entropy(
+        first["logits"], torch.tensor([0, 1]),
+    ).backward()
+    for name, parameter in head.named_parameters():
+        if name.startswith("text_gate"):
+            assert parameter.grad is not None, name
+            assert torch.isfinite(parameter.grad).all(), name
+            assert parameter.grad.abs().sum() > 0, name
 
 
 def test_text_bridge_uses_the_same_raw_query_with_or_without_residual_trunk():
@@ -288,3 +352,20 @@ def test_regime_split_routes_and_shares_nothing():
     moved = head(**values)["logits"]
     assert not torch.equal(moved[1], got[1])      # zero head owns the zero row
     assert torch.equal(moved[:1], got[:1])        # and cannot touch the enrolled row
+
+
+def test_regime_split_text_off_with_adaptive_gate_does_not_copy_none():
+    from model.support.residual_classifier import build_support_classifier
+    values = _episode()
+    values["support_mask"] = values["support_mask"].clone()
+    values["support_mask"][1] = False
+    head = build_support_classifier(
+        AttentionSpec(d_model=12, n_heads=3, dropout=0),
+        ResidualClassifierConfig(
+            centring="none", n_layers=1, regime_split=True,
+            text_term_enabled=False, adaptive_text_gate=True,
+        ),
+    )
+    result = head(**values)
+    assert torch.isfinite(result["logits"]).all()
+    assert result["text_gate_features"] is None

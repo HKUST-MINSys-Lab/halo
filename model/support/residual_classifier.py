@@ -39,6 +39,8 @@ class ResidualClassifierConfig:
     # a different axis; the two flags compose.
     regime_split: bool = False
     normalized_token_composition: bool = True
+    adaptive_text_gate: bool = False
+    text_gate_hidden: int = 16
 
     def __post_init__(self) -> None:
         if self.text_dim < 1 or self.n_layers < 0 or self.max_candidates < 2 or self.max_supports < 0:
@@ -52,6 +54,8 @@ class ResidualClassifierConfig:
             )
         if not self.lambda_buckets or self.lambda_buckets[0] != 0 or tuple(sorted(set(self.lambda_buckets))) != self.lambda_buckets:
             raise ValueError("lambda_buckets must be unique, sorted, and start with zero")
+        if self.text_gate_hidden < 1:
+            raise ValueError("text_gate_hidden must be positive")
 
 
 class ResidualSupportClassifier(nn.Module):
@@ -87,8 +91,25 @@ class ResidualSupportClassifier(nn.Module):
         nn.init.zeros_(self.r_candidate_head.weight); nn.init.zeros_(self.r_candidate_head.bias)
         self.p_text = nn.Linear(d, self.cfg.text_dim)
         self.lambda_table = nn.Parameter(torch.zeros(len(self.cfg.lambda_buckets)))
-        with torch.no_grad():
-            self.lambda_table[0] = 1.0
+        if self.cfg.adaptive_text_gate:
+            # Positive base weights under the softplus parameterization. Enrolled candidates begin
+            # arbitrarily close to the historical zero text weight without creating a dead path.
+            desired = torch.full_like(self.lambda_table, 1e-3)
+            desired[0] = 1.0
+            with torch.no_grad():
+                self.lambda_table.copy_(torch.log(torch.expm1(desired)))
+            self.text_gate_norm = nn.LayerNorm(6)
+            self.text_gate = nn.Sequential(
+                nn.Linear(6, self.cfg.text_gate_hidden), nn.SiLU(),
+                nn.Linear(self.cfg.text_gate_hidden, 1),
+            )
+            # A tiny nonzero output weight lets every gate layer receive gradient on step one while
+            # keeping initialization within 1e-3 of the support-count prior.
+            nn.init.normal_(self.text_gate[-1].weight, std=1e-3)
+            nn.init.zeros_(self.text_gate[-1].bias)
+        else:
+            with torch.no_grad():
+                self.lambda_table[0] = 1.0
         # Keep persistent-buffer shape invariant so strict checkpoint restoration works. NaNs mark
         # an unfitted mean and make accidental corpus centring fail loudly before any scoring.
         self.register_buffer("corpus_mean", torch.full((d,), float("nan")), persistent=True)
@@ -156,6 +177,71 @@ class ResidualSupportClassifier(nn.Module):
             bucket = torch.where(k_c >= lower, torch.full_like(bucket, index), bucket)
         return self.lambda_table[bucket]
 
+    def _adaptive_lambda(
+        self,
+        *,
+        k_c: torch.Tensor,
+        query: torch.Tensor,
+        support: torch.Tensor,
+        support_bound: torch.Tensor,
+        support_mask: torch.Tensor,
+        candidate_mask: torch.Tensor,
+        metric_logits: torch.Tensor,
+        text_cosine: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Candidate-local semantic weight from observed sensor evidence, never label identity."""
+        b, c = k_c.shape
+        bucket = torch.zeros_like(k_c, dtype=torch.long)
+        for index, lower in enumerate(self.cfg.lambda_buckets[1:], start=1):
+            bucket = torch.where(k_c >= lower, torch.full_like(bucket, index), bucket)
+
+        sums = k_c.new_zeros((b, c))
+        squares = k_c.new_zeros((b, c))
+        strongest = k_c.new_full((b, c), -1.0)
+        if support.shape[1]:
+            similarity = torch.einsum(
+                "bd,bkd->bk", F.normalize(query, dim=-1), F.normalize(support, dim=-1),
+            ).float()
+            slots = support_bound.clamp_min(0)
+            valid_similarity = similarity * support_mask.to(similarity.dtype)
+            sums.scatter_add_(1, slots, valid_similarity)
+            squares.scatter_add_(1, slots, valid_similarity.square())
+            strongest.scatter_reduce_(
+                1, slots,
+                similarity.masked_fill(~support_mask, -1.0),
+                reduce="amax", include_self=True,
+            )
+        denom = k_c.clamp_min(1.0)
+        mean = sums / denom
+        # k=1 has exactly zero variance. sqrt'(0) is infinite, so use a small FP32 floor rather
+        # than letting ordinary one-shot enrollment create NaN gradients in the gate.
+        spread = (squares / denom - mean.square()).clamp_min(0.0).add(1e-6).sqrt()
+        strongest = torch.where(k_c.gt(0), strongest, torch.zeros_like(strongest))
+
+        valid_metric = metric_logits.masked_fill(~candidate_mask, float("-inf"))
+        top_values, top_slots = valid_metric.topk(k=min(2, c), dim=1)
+        if c == 1:  # Defensive; config and sampler both require at least two candidates.
+            competitor = top_values[:, :1].expand_as(metric_logits)
+        else:
+            candidate = torch.arange(c, device=metric_logits.device).unsqueeze(0)
+            competitor = torch.where(
+                top_slots[:, :1].eq(candidate), top_values[:, 1:2], top_values[:, :1],
+            )
+        margin = torch.where(
+            candidate_mask, torch.tanh(metric_logits - competitor), torch.zeros_like(metric_logits),
+        )
+        sensor_score = 2.0 * torch.softmax(valid_metric.float(), dim=1).to(text_cosine) - 1.0
+        disagreement = torch.where(
+            candidate_mask, text_cosine - sensor_score, torch.zeros_like(text_cosine),
+        )
+        features = torch.stack((
+            torch.log1p(k_c), strongest, mean, spread, margin, disagreement,
+        ), dim=-1)
+        features = features.masked_fill(~candidate_mask.unsqueeze(-1), 0.0)
+        residual = self.text_gate(self.text_gate_norm(features)).squeeze(-1)
+        value = F.softplus(self.lambda_table[bucket] + residual)
+        return value.masked_fill(~candidate_mask, 0.0), features
+
     def forward(self, *, query_feature: torch.Tensor, support_feature: torch.Tensor,
                 support_label_text: torch.Tensor, support_bound: torch.Tensor,
                 support_mask: torch.Tensor, support_pair_slot: torch.Tensor,
@@ -221,13 +307,28 @@ class ResidualSupportClassifier(nn.Module):
             weight, metric_logits = base_weight, base_logits
         # P_text is fitted in closed form on raw pooled encoder features. Keep that exact input at
         # initialization; the attention trunk contributes only through the scalar residual heads.
-        text_score = torch.einsum("bd,bcd->bc", F.normalize(self.p_text(query_feature).float(), dim=-1),
-                                  F.normalize(candidate_text.float(), dim=-1)) / self.cfg.text_temperature
-        lam = self._lambda(k_c) if self.cfg.text_term_enabled else torch.zeros_like(k_c)
+        text_cosine = torch.einsum(
+            "bd,bcd->bc", F.normalize(self.p_text(query_feature).float(), dim=-1),
+            F.normalize(candidate_text.float(), dim=-1),
+        )
+        text_score = text_cosine / self.cfg.text_temperature
+        uniform_log_prior = -candidate_mask.sum(dim=1, keepdim=True).to(metric_logits.dtype).log()
+        gate_features = None
+        if self.cfg.text_term_enabled and self.cfg.adaptive_text_gate:
+            # A candidate with no sensor evidence is represented by the same uninformative prior
+            # used by final scoring. Giving the gate a raw zero logit here would make missing
+            # candidates appear artificially stronger whenever enrolled candidates are negative.
+            gate_metric = torch.where(k_c.eq(0), uniform_log_prior, metric_logits)
+            lam, gate_features = self._adaptive_lambda(
+                k_c=k_c, query=q, support=s, support_bound=support_bound,
+                support_mask=support_mask, candidate_mask=candidate_mask,
+                metric_logits=gate_metric, text_cosine=text_cosine,
+            )
+        else:
+            lam = self._lambda(k_c) if self.cfg.text_term_enabled else torch.zeros_like(k_c)
         # A missing candidate has no neighbour probability, not a logit of zero.  Its reference
         # is the uniform prior of an uninformative complete vote.  Thus text competes with a
         # defined prior rather than receiving an arbitrary numerical advantage.
-        uniform_log_prior = -candidate_mask.sum(dim=1, keepdim=True).to(metric_logits.dtype).log()
         base_part = torch.where(k_c.eq(0), uniform_log_prior, base_logits)
         metric_part = torch.where(k_c.eq(0), uniform_log_prior, metric_logits)
         text_part = lam * text_score
@@ -236,10 +337,12 @@ class ResidualSupportClassifier(nn.Module):
                 "k_c": k_c, "r_support": r_support, "r_candidate": r_candidate,
                 "text_score": text_score, "lambda": lam,
                 "base_part": base_part, "metric_part": metric_part,
-                "text_part": text_part}
+                "text_part": text_part, "text_gate_features": gate_features}
 
     def telemetry(self) -> dict[str, float]:
-        return {f"classifier/lambda_{bucket}": float(self.lambda_table[index].detach())
+        values = F.softplus(self.lambda_table.detach()) if self.cfg.adaptive_text_gate \
+            else self.lambda_table.detach()
+        return {f"classifier/lambda_{bucket}": float(values[index])
                 for index, bucket in enumerate(self.cfg.lambda_buckets)}
 
 
@@ -287,7 +390,10 @@ class RegimeSplitSupportClassifier(nn.Module):
                "lambda": query_feature.new_zeros((b, c)),
                "base_part": query_feature.new_zeros((b, c)),
                "metric_part": query_feature.new_zeros((b, c)),
-               "text_part": query_feature.new_zeros((b, c))}
+               "text_part": query_feature.new_zeros((b, c)),
+               "text_gate_features": (query_feature.new_zeros((b, c, 6))
+                                      if self.cfg.text_term_enabled and self.cfg.adaptive_text_gate
+                                      else None)}
         for head, rows in ((self.few_head, torch.nonzero(enrolled).flatten()),
                            (self.zero_head, torch.nonzero(~enrolled).flatten())):
             if not len(rows):
@@ -301,7 +407,8 @@ class RegimeSplitSupportClassifier(nn.Module):
                    else value for name, value in kwargs.items()},
             )
             for name, value in out.items():
-                value.index_copy_(0, rows, part[name].to(value.dtype))
+                if value is not None:
+                    value.index_copy_(0, rows, part[name].to(value.dtype))
         return out
 
     def telemetry(self) -> dict[str, float]:

@@ -8,6 +8,8 @@ belong.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -19,6 +21,8 @@ from data.scripts.curate.compatibility import (
 from training.support_classifier.sampling import (
     Recording,
     SupportCorpus,
+    _keys_for,
+    _eligible_deployment_datasets,
     draw_batch,
     draw_episode,
 )
@@ -70,6 +74,22 @@ def _corpus(
 
 def _rng(seed=0):
     return np.random.default_rng(seed)
+
+
+def _same_dataset_multiplacement_corpus(**kwargs) -> SupportCorpus:
+    """Synthetic placements from one corpus, matching real multi-placement dataset structure."""
+    source = _corpus(**kwargs)
+    recordings = [replace(recording, dataset="same_dataset") for recording in source.recordings]
+    corpus = SupportCorpus(
+        recordings=recordings,
+        keys=source.keys,
+        stream_names=[("same_dataset", stream) for _, stream in source.stream_names],
+    )
+    for index, recording in enumerate(recordings):
+        key = corpus.keys[recording.stream_index]
+        corpus.by_key.setdefault(key, []).append(index)
+        corpus.by_key_label.setdefault((key, recording.label), []).append(index)
+    return corpus
 
 
 def test_direct_semantic_episode_needs_no_background_or_support_subject():
@@ -127,6 +147,168 @@ def test_deployment_candidate_masking_removes_only_the_selected_support_rows():
         assert set(episode.support_candidate) == {episode.gt_slot}
         assert not episode.is_zero_shot
     assert telemetry["sampler/mean_k_per_candidate"] == pytest.approx(0.5)
+
+
+def test_curriculum_cross_dataset_support_comes_only_from_other_datasets():
+    corpus = _corpus(
+        subjects_per_label=8, windows_per_subject=2,
+        sites=("left_wrist", "left_wrist"),
+    )
+    episodes, telemetry = draw_batch(
+        corpus, _rng(920), batch_size=2, deployment_matched=True,
+        enrollment_k=(1, 2), queries_per_support_set=3, windows_per_execution=1,
+        p_gt_present=1.0, label_subset=(2, 4), mode="compatible",
+        same_subject_probability=0.0, semantic_zero_shot=True,
+        acquisition_mix=(0.0, 0.0, 1.0), enrollment_mix=(1.0, 0.0, 0.0),
+        variable_support_probability=0.0,
+    )
+    assert telemetry["sampler/acquisition_cross_dataset_fraction"] == 1.0
+    for episode in episodes:
+        query_dataset = corpus.recordings[episode.query].dataset
+        assert episode.acquisition_regime == "cross_dataset"
+        assert all(corpus.recordings[index].dataset != query_dataset for index in episode.support)
+        assert all(corpus.key_of(corpus.recordings[index]) ==
+                   corpus.key_of(corpus.recordings[episode.query]) for index in episode.support)
+
+
+def test_curriculum_cross_placement_changes_site_without_changing_sensor_contract():
+    corpus = _same_dataset_multiplacement_corpus(
+        subjects_per_label=8, windows_per_subject=2,
+        sites=("left_wrist", "right_forearm"),
+    )
+    episodes, telemetry = draw_batch(
+        corpus, _rng(921), batch_size=2, deployment_matched=True,
+        enrollment_k=(1,), queries_per_support_set=2, windows_per_execution=1,
+        p_gt_present=1.0, label_subset=(2, 4), mode="compatible",
+        same_subject_probability=0.0, semantic_zero_shot=True,
+        acquisition_mix=(0.0, 1.0, 0.0), enrollment_mix=(1.0, 0.0, 0.0),
+        variable_support_probability=0.0,
+    )
+    assert telemetry["sampler/acquisition_cross_placement_fraction"] == 1.0
+    for episode in episodes:
+        query_key = corpus.key_of(corpus.recordings[episode.query])
+        for index in episode.support:
+            support_key = corpus.key_of(corpus.recordings[index])
+            assert support_key.site != query_key.site
+            assert support_key.device_family == query_key.device_family
+            assert support_key.channels == query_key.channels
+            assert support_key.gravity_state == query_key.gravity_state
+
+
+def test_cross_placement_excludes_laterality_within_one_anatomical_site():
+    corpus = _same_dataset_multiplacement_corpus(
+        sites=("left_wrist", "right_wrist", "right_forearm"),
+    )
+    wrist = next(key for key in corpus.by_key if key.site == "left_wrist")
+    selected = _keys_for(corpus, wrist, "cross_placement")
+    assert {key.site for key in selected} == {"right_forearm"}
+
+
+def test_curriculum_mismatch_eligibility_retains_every_viable_label():
+    labels = tuple(f"label_{index:02d}" for index in range(12))
+    corpus = _same_dataset_multiplacement_corpus(
+        labels=labels, subjects_per_label=3, windows_per_subject=1,
+        sites=("left_wrist", "right_forearm"),
+    )
+    eligible = _eligible_deployment_datasets(
+        corpus, p_gt_present=1.0, mode="cross_placement", enrollment_k=(1,),
+        semantic_zero_shot=True, label_subset=(2, 12),
+    )
+    assert eligible == ("same_dataset",)
+    cached = next(iter(corpus.deployment_label_cache.values()))
+    assert cached == labels
+
+
+def test_partial_enrollment_is_shared_and_independent_of_query_truth():
+    corpus = _corpus(subjects_per_label=10, windows_per_subject=2)
+    episodes, telemetry = draw_batch(
+        corpus, _rng(922), batch_size=1, deployment_matched=True,
+        enrollment_k=(2,), queries_per_support_set=8, windows_per_execution=1,
+        p_gt_present=1.0, label_subset=(4, 4), mode="compatible",
+        same_subject_probability=0.0, semantic_zero_shot=True,
+        acquisition_mix=(1.0, 0.0, 0.0), enrollment_mix=(0.0, 1.0, 0.0),
+        partial_coverage=(0.5, 0.5), variable_support_probability=0.0,
+    )
+    assert telemetry["sampler/enrollment_partial_fraction"] == 1.0
+    assert len({episode.masked_candidates for episode in episodes}) == 1
+    assert len(episodes[0].masked_candidates) == 2
+    assert all(episode.enrollment_regime == "partial" for episode in episodes)
+    # Query labels are drawn after the enrolled subset. Across this deterministic group the truth
+    # lands on both sides, proving support presence was not defined from the answer.
+    truth_supported = [episode.gt_slot not in episode.masked_candidates for episode in episodes]
+    assert any(truth_supported) and not all(truth_supported)
+
+
+def test_neighbor_partial_enrollment_hides_distractors_but_supports_every_query():
+    corpus = _corpus(subjects_per_label=10, windows_per_subject=2)
+    episodes, telemetry = draw_batch(
+        corpus, _rng(922), batch_size=1, deployment_matched=True,
+        enrollment_k=(1, 2, 4), queries_per_support_set=8, windows_per_execution=1,
+        p_gt_present=1.0, label_subset=(4, 4), mode="compatible",
+        same_subject_probability=0.0, semantic_zero_shot=True,
+        acquisition_mix=(1.0, 0.0, 0.0), enrollment_mix=(0.0, 1.0, 0.0),
+        partial_coverage=(0.5, 0.5), variable_support_probability=1.0,
+        require_query_support=True,
+    )
+    assert telemetry["sampler/enrollment_partial_fraction"] == 1.0
+    assert episodes and all(episode.support for episode in episodes)
+    assert all(episode.gt_slot not in episode.masked_candidates for episode in episodes)
+    assert all(episode.support_counts[episode.gt_slot] > 0 for episode in episodes)
+    assert all(len(episode.masked_candidates) == 2 for episode in episodes)
+
+
+def test_zero_weight_curriculum_regimes_cannot_be_selected_as_fallbacks():
+    corpus = _corpus(subjects_per_label=10, windows_per_subject=2)
+    episodes, telemetry = draw_batch(
+        corpus, _rng(924), batch_size=8, deployment_matched=True,
+        enrollment_k=(1, 2), queries_per_support_set=4, windows_per_execution=1,
+        p_gt_present=1.0, label_subset=(2, 4), mode="compatible",
+        same_subject_probability=0.0, semantic_zero_shot=True,
+        acquisition_mix=(1.0, 0.0, 0.0), enrollment_mix=(2.0, 1.0, 0.0),
+        partial_coverage=(0.5, 0.5), variable_support_probability=0.5,
+        require_query_support=True,
+    )
+    assert episodes
+    assert all(not episode.zero_shot for episode in episodes)
+    assert telemetry["sampler/enrollment_zero_fraction"] == 0.0
+
+
+def test_zero_enrollment_does_not_claim_an_acquisition_mismatch():
+    corpus = _same_dataset_multiplacement_corpus(
+        subjects_per_label=5, windows_per_subject=2,
+        sites=("left_wrist", "right_wrist"),
+    )
+    episodes, telemetry = draw_batch(
+        corpus, _rng(925), batch_size=4, deployment_matched=True,
+        enrollment_k=(1,), queries_per_support_set=2, windows_per_execution=1,
+        p_gt_present=0.0, label_subset=(2, 4), mode="compatible",
+        same_subject_probability=0.0, semantic_zero_shot=True,
+        acquisition_mix=(0.0, 1.0, 0.0), enrollment_mix=(0.0, 0.0, 1.0),
+        variable_support_probability=0.0,
+    )
+    assert episodes and all(not episode.support for episode in episodes)
+    assert all(episode.acquisition_regime == "not_applicable" for episode in episodes)
+    assert telemetry["sampler/acquisition_not_applicable_fraction"] == 1.0
+    assert telemetry["sampler/acquisition_cross_placement_fraction"] == 0.0
+
+
+def test_variable_support_counts_preserve_distinct_executions():
+    corpus = _corpus(subjects_per_label=40, windows_per_subject=2)
+    episodes, telemetry = draw_batch(
+        corpus, _rng(923), batch_size=8, deployment_matched=True,
+        enrollment_k=(1, 2, 4, 8, 16, 32), queries_per_support_set=2,
+        windows_per_execution=1, p_gt_present=1.0, label_subset=(4, 4),
+        mode="compatible", same_subject_probability=0.0, semantic_zero_shot=True,
+        acquisition_mix=(1.0, 0.0, 0.0), enrollment_mix=(1.0, 0.0, 0.0),
+        variable_support_probability=1.0,
+    )
+    assert telemetry["sampler/unequal_support_count_fraction"] > 0
+    for episode in episodes:
+        units = [(corpus.recordings[index].dataset, corpus.recordings[index].subject,
+                  corpus.recordings[index].execution) for index in episode.support]
+        assert len(units) == len(set(units))
+        assert tuple(episode.support_candidate.count(slot)
+                     for slot in range(len(episode.candidates))) == episode.support_counts
 
 
 def test_masking_every_candidate_marks_the_episode_zero_shot():

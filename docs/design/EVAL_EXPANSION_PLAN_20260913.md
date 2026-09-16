@@ -1,5 +1,8 @@
 # Plan: correct the evaluation, and evaluate at 4 s / 8 s / 16 s windows
 
+> Historical implementation plan. Baseline contracts and the primary roster were corrected by
+> `BASELINE_FIDELITY_FIX_PLAN_20260916.md`; do not use this file as the current run recipe.
+
 **Written 2026-09-13.** Implementation brief for another agent. "Implement" = **build + tests +
 short smoke**. Do **not** run sealed evaluation and do **not** launch long training without Alex's
 explicit go.

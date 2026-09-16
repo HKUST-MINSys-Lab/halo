@@ -45,6 +45,7 @@ from data.scripts.labels.canonical_labels import NON_SEMANTIC_LABELS, canonicali
 from data.scripts.curate.compatibility import (
     AcquisitionKey,
     is_near_miss,
+    site_group,
     stream_key,
 )
 from data.scripts.eda.grid_io import discover_grids
@@ -52,7 +53,10 @@ from data.scripts.eda.grid_io import discover_grids
 REPO = Path(__file__).resolve().parents[2]
 DATASETS_DIR = REPO / "data" / "datasets"
 
-SamplingMode = Literal["compatible", "near_miss", "unfiltered"]
+SamplingMode = Literal[
+    "compatible", "near_miss", "cross_placement", "cross_dataset", "unfiltered",
+]
+EnrollmentRegime = Literal["complete", "partial", "zero"]
 SubjectRelation = Literal["same_subject", "cross_subject"]
 SupportUnit = tuple[str, str, str]  # dataset, subject, physical execution
 
@@ -65,9 +69,13 @@ DEFAULT_P_GT_PRESENT = 0.5
 DEFAULT_LABEL_SUBSET = (2, 32)
 LARGE_C_MIN = 16
 DEFAULT_SAME_SUBJECT_PROBABILITY = 0.5
-DEFAULT_ENROLLMENT_K = (1, 2, 4, 8)
+DEFAULT_ENROLLMENT_K = (1, 2, 4, 8, 16, 32)
 DEFAULT_QUERIES_PER_SUPPORT_SET = 4
 DEFAULT_WINDOWS_PER_EXECUTION = 2
+DEFAULT_ACQUISITION_MIX = (0.50, 0.25, 0.25)  # compatible, cross-placement, cross-dataset
+DEFAULT_ENROLLMENT_MIX = (0.50, 0.25, 0.25)   # complete, partial, zero
+DEFAULT_PARTIAL_COVERAGE = (0.25, 0.75)
+DEFAULT_VARIABLE_SUPPORT_PROBABILITY = 0.50
 MIN_RECORDING_SECONDS = 1.0
 
 
@@ -134,10 +142,14 @@ class SupportCorpus:
     by_key_label_unit: dict[
         tuple[AcquisitionKey, str], dict[SupportUnit, list[int]]
     ] = field(default_factory=dict)
+    labels_by_key: dict[AcquisitionKey, tuple[str, ...]] = field(default_factory=dict)
     query_by_dataset_label: dict[tuple[str, str], list[int]] = field(default_factory=dict)
     query_labels_by_dataset: dict[str, tuple[str, ...]] = field(default_factory=dict)
     all_labels: tuple[str, ...] = ()
     deployment_dataset_cache: dict[tuple, tuple[str, ...]] = field(
+        default_factory=dict, repr=False,
+    )
+    deployment_label_cache: dict[tuple, tuple[str, ...]] = field(
         default_factory=dict, repr=False,
     )
 
@@ -161,6 +173,7 @@ class SupportCorpus:
             for key in distinct:
                 self.near_miss_keys[key] = [other for other in distinct if is_near_miss(key, other)]
         labels_by_dataset: dict[str, set[str]] = defaultdict(set)
+        labels_by_key: dict[AcquisitionKey, set[str]] = defaultdict(set)
         labels: set[str] = set()
         for index, recording in enumerate(self.recordings):
             key = self.key_of(recording)
@@ -172,12 +185,16 @@ class SupportCorpus:
                 (recording.dataset, recording.label), []
             ).append(index)
             labels_by_dataset[recording.dataset].add(recording.label)
+            labels_by_key[key].add(recording.label)
             labels.add(recording.label)
         self.query_labels_by_dataset = {
             dataset: tuple(sorted(dataset_labels))
             for dataset, dataset_labels in labels_by_dataset.items()
         }
         self.all_labels = tuple(sorted(labels))
+        self.labels_by_key = {
+            key: tuple(sorted(key_labels)) for key, key_labels in labels_by_key.items()
+        }
 
     def summary(self) -> dict[str, object]:
         pools = {key: len(rows) for key, rows in self.by_key.items()}
@@ -299,6 +316,10 @@ class Episode:
     # Candidate slots whose otherwise valid enrolled rows were deliberately withheld. This is
     # training-only supervision for the text-only portion of the unified residual classifier.
     masked_candidates: tuple[int, ...] = ()
+    support_counts: tuple[int, ...] = ()
+    acquisition_regime: str = "compatible"
+    enrollment_regime: str = "complete"
+    curriculum_fallback: bool = False
 
     @property
     def is_zero_shot(self) -> bool:
@@ -310,6 +331,18 @@ def _keys_for(corpus: SupportCorpus, key: AcquisitionKey, mode: SamplingMode) ->
         return [key] if key in corpus.by_key else []
     if mode == "near_miss":
         return list(corpus.near_miss_keys.get(key, []))
+    if mode == "cross_placement":
+        return [
+            other for other in corpus.by_key
+            if other.device_family == key.device_family
+            and other.channels == key.channels
+            and other.gravity_state == key.gravity_state
+            # Laterality or an unspecified side is a near-miss within one anatomical site, not a
+            # deployment placement shift. Cross-placement means a genuinely different site.
+            and site_group(other.site) != site_group(key.site)
+        ]
+    if mode == "cross_dataset":
+        return [key] if key in corpus.by_key else []
     if mode == "unfiltered":
         return list(corpus.by_key)
     raise ValueError(f"unknown sampling mode {mode!r}")
@@ -319,6 +352,7 @@ def _choose_query(
     corpus: SupportCorpus,
     rng: np.random.Generator,
     dataset: str | None = None,
+    label: str | None = None,
 ) -> int:
     """Dataset-first, label-second sampling prevents large sources/classes dominating queries."""
     corpus.ensure_indexes()
@@ -326,7 +360,9 @@ def _choose_query(
     dataset = str(rng.choice(datasets)) if dataset is None else str(dataset)
     if dataset not in corpus.query_labels_by_dataset:
         raise KeyError(f"unknown query dataset {dataset!r}")
-    label = str(rng.choice(corpus.query_labels_by_dataset[dataset]))
+    label = str(rng.choice(corpus.query_labels_by_dataset[dataset])) if label is None else str(label)
+    if label not in corpus.query_labels_by_dataset[dataset]:
+        raise KeyError(f"unknown query label {label!r} for dataset {dataset!r}")
     rows = corpus.query_by_dataset_label[(dataset, label)]
     return int(rows[int(rng.integers(len(rows)))])
 
@@ -345,6 +381,9 @@ def _available_units(
     keys: Sequence[AcquisitionKey],
     query: Recording,
     relation: SubjectRelation,
+    *,
+    different_dataset: bool = False,
+    same_dataset: bool = False,
 ) -> dict[str, dict[SupportUnit, list[int]]]:
     """Execution groups available under one subject relation, without scanning corpus windows."""
     query_subject = (query.dataset, query.subject)
@@ -356,6 +395,8 @@ def _available_units(
                 unit: rows
                 for unit, rows in corpus.by_key_label_unit.get((key, label), {}).items()
                 if unit != query_execution
+                and (not different_dataset or unit[0] != query.dataset)
+                and (not same_dataset or unit[0] == query.dataset)
                 and (relation != "same_subject" or unit[:2] == query_subject)
                 and (relation != "cross_subject" or unit[:2] != query_subject)
             }
@@ -597,7 +638,7 @@ def _additional_queries(
     rng: np.random.Generator,
     *,
     base_query: int,
-    keys: Sequence[AcquisitionKey],
+    query_keys: Sequence[AcquisitionKey],
     candidates: Sequence[str],
     support: Sequence[int],
     relation: SubjectRelation,
@@ -614,7 +655,7 @@ def _additional_queries(
     by_label: dict[str, dict[str, list[tuple[SupportUnit, list[int]]]]] = {}
     for label in candidates:
         choices: dict[str, list[tuple[SupportUnit, list[int]]]] = defaultdict(list)
-        for key in keys:
+        for key in query_keys:
             for unit, rows in corpus.by_key_label_unit.get((key, label), {}).items():
                 # The support roster may span compatible sources, but all queries assigned to one
                 # source-balanced support set represent the same source. Otherwise the extra
@@ -779,50 +820,80 @@ def _draw_deployment_support_set(
     windows_per_execution: int,
     semantic_zero_shot: bool,
     query_dataset: str | None = None,
+    query_label: str | None = None,
     p_mask_candidate: float = 0.0,
     p_mask_gt: float = 0.0,
+    enrollment_regime: EnrollmentRegime | None = None,
+    partial_coverage: tuple[float, float] = DEFAULT_PARTIAL_COVERAGE,
+    variable_support_probability: float = DEFAULT_VARIABLE_SUPPORT_PROBABILITY,
+    require_query_support: bool = False,
+    curriculum_fallback: bool = False,
 ) -> list[Episode] | None:
     """Draw one deployment-shaped support roster and several independent query executions."""
-    query_index = _choose_query(corpus, rng, query_dataset)
+    query_index = _choose_query(corpus, rng, query_dataset, query_label)
     query = corpus.recordings[query_index]
-    keys = _keys_for(corpus, corpus.key_of(query), mode)
+    low, high = label_subset
+    if enrollment_regime not in {None, "complete", "partial", "zero"}:
+        raise ValueError(f"unknown enrollment regime {enrollment_regime!r}")
+    if not 0.0 <= partial_coverage[0] <= partial_coverage[1] <= 1.0:
+        raise ValueError("partial_coverage must be ordered within [0, 1]")
+    if not 0.0 <= variable_support_probability <= 1.0:
+        raise ValueError("variable_support_probability must be in [0, 1]")
+    want_support = (
+        enrollment_regime != "zero" if enrollment_regime is not None
+        else bool(rng.random() < p_gt_present)
+    )
+    # Acquisition mismatch is undefined without evidence. A zero-support episode draws its
+    # candidate vocabulary from the query's own configuration and is reported as not applicable,
+    # rather than pretending that an absent bank came from another placement or dataset.
+    effective_mode: SamplingMode = "compatible" if not want_support else mode
+    keys = _keys_for(corpus, corpus.key_of(query), effective_mode)
     if not keys:
         return None
-    low, high = label_subset
-    want_support = bool(rng.random() < p_gt_present)
-    cross = _available_units(corpus, keys, query, "cross_subject")
-    same = _available_units(corpus, keys, query, "same_subject")
+    different_dataset = effective_mode == "cross_dataset"
+    same_dataset = effective_mode == "cross_placement"
+    cross = _available_units(
+        corpus, keys, query, "cross_subject", different_dataset=different_dataset,
+        same_dataset=same_dataset,
+    )
+    same = _available_units(
+        corpus, keys, query, "same_subject", different_dataset=different_dataset,
+        same_dataset=same_dataset,
+    )
 
     if not want_support:
         # The zero-shot head is a genuine query/candidate-label model.  Do not manufacture the
         # retired semantic background bank: its row count and acquisition mix are unrelated to
         # the deployment condition and would give the two heads different input semantics.
-        available_labels = sorted(
-            label for label, units in cross.items() if units
-        )
+        available_labels = sorted({
+            query.label, *(label for label, units in cross.items() if units),
+        })
         if len(available_labels) < low:
             return None
         requested_candidates = _large_candidate_count(
             rng, available=len(available_labels), label_subset=label_subset,
         )
-        base = draw_episode(
-            corpus, rng,
-            p_gt_present=0.0,
-            label_subset=(requested_candidates, requested_candidates),
-            mode=mode,
-            query_index=query_index,
-            same_subject_probability=same_subject_probability,
-            semantic_zero_shot=True,
+        others = [label for label in available_labels if label != query.label]
+        selected = [query.label, *rng.choice(
+            others, size=requested_candidates - 1, replace=False,
+        ).tolist()]
+        rng.shuffle(selected)
+        candidates = tuple(str(label) for label in selected)
+        base = Episode(
+            query=query_index, support=(), support_candidate=(), candidates=candidates,
+            gt_slot=candidates.index(query.label), mode=effective_mode, requested_support=0,
+            shrunk=False, zero_shot=True, requested_candidates=requested_candidates,
         )
-        if base is None or len(base.candidates) < low or base.support:
-            return None
         query_rows = _additional_queries(
-            corpus, rng, base_query=query_index, keys=keys, candidates=base.candidates,
+            corpus, rng, base_query=query_index, query_keys=(corpus.key_of(query),),
+            candidates=base.candidates,
             support=base.support, relation="cross_subject", count=queries_per_support_set,
         )
         return [replace(
             base, query=row, gt_slot=base.candidates.index(corpus.recordings[row].label),
             requested_support=0, shrunk=False, support_set_id=support_set_id,
+            acquisition_regime="not_applicable", enrollment_regime="zero",
+            curriculum_fallback=curriculum_fallback,
         ) for row in query_rows]
 
     feasible_by_k: dict[int, list[tuple[SubjectRelation, dict, list[str]]]] = {}
@@ -861,21 +932,84 @@ def _draw_deployment_support_set(
         return None
     if not 0.0 <= p_mask_candidate <= 1.0 or not 0.0 <= p_mask_gt <= 1.0:
         raise ValueError("candidate masking probabilities must be in [0, 1]")
-    query_rows = _additional_queries(
-        corpus, rng, base_query=query_index, keys=keys, candidates=candidates,
-        support=support, relation=relation, count=queries_per_support_set,
-    )
+    query_rows = None
+    if not require_query_support:
+        query_rows = _additional_queries(
+            corpus, rng, base_query=query_index, query_keys=(corpus.key_of(query),),
+            candidates=candidates,
+            support=support, relation=relation, count=queries_per_support_set,
+        )
     requested = len(candidates) * k
+    # Unequal enrollment counts are created only by removing honestly drawn, execution-distinct
+    # rows. This preserves every leakage and feasibility guarantee of the exact-k draw.
+    if k > 1 and rng.random() < variable_support_probability:
+        available_counts = [value for value in enrollment_k if int(value) <= k]
+        target_counts = [int(rng.choice(available_counts)) for _ in candidates]
+        keep = []
+        seen = [0] * len(candidates)
+        for index, slot in enumerate(slots):
+            if seen[slot] < target_counts[slot]:
+                keep.append(index)
+                seen[slot] += 1
+        support = [support[index] for index in keep]
+        slots = [slots[index] for index in keep]
+        groups = [groups[index] for index in keep]
+
+    shared_masked: tuple[int, ...] | None = None
+    effective_regime = enrollment_regime or "complete"
+    if enrollment_regime == "partial":
+        fraction = float(rng.uniform(*partial_coverage))
+        enrolled_count = min(len(candidates) - 1, max(1, int(round(len(candidates) * fraction))))
+        if require_query_support:
+            # A support-only neighbor objective is undefined when the query's class has no
+            # enrollment. Keep the base query's class, then hide an independently sampled subset
+            # of distractors. Learned classifiers leave this flag false and retain the harder,
+            # query-independent partial-enrollment protocol.
+            base_slot = candidates.index(query.label)
+            other_slots = [slot for slot in range(len(candidates)) if slot != base_slot]
+            enrolled = {base_slot, *(int(value) for value in rng.choice(
+                other_slots, size=enrolled_count - 1, replace=False,
+            ))}
+        else:
+            enrolled = set(int(value) for value in rng.choice(
+                len(candidates), size=enrolled_count, replace=False,
+            ))
+        shared_masked = tuple(slot for slot in range(len(candidates)) if slot not in enrolled)
+    elif enrollment_regime == "complete":
+        shared_masked = ()
+
+    if require_query_support:
+        allowed_candidates = tuple(
+            candidate for slot, candidate in enumerate(candidates)
+            if shared_masked is None or slot not in shared_masked
+        )
+        query_rows = _additional_queries(
+            corpus, rng, base_query=query_index, query_keys=(corpus.key_of(query),),
+            candidates=allowed_candidates,
+            support=support, relation=relation, count=queries_per_support_set,
+        )
+    assert query_rows is not None
+
     episodes = []
     for row in query_rows:
         row_gt_slot = candidates.index(corpus.recordings[row].label)
-        masked = [
-            slot for slot in range(len(candidates))
-            if slot != row_gt_slot and rng.random() < p_mask_candidate
-        ]
-        if rng.random() < p_mask_gt:
-            masked.append(row_gt_slot)
-        masked_tuple = tuple(sorted(set(masked)))
+        if shared_masked is None:
+            # Historical masking path retained for exact checkpoint reproduction.
+            masked = [
+                slot for slot in range(len(candidates))
+                if slot != row_gt_slot and rng.random() < p_mask_candidate
+            ]
+            if rng.random() < p_mask_gt:
+                masked.append(row_gt_slot)
+            masked_tuple = tuple(sorted(set(masked)))
+            if not masked_tuple:
+                effective_regime = "complete"
+            elif len(masked_tuple) == len(candidates):
+                effective_regime = "zero"
+            else:
+                effective_regime = "partial"
+        else:
+            masked_tuple = shared_masked
         masked_set = set(masked_tuple)
         keep = [index for index, slot in enumerate(slots) if slot not in masked_set]
         row_support = tuple(support[index] for index in keep)
@@ -884,12 +1018,19 @@ def _draw_deployment_support_set(
         episodes.append(Episode(
             query=row, support=row_support, support_candidate=row_slots,
             candidates=candidates, gt_slot=row_gt_slot, mode=mode,
-            requested_support=requested, shrunk=False, zero_shot=not row_support,
+            requested_support=requested, shrunk=len(row_support) < requested,
+            zero_shot=not row_support,
             subject_relation=relation, support_window_groups=row_groups,
-            support_per_candidate=k, support_set_id=support_set_id,
+            support_per_candidate=(max(row_slots.count(slot) for slot in range(len(candidates)))
+                                   if row_slots else 0),
+            support_set_id=support_set_id,
             requested_candidates=requested_labels,
             subject_relation_fallback=relation_fallback,
             masked_candidates=masked_tuple,
+            support_counts=tuple(row_slots.count(slot) for slot in range(len(candidates))),
+            acquisition_regime=mode,
+            enrollment_regime=effective_regime,
+            curriculum_fallback=curriculum_fallback,
         ))
     return episodes
 
@@ -922,50 +1063,88 @@ def _eligible_deployment_datasets(
     eligible: list[str] = []
     k_values = cache_key[2]
     minimum_candidates = cache_key[4][0]
+    def representative_queries(dataset: str, label: str) -> list[int]:
+        """One execution per acquisition key/subject, not every overlapping source window."""
+        representatives: list[int] = []
+        seen: set[tuple[AcquisitionKey, str]] = set()
+        for index in corpus.query_by_dataset_label[(dataset, label)]:
+            recording = corpus.recordings[index]
+            identity = (corpus.key_of(recording), recording.subject)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            representatives.append(index)
+        return representatives
+
+    def structurally_available_labels(
+        query: Recording,
+        keys: Sequence[AcquisitionKey],
+        *,
+        minimum_k: int,
+        require_other_dataset: bool,
+        require_same_dataset: bool,
+    ) -> set[str]:
+        """Cheap conservative index used only to choose queries worth an exact draw.
+
+        The final draw still performs the global distinct-execution matching. Here we merely avoid
+        retrying query configurations that cannot provide even ``minimum_k`` cross-subject units
+        for the true label and one distractor.
+        """
+        query_subject = (query.dataset, query.subject)
+        query_execution = (query.dataset, query.subject, query.execution)
+        units_by_label: dict[str, set[SupportUnit]] = defaultdict(set)
+        for key in keys:
+            for candidate_label in corpus.labels_by_key.get(key, ()):
+                units_by_label[candidate_label].update(
+                    unit
+                    for unit in corpus.by_key_label_unit.get((key, candidate_label), {})
+                    if unit != query_execution
+                    and unit[:2] != query_subject
+                    and (not require_other_dataset or unit[0] != query.dataset)
+                    and (not require_same_dataset or unit[0] == query.dataset)
+                )
+        return {
+            candidate_label for candidate_label, units in units_by_label.items()
+            if len(units) >= minimum_k
+        }
+
     for dataset in sorted(corpus.query_labels_by_dataset):
         viable_query_labels: set[str] = set()
         for label in corpus.query_labels_by_dataset[dataset]:
             label_is_viable = False
-            for query_index in corpus.query_by_dataset_label[(dataset, label)]:
+            for query_index in representative_queries(dataset, label):
                 query = corpus.recordings[query_index]
                 keys = _keys_for(corpus, corpus.key_of(query), mode)
                 if not keys:
                     continue
                 if allow_zero:
-                    labels = {
-                        candidate_label for key in keys for candidate_label in corpus.all_labels
-                        if (key, candidate_label) in corpus.by_key_label_unit
-                    }
+                    labels = structurally_available_labels(
+                        query, keys, minimum_k=1,
+                        require_other_dataset=mode == "cross_dataset",
+                        require_same_dataset=mode == "cross_placement",
+                    )
+                    labels.add(query.label)
                     if query.label in labels and len(labels) >= minimum_candidates:
                         label_is_viable = True
                         break
                 if allow_support:
-                    for relation in ("cross_subject", "same_subject"):
-                        pool = _available_units(corpus, keys, query, relation)
-                        for k in k_values:
-                            available = sorted(
-                                candidate_label for candidate_label, units in pool.items()
-                                if len(units) >= k
-                            )
-                            if _can_draw_candidate_count(
-                                pool, query_label=query.label, available_labels=available,
-                                count=minimum_candidates, k=k,
-                            ):
-                                label_is_viable = True
-                                break
-                        if label_is_viable:
-                            break
+                    minimum_k = min(k_values)
+                    available = structurally_available_labels(
+                        query, keys, minimum_k=minimum_k,
+                        require_other_dataset=mode == "cross_dataset",
+                        require_same_dataset=mode == "cross_placement",
+                    )
+                    # This is a cheap eligibility index, not the final draw. Exact global
+                    # execution matching still happens in _draw_k_per_candidate.
+                    if query.label in available and len(available) >= minimum_candidates:
+                        label_is_viable = True
                 if label_is_viable:
                     break
             if label_is_viable:
                 viable_query_labels.add(label)
-            # A held-out source must support a decision over at least two query classes. Including a
-            # source through one exceptional drawable class would produce a misleading validation
-            # score rather than representative source coverage.
-            if len(viable_query_labels) >= 2:
-                break
         if len(viable_query_labels) >= 2:
             eligible.append(dataset)
+        corpus.deployment_label_cache[(cache_key, dataset)] = tuple(sorted(viable_query_labels))
     result = tuple(eligible)
     corpus.deployment_dataset_cache[cache_key] = result
     return result
@@ -983,6 +1162,11 @@ def draw_batch(
     windows_per_execution: int = DEFAULT_WINDOWS_PER_EXECUTION,
     p_mask_candidate: float = 0.0,
     p_mask_gt: float = 0.0,
+    acquisition_mix: Sequence[float] | None = None,
+    enrollment_mix: Sequence[float] | None = None,
+    partial_coverage: tuple[float, float] = DEFAULT_PARTIAL_COVERAGE,
+    variable_support_probability: float = DEFAULT_VARIABLE_SUPPORT_PROBABILITY,
+    require_query_support: bool = False,
     **kwargs,
 ) -> tuple[list[Episode], dict[str, float]]:
     """Draw ``batch_size`` episodes plus the telemetry that makes the draw auditable."""
@@ -1004,16 +1188,54 @@ def draw_batch(
         if not enrollment_k or any(int(k) < 1 for k in enrollment_k):
             raise ValueError("enrollment_k must contain positive values")
         corpus.ensure_indexes()
+        acquisition_names: tuple[SamplingMode, ...] = (
+            ("compatible", "cross_placement", "cross_dataset")
+            if acquisition_mix is not None else (kwargs.get("mode", "compatible"),)
+        )
+        enrollment_names: tuple[EnrollmentRegime | None, ...] = (
+            ("complete", "partial", "zero") if enrollment_mix is not None else (None,)
+        )
+
+        def probabilities(values: Sequence[float] | None, count: int, name: str) -> np.ndarray:
+            if values is None:
+                return np.ones(count, dtype=np.float64) / count
+            result = np.asarray(values, dtype=np.float64)
+            if result.shape != (count,) or not np.isfinite(result).all() or (result < 0).any() \
+                    or result.sum() <= 0:
+                raise ValueError(f"{name} must contain {count} finite nonnegative weights")
+            return result / result.sum()
+
+        acquisition_probability = probabilities(
+            acquisition_mix, len(acquisition_names), "acquisition_mix",
+        )
+        enrollment_probability = probabilities(
+            enrollment_mix, len(enrollment_names), "enrollment_mix",
+        )
+        pair_weight = {
+            (mode_name, regime): float(acquisition_probability[mode_index]
+                                       * enrollment_probability[regime_index])
+            for mode_index, mode_name in enumerate(acquisition_names)
+            for regime_index, regime in enumerate(enrollment_names)
+        }
+        active_pairs = tuple(pair for pair, weight in pair_weight.items() if weight > 0.0)
+        eligible_by_pair: dict[tuple[SamplingMode, EnrollmentRegime | None], tuple[str, ...]] = {}
+        for pair in active_pairs:
+            mode_name, regime = pair
+            eligibility_mode: SamplingMode = "compatible" if regime == "zero" else mode_name
+            eligible_by_pair[pair] = _eligible_deployment_datasets(
+                corpus,
+                p_gt_present=(0.0 if regime == "zero" else 1.0 if regime is not None
+                              else float(kwargs.get("p_gt_present", DEFAULT_P_GT_PRESENT))),
+                mode=eligibility_mode,
+                enrollment_k=enrollment_k,
+                semantic_zero_shot=bool(kwargs.get("semantic_zero_shot", False)),
+                label_subset=kwargs.get("label_subset", DEFAULT_LABEL_SUBSET),
+            )
+        eligible = tuple(sorted({
+            dataset for datasets in eligible_by_pair.values() for dataset in datasets
+        }))
         support_sets: list[list[Episode]] = []
         attempts = unusable = 0
-        eligible = _eligible_deployment_datasets(
-            corpus,
-            p_gt_present=float(kwargs.get("p_gt_present", DEFAULT_P_GT_PRESENT)),
-            mode=kwargs.get("mode", "compatible"),
-            enrollment_k=enrollment_k,
-            semantic_zero_shot=bool(kwargs.get("semantic_zero_shot", False)),
-            label_subset=kwargs.get("label_subset", DEFAULT_LABEL_SUBSET),
-        )
         if not eligible:
             raise RuntimeError(
                 "no dataset can form the requested deployment-matched regime; refusing to relax "
@@ -1026,25 +1248,68 @@ def draw_batch(
         while len(schedule) < batch_size:
             schedule.extend(str(value) for value in rng.permutation(datasets))
         for support_set_id, query_dataset in enumerate(schedule[:batch_size]):
+            requested_pair = (
+                acquisition_names[int(rng.choice(len(acquisition_names), p=acquisition_probability))],
+                enrollment_names[int(rng.choice(len(enrollment_names), p=enrollment_probability))],
+            )
+            feasible_pairs = [pair for pair, datasets_for_pair in eligible_by_pair.items()
+                              if query_dataset in datasets_for_pair]
+            if not feasible_pairs:
+                raise RuntimeError(f"dataset {query_dataset!r} has no feasible curriculum condition")
+            initial_fallback = requested_pair not in feasible_pairs
+            if initial_fallback:
+                weights = np.asarray([pair_weight[pair] for pair in feasible_pairs], dtype=np.float64)
+                weights /= weights.sum()
+                actual_pair = feasible_pairs[int(rng.choice(len(feasible_pairs), p=weights))]
+            else:
+                actual_pair = requested_pair
             group = None
-            for _ in range(max_attempts_per_episode):
-                attempts += 1
-                group = _draw_deployment_support_set(
-                    corpus, rng, support_set_id=support_set_id,
-                    enrollment_k=enrollment_k,
-                    queries_per_support_set=queries_per_support_set,
-                    windows_per_execution=windows_per_execution,
-                    query_dataset=query_dataset,
-                    p_mask_candidate=p_mask_candidate, p_mask_gt=p_mask_gt,
-                    **kwargs,
-                )
+            alternatives = [pair for pair in feasible_pairs if pair != actual_pair]
+            rng.shuffle(alternatives)
+            attempted_pairs = [actual_pair, *alternatives]
+            for pair_index, attempted_pair in enumerate(attempted_pairs):
+                actual_mode, actual_enrollment = attempted_pair
+                fallback = initial_fallback or pair_index > 0
+                for _ in range(max_attempts_per_episode):
+                    attempts += 1
+                    eligibility_key = (
+                        0.0 if actual_enrollment == "zero" else 1.0 if actual_enrollment is not None
+                        else float(kwargs.get("p_gt_present", DEFAULT_P_GT_PRESENT)),
+                        actual_mode, tuple(dict.fromkeys(int(k) for k in enrollment_k)),
+                        bool(kwargs.get("semantic_zero_shot", False)),
+                        tuple(int(value) for value in kwargs.get("label_subset", DEFAULT_LABEL_SUBSET)),
+                    )
+                    viable_labels = corpus.deployment_label_cache.get(
+                        (eligibility_key, query_dataset), (),
+                    )
+                    query_label = (
+                        str(rng.choice(viable_labels))
+                        if actual_mode != "compatible" and viable_labels else None
+                    )
+                    group = _draw_deployment_support_set(
+                        corpus, rng, support_set_id=support_set_id,
+                        enrollment_k=enrollment_k,
+                        queries_per_support_set=queries_per_support_set,
+                        windows_per_execution=windows_per_execution,
+                        query_dataset=query_dataset,
+                        query_label=query_label,
+                        p_mask_candidate=p_mask_candidate, p_mask_gt=p_mask_gt,
+                        enrollment_regime=actual_enrollment,
+                        partial_coverage=partial_coverage,
+                        variable_support_probability=variable_support_probability,
+                        require_query_support=require_query_support,
+                        curriculum_fallback=fallback,
+                        **{**kwargs, "mode": actual_mode},
+                    )
+                    if group:
+                        break
+                    unusable += 1
                 if group:
                     break
-                unusable += 1
             if not group:
                 raise RuntimeError(
                     f"could not draw a deployment-matched support set for dataset "
-                    f"{query_dataset!r} in {max_attempts_per_episode} attempts; refusing to "
+                    f"{query_dataset!r} under any of {attempted_pairs!r}; refusing to "
                     "relax compatibility or duplicate executions, and will not substitute an "
                     "easier source"
                 )
@@ -1133,26 +1398,14 @@ def draw_batch(
         ),
         "sampler/duplicate_support_execution_mean": float(np.mean(duplicate_executions)),
         "sampler/support_set_count": float(len(query_counts)),
-        "sampler/eligible_dataset_count": float(
-            len(_eligible_deployment_datasets(
-                corpus,
-                p_gt_present=float(kwargs.get("p_gt_present", DEFAULT_P_GT_PRESENT)),
-                mode=kwargs.get("mode", "compatible"),
-                enrollment_k=enrollment_k,
-                semantic_zero_shot=bool(kwargs.get("semantic_zero_shot", False)),
-                label_subset=kwargs.get("label_subset", DEFAULT_LABEL_SUBSET),
-            ))
-        ) if deployment_matched else float(len(corpus.query_labels_by_dataset)),
-        "sampler/ineligible_dataset_count": float(
-            len(corpus.query_labels_by_dataset) - len(_eligible_deployment_datasets(
-                corpus,
-                p_gt_present=float(kwargs.get("p_gt_present", DEFAULT_P_GT_PRESENT)),
-                mode=kwargs.get("mode", "compatible"),
-                enrollment_k=enrollment_k,
-                semantic_zero_shot=bool(kwargs.get("semantic_zero_shot", False)),
-                label_subset=kwargs.get("label_subset", DEFAULT_LABEL_SUBSET),
-            ))
-        ) if deployment_matched else 0.0,
+        "sampler/eligible_dataset_count": (
+            float(len(eligible)) if deployment_matched
+            else float(len(corpus.query_labels_by_dataset))
+        ),
+        "sampler/ineligible_dataset_count": (
+            float(len(corpus.query_labels_by_dataset) - len(eligible))
+            if deployment_matched else 0.0
+        ),
         "sampler/mean_queries_per_support_set": float(np.mean(query_counts)),
         "sampler/query_set_shrink_fraction": float(np.mean([
             count < queries_per_support_set for count in query_counts
@@ -1164,10 +1417,31 @@ def draw_batch(
         "sampler/mean_windows_per_support_execution": float(np.mean([
             len(group) for episode in episodes for group in episode.support_window_groups
         ])) if any(episode.support_window_groups for episode in episodes) else 1.0,
+        "sampler/curriculum_fallback_fraction": float(np.mean([
+            episode.curriculum_fallback for episode in support_set_episodes
+        ])),
     }
     if deployment_matched:
+        enrolled_support_sets = [
+            episode for episode in support_set_episodes if not episode.is_zero_shot
+        ]
         for value in dict.fromkeys(int(item) for item in enrollment_k):
             telemetry[f"sampler/k_{value}_support_set_fraction"] = sum(
-                episode.support_per_candidate == value for episode in support_set_episodes
+                episode.support_per_candidate == value for episode in enrolled_support_sets
+            ) / max(1, len(enrolled_support_sets))
+        for name in ("compatible", "cross_placement", "cross_dataset"):
+            telemetry[f"sampler/acquisition_{name}_fraction"] = sum(
+                episode.acquisition_regime == name for episode in enrolled_support_sets
+            ) / max(1, len(enrolled_support_sets))
+        telemetry["sampler/acquisition_not_applicable_fraction"] = sum(
+            episode.acquisition_regime == "not_applicable" for episode in support_set_episodes
+        ) / len(support_set_episodes)
+        for name in ("complete", "partial", "zero"):
+            telemetry[f"sampler/enrollment_{name}_fraction"] = sum(
+                episode.enrollment_regime == name for episode in support_set_episodes
             ) / len(support_set_episodes)
+        telemetry["sampler/unequal_support_count_fraction"] = float(np.mean([
+            len(set(count for count in episode.support_counts if count > 0)) > 1
+            for episode in enrolled_support_sets
+        ])) if enrolled_support_sets else 0.0
     return episodes, telemetry

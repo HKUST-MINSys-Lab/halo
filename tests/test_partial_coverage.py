@@ -5,23 +5,31 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import torch
+import baselines
 
 from training.support_classifier.partial_coverage import (
     CoverageCell,
     choose_hidden_candidates,
     hide_supports,
-    hybrid_predictions,
+    equal_weight_normalized_fusion_predictions,
     support_only_predictions,
     truth_split,
     zscore,
 )
 from training.support_classifier.sealed_eval import (
+    PRIMARY_BASELINES,
+    TRAINING_BANK_ZERO_SHOT,
     QueryPlan,
     _readout_predictions,
     manifest_fingerprint,
 )
 
 CANDIDATES = ("walking", "running", "sitting", "standing")
+
+
+def test_every_primary_baseline_has_a_declared_semantic_route_for_fusion():
+    for name in PRIMARY_BASELINES:
+        assert name in TRAINING_BANK_ZERO_SHOT or baselines.REGISTRY[name].supports_native_zero_shot()
 
 
 def _plans(k: int = 2, n_queries: int = 6) -> list[QueryPlan]:
@@ -193,11 +201,11 @@ def test_support_only_refuses_an_episode_with_no_enrolment_left():
         support_only_predictions(_features(), CANDIDATES, empty, cell)
 
 
-# -------------------------------------------------------------------- hybrid
+# ------------------------------------------------ equal-weight normalized fusion
 
 
-def test_hybrid_can_name_a_hidden_candidate():
-    """The whole point of the scenario: support-only readouts cannot, the hybrid can."""
+def test_equal_weight_fusion_can_name_a_hidden_candidate():
+    """Support-only readouts cannot name a hidden candidate, while fusion can."""
     cell = CoverageCell(supported=("walking", "running"), hidden=("sitting", "standing"),
                         coverage=0.5, requested_coverage=0.5)
     plans = hide_supports(_plans(n_queries=4), cell)
@@ -205,26 +213,32 @@ def test_hybrid_can_name_a_hidden_candidate():
     # Text evidence overwhelmingly favours a candidate that carries no enrolment.
     text = np.zeros((len(features), len(CANDIDATES)))
     text[:, CANDIDATES.index("sitting")] = 10.0
-    predicted = hybrid_predictions(text, features, CANDIDATES, plans, cell)
+    predicted = equal_weight_normalized_fusion_predictions(
+        text, features, CANDIDATES, plans, cell,
+    )
     assert set(predicted) == {"sitting"}
 
 
-def test_hybrid_follows_support_when_text_is_uninformative():
+def test_equal_weight_fusion_follows_support_when_semantics_are_uninformative():
     cell = CoverageCell(supported=("walking", "running"), hidden=("sitting", "standing"),
                         coverage=0.5, requested_coverage=0.5)
     plans = hide_supports(_plans(n_queries=5), cell)
     features = _features(seed=5)
     flat_text = np.zeros((len(features), len(CANDIDATES)))
-    predicted = hybrid_predictions(flat_text, features, CANDIDATES, plans, cell)
+    predicted = equal_weight_normalized_fusion_predictions(
+        flat_text, features, CANDIDATES, plans, cell,
+    )
     support_only = support_only_predictions(features, CANDIDATES, plans, cell)["1nn"]
     assert predicted == support_only
 
 
-def test_hybrid_rejects_a_mismatched_text_matrix():
+def test_equal_weight_fusion_rejects_a_mismatched_semantic_matrix():
     cell = choose_hidden_candidates(CANDIDATES, coverage=0.5, seed_parts=("cell",))
     plans = hide_supports(_plans(), cell)
     with pytest.raises(ValueError):
-        hybrid_predictions(np.zeros((200, 2)), _features(), CANDIDATES, plans, cell)
+        equal_weight_normalized_fusion_predictions(
+            np.zeros((200, 2)), _features(), CANDIDATES, plans, cell,
+        )
 
 
 # ------------------------------------------------------------- reporting splits
@@ -304,7 +318,7 @@ def test_emit_rows_carries_the_coverage_configuration(monkeypatch):
         assert row["hidden_candidates"] == ["sitting"]
         assert row["supported_candidates"] == ["walking"]
         assert row["coverage_fingerprint"] == cell.fingerprint
-        assert row["scenario"] == "partial_coverage_v1"
+        assert row["scenario"] == "s1_partial_coverage"
 
 
 def test_cannot_attempt_row_is_disclosed_not_scored(monkeypatch):
@@ -312,7 +326,8 @@ def test_cannot_attempt_row_is_disclosed_not_scored(monkeypatch):
     cell = CoverageCell(supported=("walking",), hidden=("sitting",),
                         coverage=0.5, requested_coverage=0.5)
     rows = runner.cannot_attempt_rows(_FakeStream(["walking"]), cell, model="limubert_x",
-                                      readout="hybrid-text-support", k=1, window_seconds=8.0,
+                                      readout="equal-weight-normalized-fusion", k=1,
+                                      window_seconds=8.0,
                                       reason="no text path")
     assert len(rows) == 1
     assert rows[0]["status"] == "cannot_attempt"

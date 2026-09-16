@@ -26,6 +26,7 @@ data_or_code_url) is a follow-up.
 
 from __future__ import annotations
 
+import json
 import sys
 from fractions import Fraction
 from pathlib import Path
@@ -41,6 +42,7 @@ from ..base import CosineAdapter, InputContract, UnsupportedEvaluationCell, regi
 _LEGACY_ROOT = Path("/home/alex/code/HALO/legacy_code")
 UNIMTS_REPO = _LEGACY_ROOT / "auxiliary_repos" / "UniMTS"
 UNIMTS_CKPT = UNIMTS_REPO / "checkpoint" / "UniMTS.pth"
+LABEL_DICTIONARIES = Path(__file__).resolve().parent / "sealed_label_dictionaries.json"
 
 # --- input config (verified against the released code) ---
 GRAVITY_MS2 = 9.80665  # our grids store accel in g; UniMTS expects m/s^2 WITH gravity
@@ -162,7 +164,12 @@ class UniMTSAdapter(CosineAdapter):
             "input_rate_hz": TARGET_HZ,
             "input_samples": PAD_LEN,
             "input_channels": ["acc_x", "acc_y", "acc_z"],
-            "label_text_ensemble": self.TEXT_ENSEMBLE,
+            "label_text_source": "sealed source-backed dataset dictionaries",
+            "label_dictionary_sha256": __import__("hashlib").sha256(
+                LABEL_DICTIONARIES.read_bytes()
+            ).hexdigest(),
+            "window_policy": "published_wrap_pad_or_truncate",
+            "metadata_inputs": "sensor placement mapped to released SMPL joint; candidate label text",
         }
 
     def feature_config(self, state):
@@ -171,6 +178,8 @@ class UniMTSAdapter(CosineAdapter):
             "input_samples": PAD_LEN,
             "input_channels": ["acc_x", "acc_y", "acc_z"],
             "feature_layer": "acc_st_gcn",
+            "window_policy": "published_wrap_pad_or_truncate",
+            "metadata_inputs": "sensor placement mapped to released SMPL joint",
         }
 
     def setup(self, device):
@@ -238,10 +247,7 @@ class UniMTSAdapter(CosineAdapter):
                 f"UniMTS device-to-joint collision: {list(zip(stream.device_ids, joints))}"
             )
         n_windows = members[0].n_windows
-        # The released ST-GCN accepts variable temporal length.  One full evaluation
-        # interval is therefore one forward input; chunking 8/16 s into 10 s fragments
-        # discarded cross-window temporal context without being required by the model.
-        buckets: dict[int, list[tuple[int, np.ndarray]]] = {}
+        rows: list[np.ndarray] = []
         for row in range(n_windows):
             per_device = []
             target_length = None
@@ -258,49 +264,49 @@ class UniMTSAdapter(CosineAdapter):
             allx = np.zeros((target_length, N_JOINTS, 3), np.float32)
             for acc, joint in zip(per_device, joints):
                 allx[:, joint, :] = acc
-            buckets.setdefault(target_length, []).append((row, allx))
+            if target_length >= PAD_LEN:
+                # Released ``load_custom_data`` uses ``resampled_data[:, :padding_size]``.
+                allx = allx[:PAD_LEN]
+            else:
+                repeats = int(np.ceil(PAD_LEN / max(target_length, 1)))
+                allx = np.tile(allx, (repeats, 1, 1))[:PAD_LEN]
+            rows.append(allx)
 
-        output = None
-        for _length, rows in buckets.items():
-            for start in range(0, len(rows), batch):
-                group = rows[start:start + batch]
-                x = torch.from_numpy(np.asarray([value for _, value in group])).to(device) \
-                    .permute(0, 3, 1, 2).unsqueeze(-1)
-                e = model.encode_image(x)
-                encoded = (e / e.norm(dim=-1, keepdim=True)).float().cpu().numpy()
-                if output is None:
-                    output = np.zeros((n_windows, encoded.shape[1]), dtype=np.float32)
-                output[[row for row, _ in group]] = encoded
-        if output is None:
+        output = []
+        for start in range(0, len(rows), batch):
+            x = torch.from_numpy(np.asarray(rows[start:start + batch])).to(device) \
+                .permute(0, 3, 1, 2).unsqueeze(-1)
+            e = model.encode_image(x)
+            output.append((e / e.norm(dim=-1, keepdim=True)).float().cpu().numpy())
+        if not output:
             raise ValueError("UniMTS received an empty evaluation stream")
+        output = np.concatenate(output, axis=0)
         return output / np.maximum(np.linalg.norm(output, axis=1, keepdims=True), 1e-12)
 
-    # 2026-08-22 audit F2: upstream evaluates with ENRICHED label text — each class's whole
-    # label_dictionary synonym list joined into one string (data.py: `' '.join(labels)`) — not the
-    # bare class name. We reproduce that intent with the project's shared TRAIN-ONLY paraphrase
-    # pool (training/evidence/labeltext.py): variant 0 is the canonical name, the rest are
-    # template/synonym paraphrases, all encoded by UniMTS's OWN CLIP tower and averaged. This is
-    # also the labeltext.py parity rule: the halo_evidence row already ensembles E=8, so the bare
-    # string here gave UniMTS strictly weaker target text than we gave ourselves.
-    TEXT_ENSEMBLE = 8
-
     def encode_labels(self, labels, state, device) -> np.ndarray:
-        """(L,512) L2-normalized CLIP-tower label embeddings, averaged over the shared
-        train-only paraphrase ensemble (E=8; variant 0 = the raw de-underscored label)."""
+        """Encode the released protocol's joined dataset label-dictionary strings."""
         import clip
         import torch
-        from training.support_classifier.label_text import label_variant_rows
 
         model = state["model"]
-        rows = label_variant_rows(list(labels), self.TEXT_ENSEMBLE, seed=0,
-                                  use_descriptions=False, train_only=True)
-        acc = None
+        blob = json.loads(LABEL_DICTIONARIES.read_text())
+        joined = blob["joined_text"]
+        texts = [joined.get(label, label.replace("_", " ").strip()) for label in labels]
         with torch.no_grad():
-            for row in rows:
-                tok = clip.tokenize([s.replace("_", " ").strip() for s in row],
-                                    truncate=True).to(device)        # (L,77)
-                t = model.encode_text(tok)                           # (L,512)
-                t = t / t.norm(dim=-1, keepdim=True)
-                acc = t if acc is None else acc + t
-            acc = acc / acc.norm(dim=-1, keepdim=True)
-        return acc.float().cpu().numpy()
+            tok = clip.tokenize(texts, truncate=True).to(device)
+            encoded = model.encode_text(tok)
+            encoded = encoded / encoded.norm(dim=-1, keepdim=True)
+        return encoded.float().cpu().numpy()
+
+    def input_accounting(self, stream) -> dict:
+        member = stream.devices[0] if isinstance(stream, eval_data.MultiDeviceEvalStream) else stream
+        lengths = (np.asarray(member.lengths, dtype=np.float64) if member.lengths is not None
+                   else np.full(member.n_windows, member.windows.shape[1], dtype=np.float64))
+        durations = lengths / float(member.rate_hz)
+        padded = np.maximum(10.0 - durations, 0.0)
+        truncated = np.maximum(durations - 10.0, 0.0)
+        return {"padded": bool(np.any(padded > 1e-9)),
+                "padded_fraction": float(padded.sum() / (10.0 * len(durations))) if durations.size else 0.0,
+                "truncated": bool(np.any(truncated > 1e-9)),
+                "truncated_fraction": float(truncated.sum() / durations.sum()) if durations.sum() else 0.0,
+                "consumed_samples": PAD_LEN, "published_window_contract": True}

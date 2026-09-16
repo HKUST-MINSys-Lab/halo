@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 from baselines.data import EvalStream
@@ -16,14 +17,53 @@ from training.support_classifier.sealed_eval import (
     _halo_token_mixer_predictions,
     _differentiable_neighbor_predictions,
     _readout_predictions,
+    _stable_choice,
     _training_bank_conse_predictions,
+    _write_markdown,
     build_manifest,
     manifest_fingerprint,
+    validate_result_rows,
 )
 
 
 def test_default_support_curve_includes_large_enrollment_counts():
     assert DEFAULT_K == (0, 1, 2, 4, 8, 16, 32, 64, 128)
+
+
+def _result_row(**updates):
+    row = {
+        "model": "harnet5", "readout": "1nn", "window_seconds": 4.0, "k": 1,
+        "dataset": "toy", "stream": "wrist", "status": "ok", "parameters_m": 4.491,
+        "native_open_set_labels": False, "native_support_conditioning": False,
+        "published_few_label_finetuning": True, "padded": True,
+        "padded_fraction": 0.2, "accuracy": 0.5, "balanced_accuracy": 0.5,
+        "f1_macro": 0.5,
+    }
+    row.update(updates)
+    return row
+
+
+def test_result_validator_rejects_ambiguous_and_partial_artifacts():
+    expected = [(4.0, "toy", "wrist")]
+    validate_result_rows([_result_row()], expected_cells=expected, models=["harnet5"], k_values=[1])
+    with pytest.raises(RuntimeError, match="ambiguous"):
+        validate_result_rows([_result_row(model="harnet")], expected_cells=expected,
+                             models=["harnet"], k_values=[1])
+    with pytest.raises(RuntimeError, match="partial"):
+        validate_result_rows([_result_row()], expected_cells=expected,
+                             models=["harnet5"], k_values=[1, 2])
+
+
+def test_publication_markdown_hides_diagnostic_baseline_readouts(tmp_path):
+    primary = _result_row(readout="equal-weight-normalized-fusion")
+    diagnostic = _result_row(readout="ridge", diagnostic_only=True)
+    path = tmp_path / "RESULTS.md"
+
+    _write_markdown([primary, diagnostic], path)
+
+    text = path.read_text()
+    assert "equal-weight-normalized-fusion" in text
+    assert "ridge" not in text
 
 
 def _stream() -> EvalStream:
@@ -52,6 +92,17 @@ def test_manifest_is_execution_disjoint_and_deterministic():
         assert len(plan.support) == len(stream.eval_labels)
 
 
+def test_stable_choice_preserves_the_frozen_numpy_seed_mapping():
+    values = np.arange(10_000, dtype=np.int64)
+    parts = (7, "dataset", "stream", 8, 19, "walking")
+    import hashlib
+    digest = hashlib.sha256("|".join(map(str, parts)).encode()).digest()
+    expected = np.random.default_rng(int.from_bytes(digest[:8], "little")).choice(
+        values, size=8, replace=False,
+    )
+    np.testing.assert_array_equal(_stable_choice(values, 8, seed_parts=parts), expected)
+
+
 def test_common_readouts_share_the_same_manifest_and_recover_separable_features():
     stream = _stream()
     features = np.repeat(np.eye(3, dtype=np.float32), 3, axis=0)
@@ -70,6 +121,14 @@ def test_common_readouts_share_the_same_manifest_and_recover_separable_features(
 def test_k_zero_manifest_contains_no_enrollment_rows():
     plans = build_manifest(_stream(), 0)
     assert plans and all(not plan.support and not plan.support_labels for plan in plans)
+
+
+def test_k_zero_manifest_excludes_rows_outside_candidate_vocabulary():
+    stream = _stream()
+    stream.gt[-1] = "non_target_transition"
+    plans = build_manifest(stream, 0)
+    assert len(plans) == stream.n_windows - 1
+    assert all(plan.query != stream.n_windows - 1 for plan in plans)
 
 
 def test_k_zero_uses_training_bank_neighbor_before_conse(monkeypatch):
@@ -101,6 +160,28 @@ def test_k_zero_uses_training_bank_neighbor_before_conse(monkeypatch):
     assert captured["top_T"] == 1
     assert info["zero_support_protocol"] == "training_bank_1nn_conse_v1"
     assert info["reference_rows"] == 3
+
+
+def test_training_bank_can_return_the_same_pre_argmax_conse_scores(monkeypatch):
+    expected = np.asarray([[0.2, 0.8], [0.7, 0.3]], dtype=np.float64)
+
+    def fake_scores(probs, train_labels, target_labels, *, top_T):
+        assert probs.shape == (2, 2)
+        assert top_T == 1
+        return expected
+
+    monkeypatch.setattr(
+        "training.support_classifier.sealed_eval.scoring.conse_score_matrix", fake_scores,
+    )
+    scores, info = _training_bank_conse_predictions(
+        np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32),
+        np.asarray([[0.9, 0.1], [0.1, 0.9]], dtype=np.float32),
+        np.asarray([0, 1]), ["walk", "sit"], ["walking", "sitting"],
+        torch.device("cpu"), return_scores=True,
+    )
+    np.testing.assert_array_equal(scores, expected)
+    assert info["zero_support_protocol"] == "training_bank_1nn_conse_v1"
+    assert info["reference_rows"] == 2
 
 
 def test_halo_token_mixer_uses_the_same_enrolled_manifest(tmp_path, monkeypatch):

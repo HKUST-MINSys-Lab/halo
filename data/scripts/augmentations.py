@@ -663,7 +663,11 @@ class IMUAugmenter:
     # ---------- P3: anti-aliased rate resample ----------
     def _rate(self, s, spec):
         old = float(s.sampling_rate)
-        new = float(np.random.uniform(spec.min_hz, spec.max_hz))
+        downsample_max = min(float(spec.max_hz), old)
+        if downsample_max > float(spec.min_hz) and np.random.random() < 0.5:
+            new = float(np.random.uniform(spec.min_hz, downsample_max))
+        else:
+            new = float(np.random.uniform(spec.min_hz, spec.max_hz))
         if old <= 0 or abs(new - old) < 1e-3:
             return s
         frac = Fraction(new / old).limit_denominator(50)
@@ -674,7 +678,7 @@ class IMUAugmenter:
         if int(round(T * up / down)) < spec.min_samples:
             return s
         x = s.data.detach().cpu().numpy()
-        y = _sps.resample_poly(x, up, down, axis=0)     # polyphase, anti-aliased
+        y = _sps.resample_poly(x, up, down, axis=0, padtype="line")
         s.data = torch.from_numpy(np.ascontiguousarray(y)).float().to(s.data.device)
         s.sampling_rate = old * up / down               # actual achieved rate
         s.applied_augmentations.append("rate")

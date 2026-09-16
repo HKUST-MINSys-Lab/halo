@@ -88,6 +88,20 @@ class BaselineAdapter:
             return self.pool_features([self.window_features(member, state, device) for member in stream.devices])
         return self.window_features(stream, state, device)
 
+    def native_zero_shot_features_for_stream(self, stream, state, device) -> np.ndarray:
+        """Representation consumed by the released native zero-shot rule.
+
+        This is separate from :meth:`features_for_stream`: a release may align an aggregator output
+        to text while publishing backbone tokens for downstream enrollment/readout evaluation.
+        """
+        return self.features_for_stream(stream, state, device)
+
+    def native_feature_artifacts(self, state) -> Dict[str, Path]:
+        return self.evaluation_artifacts(state)
+
+    def native_feature_config(self, state) -> dict:
+        return self.evaluation_config(state)
+
     def setup(self, device):
         """Load model + artifacts once; return an opaque state object."""
         raise NotImplementedError
@@ -120,10 +134,19 @@ class BaselineAdapter:
         not silently scored, and not counted as a failure."""
         return None
 
+    def is_stream_incompatible(self, stream) -> Optional[str]:
+        """Stream-aware compatibility hook.
+
+        Dataset-only adapters inherit the historical rule. Adapters whose validity depends on a
+        concrete placement or channel configuration override this method so one incompatible
+        stream cannot exclude every other stream in the same dataset.
+        """
+        return self.is_incompatible(stream.dataset)
+
     def incompatibility_for_stream(self, stream) -> Optional[str]:
         """Apply the declared compatibility rule to every member of a composite cell."""
         members = stream.devices if isinstance(stream, eval_data.MultiDeviceEvalStream) else [stream]
-        reasons = [self.is_incompatible(member.dataset) for member in members]
+        reasons = [self.is_stream_incompatible(member) for member in members]
         reasons = [reason for reason in reasons if reason is not None]
         return reasons[0] if reasons else None
 

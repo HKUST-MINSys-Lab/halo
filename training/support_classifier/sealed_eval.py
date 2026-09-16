@@ -41,6 +41,11 @@ from training.support_classifier.train import make_label_text
 from training.support_classifier.neighbors import differentiable_neighbor_logits
 from training.support_classifier.representation_diagnostics import write_embedding_diagnostics
 from training.support_classifier.sampling import MIN_RECORDING_SECONDS
+from training.support_classifier.partial_coverage import (
+    CoverageCell,
+    classwise_neighbor_scores,
+    equal_weight_normalized_fusion_predictions,
+)
 from training.tokenizer.eval_transfer import build_encoder, encode_dataset, encode_multi_device_dataset
 from training.tokenizer.pretrain_data import _stream_gravity_state, stream_channel_descriptions
 
@@ -50,20 +55,29 @@ SEED = 20260912
 # ``build_manifest`` still fails closed per query if a future corpus revision no longer
 # satisfies a requested support count.
 DEFAULT_K = (0, 1, 2, 4, 8, 16, 32, 64, 128)
-PRIMARY_BASELINES = ("harnet", "limubert_x", "unimts", "normwear")
+PRIMARY_BASELINES = ("harnet5", "harnet10", "limubert_x", "unimts", "normwear")
 # Full released-model parameter counts in millions, measured from the pinned artifacts used by
 # the adapters.  This is model capacity, not the parameter-free common enrollment readout.
 _PARAMETER_COUNT_M = {
-    "harnet": 4.49,
+    "harnet5": 4.491,
+    "harnet10": 10.983,
     "limubert_x": 0.055,
     "unimts": 68.61,
     "normwear": 1293.86,
 }
+_PARAMETER_BREAKDOWN_M = {
+    "normwear": {
+        "sensor_backbone": 136.1,
+        "msitf_aggregator": 57.7,
+        "frozen_tinyllama_text_tower": 1100.06,
+    },
+}
 _HALO_CLASSIFIER_PARAMETER_CACHE: dict[str, int] = {}
-TRAINING_BANK_ZERO_SHOT = frozenset({"halo", "harnet", "limubert_x"})
+_HALO_RESIDUAL_HEAD_CACHE: dict[tuple[str, str, bool, bool], torch.nn.Module] = {}
+TRAINING_BANK_ZERO_SHOT = frozenset({"halo", "harnet5", "harnet10", "limubert_x"})
 # Bump whenever feature extraction semantics, cache inputs, or pooling changes.  This avoids
 # treating an old embedding array as valid after a code-only correction.
-FEATURE_CACHE_SCHEMA = "sealed-feature-v4-20260913"
+FEATURE_CACHE_SCHEMA = "sealed-feature-v5-20260916"
 MAX_EXACT_RIDGE_SYSTEM = 512
 
 
@@ -135,12 +149,14 @@ def _native_capabilities(name: str) -> dict[str, bool]:
     if name == "halo":
         return {
             "native_open_set_labels": True,
-            "native_few_shot_adaptation": True,
+            "native_support_conditioning": True,
+            "published_few_label_finetuning": False,
         }
     adapter = baselines.REGISTRY[name]
     return {
         "native_open_set_labels": bool(adapter.supports_native_zero_shot()),
-        "native_few_shot_adaptation": bool(adapter.supports_native_enrollment()),
+        "native_support_conditioning": bool(adapter.supports_native_enrollment()),
+        "published_few_label_finetuning": name in {"harnet5", "harnet10", "limubert_x", "unimts", "normwear"},
     }
 
 
@@ -233,8 +249,13 @@ def _aligned_labels(stream: EvalStream) -> np.ndarray:
 
 
 def _stable_choice(values: np.ndarray, count: int, *, seed_parts: Sequence[object]) -> np.ndarray:
+    values = np.asarray(values, dtype=np.int64)
+    if count < 0 or count > len(values):
+        raise ValueError("choice count must lie within the available pool")
     digest = hashlib.sha256("|".join(map(str, seed_parts)).encode()).digest()
     rng = np.random.default_rng(int.from_bytes(digest[:8], "little"))
+    # The exact NumPy draw is frozen protocol behavior. Optimize manifest reuse, not the mapping
+    # from a public seed to episode rows.
     return np.asarray(rng.choice(values, size=count, replace=False), dtype=np.int64)
 
 
@@ -249,7 +270,9 @@ def build_manifest(stream: EvalStream, k: int, *, seed: int = SEED) -> list[Quer
     if k < 0:
         raise ValueError("k must be non-negative")
     if k == 0:
-        return [QueryPlan(query=i, support=(), support_labels=()) for i in range(stream.n_windows)]
+        labels = _aligned_labels(stream)
+        return [QueryPlan(query=i, support=(), support_labels=())
+                for i, label in enumerate(labels) if label in stream.eval_labels]
     if not stream.execution_identity_known or stream.execution_ids is None:
         raise ValueError(
             f"{stream.dataset}/{stream.stream}: execution identity is unavailable; refusing "
@@ -270,6 +293,7 @@ def build_manifest(stream: EvalStream, k: int, *, seed: int = SEED) -> list[Quer
         label: np.asarray(stream.execution_ids[rows], dtype=object)
         for label, rows in label_rows.items()
     }
+    execution_pools: dict[tuple[str, object], np.ndarray] = {}
     for query in valid.tolist():
         q_execution = stream.execution_ids[query]
         support: list[int] = []
@@ -277,7 +301,11 @@ def build_manifest(stream: EvalStream, k: int, *, seed: int = SEED) -> list[Quer
         possible = True
         for label in candidates:
             rows = label_rows[label]
-            pool = rows[label_execution[label] != q_execution]
+            pool_key = (label, q_execution)
+            pool = execution_pools.get(pool_key)
+            if pool is None:
+                pool = rows[label_execution[label] != q_execution]
+                execution_pools[pool_key] = pool
             if len(pool) < k:
                 possible = False
                 break
@@ -294,12 +322,14 @@ def build_manifest(stream: EvalStream, k: int, *, seed: int = SEED) -> list[Quer
 
 def manifest_fingerprint(plans: Iterable[QueryPlan]) -> str:
     payload = [asdict(plan) for plan in plans]
-    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 def _normalise(rows: np.ndarray) -> np.ndarray:
-    rows = np.asarray(rows, dtype=np.float64)
-    return rows / np.maximum(np.linalg.norm(rows, axis=1, keepdims=True), 1e-12)
+    rows = np.asarray(rows, dtype=np.float32)
+    return rows / np.maximum(np.linalg.norm(rows, axis=1, keepdims=True), np.float32(1e-12))
 
 
 @torch.no_grad()
@@ -313,7 +343,8 @@ def _training_bank_conse_predictions(
     *,
     query_batch_size: int = 1024,
     reference_batch_size: int = 32768,
-) -> tuple[list[str], dict]:
+    return_scores: bool = False,
+) -> tuple[list[str] | np.ndarray, dict]:
     """Bridge a training-bank nearest neighbour onto an unseen candidate vocabulary.
 
     ``k=0`` means zero *target-dataset enrollment*, not zero prior labelled evidence. The closest
@@ -351,7 +382,13 @@ def _training_bank_conse_predictions(
     nearest_rows = np.concatenate(nearest)
     probs = np.zeros((len(query), len(train_labels)), dtype=np.float32)
     probs[np.arange(len(query)), label_ids[nearest_rows]] = 1.0
-    predictions, info = scoring.conse_predict(probs, train_labels, target_labels, top_T=1)
+    if return_scores:
+        output: list[str] | np.ndarray = scoring.conse_score_matrix(
+            probs, train_labels, target_labels, top_T=1,
+        )
+        info = {"top_T": 1}
+    else:
+        output, info = scoring.conse_predict(probs, train_labels, target_labels, top_T=1)
     info.update({
         "zero_support_protocol": "training_bank_1nn_conse_v1",
         "reference_rows": int(len(reference)),
@@ -360,7 +397,7 @@ def _training_bank_conse_predictions(
     del reference_device
     if device.type == "cuda":
         torch.cuda.empty_cache()
-    return predictions, info
+    return output, info
 
 
 def _readout_predictions(
@@ -615,17 +652,18 @@ def _cache_key(
     fingerprint: str,
     *,
     source_fingerprint: str | None = None,
+    feature_role: str = "enrollment",
 ) -> str:
     devices = tuple(getattr(stream, "device_ids", (stream.stream,)))
     source_fingerprint = source_fingerprint or source_slice_fingerprint(stream)
-    text = (f"{FEATURE_CACHE_SCHEMA}|{name}|{stream.dataset}|{stream.stream}|{stream.alignment}|"
+    text = (f"{FEATURE_CACHE_SCHEMA}|{feature_role}|{name}|{stream.dataset}|{stream.stream}|{stream.alignment}|"
             f"{stream.window_seconds:g}|{devices}|{fingerprint}|{source_fingerprint}")
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
 @lru_cache(maxsize=128)
-def _file_hash_for_stat(path_text: str, size: int, mtime_ns: int) -> str:
-    del size, mtime_ns  # They are cache-key material; the digest still covers the complete file.
+def _file_hash_for_stat(path_text: str, size: int, mtime_ns: int, ctime_ns: int) -> str:
+    del size, mtime_ns, ctime_ns  # Cache-key material; digest covers the complete file.
     digest = hashlib.sha256()
     with Path(path_text).open("rb") as handle:
         for block in iter(lambda: handle.read(1 << 20), b""):
@@ -636,7 +674,9 @@ def _file_hash_for_stat(path_text: str, size: int, mtime_ns: int) -> str:
 def _file_hash(path: Path) -> str:
     path = Path(path).resolve()
     stat = path.stat()
-    return _file_hash_for_stat(str(path), stat.st_size, stat.st_mtime_ns)
+    # ctime closes the practical stale-cache hole where a tool preserves mtime while replacing a
+    # same-sized checkpoint. It changes on inode metadata/content replacement on this platform.
+    return _file_hash_for_stat(str(path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
 
 
 def _halo_features(
@@ -676,16 +716,21 @@ def _halo_residual_predictions(
     batch_size: int = 64,
 ) -> list[str]:
     """Evaluate v2's unified scorer; shared parameter-free controls remain elsewhere unchanged."""
-    blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    if blob.get("architecture_version") not in {"support_classifier_v2", "support_classifier_v3"}:
-        raise ValueError("residual readout requires a residual support-classifier checkpoint")
-    classifier_config = dict(blob["classifier_config"])
-    if blob.get("architecture_version") == "support_classifier_v2":
-        classifier_config.setdefault("normalized_token_composition", False)
-    cfg = ResidualClassifierConfig(**classifier_config)
-    cfg = replace(cfg, residual_enabled=residual_enabled, text_term_enabled=text_term_enabled)
-    head = build_support_classifier(AttentionSpec(**blob["attention_spec"]), cfg).to(device).eval()
-    head.load_state_dict(blob["classifier"], strict=True)
+    fingerprint = _file_hash(checkpoint)
+    cache_key = (fingerprint, str(device), bool(residual_enabled), bool(text_term_enabled))
+    head = _HALO_RESIDUAL_HEAD_CACHE.get(cache_key)
+    if head is None:
+        blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        if blob.get("architecture_version") not in {"support_classifier_v2", "support_classifier_v3"}:
+            raise ValueError("residual readout requires a residual support-classifier checkpoint")
+        classifier_config = dict(blob["classifier_config"])
+        if blob.get("architecture_version") == "support_classifier_v2":
+            classifier_config.setdefault("normalized_token_composition", False)
+        cfg = ResidualClassifierConfig(**classifier_config)
+        cfg = replace(cfg, residual_enabled=residual_enabled, text_term_enabled=text_term_enabled)
+        head = build_support_classifier(AttentionSpec(**blob["attention_spec"]), cfg).to(device).eval()
+        head.load_state_dict(blob["classifier"], strict=True)
+        _HALO_RESIDUAL_HEAD_CACHE[cache_key] = head
     candidates = tuple(stream.eval_labels)
     table = make_label_text(candidates, device)
     candidate_text = table.matrix[torch.as_tensor(table.ids(candidates), device=device)].unsqueeze(0)
@@ -886,6 +931,7 @@ def _baseline_feature_state(
     stream: EvalStream,
     device: torch.device,
     state: dict | None = None,
+    feature_role: str = "enrollment",
 ):
     """Load a released feature provider and fingerprint it without encoding a stream."""
     adapter = baselines.REGISTRY[name]
@@ -893,13 +939,16 @@ def _baseline_feature_state(
     if reason is not None:
         raise baselines.UnsupportedEvaluationCell(reason)
     state = adapter.setup_features(device) if state is None else state
-    fingerprint_key = f"_feature_fingerprint_{FEATURE_CACHE_SCHEMA}"
+    fingerprint_key = f"_feature_fingerprint_{FEATURE_CACHE_SCHEMA}_{feature_role}"
     fingerprint = state.get(fingerprint_key)
     if fingerprint is None:
-        artifacts = adapter.feature_artifacts(state)
+        artifacts = (adapter.native_feature_artifacts(state) if feature_role == "native_zero_shot"
+                     else adapter.feature_artifacts(state))
+        config = (adapter.native_feature_config(state) if feature_role == "native_zero_shot"
+                  else adapter.feature_config(state))
         fingerprint = hashlib.sha256(json.dumps({
             "artifacts": {key: _file_hash(Path(path)) for key, path in artifacts.items()},
-            "config": adapter.feature_config(state),
+            "config": config,
         }, sort_keys=True, default=str).encode()).hexdigest()
         state[fingerprint_key] = fingerprint
     return adapter, state, fingerprint
@@ -911,6 +960,7 @@ def _load_or_encode(
     halo_state: tuple[torch.nn.Module, str] | None = None,
     cache_read_dirs: Sequence[Path] = (),
     memory_cache: FeatureMemoryCache | None = None,
+    feature_role: str = "enrollment",
 ) -> tuple[np.ndarray, str]:
     if name == "halo":
         if halo_checkpoint is None:
@@ -920,11 +970,12 @@ def _load_or_encode(
         # Feature artifacts can be verified only after adapter setup. Do not reuse a baseline
         # cache under a guessed key; a changed released checkpoint must force re-extraction.
         adapter, state, probe = _baseline_feature_state(
-            name, stream, device, state=baseline_state,
+            name, stream, device, state=baseline_state, feature_role=feature_role,
         )
     source_fingerprint = (memory_cache.stream_fingerprint(stream) if memory_cache is not None
                           else source_slice_fingerprint(stream))
-    key = _cache_key(name, stream, probe, source_fingerprint=source_fingerprint)
+    key = _cache_key(name, stream, probe, source_fingerprint=source_fingerprint,
+                     feature_role=feature_role)
     filename = f"{stream.dataset}__{stream.stream}__{name}__{key}.npy"
     memory_key = f"{name}:{key}"
     if memory_cache is not None:
@@ -953,7 +1004,9 @@ def _load_or_encode(
             stream, halo_checkpoint, device, state=halo_state,
         )
     else:
-        values = np.asarray(adapter.features_for_stream(stream, state, device), dtype=np.float32)
+        extractor = (adapter.native_zero_shot_features_for_stream
+                     if feature_role == "native_zero_shot" else adapter.features_for_stream)
+        values = np.asarray(extractor(stream, state, device), dtype=np.float32)
         fingerprint = probe
     if values.shape[0] != stream.n_windows or values.ndim != 2 or not np.isfinite(values).all():
         raise ValueError(f"{name}: invalid feature matrix {values.shape} for {stream.dataset}/{stream.stream}")
@@ -980,6 +1033,7 @@ def _build_training_reference_bank(
     baseline_state: dict | None = None,
     cache_read_dirs: Sequence[Path] = (),
     memory_cache: FeatureMemoryCache | None = None,
+    window_seconds: float = 6.0,
 ) -> tuple[np.ndarray, np.ndarray, list[str], str]:
     """Encode the active labelled training roster for zero-target-enrollment scoring."""
     assert_no_retired_sources(SUPERVISED_HEAD_TRAIN_DATASETS)
@@ -990,13 +1044,13 @@ def _build_training_reference_bank(
     provenance: list[dict] = []
     excluded: list[dict] = []
     for dataset in SUPERVISED_HEAD_TRAIN_DATASETS:
-        streams = list_streams(dataset, alignment="native")
+        streams = list_streams(dataset, alignment="native", window_seconds=window_seconds)
         if not streams:
             raise FileNotFoundError(f"zero-shot training bank has no native grid for {dataset}")
         for stream_id in streams:
             stream = load_eval_stream(
                 dataset, stream_id, alignment="native", apply_quality_screen=True,
-                candidate_labels=train_labels,
+                candidate_labels=train_labels, window_seconds=window_seconds,
             )
             if stream.quality_screen != "applied":
                 raise RuntimeError(
@@ -1079,20 +1133,84 @@ def _build_training_reference_bank(
         "parts": provenance,
         "excluded": excluded,
         "protocol": "training_bank_1nn_conse_v1",
+        "window_seconds": float(window_seconds),
     }, sort_keys=True).encode()).hexdigest()
+    manifest_dir = cache_dir / "bank_manifests"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    duration_token = f"{float(window_seconds):g}".replace(".", "p")
+    (manifest_dir / f"{name}__w{duration_token}.json").write_text(json.dumps({
+        "provider": name,
+        "window_seconds": float(window_seconds),
+        "fingerprint": fingerprint,
+        "vocabulary": train_labels,
+        "included": provenance,
+        "excluded": excluded,
+        "n_rows": int(len(labels)),
+    }, indent=2) + "\n")
     return features, labels, train_labels, fingerprint
+
+
+def validate_result_rows(
+    rows: Sequence[dict],
+    *,
+    expected_cells: Sequence[tuple[float, str, str]],
+    models: Sequence[str],
+    k_values: Sequence[int],
+) -> None:
+    """Reject incomplete or internally inconsistent result artifacts before publication."""
+    if not rows:
+        raise RuntimeError("sealed evaluation produced no rows")
+    required = {
+        "model", "readout", "window_seconds", "k", "dataset", "stream", "status",
+        "parameters_m", "native_open_set_labels", "native_support_conditioning",
+        "published_few_label_finetuning", "padded", "padded_fraction",
+    }
+    coverage: set[tuple[float, str, str, str, int]] = set()
+    for index, row in enumerate(rows):
+        missing = sorted(required - set(row))
+        if missing:
+            raise RuntimeError(f"result row {index} is missing fields: {missing}")
+        if row["model"] == "harnet":
+            raise RuntimeError("ambiguous model identity 'harnet'; use harnet5 or harnet10")
+        if row["status"] not in {"ok", "n/a"}:
+            raise RuntimeError(f"result row {index} has non-publishable status {row['status']!r}")
+        if not np.isfinite(float(row["padded_fraction"])) or float(row["padded_fraction"]) < 0:
+            raise RuntimeError(f"result row {index} has invalid padding accounting")
+        if row["status"] == "ok":
+            for metric in ("accuracy", "balanced_accuracy", "f1_macro"):
+                if metric in row and not np.isfinite(float(row[metric])):
+                    raise RuntimeError(f"result row {index} has non-finite {metric}")
+        coverage.add((float(row["window_seconds"]), str(row["dataset"]), str(row["stream"]),
+                      str(row["model"]), int(row["k"])))
+    expected = {
+        (float(duration), dataset, stream, model, int(k))
+        for duration, dataset, stream in expected_cells
+        for model in models for k in k_values
+    }
+    missing_cells = sorted(expected - coverage)
+    if missing_cells:
+        preview = missing_cells[:5]
+        raise RuntimeError(
+            f"sealed evaluation is partial: {len(missing_cells)} model/cell/k combinations missing; "
+            f"first={preview}"
+        )
 
 
 def _write_markdown(rows: Sequence[dict], path: Path) -> None:
     columns = ("model", "readout", "window_seconds", "k", "dataset", "stream", "n_devices",
                "multi_device_mode", "padded", "padded_fraction", "f1_macro", "balanced_accuracy",
                "accuracy", "f1_macro_ci_lo", "f1_macro_ci_hi", "n_queries", "n_candidates",
-               "parameters_m", "native_open_set_labels", "native_few_shot_adaptation", "status")
+               "parameters_m", "parameter_breakdown_m", "native_open_set_labels", "native_support_conditioning",
+               "published_few_label_finetuning", "status")
     lines = ["# Sealed support-conditioned HAR results", "",
              "Generated by `training.support_classifier.sealed_eval`; no values select a checkpoint.", "",
              "| " + " | ".join(columns) + " |",
              "|" + "|".join(["---"] * len(columns)) + "|"]
+    # Keep diagnostic controls in results.json for auditability, but do not let them look like
+    # competing baseline classifiers in the publication-facing table.
     for row in rows:
+        if row.get("diagnostic_only"):
+            continue
         lines.append("| " + " | ".join(str(row.get(column, "")) for column in columns) + " |")
     path.write_text("\n".join(lines) + "\n")
 
@@ -1117,6 +1235,10 @@ def main() -> None:
         help="optional shared sealed-stream feature cache; defaults to OUT/feature_cache",
     )
     parser.add_argument(
+        "--feature-memory-cache-gib", type=float, default=2.0,
+        help="bounded in-process LRU for decoded feature matrices (default: 2 GiB)",
+    )
+    parser.add_argument(
         "--zero-shot-bank-cache",
         type=Path,
         default=Path("training/support_classifier/evaluations/zero_shot_feature_cache"),
@@ -1125,6 +1247,11 @@ def main() -> None:
     parser.add_argument("--embedding-diagnostics", action="store_true",
                         help="write opt-in representation figures beside each encoded stream; this never "
                              "changes predictions, manifests, or checkpoint selection")
+    parser.add_argument(
+        "--baseline-diagnostic-readouts", action="store_true",
+        help=("also compute 1-NN, prototype, and ridge controls for external encoders; "
+              "the primary baseline readout remains equal-weight normalized fusion"),
+    )
     parser.add_argument(
         "--classifier-isolation", action="store_true",
         help="add HALO-only component and support-label-binding diagnostics",
@@ -1135,6 +1262,8 @@ def main() -> None:
     if (not args.window_seconds or any(value <= 0 or not np.isfinite(value)
                                        for value in args.window_seconds)):
         parser.error("--window-seconds must contain finite positive durations")
+    if not np.isfinite(args.feature_memory_cache_gib) or args.feature_memory_cache_gib < 0:
+        parser.error("--feature-memory-cache-gib must be finite and non-negative")
     unknown = sorted(set(args.models) - set(PRIMARY_BASELINES) - {"halo"})
     if unknown:
         parser.error(f"models outside the registered primary roster: {unknown}")
@@ -1161,27 +1290,19 @@ def main() -> None:
     # A very large native model (notably NormWear) must be instantiated once and reused across
     # sealed streams. The same state also serves training-bank encoding so ordinary released
     # encoders are not reconstructed once per source stream.
-    persistent_states: dict[str, dict] = {}
-    if len(args.models) == 1 and args.models[0] != "halo":
-        name = args.models[0]
-        persistent_states[name] = baselines.REGISTRY[name].setup_features(device)
-    zero_shot_banks: dict[str, tuple[np.ndarray, np.ndarray, list[str], str]] = {}
-    if 0 in args.k:
-        for name in args.models:
-            if name not in TRAINING_BANK_ZERO_SHOT:
-                continue
-            print(f"[sealed-eval] building/loading k=0 training bank for {name}", flush=True)
-            zero_shot_banks[name] = _build_training_reference_bank(
-                name=name,
-                device=device,
-                cache_dir=args.zero_shot_bank_cache,
-                halo_checkpoint=args.halo_checkpoint,
-                halo_state=halo_state,
-                baseline_state=persistent_states.get(name),
-            )
+    persistent_states: dict[str, dict] = {
+        name: baselines.REGISTRY[name].setup_features(device)
+        for name in args.models if name != "halo"
+    }
+    feature_memory_cache = FeatureMemoryCache(
+        int(args.feature_memory_cache_gib * 1024**3),
+    )
+    # Banks are duration-specific because every provider must see the same physical evidence budget.
+    zero_shot_banks: dict[tuple[str, float], tuple[np.ndarray, np.ndarray, list[str], str]] = {}
     all_rows: list[dict] = []
     manifests: dict[str, dict] = {}
-    for window_seconds, dataset, stream_id, device_ids in evaluation_cells(args.window_seconds):
+    requested_cells = list(evaluation_cells(args.window_seconds))
+    for window_seconds, dataset, stream_id, device_ids in requested_cells:
         cell_row_start = len(all_rows)
         stream = (
             load_multi_device_stream(
@@ -1210,12 +1331,13 @@ def main() -> None:
                 "window_seconds": float(window_seconds),
                 "source_slice_fingerprint": source_slice_fingerprint(stream),
                 "seed": args.seed,
-                "construction": "execution_disjoint_stable_choice_v1",
+                "construction": "execution_disjoint_numpy_choice_json_v2",
             }
         # A representation depends only on the provider and the stream, never on enrollment k.
         # Encode/cache it once, then run all protocol readouts on immutable manifests.
         features_by_model: dict[str, tuple[np.ndarray, str]] = {}
         feature_errors: dict[str, str] = {}
+        semantic_by_model: dict[str, tuple[np.ndarray, dict]] = {}
         # Enrollment readouts and the training-bank bridge consume recording representations.
         # Native text-aligned baselines can bypass them at k=0.
         if args.models:
@@ -1225,7 +1347,7 @@ def main() -> None:
                         name=name, stream=stream, device=device, cache_dir=cache_dir,
                         halo_checkpoint=args.halo_checkpoint,
                         baseline_state=persistent_states.get(name),
-                        halo_state=halo_state,
+                        halo_state=halo_state, memory_cache=feature_memory_cache,
                     )
                     if args.embedding_diagnostics:
                         features, _ = features_by_model[name]
@@ -1307,7 +1429,15 @@ def main() -> None:
                                              "status": "n/a", "reason": feature_errors[name]})
                             continue
                         features, fingerprint = features_by_model[name]
-                        bank_features, bank_labels, train_labels, bank_fingerprint = zero_shot_banks[name]
+                        bank_key = (name, float(window_seconds))
+                        if bank_key not in zero_shot_banks:
+                            zero_shot_banks[bank_key] = _build_training_reference_bank(
+                                name=name, device=device, cache_dir=args.zero_shot_bank_cache,
+                                halo_checkpoint=args.halo_checkpoint, halo_state=halo_state,
+                                baseline_state=persistent_states.get(name),
+                                window_seconds=window_seconds,
+                            )
+                        bank_features, bank_labels, train_labels, bank_fingerprint = zero_shot_banks[bank_key]
                         predicted, info = _training_bank_conse_predictions(
                             features, bank_features, bank_labels, train_labels,
                             stream.eval_labels, device,
@@ -1340,7 +1470,11 @@ def main() -> None:
                     state = persistent_states.get(name)
                     if state is None:
                         state = adapter.setup(device)
-                    features, fingerprint = features_by_model[name]
+                    features, fingerprint = _load_or_encode(
+                        name=name, stream=stream, device=device, cache_dir=cache_dir,
+                        halo_checkpoint=args.halo_checkpoint, baseline_state=state,
+                        feature_role="native_zero_shot", memory_cache=feature_memory_cache,
+                    )
                     prediction, _ = adapter.predict_candidates_from_features(
                         features, stream.eval_labels, state, device,
                     )
@@ -1365,16 +1499,21 @@ def main() -> None:
                                      "status": "n/a", "reason": feature_errors[name]})
                     continue
                 features, fingerprint = features_by_model[name]
+                # Every enrolled external baseline exposes 1-NN beside the primary normalized
+                # fusion row. Prototype/ridge remain opt-in diagnostics.
                 predictions = _readout_predictions(
                     features, _aligned_labels(stream), stream.eval_labels, plans, device=device,
+                    readouts=(None if name == "halo" or args.baseline_diagnostic_readouts
+                              else frozenset(("1nn",))),
                 )
                 for readout, predicted in predictions.items():
                     metric = _metric_row(stream, plans, predicted, bootstrap=args.bootstrap)
                     metric.update({"model": name, "readout": readout, "k": k,
                                    "status": "ok", "feature_fingerprint": fingerprint,
-                                   "manifest": manifests[manifest_id]["fingerprint"]})
+                                   "manifest": manifests[manifest_id]["fingerprint"],
+                                   "diagnostic_only": name != "halo" and readout != "1nn"})
                     all_rows.append(metric)
-                if "ridge" not in predictions:
+                if (name == "halo" or args.baseline_diagnostic_readouts) and "ridge" not in predictions:
                     all_rows.append({
                         "model": name, "readout": "ridge", "k": k,
                         "dataset": dataset, "stream": stream_id,
@@ -1383,7 +1522,70 @@ def main() -> None:
                             "exact query-specific ridge system exceeds "
                             f"{MAX_EXACT_RIDGE_SYSTEM} dimensions"
                         ),
+                        "diagnostic_only": name != "halo",
                     })
+                if name != "halo":
+                    state = persistent_states.get(name)
+                    if name in TRAINING_BANK_ZERO_SHOT:
+                        if name not in semantic_by_model:
+                            bank_key = (name, float(window_seconds))
+                            if bank_key not in zero_shot_banks:
+                                zero_shot_banks[bank_key] = _build_training_reference_bank(
+                                    name=name, device=device, cache_dir=args.zero_shot_bank_cache,
+                                    halo_checkpoint=args.halo_checkpoint, halo_state=halo_state,
+                                    baseline_state=state, window_seconds=window_seconds,
+                                    memory_cache=feature_memory_cache,
+                                )
+                            bank_features, bank_labels, train_labels, bank_fingerprint = zero_shot_banks[bank_key]
+                            semantic_scores, semantic_info = _training_bank_conse_predictions(
+                                features, bank_features, bank_labels, train_labels,
+                                stream.eval_labels, device, return_scores=True,
+                            )
+                            semantic_info["training_bank_fingerprint"] = bank_fingerprint
+                            semantic_by_model[name] = (semantic_scores, semantic_info)
+                        semantic_scores, semantic_info = semantic_by_model[name]
+                    elif baselines.REGISTRY[name].supports_native_zero_shot():
+                        if name not in semantic_by_model:
+                            native_features, _ = _load_or_encode(
+                                name=name, stream=stream, device=device, cache_dir=cache_dir,
+                                halo_checkpoint=args.halo_checkpoint, baseline_state=state,
+                                feature_role="native_zero_shot", memory_cache=feature_memory_cache,
+                            )
+                            semantic_by_model[name] = (
+                                np.asarray(
+                                    baselines.REGISTRY[name].candidate_scores_from_features(
+                                        native_features, stream.eval_labels, state, device,
+                                    ), dtype=np.float64,
+                                ),
+                                {"zero_support_protocol": "native_candidate_scores"},
+                            )
+                        semantic_scores, semantic_info = semantic_by_model[name]
+                    else:
+                        all_rows.append({
+                            "model": name, "readout": "equal-weight-normalized-fusion", "k": k,
+                            "dataset": dataset, "stream": stream_id, "status": "n/a",
+                            "reason": "no native or configured semantic-score path",
+                        })
+                        continue
+                    neighbor_scores = classwise_neighbor_scores(
+                        features, stream.eval_labels, plans, device=device,
+                    )
+                    full_coverage = CoverageCell(
+                        supported=tuple(stream.eval_labels), hidden=(), coverage=1.0,
+                        requested_coverage=1.0,
+                    )
+                    fused = equal_weight_normalized_fusion_predictions(
+                        semantic_scores, features, stream.eval_labels, plans, full_coverage,
+                        classwise_scores=neighbor_scores,
+                    )
+                    metric = _metric_row(stream, plans, fused, bootstrap=args.bootstrap)
+                    metric.update({
+                        "model": name, "readout": "equal-weight-normalized-fusion", "k": k,
+                        "status": "ok", "feature_fingerprint": fingerprint,
+                        "manifest": manifests[manifest_id]["fingerprint"], **semantic_info,
+                    })
+                    all_rows.append(metric)
+                    continue
                 if name == "halo":
                     # Differentiable neighbours is used only to train and diagnose the HALO
                     # encoder. Sealed reports use the deployment readouts: 1-NN, prototype,
@@ -1451,6 +1653,8 @@ def main() -> None:
                 name, halo_state, halo_checkpoint=args.halo_checkpoint,
                 include_classifier=learned_head,
             ), 3)
+            if name in _PARAMETER_BREAKDOWN_M:
+                row["parameter_breakdown_m"] = _PARAMETER_BREAKDOWN_M[name]
             if name == "halo":
                 accounting = {"padded": False, "padded_fraction": 0.0}
                 mode = "native" if isinstance(stream, MultiDeviceEvalStream) else "single-device"
@@ -1462,9 +1666,26 @@ def main() -> None:
             row.setdefault("window_seconds", float(window_seconds))
             row["n_devices"] = len(stream.devices) if isinstance(stream, MultiDeviceEvalStream) else 1
             row["multi_device_mode"] = mode
-            row["padded"] = accounting["padded"]
-            row["padded_fraction"] = accounting["padded_fraction"]
+            row.update(accounting)
             row["source_slice_fingerprint"] = source_slice_fingerprint(stream)
+    validate_result_rows(
+        all_rows,
+        expected_cells=[(duration, dataset, stream_id)
+                        for duration, dataset, stream_id, _ in requested_cells],
+        models=args.models,
+        k_values=sorted(set(args.k)),
+    )
+    (args.out / "run_metadata.json").write_text(json.dumps({
+        "result_schema": "sealed-results-v3-20260916",
+        "manifest_protocol": "sealed-manifest-v2-20260916",
+        "manifest_generator": "numpy-choice-json-fingerprint-v1",
+        "feature_cache_schema": FEATURE_CACHE_SCHEMA,
+        "models": args.models,
+        "k": sorted(set(args.k)),
+        "window_seconds": sorted(set(map(float, args.window_seconds))),
+        "n_cells": len(requested_cells),
+        "complete": True,
+    }, indent=2) + "\n")
     (args.out / "episode_manifests.json").write_text(json.dumps(manifests, indent=2) + "\n")
     (args.out / "results.json").write_text(json.dumps(all_rows, indent=2, allow_nan=True) + "\n")
     _write_markdown(all_rows, args.out / "RESULTS.md")

@@ -9,7 +9,7 @@ and NormWear; **no full comparison run has been made.** Implements
 
 | file | role |
 |---|---|
-| `training/support_classifier/partial_coverage.py` | Scenario 1 primitives: hidden-candidate choice, support hiding, truth splitting, coverage-safe readouts, the fixed untrained hybrid combiner |
+| `training/support_classifier/partial_coverage.py` | Scenario 1 primitives: hidden-candidate choice, support hiding, truth splitting, coverage-safe readouts, and equal-weight normalized fusion |
 | `training/support_classifier/scenarios.py` | Scenarios 2-8 primitives: accel-only and resampled derived streams, cross-stream enrolment manifests, shared-label rosters |
 | `training/support_classifier/run_partial_coverage.py` | Scenario 1 standalone runner; also the home of `emit_rows`, `conse_scores`, `native_text_scores`, reused by the unified runner |
 | `training/support_classifier/run_scenarios.py` | Unified runner for all eight scenarios, with severity stamping |
@@ -25,10 +25,12 @@ maintaining separate model adapters.
 cd /home/alex/code/HALO/halo
 /home/alex/code/HALO/legacy_code/.venv/bin/python -m training.support_classifier.run_scenarios \
   --out training/support_classifier/evaluations/scenarios_20260915 \
-  --models halo harnet limubert_x unimts normwear \
-  --halo-checkpoint training/support_classifier/outputs/halo_fixed_mr_residual_v3_8s_4res_40k_20260914/best_internal.pt \
-  --k 1 8 --window-seconds 8
+  --models halo harnet5 harnet10 limubert_x unimts normwear \
+  --halo-checkpoint training/support_classifier/outputs/halo_fixed_mr_residual_v3_curriculum12_40k_20260916/best_internal.pt
 ```
+
+The default full grid is `k = 0, 1, 2, 4, 8, 16, 32, 64` at 4, 8, and 16 seconds. Pass explicit
+subsets only for a bounded diagnostic.
 
 `--smoke` runs up to two cells per scenario, one k, no bootstrap. Two cells are necessary for
 matched scenarios because they exercise both the control and perturbation. `--scenarios` selects a subset.
@@ -53,11 +55,16 @@ LRU avoids repeated disk loads within a run and is adjustable with `--feature-me
 2. **Support-only readouts can never name a hidden candidate.** 1-NN, prototype and ridge score only
    enrolled candidates, so a query whose truth is hidden is necessarily wrong. That is the
    measurement of the capability gap, not a bug.
-3. **The hybrid readout is fixed and untrained.** Per query: z-score the text row over the full
-   roster, z-score the 1-NN row over the enrolled subset, add. A hidden candidate competes on text
-   alone. Nothing is fitted, so no baseline is handicapped and none is credited with a tuned
-   combiner. `conse_scores` reproduces the exact matrix `scoring.conse_predict` takes its arg-max
-   over, so a bridge model is ranked by its own zero-support rule.
+3. **Equal-weight normalized fusion is fixed and untrained.** Per query: z-score the semantic row
+   from the model's declared zero-support route over the full roster, z-score class-wise maximum
+   cosine similarity over the enrolled subset, and add with weights `1 + 1`. A hidden candidate
+   competes on semantic evidence alone. Nothing is fitted, so no baseline is handicapped and none
+   is credited with a tuned combiner. `conse_scores` reproduces the exact matrix
+   `scoring.conse_predict` takes its arg-max over, so a bridge model is ranked by its own
+   zero-support rule.
+   This is the primary external-baseline classifier for every enrolled scenario, not only partial
+   coverage. Support-only 1-NN is always reported beside fusion; prototype and ridge are opt-in
+   diagnostics.
 4. **Truth-restricted metrics are explicit.** Enrolled-truth and unenrolled-truth rows report
    macro F1 over the observed truth/prediction union and balanced accuracy over classes present in
    truth. The output names the split and also reports false-enrolment pull for unenrolled truth.
@@ -114,7 +121,7 @@ Not results. A wiring check, single cell, no baselines except where noted. Sever
 | s8 cold start (all) | 3/2/2/3 | 22.2 | 24.1 |
 | s8 truth unenrolled (balanced acc.) | | 0.0 | 9.2 |
 
-Baseline hybrid readout, Scenario 1 only, same cell, balanced accuracy on unenrolled truth:
+Baseline equal-weight normalized fusion, Scenario 1 only, same cell, balanced accuracy on unenrolled truth:
 UniMTS 56.9, LiMU-BERT-X 39.8, HARNet 34.3, against HALO's 86.0. **One cell of one dataset with no
 confidence intervals; treat as wiring evidence only.**
 
@@ -156,12 +163,20 @@ semantics:
 * Paired subject bootstrap now accumulates per-subject confusion matrices and vectorizes the same
   seeded resamples. It is bit-for-bit equivalent to the former per-replicate sklearn estimator in
   parity tests, reducing a typical 1,000-replicate comparison from about 4.1 s to 0.006 s.
-* Partial-coverage support readouts and the fixed hybrid combiner are batched. The support roster,
+* Partial-coverage support readouts and equal-weight normalized fusion are batched. The support roster,
   max-over-enrolments rule, z-score definition, and predictions are unchanged.
 * Scenario task limiting now stops construction at the requested limit instead of constructing and
   discarding the full suite. A two-task rate-mismatch smoke fell from 12.4 s to 1.6 s in task setup.
-* Repeated immutable manifests, composite views, source fingerprints, model-artifact hashes, and
-  feature matrices are cached with bounded memory and content validation.
+* Composite views, source fingerprints, model-artifact hashes, and feature matrices are cached
+  with bounded memory and content validation. Manifest generation retains the frozen NumPy draw
+  and canonical JSON fingerprint; optimization must not alter the seed-to-row mapping.
+* External baselines always report cosine 1-NN beside equal-weight normalized fusion. Fusion stays
+  the declared primary deployment readout, but never hides the representation-only floor.
+* HALO residual heads are loaded once per checkpoint/configuration rather than once per task. One
+  unloadable stream is recorded without discarding sibling datasets in the scenario cell.
+* Sealed evaluation retains released provider states for the process, keeps a bounded decoded
+  feature LRU, and computes each model/stream candidate-semantic matrix once for the full k curve.
+  Those quantities are k-independent; redoing them at every support count was pure overhead.
 * ConSE and HALO label tokens now use one process-wide frozen MiniLM instance and embedding cache
   instead of loading the same 22M-parameter model twice.
 * HALO extraction uses a measured-safe CUDA batch of 512. NormWear uses 32 six-channel chunks on

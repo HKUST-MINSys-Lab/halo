@@ -13,10 +13,12 @@
   "license": "MIT (source repository); paper copyright ACM",
   "input_contract": {
     "channels": ["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"],
-    "rate_hz": 20,
+    "rate_hz": 10,
     "window_samples": 20,
-    "window_sec": 1,
+    "window_sec": 2,
     "acceleration_units": "g after the authors' divide-by-9.8 normalization",
-    "gyroscope_units": "rad/s"
+    "gyroscope_units": "rad/s",
+    "metadata_inputs": "none",
+    "representation_note": "The released downstream network consumes transformer hidden states with a GRU. HALO mean-pools hidden states within each 20-sample clip and duration-weights clips only to obtain a common frozen recording vector; this is an evaluation readout, not a claimed native LiMU-BERT-X head."
   }
 }

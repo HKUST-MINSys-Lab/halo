@@ -14,7 +14,7 @@ from sklearn.metrics import accuracy_score, f1_score, recall_score
 from baselines.data import EvalStream, source_slice_fingerprint
 from baselines.scoring import paired_subject_bootstrap_difference
 from training.support_classifier.partial_coverage import zscore
-from training.support_classifier.run_scenarios import _PairedDeltaTracker
+from training.support_classifier.run_scenarios import _PairedDeltaTracker, _paired_deltas
 from training.support_classifier.sealed_eval import (
     FEATURE_CACHE_SCHEMA,
     FeatureMemoryCache,
@@ -176,3 +176,27 @@ def test_paired_tracker_releases_a_completed_control_group():
     assert len(output) == 1
     assert output[0]["f1_macro_delta"] < 0
     assert not tracker.controls
+
+
+def test_paired_delta_point_and_interval_use_the_same_class_set():
+    common = {
+        "matched_group": "g", "model": "m", "readout": "1nn", "k": 1,
+        "window_seconds": 8.0,
+    }
+    truth = ("a", "a", "b", "b")
+    rows = []
+    for index, label in enumerate(truth):
+        rows.append({
+            **common, "condition": "control", "variant": "control",
+            "query_event_id": str(index), "query_group_id": f"s{index % 2}",
+            "truth": label, "prediction": label,
+        })
+        rows.append({
+            **common, "condition": "scenario", "variant": "shift",
+            "query_event_id": str(index), "query_group_id": f"s{index % 2}",
+            "truth": label, "prediction": "new_false_positive" if index == 0 else label,
+        })
+    result = _paired_deltas(rows, bootstrap=8)[0]
+    assert result["f1_macro_delta"] == pytest.approx(
+        result["f1_macro_difference"], abs=1e-12,
+    )

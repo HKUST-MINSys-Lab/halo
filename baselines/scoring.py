@@ -688,26 +688,18 @@ def conse_embeddings(
     return v / norms
 
 
-def conse_predict(
+def conse_score_matrix(
     probs: np.ndarray,
     train_vocab: Sequence[str],
     target_labels: Sequence[str],
     encode: Optional[Callable[[Sequence[str]], np.ndarray]] = None,
     top_T: int = CONSE_TOP_T,
     centre_query: bool = CONSE_CENTRE_QUERY,
-) -> Tuple[List[str], Dict[str, object]]:
-    """Full ConSE bridge: classifier softmax over the train vocab -> predictions
-    over the target dataset's label strings, plus reachability stats.
+) -> np.ndarray:
+    """ConSE similarity to every target label, before the final argmax.
 
     No target-label leakage: the bridge combines only *training* label
     embeddings; the target vocabulary enters solely as the projection space.
-
-    Returns:
-        pred_names: N predictions among `target_labels`.
-        info: reachability stats. `reachable_nn_lb` is a T=1 nearest-neighbour
-              LOWER BOUND on which target classes the bridge can output; the
-              actual top-T convex combinations can also land on other classes,
-              so `predicted_classes` (the classes actually hit) is reported too.
     """
     if encode is None:
         encode = get_sbert_encoder()
@@ -724,7 +716,26 @@ def conse_predict(
         # information enters, and it adds no parameters.
         v = v - train_embs.mean(axis=0, keepdims=True)
         v = v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-9)
-    sims = v @ target_embs.T                                         # (N, L)
+    return np.asarray(v @ target_embs.T, dtype=np.float64)            # (N, L)
+
+
+def conse_predict(
+    probs: np.ndarray,
+    train_vocab: Sequence[str],
+    target_labels: Sequence[str],
+    encode: Optional[Callable[[Sequence[str]], np.ndarray]] = None,
+    top_T: int = CONSE_TOP_T,
+    centre_query: bool = CONSE_CENTRE_QUERY,
+) -> Tuple[List[str], Dict[str, object]]:
+    """Full ConSE bridge over the target dataset's label strings."""
+    if encode is None:
+        encode = get_sbert_encoder()
+    train_embs = encode(train_vocab)
+    target_embs = encode(target_labels)
+    sims = conse_score_matrix(
+        probs, train_vocab, target_labels, encode=encode, top_T=top_T,
+        centre_query=centre_query,
+    )
     preds = [target_labels[i] for i in sims.argmax(axis=1)]
 
     nn_of_train = (train_embs @ target_embs.T).argmax(axis=1)        # (K,)

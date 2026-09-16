@@ -17,20 +17,27 @@ Design notes
 * **Support-only readouts can never name a hidden candidate.**  1-NN, prototype and ridge score the
   supported subset, so a query whose truth is hidden is necessarily wrong.  That is the measurement,
   not a bug: it is exactly the capability a support-only model lacks.
-* **The hybrid readout is fixed and untrained.**  Text-path models get z-scored text evidence over
-  the full roster plus z-scored support evidence where it exists.  Nothing is fitted, so no baseline
-  is handicapped by our training choices and none is credited with a tuned combiner.
+* **Fusion is fixed, equal-weight and untrained.**  Every model gets its declared zero-support
+  semantic scores over the full roster plus cosine 1-NN evidence where enrolment exists.  Each
+  score family is normalised independently per query before addition.  Nothing is fitted, so no
+  baseline is handicapped by our training choices and none is credited with a tuned combiner.
 """
 
 from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, replace
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
 import numpy as np
 
-from .sealed_eval import QueryPlan, _normalise
+if TYPE_CHECKING:
+    from .sealed_eval import QueryPlan
+
+
+def _normalise(rows: np.ndarray) -> np.ndarray:
+    rows = np.asarray(rows, dtype=np.float32)
+    return rows / np.maximum(np.linalg.norm(rows, axis=1, keepdims=True), np.float32(1e-12))
 
 __all__ = [
     "CoverageCell",
@@ -38,7 +45,8 @@ __all__ = [
     "hide_supports",
     "truth_split",
     "support_only_predictions",
-    "hybrid_predictions",
+    "equal_weight_normalized_fusion_predictions",
+    "classwise_neighbor_scores",
     "zscore",
 ]
 
@@ -168,6 +176,7 @@ def support_only_predictions(
     ridge_alpha: float = 1.0,
     device=None,
     readouts: frozenset[str] | None = None,
+    classwise_scores: np.ndarray | None = None,
 ) -> dict[str, list[str]]:
     """1-NN, prototype and ridge restricted to the candidates that actually carry enrolment.
 
@@ -182,20 +191,30 @@ def support_only_predictions(
         # same readout over a smaller candidate roster, including the same ridge system.
         from .sealed_eval import _readout_predictions
 
-        return _readout_predictions(
+        requested = frozenset(("1nn", "prototype", "ridge")) if readouts is None else readouts
+        delegated = requested - {"1nn"} if classwise_scores is not None else requested
+        result = _readout_predictions(
             features,
             np.empty(len(features), dtype=object),
             tuple(cell.supported),
             plans,
             ridge_alpha=ridge_alpha,
             device=device,
-            readouts=readouts,
+            readouts=delegated,
         )
+        if classwise_scores is not None and "1nn" in requested:
+            result["1nn"] = [str(candidates[index]) for index in classwise_scores.argmax(1)]
+        return result
     z = _normalise(features)
     supported = list(cell.supported)
     slot_of = {label: index for index, label in enumerate(supported)}
     requested = frozenset(("1nn", "prototype", "ridge")) if readouts is None else readouts
     result: dict[str, list[str]] = {name: [] for name in requested}
+    if classwise_scores is not None and "1nn" in requested:
+        scores = np.asarray(classwise_scores)
+        if scores.shape != (len(plans), len(candidates)):
+            raise ValueError("classwise neighbor scores have the wrong shape")
+        result["1nn"] = [str(candidates[index]) for index in scores.argmax(1)]
     for plan in plans:
         if not plan.support:
             raise ValueError("partial coverage still requires at least one enrolled support row")
@@ -203,7 +222,7 @@ def support_only_predictions(
         x = z[np.asarray(plan.support, dtype=np.int64)]
         y = np.asarray([slot_of[label] for label in plan.support_labels], dtype=np.int64)
 
-        if "1nn" in requested:
+        if "1nn" in requested and classwise_scores is None:
             result["1nn"].append(str(plan.support_labels[int(np.argmax(x @ query))]))
 
         present = [slot for slot in range(len(supported)) if np.any(y == slot)]
@@ -228,19 +247,22 @@ def support_only_predictions(
     return result
 
 
-def hybrid_predictions(
+def equal_weight_normalized_fusion_predictions(
     text_scores: np.ndarray,
     features: np.ndarray,
     candidates: Sequence[str],
     plans: Sequence[QueryPlan],
     cell: CoverageCell,
+    *,
+    classwise_scores: np.ndarray | None = None,
 ) -> list[str]:
-    """The fixed, untrained text+support combiner used by every text-path model.
+    """Fixed equal-weight fusion of semantic and cosine-neighbour evidence.
 
     ``text_scores`` is ``(n_windows, n_candidates)`` in the model's own candidate order.  Per query
-    the text row is standardised over the full roster and the 1-NN similarity row over the supported
-    subset only; the two are summed, so a hidden candidate competes on text evidence alone and a
-    supported one carries both.  Nothing here is fitted to any dataset.
+    the semantic row is standardised over the full roster and the class-wise maximum cosine
+    similarity is standardised over the supported subset.  The two components are added with
+    coefficients 1 and 1.  A hidden candidate therefore competes on semantic evidence alone while
+    a supported candidate carries both.  Nothing here is fitted to any dataset.
     """
     roster = list(str(label) for label in candidates)
     text_scores = np.asarray(text_scores, dtype=np.float64)
@@ -257,28 +279,11 @@ def hybrid_predictions(
         return []
     support_counts = {len(plan.support) for plan in plans}
     if len(support_counts) != 1 or not next(iter(support_counts)):
-        raise ValueError("hybrid readout requires a uniform, non-empty support set per query")
-    support_rows = np.asarray([plan.support for plan in plans], dtype=np.int64)
-    query_rows = np.asarray([plan.query for plan in plans], dtype=np.int64)
-    similarities = np.einsum(
-        "nsd,nd->ns", z[support_rows], z[query_rows], optimize=True,
-    )
-    candidate_index = {label: index for index, label in enumerate(roster)}
-    try:
-        support_slots = np.asarray([
-            [candidate_index[label] for label in plan.support_labels] for plan in plans
-        ], dtype=np.int64)
-    except KeyError as error:
-        raise ValueError(f"support label is absent from the candidate roster: {error.args[0]}") from error
-    similarity = np.full((len(plans), len(roster)), -np.inf)
-    episode_rows = np.broadcast_to(
-        np.arange(len(plans), dtype=np.int64)[:, None], support_slots.shape,
-    )
-    np.maximum.at(
-        similarity,
-        (episode_rows.ravel(), support_slots.ravel()),
-        similarities.ravel(),
-    )
+        raise ValueError("fusion requires a uniform, non-empty support set per query")
+    similarity = (classwise_neighbor_scores(z, roster, plans)
+                  if classwise_scores is None else np.asarray(classwise_scores, dtype=np.float32))
+    if similarity.shape != (len(plans), len(roster)):
+        raise ValueError("classwise neighbor scores have the wrong shape")
 
     live = np.isfinite(similarity) & support_mask
     finite = np.where(live, similarity, 0.0)
@@ -286,3 +291,62 @@ def hybrid_predictions(
 
     combined = text_component + support_component
     return [roster[index] for index in combined.argmax(axis=1).tolist()]
+
+
+def classwise_neighbor_scores(
+    features: np.ndarray,
+    candidates: Sequence[str],
+    plans: Sequence[QueryPlan],
+    *,
+    device=None,
+    max_gather_bytes: int = 96 * 1024**2,
+) -> np.ndarray:
+    """Exact maximum cosine support score per candidate, reusable by 1-NN and fusion."""
+    roster = list(map(str, candidates))
+    if not plans:
+        return np.empty((0, len(roster)), dtype=np.float32)
+    z = _normalise(features)
+    support_count = len(plans[0].support)
+    if not support_count or any(len(plan.support) != support_count for plan in plans):
+        raise ValueError("classwise scores require one uniform non-empty support width")
+    candidate_index = {label: index for index, label in enumerate(roster)}
+    support_slots = np.asarray([
+        [candidate_index[label] for label in plan.support_labels] for plan in plans
+    ], dtype=np.int64)
+    support_rows = np.asarray([plan.support for plan in plans], dtype=np.int64)
+    query_rows = np.asarray([plan.query for plan in plans], dtype=np.int64)
+    if device is None:
+        similarities = np.einsum("nsd,nd->ns", z[support_rows], z[query_rows], optimize=True)
+        output = np.full((len(plans), len(roster)), -np.inf, dtype=np.float32)
+        episode = np.broadcast_to(np.arange(len(plans))[:, None], support_slots.shape)
+        np.maximum.at(output, (episode.ravel(), support_slots.ravel()), similarities.ravel())
+        return output
+
+    import torch
+
+    device = torch.device(device)
+    dim = int(z.shape[1])
+    batch_size = max(1, min(1024, max_gather_bytes // max(1, support_count * dim * 4)))
+    output = []
+    # Keep the immutable feature matrix resident when it is comfortably bounded; otherwise gather
+    # each chunk on the host. Both paths are mathematically identical.
+    resident = torch.as_tensor(z, device=device) if z.nbytes <= 1536 * 1024**2 else None
+    with torch.no_grad():
+        for start in range(0, len(plans), batch_size):
+            stop = min(len(plans), start + batch_size)
+            rows = torch.as_tensor(support_rows[start:stop], dtype=torch.long, device=device)
+            queries = torch.as_tensor(query_rows[start:stop], dtype=torch.long, device=device)
+            x = resident[rows] if resident is not None else torch.as_tensor(
+                z[support_rows[start:stop]], device=device,
+            )
+            q = resident[queries] if resident is not None else torch.as_tensor(
+                z[query_rows[start:stop]], device=device,
+            )
+            similarities = torch.einsum("bsd,bd->bs", x, q)
+            slots = torch.as_tensor(support_slots[start:stop], dtype=torch.long, device=device)
+            scores = torch.full(
+                (stop - start, len(roster)), -torch.inf, dtype=similarities.dtype, device=device,
+            )
+            scores.scatter_reduce_(1, slots, similarities, reduce="amax", include_self=True)
+            output.append(scores.cpu().numpy())
+    return np.concatenate(output, axis=0).astype(np.float32, copy=False)

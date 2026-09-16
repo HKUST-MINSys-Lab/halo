@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import random as stdlib_random
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterator, Sequence
 
@@ -680,6 +681,20 @@ def _seed_worker(worker_id: int) -> None:
     stdlib_random.seed(seed + worker_id + 1)
 
 
+@contextmanager
+def _item_randomness(seed: int):
+    """Replay module-level augmentation draws without perturbing the caller's RNG state."""
+    numpy_state = np.random.get_state()
+    python_state = stdlib_random.getstate()
+    np.random.seed(int(seed) % (2 ** 32))
+    stdlib_random.seed(int(seed))
+    try:
+        yield
+    finally:
+        np.random.set_state(numpy_state)
+        stdlib_random.setstate(python_state)
+
+
 class PretrainDataset(Dataset):
     """One item = one augmented window: variable (T', 6) data + rate + texts + label.
 
@@ -978,21 +993,35 @@ class PretrainDataset(Dataset):
         return item
 
     def item_with_rng(self, i: int, rng: np.random.Generator) -> dict:
-        """Load one item using caller-owned randomness for device composition.
+        """Load one item with replayable device composition and signal augmentation."""
+        def replay_seed() -> int:
+            # Derive augmentation randomness from the structural RNG without advancing it. Device
+            # composition therefore remains episode-identical to runs predating augmentation
+            # replay, including when augmentation probabilities are zero.
+            shadow = np.random.default_rng()
+            shadow.bit_generator.state = rng.bit_generator.state
+            return int(shadow.integers(0, np.iinfo(np.int64).max, dtype=np.int64))
 
-        Augmentations retain their existing worker-local stochasticity; the structural
-        device subset is part of the episode contract and must replay across workers.
-        """
         peers = self._aligned_devices.get(i, ())
-        if (not peers or rng.random() >= self.multi_device_probability):
-            return self._single_item(i)
+        use_composite = bool(peers) and rng.random() < self.multi_device_probability
+        if not use_composite:
+            seed = replay_seed()
+            with _item_randomness(seed):
+                return self._single_item(i)
         others = [position for position in peers if position != i]
         count = int(rng.integers(2, min(self.max_devices, len(peers)) + 1))
         chosen = [i, *rng.choice(others, size=count - 1, replace=False).tolist()]
+        seed = replay_seed()
         # Canonical stream order makes device IDs stable while query/support subsets remain
-        # independently sampled by separate dataset accesses.
+        # independently sampled by separate dataset accesses. Replay the same transform draw for
+        # every aligned device: rate and modality perturbations describe one acquisition event and
+        # must preserve a common timeline before the device rows can be merged.
         chosen.sort(key=lambda p: self.index.refs[self.keys[p].stream_i].stream)
-        return merge_device_items([self._single_item(position) for position in chosen])
+        items = []
+        for position in chosen:
+            with _item_randomness(seed):
+                items.append(self._single_item(position))
+        return merge_device_items(items)
 
     def __getitem__(self, i: int) -> dict:
         # DataLoader compatibility. Trainer prefetch uses a step-owned generator instead.

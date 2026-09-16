@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -20,6 +21,25 @@ REPO = Path(__file__).resolve().parents[3]
 DATASETS_DIR = REPO / "data" / "datasets"
 _FINGERPRINT_CACHE: dict[tuple, str] = {}
 _WINDOW_DIR_RE = re.compile(r"^w(?:\d+(?:p\d+)?|p\d+)$")
+
+
+@lru_cache(maxsize=4096)
+def _grid_signal_digests(
+    grid_dir_text: str,
+    stat_key: tuple[tuple[str, int, int, int], ...],
+) -> tuple[str, str | None]:
+    """Hash expensive arrays without changing the public fingerprint algorithm."""
+    del stat_key
+    grid_dir = Path(grid_dir_text)
+    data = np.load(grid_dir / "data.npy", mmap_mode="r")
+    sampled = np.ascontiguousarray(data[::97, ::13, :], dtype=np.float32)
+    sampled_digest = hashlib.sha256(sampled.tobytes()).hexdigest()
+    lengths_path = grid_dir / "lengths.npy"
+    lengths_digest = None
+    if lengths_path.exists():
+        lengths = np.ascontiguousarray(np.load(lengths_path, mmap_mode="r"), dtype=np.int32)
+        lengths_digest = hashlib.sha256(lengths.tobytes()).hexdigest()
+    return sampled_digest, lengths_digest
 
 
 def _is_window_dir(path: Path) -> bool:
@@ -214,7 +234,8 @@ def grid_corpus_fingerprint(
             paths.append(lengths)
         cache_parts.append((
             ref.key,
-            tuple((path.stat().st_size, path.stat().st_mtime_ns) for path in paths),
+            tuple((path.name, path.stat().st_size, path.stat().st_mtime_ns, path.stat().st_ctime_ns)
+                  for path in paths),
         ))
     cache_key = (alignment, tuple(cache_parts))
     cached = _FINGERPRINT_CACHE.get(cache_key)
@@ -227,6 +248,7 @@ def grid_corpus_fingerprint(
         digest.update(len(payload).to_bytes(8, "little"))
         digest.update(payload)
 
+    stats_by_key = dict(cache_parts)
     for ref in sorted(selected, key=lambda item: item.key):
         add((ref.key, ref.alignment, ref.rate_hz, ref.channels, ref.mask, ref.shape))
         for values in (ref.labels, ref.subjects):
@@ -236,16 +258,14 @@ def grid_corpus_fingerprint(
                 values_digest.update(len(encoded).to_bytes(4, "little"))
                 values_digest.update(encoded)
             add(values_digest.hexdigest())
-
         data_path = ref.grid_dir / "data.npy"
         add(data_path.stat().st_size)
-        sampled = np.ascontiguousarray(ref.load_data()[::97, ::13, :], dtype=np.float32)
-        add(hashlib.sha256(sampled.tobytes()).hexdigest())
-        # Preserve fingerprints for legacy all-full grids. Once a real lengths sidecar exists, its
-        # content becomes part of the corpus identity so tail-boundary changes invalidate scans.
-        if (ref.grid_dir / "lengths.npy").exists():
-            lengths = np.ascontiguousarray(ref.load_lengths(), dtype=np.int32)
-            add(hashlib.sha256(lengths.tobytes()).hexdigest())
+        sampled_digest, lengths_digest = _grid_signal_digests(
+            str(ref.grid_dir.resolve()), stats_by_key[ref.key],
+        )
+        add(sampled_digest)
+        if lengths_digest is not None:
+            add(lengths_digest)
 
     value = digest.hexdigest()
     _FINGERPRINT_CACHE[cache_key] = value
