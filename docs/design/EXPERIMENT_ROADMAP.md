@@ -82,6 +82,13 @@ useful component, even if its absolute score is high.
   source roster, candidate policy, enrolled-execution definition, manifest, and metric. Otherwise
   it is an ablation reference, not a numeric baseline.
 
+## Active curriculum experiment
+
+The staged deployment-challenge experiment is specified in
+[`CLASSIFIER_CURRICULUM_EXPERIMENT_20260916.md`](CLASSIFIER_CURRICULUM_EXPERIMENT_20260916.md).
+It first changes acquisition/enrollment episode construction, then adds truthful rate/modality
+perturbations and an evidence-dependent semantic gate. Explicit acquisition tokens are deferred.
+
 ## Promotion Gate
 
 Add a run to `docs/results/RESULTS.md` only after the sealed evaluator produced per-stream machine

@@ -1,0 +1,30 @@
+{
+  "memory_cache_gib": 2.0,
+  "prior_cache_reuse": true,
+  "read_directories": [
+    "/home/alex/code/HALO/halo/training/support_classifier/evaluations/jepa_representation_20260912/fixed_e2e_35k_legacy_checkpoint/feature_cache",
+    "/home/alex/code/HALO/halo/training/support_classifier/evaluations/jepa_representation_20260912/fixed_jepa_adapted/feature_cache",
+    "/home/alex/code/HALO/halo/training/support_classifier/evaluations/jepa_representation_20260912/fixed_jepa_frozen/feature_cache",
+    "/home/alex/code/HALO/halo/training/support_classifier/evaluations/jepa_representation_20260912/multispan_jepa_adapted/feature_cache",
+    "/home/alex/code/HALO/halo/training/support_classifier/evaluations/jepa_representation_20260912/multispan_jepa_frozen/feature_cache",
+    "/home/alex/code/HALO/halo/training/support_classifier/evaluations/jepa_representation_20260912/random_fixed_adapted/feature_cache",
+    "/home/alex/code/HALO/halo/training/support_classifier/evaluations/jepa_representation_20260912/random_fixed_frozen/feature_cache",
+    "/home/alex/code/HALO/halo/training/support_classifier/evaluations/jepa_representation_20260912/random_multispan_adapted/feature_cache",
+    "/home/alex/code/HALO/halo/training/support_classifier/evaluations/jepa_representation_20260912/random_multispan_frozen/feature_cache",
+    "/home/alex/code/HALO/halo/training/support_classifier/evaluations/jepa_representation_20260912/released_baselines/feature_cache",
+    "/home/alex/code/HALO/halo/training/support_classifier/evaluations/k0_training_bank_20260912/released_baselines/feature_cache",
+    "/home/alex/code/HALO/halo/training/support_classifier/evaluations/sealed_baselines_20260913/harnet/feature_cache",
+    "/home/alex/code/HALO/halo/training/support_classifier/evaluations/sealed_baselines_20260913/limubert_x/feature_cache",
+    "/home/alex/code/HALO/halo/training/support_classifier/evaluations/sealed_baselines_20260913/normwear/feature_cache",
+    "/home/alex/code/HALO/halo/training/support_classifier/evaluations/sealed_baselines_20260913/unimts/feature_cache",
+    "/home/alex/code/HALO/halo/training/support_classifier/evaluations/sealed_halo_fixed_mr_neighbors95k_frozen_residual_best20k_20260914/feature_cache",
+    "/home/alex/code/HALO/halo/training/support_classifier/evaluations/sealed_halo_fixed_mr_neighbors95k_frozen_residual_regimesplit_40k_20260914/feature_cache",
+    "/home/alex/code/HALO/halo/training/support_classifier/evaluations/sealed_halo_fixed_mr_neighbors95k_frozen_residual_shared_40k_20260914/feature_cache",
+    "/home/alex/code/HALO/halo/training/support_classifier/evaluations/sealed_halo_fixed_mr_neighbors_8s_4res_continue95k_20260914/feature_cache",
+    "/home/alex/code/HALO/halo/training/support_classifier/evaluations/sealed_halo_fixed_mr_neighbors_8s_4res_e2e_20260913/feature_cache",
+    "/home/alex/code/HALO/halo/training/support_classifier/evaluations/sealed_halo_fixed_mr_residual_v3_8s_4res_40k_20260914/feature_cache",
+    "/home/alex/code/HALO/halo/training/support_classifier/evaluations/zero_shot_feature_cache"
+  ],
+  "schema": "sealed-feature-v4-20260913",
+  "write_directory": "/home/alex/code/HALO/halo/training/support_classifier/evaluations/shared_sealed-feature-v4-20260913"
+}

@@ -1,0 +1,6 @@
+{
+  "halo": {
+    "checkpoint": "/home/alex/code/HALO/halo/training/support_classifier/outputs/halo_fixed_mr_residual_v3_curriculum12_40k_20260916/best_internal.pt",
+    "checkpoint_sha256": "e5f666a12112f0e48e8857a5afa47279b156a4348f8df15d86ccd5e8fc6ed2dc"
+  }
+}

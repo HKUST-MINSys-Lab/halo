@@ -3,6 +3,21 @@
 This is the promoted result record for the current support-conditioned HAR design. Retired
 future-JEPA variants are archived separately and are not mixed into this table.
 
+## Deployment-scenario diagnostics - 2026-09-16
+
+The Stage A acquisition/enrollment curriculum is reported separately from the ordinary sealed
+k-curve because it tests eight perturbed deployment conditions. The concise summary contains a
+scenario glossary, aggregate comparisons against every released baseline, and per-dataset tables;
+the adjacent exhaustive artifact retains every split, readout, and confidence interval:
+
+- [Stage A scenario summary](../../training/support_classifier/evaluations/scenarios_curriculum12_20260916/SUMMARY.md)
+- [Stage A exhaustive scenario results](../../training/support_classifier/evaluations/scenarios_curriculum12_20260916/RESULTS.md)
+
+These rows use the same immutable manifests as the released-baseline scenario run. They are not
+mixed numerically with the ordinary 4/8/16-second sealed comparison below. In the scenario summary,
+`HALO 1-NN` is a diagnostic readout of the encoder jointly trained with the residual classifier;
+it is not the older differentiable-neighbours-trained encoder.
+
 ## Current sealed comparison - 2026-09-14
 
 This supersedes the 2026-09-13 summary below. It evaluates the validation-selected checkpoint from
