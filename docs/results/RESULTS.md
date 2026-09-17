@@ -8,6 +8,24 @@ future-JEPA variants are archived separately and are not mixed into this table.
 > `sealed-manifest-v2-20260916`, with the restored NumPy manifest draw, corrected k=0 filtering,
 > and current sampler. Matched comparisons must re-score every checkpoint under one protocol.
 
+## Representative scenario protocol - 2026-09-17
+
+Deployment scenarios are a fixed set of eight stress tests, not a full Cartesian sweep. The
+current baseline scenario run uses every scenario at `k=1` and `k=8` with an 8-second analysis
+window. It evaluates the five retained baselines (`HARNet-5`, `HARNet-10`, `LiMU-BERT-X`,
+`UniMTS`, and `NormWear`) on identical episodes and reports the required 1-NN and equal-weight
+normalized-fusion readouts where the model contract permits them.
+
+The ordinary sealed evaluation is separate and may use the larger `k=0..64`, 4/8/16-second grid.
+Do not multiply that sealed grid into the scenario experiment: `8 scenarios x 8 k values x 3
+windows x all dataset variants` is an exploratory Cartesian sweep, not the representative
+scenario protocol. Such exploratory runs must use a separate output directory and must not
+replace the representative tables.
+
+The current representative artifacts will be written to
+`training/support_classifier/evaluations/scenarios_baselines_v3_20260917_representative/` after
+the run is complete. Partial files are provisional and must not be cited as results.
+
 ## Deployment-scenario diagnostics - 2026-09-16
 
 The Stage A acquisition/enrollment curriculum is reported separately from the ordinary sealed
