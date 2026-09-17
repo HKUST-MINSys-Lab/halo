@@ -9,7 +9,7 @@ from baselines import data as baseline_data
 from baselines.data import EvalStream
 from baselines.harnet.adapter import HarnetAdapter
 from baselines.limubert_x.adapter import _window_features as limubert_features
-from baselines.normwear.adapter import _normwear_groups
+from baselines.normwear.adapter import MIN_INPUT_SAMPLES, _normwear_groups, _released_calc_cwt
 from baselines.unimts.adapter import UniMTSAdapter
 
 
@@ -142,3 +142,18 @@ def test_normwear_grouped_preprocessing_matches_individual_rows():
         expected_groups, _ = _normwear_groups(single)
         expected = expected_groups[0][0][0]
         np.testing.assert_allclose(by_owner[row], expected, rtol=2e-6, atol=2e-6)
+
+
+@pytest.mark.parametrize("valid", [1, 2, 5, 8])
+def test_normwear_partial_tail_is_padded_to_released_backbone_minimum(valid):
+    base = _stream(4, 50)
+    stream = replace(base, lengths=np.asarray([valid], dtype=np.int64))
+
+    groups, channels = _normwear_groups(stream)
+    prepared = groups[0][0]
+    cwt = _released_calc_cwt(None, prepared)
+
+    assert channels == 6
+    assert prepared.shape == (1, 6, MIN_INPUT_SAMPLES)
+    assert cwt.shape[3] == MIN_INPUT_SAMPLES - 2
+    assert torch.isfinite(cwt).all()

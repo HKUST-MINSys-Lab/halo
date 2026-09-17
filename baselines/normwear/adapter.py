@@ -64,6 +64,7 @@ CLINICAL_LM_REF = CLINICAL_LM_CACHE.parents[1] / "refs" / "main"
 
 EMB_DIM = 2048
 TARGET_HZ = 65                # NormWear native rate; ricker-CWT scales are tuned for it.
+MIN_INPUT_SAMPLES = 11        # two finite differences, then the released 9-frame patch kernel
 QUERY = "What is the current activity?"            # native 'activity' question_template[0]
 ANSWER_TEMPLATE = "This subject is presently {}."  # native 'activity' answer_template[0]
 
@@ -258,6 +259,17 @@ def _normwear_groups(stream) -> tuple[list[tuple[np.ndarray, np.ndarray]], int]:
             if source != TARGET_HZ:
                 divisor = np.gcd(TARGET_HZ, source)
                 values = _sig.resample_poly(values, TARGET_HZ // divisor, source // divisor, axis=1)
+            # Sealed grids retain partial tails, some only one or two measured samples long.
+            # NormWear takes two finite differences before a 9-frame temporal patch kernel, so
+            # fewer than 11 input samples cannot enter the released backbone. Repeat the final
+            # measured sample only to satisfy that architectural minimum. This adds no motion and
+            # leaves the stream's authoritative valid length unchanged for protocol accounting.
+            if values.shape[1] < MIN_INPUT_SAMPLES:
+                values = np.pad(
+                    values,
+                    ((0, 0), (0, MIN_INPUT_SAMPLES - values.shape[1]), (0, 0)),
+                    mode="edge",
+                )
             if target_length is None:
                 target_length = values.shape[1]
             if values.shape[1] != target_length:
@@ -309,6 +321,7 @@ class NormWearAdapter(BaselineAdapter):
             "inference_precision": os.environ.get("NORMWEAR_PRECISION", "fp16").lower(),
             "cwt_implementation": "released-variable-length-ricker-torch-v1",
             "window_policy": "released variable-length single pass",
+            "short_tail_policy": f"repeat-last-to-{MIN_INPUT_SAMPLES}-samples-at-{TARGET_HZ}Hz",
             "native_zero_shot_feature": "MSiTF_query_conditioned_2048",
             "enrollment_feature": "backbone_mean_patch_then_channel_768",
         }

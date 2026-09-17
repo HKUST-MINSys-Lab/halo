@@ -49,6 +49,11 @@ the same event rows and valid samples; only their published input conversion may
 tail remains a partial tail and is identified by its valid length rather than treated as measured
 padding.
 
+NormWear's released CWT stack takes two finite differences before a nine-frame patch kernel. For a
+retained tail shorter than 11 samples at its 65 Hz model clock, its adapter repeats the final
+measured value to reach that architectural minimum. The original valid length remains in the
+manifest and source fingerprint; the extension contributes no additional motion.
+
 RealWorld and Shoaib additionally report every declared placement separately and one preregistered
 all-device cell. Composite rows require elementwise-identical event, label, subject, and execution
 identities. A row rejected by any member's quality screen is removed from the composite for every
@@ -120,6 +125,10 @@ published rule. Results disclose whether padding occurred and its fraction. UniM
 consume a composite natively. HARNet and LiMU-BERT-X encode every device independently and use the
 single shared equal-device mean plus L2 normalization; these rows are labelled
 `per-device-pooled`, not native multi-device inference.
+NormWear's native semantic path is fixed-width across device sets, but its released downstream
+enrollment representation flattens real channels. A cross-configuration enrolled cell with unequal
+channel counts is therefore explicitly unsupported rather than repaired with a project-specific
+projection or channel average.
 
 HALO is shown with the same frozen-representation readouts and, for a support-classifier checkpoint,
 its retrieve-mix-vote readout on the exact same manifest. This distinguishes representation

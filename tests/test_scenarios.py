@@ -13,7 +13,11 @@ from training.support_classifier.scenarios import (
     derive_resampled,
     shared_candidates,
 )
-from training.support_classifier.run_scenarios import _matched_within_reference
+from training.support_classifier.run_scenarios import (
+    Task,
+    _matched_within_reference,
+    _requires_cross_support_features,
+)
 
 CHANNELS = ["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"]
 
@@ -41,6 +45,20 @@ def make_stream(
         event_ids=np.arange(n), execution_ids=np.asarray(executions, dtype=object),
         block_ids=np.asarray(executions, dtype=object), execution_granularity="recording",
     )
+
+
+def test_zero_support_cross_stream_does_not_require_support_features():
+    query = make_stream(stream="query")
+    support = make_stream(stream="support", seed=1)
+    task = Task(
+        scenario="s2_cross_placement", variant="zero_support",
+        query_stream=query, support_stream=support, plans=(),
+        candidates=tuple(query.eval_labels), offset=query.n_windows,
+        severity={"L": 0, "S": 0, "P": 1, "C": 1},
+    )
+
+    assert not _requires_cross_support_features(task, 0)
+    assert _requires_cross_support_features(task, 1)
 
 
 # ------------------------------------------------------- Scenario 4: modality drop

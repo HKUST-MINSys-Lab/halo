@@ -744,6 +744,11 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
 # --------------------------------------------------------------------- scoring
 
 
+def _requires_cross_support_features(task: Task, k: int) -> bool:
+    """Whether scoring can consume support representations for this task."""
+    return bool(task.cross and int(k) > 0)
+
+
 def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootstrap,
                banks, k: int, window_seconds: float, halo_state=None,
                halo_has_classifier: bool = False,
@@ -825,7 +830,11 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
                 halo_checkpoint=halo_checkpoint, baseline_state=provider_states.get(name),
                 halo_state=halo_state, cache_read_dirs=cache_read_dirs,
                 memory_cache=feature_memory_cache)
-            if task.cross:
+            # A zero-support episode uses only the query and its declared semantic path. Loading
+            # cross-stream support here is wasted work and can incorrectly reject a native,
+            # fixed-width zero-shot representation merely because the model's enrollment feature
+            # width depends on the acquisition configuration (for example NormWear channels).
+            if _requires_cross_support_features(task, k):
                 support_features, support_fingerprint = _load_or_encode(
                     name=name, stream=task.support_stream, device=device, cache_dir=cache_dir,
                     halo_checkpoint=halo_checkpoint, baseline_state=provider_states.get(name),
@@ -844,7 +853,7 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
                 features = np.concatenate([query_features, support_features], axis=0)
             else:
                 features = query_features
-                support_fingerprint = query_fingerprint
+                support_fingerprint = query_fingerprint if not task.cross else None
             extra_base = {**severity_meta, "n_candidates": len(task.candidates),
                           # Keep the legacy field for readers that predate cross-stream scoring,
                           # but record both sides explicitly so a result is fully auditable.
