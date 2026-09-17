@@ -11,10 +11,11 @@ future-JEPA variants are archived separately and are not mixed into this table.
 ## Representative scenario protocol - 2026-09-17
 
 Deployment scenarios are a fixed set of eight stress tests, not a full Cartesian sweep. The
-current baseline scenario run uses every scenario at `k=1`, `k=4`, `k=8`, and `k=32` with an 8-second analysis
-window. It evaluates the five retained baselines (`HARNet-5`, `HARNet-10`, `LiMU-BERT-X`,
-`UniMTS`, and `NormWear`) on identical episodes and reports the required 1-NN and equal-weight
-normalized-fusion readouts where the model contract permits them.
+completed run uses every scenario at `k=0`, `k=1`, `k=4`, `k=8`, and `k=32` with an 8-second
+analysis window. It evaluates HALO and the five retained baselines (`HARNet-5`, `HARNet-10`,
+`LiMU-BERT-X`, `UniMTS`, and `NormWear`) on identical episodes. HALO uses its learned classifier;
+external encoders use the fixed equal-weight normalized fusion adapter. The complete run contains
+4,406 result rows, 651 scored tasks, and no failures.
 
 The ordinary sealed evaluation is separate and may use the larger `k=0..64`, 4/8/16-second grid.
 Do not multiply that sealed grid into the scenario experiment: `8 scenarios x 8 k values x 3
@@ -22,9 +23,11 @@ windows x all dataset variants` is an exploratory Cartesian sweep, not the repre
 scenario protocol. Such exploratory runs must use a separate output directory and must not
 replace the representative tables.
 
-The current representative artifacts will be written to
-`training/support_classifier/evaluations/scenarios_baselines_v3_20260917_representative/` after
-the run is complete. Partial files are provisional and must not be cited as results.
+The concise results, readout-fairness diagnostic, limitations, hashes, and tracked machine-readable
+artifacts are in the
+[2026-09-17 scenario checkpoint](2026-09-17-scenario-evaluation-checkpoint.md). The original local
+run is
+`training/support_classifier/evaluations/scenarios_halo_classifier_v3_20260917_profiled_v2_k0_1_4_8_32/`.
 
 Every scenario run writes `progress.json` after each scored task. It records exact completed and
 total protocol cells, progress within the current cell, elapsed time, a rolling task rate, ETA,
