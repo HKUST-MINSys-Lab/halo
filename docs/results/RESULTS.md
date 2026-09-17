@@ -11,7 +11,7 @@ future-JEPA variants are archived separately and are not mixed into this table.
 ## Representative scenario protocol - 2026-09-17
 
 Deployment scenarios are a fixed set of eight stress tests, not a full Cartesian sweep. The
-current baseline scenario run uses every scenario at `k=1` and `k=8` with an 8-second analysis
+current baseline scenario run uses every scenario at `k=1`, `k=4`, `k=8`, and `k=32` with an 8-second analysis
 window. It evaluates the five retained baselines (`HARNet-5`, `HARNet-10`, `LiMU-BERT-X`,
 `UniMTS`, and `NormWear`) on identical episodes and reports the required 1-NN and equal-weight
 normalized-fusion readouts where the model contract permits them.
