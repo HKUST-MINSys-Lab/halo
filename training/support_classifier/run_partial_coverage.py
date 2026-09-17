@@ -158,6 +158,18 @@ def _split_row(stream, plans, predictions, rows: np.ndarray, *, bootstrap: int,
     return metrics
 
 
+def _harmonic_mean(left: float | None, right: float | None) -> float | None:
+    """Symmetric summary that cannot hide failure on either coverage split."""
+    if left is None or right is None:
+        return None
+    left = float(left)
+    right = float(right)
+    if not np.isfinite(left) or not np.isfinite(right) or left < 0.0 or right < 0.0:
+        raise ValueError("coverage metrics must be finite and non-negative")
+    total = left + right
+    return 0.0 if total == 0.0 else 2.0 * left * right / total
+
+
 def emit_rows(stream, plans, predictions, cell: CoverageCell, *, model: str, readout: str,
               k: int, window_seconds: float, bootstrap: int, manifest: str,
               scenario: str = "s1_partial_coverage", variant: str | None = None,
@@ -196,6 +208,14 @@ def emit_rows(stream, plans, predictions, cell: CoverageCell, *, model: str, rea
                 [predictions[index] in supported for index in rows]
             ))
         out.append(row)
+    if cell.hidden:
+        by_split = {row["coverage_split"]: row for row in out}
+        enrolled = by_split["truth_enrolled"]
+        unenrolled = by_split["truth_unenrolled"]
+        for metric in ("f1_macro", "balanced_accuracy", "accuracy"):
+            value = _harmonic_mean(enrolled.get(metric), unenrolled.get(metric))
+            for row in out:
+                row[f"coverage_hmean_{metric}"] = value
     return out
 
 

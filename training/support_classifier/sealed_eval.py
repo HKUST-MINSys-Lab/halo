@@ -1416,17 +1416,43 @@ def main() -> None:
                             # disclosed comparison rows; v1 retains its historical single row.
                             if not is_v2:
                                 continue
-                    if isinstance(stream, MultiDeviceEvalStream):
+                    if isinstance(stream, MultiDeviceEvalStream) and name in TRAINING_BANK_ZERO_SHOT:
                         all_rows.append({"model": name, "readout": "training-bank-1nn-conse", "k": k,
                                          "window_seconds": float(window_seconds),
                                          "dataset": dataset, "stream": stream_id, "status": "n/a",
-                                         "reason": "no matching multi-device training reference bank"})
+                                         "reason": "no matching multi-device training reference bank",
+                                         "diagnostic_only": True})
+                        if name != "halo":
+                            all_rows.append({
+                                "model": name, "readout": "equal-weight-normalized-fusion", "k": k,
+                                "window_seconds": float(window_seconds),
+                                "dataset": dataset, "stream": stream_id, "status": "n/a",
+                                "reason": "no matching multi-device semantic reference bank",
+                            })
+                            all_rows.append({
+                                "model": name, "readout": "native_zero_support", "k": k,
+                                "window_seconds": float(window_seconds),
+                                "dataset": dataset, "stream": stream_id, "status": "n/a",
+                                "reason": "no declared native zero-support path",
+                            })
                         continue
                     if name in TRAINING_BANK_ZERO_SHOT:
                         if name in feature_errors:
                             all_rows.append({"model": name, "readout": "training-bank-1nn-conse", "k": k,
                                              "dataset": dataset, "stream": stream_id,
-                                             "status": "n/a", "reason": feature_errors[name]})
+                                             "status": "n/a", "reason": feature_errors[name],
+                                             "diagnostic_only": True})
+                            if name != "halo":
+                                all_rows.append({
+                                    "model": name, "readout": "equal-weight-normalized-fusion", "k": k,
+                                    "dataset": dataset, "stream": stream_id,
+                                    "status": "n/a", "reason": feature_errors[name],
+                                })
+                                all_rows.append({
+                                    "model": name, "readout": "native_zero_support", "k": k,
+                                    "dataset": dataset, "stream": stream_id, "status": "n/a",
+                                    "reason": "no declared native zero-support path",
+                                })
                             continue
                         features, fingerprint = features_by_model[name]
                         bank_key = (name, float(window_seconds))
@@ -1452,8 +1478,22 @@ def main() -> None:
                             "training_bank_fingerprint": bank_fingerprint,
                             "manifest": manifests[manifest_id]["fingerprint"],
                             **info,
+                            "diagnostic_only": True,
                         })
                         all_rows.append(metric)
+                        if name != "halo":
+                            fusion_metric = dict(metric)
+                            fusion_metric.update({
+                                "readout": "equal-weight-normalized-fusion",
+                                "diagnostic_only": False,
+                                "zero_support_fusion_degenerate": True,
+                            })
+                            all_rows.append(fusion_metric)
+                            all_rows.append({
+                                "model": name, "readout": "native_zero_support", "k": k,
+                                "dataset": dataset, "stream": stream_id, "status": "n/a",
+                                "reason": "no declared native zero-support path",
+                            })
                         continue
                     # Text-aligned released models retain their own candidate-scoring mechanism.
                     if not baselines.REGISTRY[name].supports_native_zero_shot():
@@ -1488,6 +1528,12 @@ def main() -> None:
                                    "n_queries": int(len(keep)), "n_candidates": len(stream.eval_labels),
                                    "feature_fingerprint": fingerprint})
                     all_rows.append(metric)
+                    fusion_metric = dict(metric)
+                    fusion_metric.update({
+                        "readout": "equal-weight-normalized-fusion",
+                        "zero_support_fusion_degenerate": True,
+                    })
+                    all_rows.append(fusion_metric)
                     if name not in persistent_states:
                         del state
                     if device.type == "cuda" and name not in persistent_states:

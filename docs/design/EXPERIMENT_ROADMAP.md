@@ -41,6 +41,7 @@ Each row uses the current disjoint rosters and the immutable manifest produced b
 | 2 | HALO supervised end-to-end / neighbors | yes | none | Measure what direct enrollment training can teach the encoder without semantic-head capacity. |
 | 3 | HALO frozen encoder / token mixer | no | yes | Test classifier reasoning independently of encoder adaptation. |
 | 4 | HALO end-to-end / token mixer | yes | yes | Test the complete system against the matched neighbors control. |
+| 5 | released encoder / HALO classifier | no | yes | Isolate classifier value from HALO encoder value under both aggregate and scenario manifests. |
 
 The one-second fixed filterbank is retained as the compact architectural control. The current
 multiresolution filterbank is the only planned extension. Do not add a new frontend until this
@@ -74,8 +75,13 @@ useful component, even if its absolute score is high.
   execution-disjoint enrollment. `k=0` and `k>0` are separate information conditions.
 * Report macro F1, balanced accuracy, subject bootstrap intervals, candidate count, and query
   count per sealed dataset/stream before any aggregate.
-* Baselines use author-released checkpoints. At `k>0`, show 1-NN, prototype, and ridge. At `k=0`,
-  show only a declared published native scoring path; unsupported cells are `N/A`.
+* Baselines use author-released checkpoints. On the complete-enrollment curve at `k>0`, show
+  equal-weight normalized fusion and 1-NN; every candidate receives `k` supports. At `k=0`, show
+  equal-weight normalized fusion and a separate released-native row where available. Scenario
+  tables use equal-weight normalized fusion as the default baseline readout. Unsupported native
+  cells are `N/A`.
+* Every result artifact contains macro F1, balanced accuracy, and accuracy. Partial-enrollment
+  artifacts also contain truth-enrolled, truth-unenrolled, combined, and harmonic-mean summaries.
 * Record commit, checkpoint hash, corpus fingerprint, immutable manifest fingerprint, runtime,
   peak memory, and whether the encoder/head were frozen.
 * A historical table is comparable only to another result with the same representation checkpoint,

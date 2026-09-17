@@ -63,14 +63,22 @@ model. The ordered device list and exact raw-slice fingerprint are stored in the
 
 For each eligible representation, report these readouts on exactly the same episodes:
 
-1. **Equal-weight normalized fusion:** the single primary adaptation rule for external encoders.
+1. **Equal-weight normalized fusion:** the common primary adaptation rule for external encoders.
    It combines each model's declared native-or-ConSE semantic scores with class-wise maximum cosine
-   support scores using independently normalized `1 + 1` weights and no fitted parameter.
-2. **Cosine 1-NN:** a mandatory representation-only companion row for every enrolled external
-   baseline cell. Prototype and ridge remain optional diagnostic controls.
-3. **Differentiable neighbours:** HALO encoder-development objective only; it is not reported as an
+   support scores using independently normalized `1 + 1` weights and no fitted parameter. At
+   `k=0`, no support component exists, so this readout reduces to the declared semantic route.
+2. **Cosine 1-NN:** a mandatory representation-only companion row for every fully enrolled external
+   baseline cell. Prototype and ridge remain optional diagnostic controls. In a fully enrolled
+   `k`-shot cell, every candidate has exactly `k` support recordings; `k` never means that only the
+   query's ground-truth class receives support.
+3. **Released native method:** a separate `k=0` row when the released model exposes a valid route
+   to the complete target candidate set. If it does not, record `N/A`; do not relabel a project-added
+   ConSE bridge or training-bank neighbour as native behavior. When the native semantic route is
+   also the semantic branch of equal-weight fusion, retain both named rows and disclose that their
+   predictions are identical at `k=0`.
+4. **Differentiable neighbours:** HALO encoder-development objective only; it is not reported as an
    adaptation mechanism for released baseline models.
-4. **HALO retrieve-mix-vote:** its learned semantic token mixer. For `k > 0`, it jointly attends
+5. **HALO retrieve-mix-vote:** its learned semantic token mixer. For `k > 0`, it jointly attends
    to query, support, support-label, and candidate-label tokens before a soft support vote. For
    `k = 0`, it jointly attends to the query and candidate-label tokens before direct cosine
    scoring. The two paths use separately trained head weights and one shared encoder.
@@ -100,11 +108,15 @@ one deployable prediction with the fixed **equal-weight normalized fusion** rule
    model-specific fusion weight is fitted.
 
 Semantic-only, prototype, and ridge controls are opt-in diagnostics. Cosine 1-NN is always retained
-beside the primary fusion row; neither is selected per cell. An "either prediction was correct"
+beside the primary fusion row in the complete-enrollment aggregate curve; neither is selected per
+cell. Scenario tables use equal-weight normalized fusion as the default external-baseline row and
+may retain 1-NN as a diagnostic rather than a headline result. An "either prediction was correct"
 oracle may be reported only as a clearly
 labelled diagnostic ceiling; it is not deployed accuracy. Partial-coverage results are split into
 truth-enrolled, truth-unenrolled and combined queries, because a support-only method cannot name an
-unenrolled candidate.
+unenrolled candidate. Also compute the harmonic mean of truth-enrolled and truth-unenrolled
+performance as a diagnostic summary; whether it appears in the main paper or appendix is a later
+presentation decision.
 
 The sealed runner always computes external 1-NN. `--baseline-diagnostic-readouts` additionally
 enables prototype and ridge; omitting it avoids their repeated ridge work.
@@ -138,8 +150,24 @@ time, peak memory, and known data overlap must be disclosed beside the score.
 ## Metrics and reporting
 
 Primary classification metrics are per-dataset macro F1 and balanced accuracy. Report accuracy only
-as secondary context. Compute confidence intervals by subject, not by overlapping windows. Publish
+as secondary context. Every retained result artifact must nevertheless contain all three metrics:
+macro F1, balanced accuracy, and accuracy. Compute confidence intervals by subject, not by
+overlapping windows. Publish
 per-dataset tables before an aggregate so one large or easy dataset cannot conceal failures.
+
+Two evaluation regimes are retained:
+
+1. **Complete-enrollment aggregate curve:** every candidate receives exactly `k` supports at
+   `k>0`; external baselines report both equal-weight normalized fusion and cosine 1-NN. At `k=0`,
+   report equal-weight normalized fusion and the released native method where one exists.
+2. **Deployment-scenario evaluation:** partial enrollment and the preregistered heterogeneity
+   scenarios use equal-weight normalized fusion as the default external-baseline readout.
+
+For both regimes, the classifier-attribution experiment freezes each released baseline encoder,
+attaches the same HALO learnable classifier, trains only that classifier under the same training
+episodes and selection rule, and evaluates on the same manifests. Name these arms `HALO classifier
+with frozen <encoder>`, not as native baseline methods. Report trainable parameter count, training
+steps, runtime, and seed so the adapter budget is explicit.
 
 For every promoted result, save:
 

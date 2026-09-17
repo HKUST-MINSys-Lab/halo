@@ -285,6 +285,10 @@ def test_emit_rows_splits_by_enrolment_and_picks_honest_metrics(monkeypatch):
     assert by_split["truth_unenrolled"]["balanced_accuracy"] == pytest.approx(0.0)
     assert by_split["truth_enrolled"]["n_queries"] == 2
     assert by_split["truth_unenrolled"]["n_queries"] == 2
+    for row in rows:
+        assert row["coverage_hmean_balanced_accuracy"] == pytest.approx(0.0)
+        assert row["coverage_hmean_accuracy"] == pytest.approx(0.0)
+        assert row["coverage_hmean_f1_macro"] == pytest.approx(0.0)
 
 
 def test_emit_rows_bootstraps_wrong_predictions_outside_the_conditional_truth(monkeypatch):
