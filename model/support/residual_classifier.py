@@ -336,7 +336,8 @@ class ResidualSupportClassifier(nn.Module):
         return {"logits": logits.masked_fill(~candidate_mask, -1e30), "support_weight": weight,
                 "k_c": k_c, "r_support": r_support, "r_candidate": r_candidate,
                 "text_score": text_score, "lambda": lam,
-                "base_part": base_part, "metric_part": metric_part,
+                "neighbor_logits": base_logits, "base_part": base_part,
+                "metric_part": metric_part,
                 "text_part": text_part, "text_gate_features": gate_features}
 
     def telemetry(self) -> dict[str, float]:
@@ -388,6 +389,7 @@ class RegimeSplitSupportClassifier(nn.Module):
                "r_candidate": query_feature.new_zeros((b, c)),
                "text_score": query_feature.new_zeros((b, c)),
                "lambda": query_feature.new_zeros((b, c)),
+               "neighbor_logits": query_feature.new_zeros((b, c)),
                "base_part": query_feature.new_zeros((b, c)),
                "metric_part": query_feature.new_zeros((b, c)),
                "text_part": query_feature.new_zeros((b, c)),

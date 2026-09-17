@@ -612,7 +612,9 @@ def weighted_present_metrics(
         # as a common condition. Its sibling fraction recovers the honest selected-row count.
         suffix = key.rsplit("/", 1)[-1]
         conditional = key.startswith("scenario/") and suffix in {
-            "loss", "accuracy", "semantic_weight",
+            "loss", "accuracy", "semantic_weight", "neighbor_accuracy",
+            "classifier_accuracy", "rescue_rate", "overturn_rate", "preserve_rate",
+            "both_wrong_rate", "net_gain",
         }
         fraction_key = f"{key.rsplit('/', 1)[0]}/fraction" if conditional else None
         present = []
@@ -825,6 +827,60 @@ def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, flo
         )
         truth_enrollment.append("enrolled" if supported else "unenrolled")
     add_scenario("truth", truth_enrollment, ("enrolled", "unenrolled"))
+
+    neighbor_logits = result.get("neighbor_logits")
+    if neighbor_logits is not None:
+        neighbor = neighbor_logits.detach().masked_fill(~mask, float("-inf")).argmax(dim=-1)
+        neighbor_correct = neighbor.eq(target)
+        classifier_correct = learned.eq(target)
+
+        def add_comparison(axis: str, name: str, selected: torch.Tensor) -> None:
+            # A support-only neighbor prediction is undefined for direct k=0 episodes. Excluding
+            # those rows keeps this diagnostic about whether the learned classifier improves on
+            # the exact enrolled neighbor floor it receives, rather than inventing a k=0 rule.
+            selected = selected & has_support
+            prefix = f"scenario/comparison/{axis}/{name}"
+            metrics[f"{prefix}/fraction"] = float(selected.float().mean())
+            if not bool(selected.any()):
+                return
+            base = neighbor_correct[selected]
+            learned_ok = classifier_correct[selected]
+            metrics[f"{prefix}/neighbor_accuracy"] = float(base.float().mean())
+            metrics[f"{prefix}/classifier_accuracy"] = float(learned_ok.float().mean())
+            metrics[f"{prefix}/rescue_rate"] = float((~base & learned_ok).float().mean())
+            metrics[f"{prefix}/overturn_rate"] = float((base & ~learned_ok).float().mean())
+            metrics[f"{prefix}/preserve_rate"] = float((base & learned_ok).float().mean())
+            metrics[f"{prefix}/both_wrong_rate"] = float((~base & ~learned_ok).float().mean())
+            metrics[f"{prefix}/net_gain"] = float(
+                learned_ok.float().mean() - base.float().mean()
+            )
+
+        all_rows = torch.ones_like(has_support)
+        add_comparison("all", "enrolled", all_rows)
+        for name in ("compatible", "cross_placement", "cross_dataset"):
+            add_comparison(
+                "acquisition", name,
+                torch.tensor(
+                    [episode.acquisition_regime == name for episode in episodes],
+                    dtype=torch.bool, device=target.device,
+                ),
+            )
+        for name in ("complete", "partial"):
+            add_comparison(
+                "enrollment", name,
+                torch.tensor(
+                    [episode.enrollment_regime == name for episode in episodes],
+                    dtype=torch.bool, device=target.device,
+                ),
+            )
+        for name in ("enrolled", "unenrolled"):
+            add_comparison(
+                "truth", name,
+                torch.tensor(
+                    [value == name for value in truth_enrollment],
+                    dtype=torch.bool, device=target.device,
+                ),
+            )
 
     augmentation_rows = result.get("augmentation_rows", ())
     episode_perturbations = result.get("episode_perturbations", ())
@@ -1059,6 +1115,14 @@ def validate(
     learned_by_regime: dict[bool, dict[str, tuple[list[str], list[str]]]] = {
         False: {}, True: {},
     }
+    learned_by_panel: dict[str, dict[str, tuple[list[str], list[str]]]] = {}
+    panel_payload = json.dumps(
+        [dataclasses.asdict(episode) for episode in episodes],
+        sort_keys=True, separators=(",", ":"),
+    ).encode()
+    # Twelve hex digits fit exactly in a float and are sufficient to detect an accidental panel
+    # change in logs/checkpoints while keeping validation metrics numeric for existing consumers.
+    panel_fingerprint = float(int(hashlib.sha256(panel_payload).hexdigest()[:12], 16))
     if deployment_matched:
         by_set: dict[int, list[Episode]] = {}
         for episode in episodes:
@@ -1101,6 +1165,23 @@ def validate(
             )
             learned[0].append(recording.label)
             learned[1].append(episode.candidates[int(learned_slot[index])])
+            truth_supported = (
+                episode.gt_slot < len(episode.support_counts)
+                and episode.support_counts[episode.gt_slot] > 0
+            )
+            panel_names = {
+                f"acquisition/{episode.acquisition_regime}",
+                f"enrollment/{episode.enrollment_regime}",
+                f"truth/{'enrolled' if truth_supported else 'unenrolled'}",
+            }
+            if episode.acquisition_regime == "compatible" and episode.enrollment_regime == "complete":
+                panel_names.add("clean_complete")
+            for panel_name in panel_names:
+                panel = learned_by_panel.setdefault(panel_name, {}).setdefault(
+                    recording.dataset, ([], []),
+                )
+                panel[0].append(recording.label)
+                panel[1].append(episode.candidates[int(learned_slot[index])])
     if was_encoder_training:
         encoder.train()
     if was_classifier_training:
@@ -1115,6 +1196,13 @@ def validate(
     }
     enrolled_f1 = learned_dataset_f1[False]
     zero_f1 = learned_dataset_f1[True]
+    panel_f1 = {
+        panel_name: {
+            dataset: _macro_f1_names(truth, prediction)
+            for dataset, (truth, prediction) in datasets.items()
+        }
+        for panel_name, datasets in learned_by_panel.items()
+    }
     return {
         "validation/loss": float(np.average(losses, weights=loss_group_sizes)),
         "validation/encoder_effective_rank": float(np.mean(ranks)),
@@ -1130,6 +1218,8 @@ def validate(
         "validation/selection_dataset_macro_f1": (
             float(np.mean(list(enrolled_f1.values()))) if enrolled_f1 else float("-inf")
         ),
+        "validation/panel/fingerprint_48": panel_fingerprint,
+        "validation/panel/episode_count": float(len(episodes)),
         **{
             f"validation/enrolled/dataset/{dataset}/learned_macro_f1": value
             for dataset, value in enrolled_f1.items()
@@ -1137,6 +1227,14 @@ def validate(
         **{
             f"validation/zero_shot/dataset/{dataset}/learned_macro_f1": value
             for dataset, value in zero_f1.items()
+        },
+        **{
+            f"validation/panel/{panel_name}/dataset_macro_f1": float(np.mean(list(values.values())))
+            for panel_name, values in panel_f1.items() if values
+        },
+        **{
+            f"validation/panel/{panel_name}/dataset_count": float(len(values))
+            for panel_name, values in panel_f1.items()
         },
         **{f"validation/{key}": value for key, value in aggregate_telemetry.items()},
         **{f"validation/{key}": value for key, value in sampler.items()},

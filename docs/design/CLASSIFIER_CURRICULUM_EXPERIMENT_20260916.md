@@ -196,3 +196,40 @@ layer, deterministic perturbation replay, aligned multi-device timelines, and te
 acquisition regime, enrollment regime, truth enrollment, query/support perturbation, support
 count, and sensor-evidence margin. The 3-step real-data smoke passed these checks before the full
 run was launched.
+
+## Bounded diagnostics - 2026-09-17
+
+Two cheap diagnostics now gate any replacement 40,000-step run:
+
+- `training/support_classifier/curriculum_audit.py` samples the active curriculum without loading
+  sensor tensors. Its 2,000-support-set report is stored in
+  `training/support_classifier/evaluations/curriculum_audit_20260917.{md,json}`.
+- `training/support_classifier/development_panel.py` scores checkpoints on one deterministic,
+  subject-held-out episode panel under clean, rate-resampled, and gyroscope-dropout recording
+  conditions. It also reports exact neighbour-to-classifier rescues and harmful overturns. Its
+  report is stored in
+  `training/support_classifier/evaluations/development_panel_20260917.{md,json}`.
+
+The sampler audit measured 2,000 support sets and 7,457 queries. Among enrolled sets, the realized
+acquisition mixture was 74.8% compatible, 15.1% cross-placement, and 10.1% cross-dataset, rather
+than the requested 50/25/25. Cross-placement was feasible for four datasets and cross-dataset for
+three. The strict corrected cross-placement path had zero sets containing support from another
+dataset. These are corpus feasibility limits, not sampler leakage.
+
+The development panel is diagnostic because both evaluated checkpoints predate the corrected
+sampler. On the identical clean panel, Stage A improved over its own neighbour floor by 11.1
+accuracy points; the stopped Stage B checkpoint improved by 9.5. Stage B was also lower in
+dataset-macro F1 under clean, rate-resampled, and gyroscope-dropout conditions. This does not
+separate perturbations from the adaptive gate, but it rejects the claim that the stopped combined
+run already demonstrated a robustness gain.
+
+Before another long run, use matched short screens from the same initialization and current source:
+
+1. corrected Stage A (neither perturbations nor adaptive gate);
+2. rate/modality perturbations only;
+3. adaptive gate only;
+4. perturbations plus adaptive gate.
+
+The fixed panel, correction telemetry, seeds, validation cadence, and all other hyperparameters
+must be identical. The screen is only a filter: a promising arm still requires a complete run and
+sealed evaluation before promotion.

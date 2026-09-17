@@ -6,7 +6,7 @@ from model.support.residual_classifier import ResidualClassifierConfig, Residual
 from training.support_classifier.neighbors import differentiable_neighbor_logits
 from training.support_classifier.sampling import Episode
 from training.support_classifier.train import (
-    episode_loss, fit_text_projection, weighted_present_metrics,
+    episode_loss, fit_text_projection, prediction_telemetry, weighted_present_metrics,
 )
 from training.support_classifier.encoding import build_random_encoder
 from training.tokenizer.eval_transfer import build_encoder
@@ -31,12 +31,14 @@ def test_initial_residual_head_equals_neighbor_floor_without_centring():
     values = _episode()
     head = ResidualSupportClassifier(AttentionSpec(d_model=12, n_heads=3, dropout=0),
                                      ResidualClassifierConfig(centring="none", n_layers=1))
-    got = head(**values)["logits"]
+    result = head(**values)
+    got = result["logits"]
     expected, _ = differentiable_neighbor_logits(
         values["query_feature"], values["support_feature"], values["support_bound"],
         values["support_mask"], values["candidate_mask"], temperature=.07,
     )
     assert torch.equal(got, expected)
+    assert torch.equal(result["neighbor_logits"], expected)
 
 
 def test_initial_residual_head_equals_support_centred_neighbor_floor():
@@ -132,6 +134,35 @@ def test_validation_telemetry_keeps_conditional_gate_metrics_with_explicit_fract
          "scenario/support_count/0/semantic_weight": 0.6},
     ], [8, 8])
     assert got["scenario/support_count/0/semantic_weight"] == pytest.approx(0.5)
+
+
+def test_prediction_telemetry_reports_neighbor_rescues_and_overturns():
+    episodes = [
+        Episode(
+            index, (10, 11), (0, 1), ("a", "b"), 0, "compatible", 1, False,
+            support_counts=(1, 1), acquisition_regime=("cross_placement" if index == 0 else "compatible"),
+            enrollment_regime=("partial" if index == 1 else "complete"),
+        )
+        for index in range(4)
+    ]
+    result = {
+        # rescue, overturn, preserve, both wrong relative to target slot zero
+        "logits": torch.tensor([[3., 0.], [0., 3.], [3., 0.], [0., 3.]]),
+        "neighbor_logits": torch.tensor([[0., 3.], [3., 0.], [3., 0.], [0., 3.]]),
+        "support_weight": torch.full((4, 2), 0.5),
+        "rows": {"support_mask": torch.ones(4, 2, dtype=torch.bool)},
+        "text": {"candidate_mask": torch.ones(4, 2, dtype=torch.bool)},
+        "device_count": torch.ones(4),
+    }
+    got = prediction_telemetry(result, episodes)
+    prefix = "scenario/comparison/all/enrolled"
+    assert got[f"{prefix}/neighbor_accuracy"] == pytest.approx(0.5)
+    assert got[f"{prefix}/classifier_accuracy"] == pytest.approx(0.5)
+    assert got[f"{prefix}/rescue_rate"] == pytest.approx(0.25)
+    assert got[f"{prefix}/overturn_rate"] == pytest.approx(0.25)
+    assert got[f"{prefix}/preserve_rate"] == pytest.approx(0.25)
+    assert got[f"{prefix}/both_wrong_rate"] == pytest.approx(0.25)
+    assert got[f"{prefix}/net_gain"] == pytest.approx(0.0)
 
 
 def test_mixed_support_backward_reaches_every_trainable_parameter():
