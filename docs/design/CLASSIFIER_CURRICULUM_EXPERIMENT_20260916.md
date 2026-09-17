@@ -233,3 +233,9 @@ Before another long run, use matched short screens from the same initialization 
 The fixed panel, correction telemetry, seeds, validation cadence, and all other hyperparameters
 must be identical. The screen is only a filter: a promising arm still requires a complete run and
 sealed evaluation before promotion.
+
+The completed screen and decision are recorded in
+`docs/results/2026-09-17-classifier-curriculum-screen.md`. In brief, adaptive-gate-only preserved
+clean performance and improved partial, zero-support, and cross-dataset panels; perturbations-only
+improved gyroscope-dropout robustness; their combination underperformed both. The combined recipe
+is therefore not promoted.

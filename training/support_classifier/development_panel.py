@@ -110,13 +110,42 @@ def evaluate_checkpoint(
     classifier.load_state_dict(blob["classifier"])
     text = make_label_text(corpus.all_labels, device)
     draw_kwargs = _draw_kwargs(blob)
+    clean = _dataset(index, blob, rate_p=0.0, modality_p=0.0)
+    rate = _dataset(index, blob, rate_p=0.5, modality_p=0.0)
+    modality = _dataset(index, blob, rate_p=0.0, modality_p=0.5)
+
+    def forced(*, acquisition=None, enrollment=None) -> dict:
+        value = dict(draw_kwargs)
+        if acquisition is not None:
+            names = ("compatible", "cross_placement", "cross_dataset")
+            value["acquisition_mix"] = tuple(float(name == acquisition) for name in names)
+            # A zero-support set has no acquisition relation. Exclude it from an acquisition panel
+            # so every sampled row actually measures the named condition.
+            value["enrollment_mix"] = (0.5, 0.5, 0.0)
+        if enrollment is not None:
+            names = ("complete", "partial", "zero")
+            value["enrollment_mix"] = tuple(float(name == enrollment) for name in names)
+        return value
+
     conditions = {
-        "clean": _dataset(index, blob, rate_p=0.0, modality_p=0.0),
-        "rate_downsample_mixture": _dataset(index, blob, rate_p=0.5, modality_p=0.0),
-        "gyro_dropout_mixture": _dataset(index, blob, rate_p=0.0, modality_p=0.5),
+        "clean_mixed": (clean, draw_kwargs),
+        "rate_downsample_mixture": (rate, draw_kwargs),
+        "gyro_dropout_mixture": (modality, draw_kwargs),
+        "clean_acquisition_compatible": (
+            clean, forced(acquisition="compatible"),
+        ),
+        "clean_acquisition_cross_placement": (
+            clean, forced(acquisition="cross_placement"),
+        ),
+        "clean_acquisition_cross_dataset": (
+            clean, forced(acquisition="cross_dataset"),
+        ),
+        "clean_enrollment_complete": (clean, forced(enrollment="complete")),
+        "clean_enrollment_partial": (clean, forced(enrollment="partial")),
+        "clean_enrollment_zero": (clean, forced(enrollment="zero")),
     }
     metrics = {}
-    for name, dataset in conditions.items():
+    for name, (dataset, panel_draw_kwargs) in conditions.items():
         metrics[name] = validate(
             encoder=encoder,
             classifier=classifier,
@@ -129,7 +158,7 @@ def evaluate_checkpoint(
             episodes_count=support_sets,
             episodes_per_step=int(_value(blob, "episodes_per_step", 4)),
             seed=seed + 91_003,
-            draw_kwargs=draw_kwargs,
+            draw_kwargs=panel_draw_kwargs,
             executor=None,
             deployment_matched=True,
         )
@@ -140,6 +169,11 @@ def evaluate_checkpoint(
         "support_sets_per_condition": support_sets,
         "window_seconds": window_seconds,
         "resolutions": list(resolutions),
+        "panel_contracts": {
+            "mixed": "default acquisition and enrollment mixtures",
+            "acquisition": "named acquisition regime; 50/50 complete/partial enrollment",
+            "enrollment": "named enrollment regime; default acquisition mixture",
+        },
         "metrics": metrics,
     }
 
@@ -153,8 +187,8 @@ def _markdown(report: dict) -> str:
     lines = [
         "# Internal Classifier Development Panel",
         "",
-        "Subject-held-out development data only. Values are percentages. The same deterministic "
-        "episode panel is reused across recording conditions.",
+        "Subject-held-out development data only. Values are percentages. Clean/rate/dropout "
+        "reuse one episode panel; each condition-specific panel is fixed across checkpoints.",
         "",
         "| checkpoint | condition | enrolled macro-F1 | zero-shot macro-F1 | neighbor acc. | "
         "classifier acc. | rescue | overturn | net gain |",
