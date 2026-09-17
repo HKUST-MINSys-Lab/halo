@@ -3,6 +3,9 @@
 **Status:** implemented and smoke-tested. This note resolves the second evaluation/curriculum
 debug sweep and defines the protocol boundary for subsequent scenario and sealed runs.
 
+> **Later protocol update:** v4 (`deployment-scenarios-v4-20260917`) differs only by retiring the
+> redundant compound cold-start scenario. The seven retained scenario constructions are unchanged.
+
 ## Protocol and fairness
 
 - Restored the historical NumPy without-replacement draw and canonical JSON manifest fingerprint.

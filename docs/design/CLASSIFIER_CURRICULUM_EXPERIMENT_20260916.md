@@ -4,6 +4,9 @@
 order, controls, and reporting contract. It supplements `SUPPORT_CLASSIFIER_DESIGN_20260914.md`;
 it does not redefine the sealed evaluation protocol.
 
+> **Protocol update (2026-09-17):** active comparisons use the seven-scenario v4 roster. Cold-start
+> rows below are retained only as historical v3 measurements and are not promoted.
+
 ## Question
 
 Can deployment-shaped training make HALO's learned classifier improve on its own neighbour floor
@@ -19,7 +22,7 @@ sensor evidence was overridden by the semantic term. This experiment targets tho
 - End-to-end encoder and residual-classifier training for 40,000 optimizer steps.
 - The current eight-source supervised corpus, subject-held-out validation split, seed, optimizer,
   candidate policy, and multi-device policy.
-- The same eight-scenario evaluator, at `k in {1, 8}`, with immutable episode manifests and the
+- The same seven-scenario evaluator, at `k in {1, 8}`, with immutable episode manifests and the
   same HALO 1-NN, prototype, ridge, and learned-classifier readouts.
 - Checkpoint selection uses internal validation only. Scenario results never select a checkpoint.
 
@@ -72,7 +75,7 @@ the primary results. Its partial run remains a diagnostic artifact only.
 
 The stopped Stage B run predates the 2026-09-16 sampler corrections and is not a valid matched
 ablation of the current curriculum. A new comparison must train both arms from scratch on the
-current sampler and score both on `deployment-scenarios-v3-20260916` manifests.
+current sampler and score both on `deployment-scenarios-v4-20260917` manifests.
 
 The command line does not infer an experiment stage. A Stage B run must explicitly include
 `--rate-augmentation-probability 0.25 --modality-dropout-probability 0.20

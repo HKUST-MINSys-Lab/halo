@@ -160,8 +160,11 @@ Two evaluation regimes are retained:
 1. **Complete-enrollment aggregate curve:** every candidate receives exactly `k` supports at
    `k>0`; external baselines report both equal-weight normalized fusion and cosine 1-NN. At `k=0`,
    report equal-weight normalized fusion and the released native method where one exists.
-2. **Deployment-scenario evaluation:** partial enrollment and the preregistered heterogeneity
-   scenarios use equal-weight normalized fusion as the default external-baseline readout.
+2. **Deployment-scenario evaluation:** partial enrollment and the six other preregistered
+   heterogeneity scenarios use equal-weight normalized fusion as the default external-baseline
+   readout. The active `deployment-scenarios-v4-20260917` roster is partial enrollment, cross
+   placement, cross dataset, missing modality, rate mismatch, new domain, and device-set mismatch.
+   The former compound cold-start scenario is retired because it duplicated these factors.
 
 For both regimes, the classifier-attribution experiment freezes each released baseline encoder,
 attaches the same HALO learnable classifier, trains only that classifier under the same training

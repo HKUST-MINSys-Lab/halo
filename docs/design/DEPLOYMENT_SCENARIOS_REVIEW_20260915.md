@@ -1,5 +1,8 @@
 # Deployment scenario implementation review - 2026-09-15
 
+> **Historical v3 review:** the active v4 protocol retired `s8_cold_start` on 2026-09-17 because
+> it duplicated factors measured by the seven retained scenarios.
+
 Status: repairs implemented and regression-tested on 2026-09-15. Bounded real-data probes pass;
 no full comparison run has been launched. This review remains the rationale and acceptance record
 for the repaired protocol.

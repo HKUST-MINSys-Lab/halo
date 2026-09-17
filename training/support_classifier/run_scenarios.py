@@ -1,4 +1,4 @@
-"""Deployment-heterogeneity scenario runner (Scenarios 1-8).
+"""Deployment-heterogeneity scenario runner (Scenarios 1-7).
 
 Evaluation only.  Nothing here trains, selects a checkpoint, or writes into the sealed comparison
 directory.  Each scenario removes information that the standard sealed protocol supplies, and every
@@ -15,7 +15,6 @@ Scenarios
 ``s5_rate_mismatch``       the query is acquired at a different sampling rate
 ``s6_new_domain``          rehabilitation / gym / daily-living labels no model has trained on
 ``s7_device_set``          the number of worn devices differs between enrolment and deployment
-``s8_cold_start``          all of the above at once, on one held-out domain
 =========================  ===================================================================
 
 Severity is recorded per row on the four axes of the plan (label, support coverage, provenance,
@@ -127,6 +126,15 @@ NEW_DOMAIN_CELLS = (
 )
 
 RATE_TARGETS = (20.0, 25.0, 100.0)
+ACTIVE_SCENARIOS = (
+    "s1_partial_coverage",
+    "s2_cross_placement",
+    "s3_cross_dataset",
+    "s4_missing_modality",
+    "s5_rate_mismatch",
+    "s6_new_domain",
+    "s7_device_set",
+)
 EVALUATION_ROOT = Path(__file__).resolve().parent / "evaluations"
 DEFAULT_SHARED_FEATURE_CACHE = EVALUATION_ROOT / f"shared_{FEATURE_CACHE_SCHEMA}"
 _WITHIN_PLAN_CACHE: dict[tuple, tuple] = {}
@@ -712,31 +720,6 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                 if complete():
                     return tasks
 
-    elif scenario == "s8_cold_start":
-        if k == 0:
-            return tasks
-        dataset = "mmfit"
-        query = _composite(dataset, ("left_wrist", "right_pocket"), window_seconds)
-        support = safe_load(dataset, "right_wrist")
-        if support is None:
-            return tasks
-        query_rows = _mmfit_split_rows(query, ("cross_subject_test",))
-        support_rows = _mmfit_split_rows(support, ("train", "validation"))
-        cross = build_cross_manifest(query, support, k, seed=seed,
-                                     relation="cold_start_paper_split",
-                                     query_rows=query_rows, support_rows=support_rows)
-        if cross.plans:
-            cell = _coverage_cell(cross.candidates, seed=seed, dataset=dataset, stream="cold_start",
-                                  window_seconds=window_seconds, coverage=coverage)
-            tasks.append(Task(
-                scenario, f"{dataset}/cold_start", query, support,
-                tuple(hide_supports(cross.plans, cell)), cross.candidates, cross.offset,
-                {"L": 3, "S": 2, "P": 2, "C": 3}, coverage=cell,
-                meta={"support_stream": "right_wrist", "query_devices": 2,
-                      "provenance_unit": "published_mmfit_workout_partition",
-                      "bootstrap_unit": "workout"}))
-            if complete():
-                return tasks
     else:
         raise ValueError(f"unknown scenario {scenario!r}")
     return tasks
@@ -1084,7 +1067,7 @@ def _run_provenance(argv: list[str], *, device: torch.device, halo_checkpoint: P
     except (OSError, subprocess.CalledProcessError):
         dirty_digest = None
     return {
-        "protocol": "deployment-scenarios-v3-20260916",
+        "protocol": "deployment-scenarios-v4-20260917",
         "manifest_generator": "numpy-choice-json-fingerprint-v1",
         "argv": argv,
         "git_revision": revision,
@@ -1291,9 +1274,8 @@ def _write_tabular_results(out: Path, rows: list[dict]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--scenarios", nargs="+", default=[
-        "s1_partial_coverage", "s2_cross_placement", "s3_cross_dataset", "s4_missing_modality",
-        "s5_rate_mismatch", "s6_new_domain", "s7_device_set", "s8_cold_start"])
+    parser.add_argument("--scenarios", nargs="+", choices=ACTIVE_SCENARIOS,
+                        default=list(ACTIVE_SCENARIOS))
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--models", nargs="+", default=["halo", *PRIMARY_BASELINES])
     parser.add_argument(
@@ -1468,7 +1450,6 @@ def main() -> None:
                 if not tasks:
                     requires_enrollment = scenario in {
                         "s1_partial_coverage", "s4_missing_modality", "s5_rate_mismatch",
-                        "s8_cold_start",
                     }
                     if k == 0 and requires_enrollment:
                         rows.append({"scenario": scenario, "k": k,

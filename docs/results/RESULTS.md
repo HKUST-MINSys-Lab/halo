@@ -4,21 +4,22 @@ This is the promoted result record for the current support-conditioned HAR desig
 future-JEPA variants are archived separately and are not mixed into this table.
 
 > **Protocol boundary (2026-09-16):** historical tables retain their original artifacts but must
-> not be extended with new checkpoints. Current runs use `deployment-scenarios-v3-20260916` and
+> not be extended with new checkpoints. Current runs use `deployment-scenarios-v4-20260917` and
 > `sealed-manifest-v2-20260916`, with the restored NumPy manifest draw, corrected k=0 filtering,
 > and current sampler. Matched comparisons must re-score every checkpoint under one protocol.
 
 ## Representative scenario protocol - 2026-09-17
 
-Deployment scenarios are a fixed set of eight stress tests, not a full Cartesian sweep. The
+Deployment scenarios are a fixed set of seven stress tests, not a full Cartesian sweep. The
 completed run uses every scenario at `k=0`, `k=1`, `k=4`, `k=8`, and `k=32` with an 8-second
 analysis window. It evaluates HALO and the five retained baselines (`HARNet-5`, `HARNet-10`,
 `LiMU-BERT-X`, `UniMTS`, and `NormWear`) on identical episodes. HALO uses its learned classifier;
 external encoders use the fixed equal-weight normalized fusion adapter. The complete run contains
-4,406 result rows, 651 scored tasks, and no failures.
+4,341 promoted result rows after excluding the retired cold-start condition. The immutable source
+artifact contains 65 additional cold-start rows retained only for reproducibility.
 
 The ordinary sealed evaluation is separate and may use the larger `k=0..64`, 4/8/16-second grid.
-Do not multiply that sealed grid into the scenario experiment: `8 scenarios x 8 k values x 3
+Do not multiply that sealed grid into the scenario experiment: `7 scenarios x 8 k values x 3
 windows x all dataset variants` is an exploratory Cartesian sweep, not the representative
 scenario protocol. Such exploratory runs must use a separate output directory and must not
 replace the representative tables.
@@ -33,13 +34,14 @@ Every scenario run writes `progress.json` after each scored task. It records exa
 total protocol cells, progress within the current cell, elapsed time, a rolling task rate, ETA,
 episode-construction time, and cumulative time attributed to each model. Console `[progress]`
 lines mirror the durable file. Use these measurements for status and duration estimates; counting
-plain `[scenarios]` log lines is not a reliable ETA because cold-start and multi-device tasks are
-substantially more expensive than ordinary cached cells.
+plain `[scenarios]` log lines is not a reliable ETA because multi-device tasks are substantially
+more expensive than ordinary cached cells.
 
 ## Deployment-scenario diagnostics - 2026-09-16
 
 The Stage A acquisition/enrollment curriculum is reported separately from the ordinary sealed
-k-curve because it tests eight perturbed deployment conditions. The concise summary contains a
+k-curve because it historically tested eight perturbed deployment conditions. Cold start is now
+retired; active v4 runs test the seven nonredundant conditions. The concise summary contains a
 scenario glossary, aggregate comparisons against every released baseline, and per-dataset tables;
 the adjacent exhaustive artifact retains every split, readout, and confidence interval:
 

@@ -5,16 +5,17 @@ not a checkpoint-selection result.
 
 ## Protocol
 
-- Protocol: `deployment-scenarios-v3-20260916`
+- Active protocol: `deployment-scenarios-v4-20260917`
+- Source artifact: `deployment-scenarios-v3-20260916`; its cold-start rows are retired and excluded
 - Window duration: 8 seconds
 - Enrollment counts: `k = 0, 1, 4, 8, 32`
 - Scenarios: partial enrollment, cross placement, cross dataset, missing modality, rate mismatch,
-  new domain, device-set mismatch, and cold start
+  new domain, and device-set mismatch
 - HALO readout: learned support classifier
 - External readout: fixed equal-weight normalized fusion
 - Models: HALO, HARNet-5, HARNet-10, LiMU-BERT-X, UniMTS, and NormWear
-- Result rows: 4,406
-- Scored tasks: 651
+- Promoted result rows: 4,341 (65 retired cold-start rows excluded)
+- Source-artifact scored tasks: 651
 - Task failures: 0
 - Failed result rows: 0
 - Runtime: 1,600.05 seconds
@@ -41,9 +42,8 @@ artifact retains every model, variant, coverage split, and enrollment count.
 | Rate mismatch | 66.35 | 40.98 | UniMTS | +25.38 |
 | New domain | 50.36 | 27.98 | UniMTS | +22.39 |
 | Device-set mismatch | 71.60 | 46.90 | UniMTS | +24.69 |
-| Cold start | 30.98 | 45.26 | UniMTS | -14.28 |
 
-HALO leads seven scenarios and loses cold start. These are system-level comparisons: HALO received
+HALO leads all seven retained scenarios. These are system-level comparisons: HALO received
 task-specific episodic training, while the external encoders use released weights with the fixed
 common adapter. They do not by themselves attribute the gain to HALO's encoder or classifier.
 
@@ -63,7 +63,6 @@ without failure.
 | Missing modality | -7.89 | -19.85 |
 | Rate mismatch | -5.94 | -16.69 |
 | Device-set mismatch | -10.60 | -21.00 |
-| Cold start, all queries | +9.04 | +7.71 |
 
 Fusion is the primary fixed adaptation protocol because it can name candidates without enrollment.
 The diagnostic shows why representation-only 1-NN must remain available as a companion control:
@@ -72,8 +71,11 @@ has support. No per-model or test-selected fusion weight is used.
 
 ## Artifacts
 
-The complete rows and immutable manifests are tracked in
+The source artifact's complete rows and immutable manifests are tracked in
 `docs/results/artifacts/scenarios_halo_classifier_v3_20260917/`.
+
+That immutable v3 artifact retains 65 cold-start rows for reproducibility. Readers and summary
+generators must exclude `scenario == "s8_cold_start"`; new runs use v4 and cannot generate it.
 
 | artifact | uncompressed SHA-256 |
 |---|---|

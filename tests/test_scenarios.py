@@ -1,4 +1,4 @@
-"""Deployment-heterogeneity scenarios 2-8 — unit tests for derived streams and cross enrolment."""
+"""Deployment-heterogeneity scenarios 2-7 — unit tests for derived streams and cross enrolment."""
 
 from __future__ import annotations
 
@@ -14,12 +14,25 @@ from training.support_classifier.scenarios import (
     shared_candidates,
 )
 from training.support_classifier.run_scenarios import (
+    ACTIVE_SCENARIOS,
     Task,
     _matched_within_reference,
     _requires_cross_support_features,
 )
 
 CHANNELS = ["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"]
+
+
+def test_active_scenario_roster_excludes_retired_compound_cold_start():
+    assert ACTIVE_SCENARIOS == (
+        "s1_partial_coverage",
+        "s2_cross_placement",
+        "s3_cross_dataset",
+        "s4_missing_modality",
+        "s5_rate_mismatch",
+        "s6_new_domain",
+        "s7_device_set",
+    )
 
 
 def make_stream(

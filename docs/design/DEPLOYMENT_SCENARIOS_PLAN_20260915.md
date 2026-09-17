@@ -53,7 +53,12 @@ Verified on disk 2026-09-15 (`data/datasets/`, `deployment_policy.STREAM_SPECS`,
   shin / upper arm and Shoaib upper arm remain optional expansion cells and are not silently
   represented by another placement.
 
-## 3. The eight scenarios
+> **Protocol update (2026-09-17):** the compound cold-start scenario was retired because it only
+> combines conditions already measured separately. The active protocol contains the seven
+> scenarios below. Historical v3 artifacts may still contain `s8_cold_start`, but that row is not
+> part of promoted analysis and must not be extended to new checkpoints.
+
+## 3. The seven scenarios
 
 Each scenario states: severity, the deployment story in one sentence, data, construction, the fair
 readout for baselines, what is reported, what we predict and **why** (the mechanism that would be
@@ -206,27 +211,6 @@ enrolled from a multi-sensor lab session and deployed on a single phone.*
 - **Cost:** composite manifests already exist; A/B support-query pairing shared with Scenario 2;
   eval ~2 h.
 
-### Scenario 8 — Cold-start user in a new domain (compound)
-**Severity `3/2/2/3`.** *A new user starts a gym-tracking app on a watch and a phone. The app ships
-one enrolment example per exercise, recorded by someone else on a single wrist device, for only
-half of the exercises it recognises; the rest are recognised from their names.*
-
-- **Data:** mmfit only. Support: one execution per supported label, from a different subject, from
-  the right-wrist stream. Query: the left-wrist + right-pocket + earbud composite (or the largest
-  composite the grids support) for a held-out subject. 50 % of labels unsupported, truth balanced
-  across supported and unsupported.
-- **Construction:** k=1 with the Scenario 1 hiding rule, the Scenario 2 cross-subject/cross-site
-  pairing, and the Scenario 7 device-set mismatch, in one manifest. Also report the same manifest
-  at k=4.
-- **Fair baseline readout:** hybrid text + 1-NN with per-device pooling, i.e. the most generous
-  untrained composition of every baseline's parts.
-- **Report:** F1 on supported truth, unsupported truth, and union; plus each model's Scenario 0
-  number on mmfit so the compound cost is visible.
-- **Prediction and mechanism:** this is where the design should separate most, because every
-  mechanism above is engaged at once and no baseline has more than one of them. If HALO does *not*
-  lead here, the thesis is wrong and we should know that before writing.
-- **Cost:** everything is shared with Scenarios 1, 2, 6, 7; eval ~1 h.
-
 ## 4. Severity summary
 
 | # | scenario | L | S | P | C | new build | predicted lead |
@@ -238,7 +222,6 @@ half of the exercises it recognises; the rest are recognised from their names.*
 | 5 | rate mismatch | 0 | 0 | 0 | 2 | query resampling | small |
 | 6 | new domain | 3 | 0→2 | 0 | 0 | grid spar / mmfit / upper_limb_use | k=0 unknown; k≥1 moderate |
 | 7 | device-set mismatch | 0 | 0 | 0 | 3 | A/B + composite pairing | **large** (learned pool) |
-| 8 | cold-start compound | 3 | 2 | 2 | 3 | composition of the above | **largest, or thesis fails** |
 
 \* Scenario 3 changes device model, rate and protocol implicitly through the dataset change.
 

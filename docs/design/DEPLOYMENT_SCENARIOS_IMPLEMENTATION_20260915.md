@@ -1,5 +1,8 @@
 # Deployment-heterogeneity scenarios — implementation handoff (2026-09-15)
 
+> **Historical v3 handoff:** the active v4 protocol retired `s8_cold_start` on 2026-09-17.
+> References below to eight scenarios describe the archived implementation, not the current roster.
+
 **Status:** repaired and performance-audited after the 2026-09-15 implementation review. Focused
 regression tests and an all-scenario real-data smoke pass for HALO, HARNet, LiMU-BERT-X, UniMTS,
 and NormWear; **no full comparison run has been made.** Implements
