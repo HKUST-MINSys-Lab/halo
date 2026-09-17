@@ -1,7 +1,7 @@
-# Deployment-scenario evaluation checkpoint - 2026-09-17
+# Deployment-scenario evaluation results - 2026-09-17
 
-This is the durable checkpoint for the completed representative deployment-scenario run. It is
-an evaluation record, not a checkpoint-selection result.
+This is the durable result record for the completed representative deployment-scenario run. It is
+not a checkpoint-selection result.
 
 ## Protocol
 

@@ -25,7 +25,7 @@ replace the representative tables.
 
 The concise results, readout-fairness diagnostic, limitations, hashes, and tracked machine-readable
 artifacts are in the
-[2026-09-17 scenario checkpoint](2026-09-17-scenario-evaluation-checkpoint.md). The original local
+[2026-09-17 scenario results](2026-09-17-scenario-evaluation-results.md). The original local
 run is
 `training/support_classifier/evaluations/scenarios_halo_classifier_v3_20260917_profiled_v2_k0_1_4_8_32/`.
 
