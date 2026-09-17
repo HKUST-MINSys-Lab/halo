@@ -1398,7 +1398,8 @@ def main() -> None:
         within_cell = (task_done / task_total) if task_total else 0.0
         completed_equivalent = completed_cells + within_cell
         fraction = completed_equivalent / total_cells if total_cells else 1.0
-        eta = (elapsed * (1.0 - fraction) / fraction) if fraction > 0.0 else None
+        eta = (elapsed * (1.0 - fraction) / fraction
+               if fraction > 0.0 and task_seconds else None)
         recent = task_seconds[-20:]
         payload = {
             "complete": completed_cells >= total_cells,
