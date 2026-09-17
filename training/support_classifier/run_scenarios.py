@@ -874,10 +874,10 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
 
             if k > 0:
                 support_readouts = (
-                    # Fusion remains the declared baseline deployment readout, but 1-NN is always
-                    # reported beside it. Hiding the representation-only floor can handicap a
-                    # model whose native semantic score is noisy and can dilute severity deltas.
-                    frozenset(("1nn",)) if default_baseline_fusion else
+                    # Baselines use the fixed fusion readout as their declared result. Their
+                    # representation-only 1-NN is a HALO development diagnostic, not a baseline
+                    # headline row; request it explicitly when needed.
+                    frozenset() if default_baseline_fusion else
                     None if selected_readouts is None else
                     frozenset(selected_readouts & {"1nn", "prototype", "ridge"})
                 )
@@ -923,6 +923,12 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
                     predicted = _halo_residual_predictions(features, roster, task.plans,
                                                           halo_checkpoint, device)
                     append_emitted(predicted, readout="halo-classifier")
+                elif (name != "halo" and text is not None and baseline_fusion_requested):
+                    # With no enrolled supports the fixed combiner has only its semantic
+                    # component. Keep the readout name consistent with enrolled baseline rows;
+                    # do not imply that a support term was available.
+                    predicted = [task.candidates[index] for index in text.argmax(axis=1).tolist()]
+                    append_emitted(predicted, readout="equal-weight-normalized-fusion")
                 elif (text is not None and (selected_readouts is None
                                              or "zero-shot-native-or-bridge" in selected_readouts)):
                     predicted = [task.candidates[index] for index in text.argmax(axis=1).tolist()]
@@ -1281,8 +1287,9 @@ def main() -> None:
             "1nn", "prototype", "ridge", "equal-weight-normalized-fusion",
             "zero-shot-native-or-bridge", "halo-classifier",
         ), default=None,
-        help=("optional readout subset for a controlled diagnostic; omitted reports equal-weight "
-              "normalized fusion plus 1-NN for baselines and the deployment classifier for HALO"),
+        help=("optional readout subset for a controlled diagnostic; omitted reports only "
+              "equal-weight normalized fusion for baselines and the deployment classifier for "
+              "HALO"),
     )
     parser.add_argument("--halo-checkpoint", type=Path, default=None)
     parser.add_argument("--k", nargs="+", type=int, default=[0, 1, 2, 4, 8, 16, 32, 64])
