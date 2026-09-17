@@ -31,6 +31,7 @@ import json
 import os
 import platform
 import subprocess
+import time
 import traceback
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -754,7 +755,8 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
                halo_has_classifier: bool = False,
                selected_readouts: frozenset[str] | None = None,
                provider_states=None, prediction_sink=None, cache_read_dirs=(),
-               feature_memory_cache=None, manifest: str | None = None) -> list[dict]:
+               feature_memory_cache=None, manifest: str | None = None,
+               timing_sink: dict[str, float] | None = None) -> list[dict]:
     """Every readout for every model on one task's episodes."""
     if not task.plans:
         severity = {f"severity_{axis}": value for axis, value in task.severity.items()}
@@ -817,6 +819,7 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
             })
 
     for name in models:
+        model_started = time.perf_counter()
         try:
             default_baseline_fusion = selected_readouts is None and name != "halo"
             baseline_fusion_requested = name != "halo" and (
@@ -964,6 +967,11 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
         except Exception as exc:  # Preserve other models' completed rows and make unexpected failures visible.
             rows.append({"model": name, "status": "failed", "reason": f"{type(exc).__name__}: {exc}",
                          "k": k, "window_seconds": float(window_seconds), **severity_meta})
+        finally:
+            if timing_sink is not None:
+                timing_sink[name] = timing_sink.get(name, 0.0) + (
+                    time.perf_counter() - model_started
+                )
     return rows
 
 
@@ -1376,6 +1384,49 @@ def main() -> None:
     manifest_path.write_text("")
     prediction_path.write_text("")
     completed_tasks = 0
+    completed_cells = 0
+    total_cells = len(args.scenarios) * len(windows) * len(ks)
+    run_started = time.perf_counter()
+    task_seconds: list[float] = []
+    build_seconds: dict[str, float] = {}
+    model_seconds: dict[str, float] = {}
+
+    def checkpoint_progress(*, scenario: str | None, k: int | None,
+                            window_seconds: float | None, task_done: int = 0,
+                            task_total: int = 0, last_task_seconds: float | None = None) -> None:
+        elapsed = time.perf_counter() - run_started
+        within_cell = (task_done / task_total) if task_total else 0.0
+        completed_equivalent = completed_cells + within_cell
+        fraction = completed_equivalent / total_cells if total_cells else 1.0
+        eta = (elapsed * (1.0 - fraction) / fraction) if fraction > 0.0 else None
+        recent = task_seconds[-20:]
+        payload = {
+            "complete": completed_cells >= total_cells,
+            "completed_cells": completed_cells,
+            "total_cells": total_cells,
+            "cell_fraction": fraction,
+            "completed_tasks": completed_tasks,
+            "current": {
+                "scenario": scenario, "k": k, "window_seconds": window_seconds,
+                "task_done": task_done, "task_total": task_total,
+            },
+            "elapsed_seconds": elapsed,
+            "eta_seconds": eta,
+            "tasks_per_minute": (60.0 * completed_tasks / elapsed) if elapsed else 0.0,
+            "recent_task_seconds_mean": (sum(recent) / len(recent)) if recent else None,
+            "last_task_seconds": last_task_seconds,
+            "build_seconds_by_scenario": build_seconds,
+            "model_seconds": model_seconds,
+        }
+        _atomic_json(args.out / "progress.json", payload)
+        eta_text = "unknown" if eta is None else f"{eta / 60.0:.1f}m"
+        print(
+            f"[progress] cells={completed_cells}/{total_cells} "
+            f"cell_tasks={task_done}/{task_total} tasks={completed_tasks} "
+            f"elapsed={elapsed / 60.0:.1f}m eta={eta_text}",
+            flush=True,
+        )
+
     _atomic_json(args.out / "run_provenance.json", _run_provenance(
         list(os.sys.argv), device=device, halo_checkpoint=args.halo_checkpoint,
     ))
@@ -1389,6 +1440,7 @@ def main() -> None:
     for scenario in args.scenarios:
         for window_seconds in windows:
             for k in ks:
+                build_started = time.perf_counter()
                 try:
                     tasks = build_tasks(scenario, k, window_seconds,
                                         seed=args.seed, coverage=args.coverage, limit=limit,
@@ -1400,7 +1452,12 @@ def main() -> None:
                                      "error": f"{type(exc).__name__}: {exc}",
                                      "traceback": traceback.format_exc()})
                     _atomic_json(args.out / "failures.json", failures)
+                    completed_cells += 1
+                    checkpoint_progress(scenario=scenario, k=k,
+                                        window_seconds=window_seconds)
                     continue
+                build_key = f"{scenario}|k={k}|w={window_seconds:g}"
+                build_seconds[build_key] = time.perf_counter() - build_started
                 if not tasks:
                     requires_enrollment = scenario in {
                         "s1_partial_coverage", "s4_missing_modality", "s5_rate_mismatch",
@@ -1421,7 +1478,7 @@ def main() -> None:
                         _atomic_json(args.out / "failures.json", failures)
                 selected_tasks = tasks
                 paired_tracker = _PairedDeltaTracker(selected_tasks, bootstrap=bootstrap)
-                for task in selected_tasks:
+                for task_index, task in enumerate(selected_tasks, start=1):
                     task_manifest = manifest_fingerprint(task.plans)
                     _append_jsonl(
                         manifest_path,
@@ -1433,6 +1490,7 @@ def main() -> None:
                     print(f"[scenarios] {scenario} k={k} w={window_seconds:g} {task.variant}",
                           flush=True)
                     task_predictions: list[dict] = []
+                    task_started = time.perf_counter()
                     try:
                         rows.extend(score_task(
                             task, models=args.models, device=device, cache_dir=cache_dir,
@@ -1445,13 +1503,16 @@ def main() -> None:
                             prediction_sink=task_predictions,
                             cache_read_dirs=cache_read_dirs,
                             feature_memory_cache=feature_memory_cache,
-                            manifest=task_manifest))
+                            manifest=task_manifest,
+                            timing_sink=model_seconds))
                     except Exception as exc:  # noqa: BLE001
                         failures.append({"scenario": scenario, "variant": task.variant, "k": k,
                                          "window_seconds": window_seconds, "stage": "score_task",
                                          "error": f"{type(exc).__name__}: {exc}",
                                          "traceback": traceback.format_exc()})
                     completed_tasks += 1
+                    last_task_seconds = time.perf_counter() - task_started
+                    task_seconds.append(last_task_seconds)
                     if args.full_audit:
                         _append_jsonl(prediction_path, task_predictions)
                     try:
@@ -1467,6 +1528,11 @@ def main() -> None:
                     if completed_tasks % 25 == 0:
                         _atomic_json(args.out / "results.json", rows)
                         _write_tabular_results(args.out, rows)
+                    checkpoint_progress(
+                        scenario=scenario, k=k, window_seconds=window_seconds,
+                        task_done=task_index, task_total=len(selected_tasks),
+                        last_task_seconds=last_task_seconds,
+                    )
                 try:
                     paired_delta_rows.extend(paired_tracker.finish())
                 except RuntimeError as exc:
@@ -1479,6 +1545,9 @@ def main() -> None:
                                      "error": str(exc)})
                     _atomic_json(args.out / "failures.json", failures)
                 _atomic_json(args.out / "paired_deltas.json", paired_delta_rows)
+                completed_cells += 1
+                checkpoint_progress(scenario=scenario, k=k,
+                                    window_seconds=window_seconds)
 
     _atomic_json(args.out / "results.json", rows)
     _atomic_json(args.out / "failures.json", failures)
@@ -1500,6 +1569,7 @@ def main() -> None:
         "k": ks,
         "window_seconds": windows,
     })
+    checkpoint_progress(scenario=None, k=None, window_seconds=None)
     print(f"wrote {len(rows)} rows and {len(failures)} task failures to {args.out}")
     if not complete:
         raise SystemExit(

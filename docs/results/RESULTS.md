@@ -26,6 +26,13 @@ The current representative artifacts will be written to
 `training/support_classifier/evaluations/scenarios_baselines_v3_20260917_representative/` after
 the run is complete. Partial files are provisional and must not be cited as results.
 
+Every scenario run writes `progress.json` after each scored task. It records exact completed and
+total protocol cells, progress within the current cell, elapsed time, a rolling task rate, ETA,
+episode-construction time, and cumulative time attributed to each model. Console `[progress]`
+lines mirror the durable file. Use these measurements for status and duration estimates; counting
+plain `[scenarios]` log lines is not a reliable ETA because cold-start and multi-device tasks are
+substantially more expensive than ordinary cached cells.
+
 ## Deployment-scenario diagnostics - 2026-09-16
 
 The Stage A acquisition/enrollment curriculum is reported separately from the ordinary sealed
