@@ -16,7 +16,7 @@ directory name. "Arm" means a training run; "readout" means how a trained checkp
 |---|---|---|---|---|
 | HALO residual arm, step 40k, 2026-09-18 | v5 | acquisition-conditioning-v2 | **current** | below |
 | HALO neighbours arm, step 40k, 2026-09-18 | v5 | acquisition-conditioning-v2 | **current** | below |
-| HALO contextual arm, 2026-09-18 | v5 | acquisition-conditioning-v2 | training, not yet scored | pending |
+| HALO contextual arm, step 40k, 2026-09-18 | v5 | acquisition-conditioning-v2 | **failed, recorded** | below |
 | Released baselines, 2026-09-18 | v5 | n/a | **current** | below |
 | HALO residual v3 `curriculum1234`, 2026-09-16 | v4 scenarios | combined-text-v1 | superseded | [artifact](../../results/artifacts/scenarios_halo_classifier_v3_20260917/) |
 | HALO residual v3 `curriculum12`, 2026-09-16 | v4 scenarios | combined-text-v1 | superseded | [summary](../../results/artifacts/historical-evaluations/scenarios_curriculum12_20260916/SUMMARY.md) |
@@ -263,6 +263,59 @@ Reading the scenario tables:
   27.0, 31.5) than the residual classifier's semantic path (42.2, 74.1, 47.6); that arm never trains on
   zero-support episodes, so its zero-support validation is undefined by design.
 
+
+### The contextual arm: a recorded negative result
+
+A third arm trained the contextualise-first semantic-voting head
+(`support_contextual_mixture_v1`, the approved [2026-09-17 plan](../journal/2026-09-17-contextual-classifier-plan.md)):
+one attention stack contextualises query, supports, support labels and candidates together, then a
+support-vote path and a semantic path are mixed by a per-candidate learned gate. Same recipe as the
+other two arms, final step-40,000 checkpoint, 1.43 M classifier parameters against the residual
+head's 1.41 M.
+
+**It failed, and the failure is instructive rather than a wasted run.** Sealed, 8 s,
+dataset-balanced macro F1:
+
+| readout | k=0 | k=1 | k=8 | k=32 | k=128 |
+|---|---:|---:|---:|---:|---:|
+| contextual classifier (headline) | 40.6 | 42.8 | 43.7 | 43.8 | 43.8 |
+| its semantic branch alone | - | 42.6 | 43.3 | 43.4 | 43.5 |
+| its support branch alone | - | 53.4 | 64.0 | 66.6 | 67.6 |
+| cosine 1-NN on its encoder | - | 54.9 | 65.8 | 69.2 | 71.7 |
+| residual arm classifier, for reference | 51.7 | 62.4 | 71.5 | 73.4 | 74.4 |
+
+* **The headline row is flat**: 1.0 point from one support to 128. A support-conditioned model that
+  does not respond to support is not doing its job.
+* **The gate collapsed onto the semantic branch.** Measured on real sealed features with twelve
+  supports enrolled, the mean semantic weight is **0.996** and every candidate exceeds 0.9. The
+  mixture sits 0.001 from the semantic branch and 0.28 from the support branch: the support path is
+  computed and then discarded, and the gate selects the weaker branch nearly everywhere.
+* **Its own support branch would have been better**, and plain 1-NN on the same features better
+  still, so the contextualised vote also underperforms the parameter-free readout it replaced.
+* **The encoder came out weaker too**: 54.9 against the residual arm's 60.7 at k=1. Contextualising
+  before comparison cost representation quality as well as decision quality.
+
+Scenarios show the same flatness in every condition. The clearest case is the new-domain scenario,
+where the residual arm climbs from 6.6 at zero enrollment to 60.6 at k=32 by using supports, while
+this arm moves only from 8.0 to 9.3 because its gate ignores them. Its cosine 1-NN readout, on the
+same checkpoint, reaches 45.4.
+
+**Internal validation could not detect any of this.** This arm finished at 76.1 enrolled and 81.7
+zero-support, better than the residual arm's 72.2 and 81.8 on both. Internal validation draws from
+the same 155 training labels, where a semantic path can succeed by memorising the vocabulary; the
+sealed datasets use labels the model never saw. Collapsing onto semantics is therefore a winning
+strategy on validation and a losing one in deployment. **Treat any future head with a semantic
+shortcut as unvalidated until it is scored on out-of-vocabulary labels**, and log gate saturation
+during training, which would have exposed this by step 2,500 instead of after a full
+train-and-evaluate cycle.
+
+The 2026-09-17 plan deliberately discarded the residual head's closed-form floor and warned never to
+claim the replacement could not underperform 1-NN. That warning was correct, and a future revision
+of this design should restore an identity-initialised floor so the learned parts must earn their
+place.
+
+Artifacts: [`halo_contextual_sealed_v5_20260918`](../../results/artifacts/halo_contextual_sealed_v5_20260918/),
+[`halo_contextual_scenarios_v5_20260918`](../../results/artifacts/halo_contextual_scenarios_v5_20260918/).
 
 ### Limitations of the current record
 

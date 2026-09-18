@@ -1,0 +1,24 @@
+{
+  "argv": [
+    ".venv/bin/halo-scenarios",
+    "--out",
+    "runs/evaluations/halo_contextual_stage_a_40k_20260918-final40k-scenarios-v5",
+    "--models",
+    "halo",
+    "--halo-checkpoint",
+    "runs/support-classifier/halo_contextual_stage_a_40k_20260918/last.pt",
+    "--feature-cache",
+    "cache/evaluations/feature_cache_halo_contextual_stage_a_40k_20260918_final40k"
+  ],
+  "device": "cuda",
+  "dirty_diff_sha256": null,
+  "git_revision": "d8aa688280fea969abda754bf200a56892cf6f29",
+  "halo_checkpoint": "/home/alex/code/HALO/halo/runs/support-classifier/halo_contextual_stage_a_40k_20260918/last.pt",
+  "halo_checkpoint_sha256": "49370bc308b4c97721556b34a5b89292aebb304632d201619bec2fb542199d47",
+  "manifest_generator": "numpy-choice-json-fingerprint-v1",
+  "numpy": "2.5.3",
+  "protocol": "deployment-scenarios-v5-20260918",
+  "python": "3.13.9",
+  "seed_policy": "fixed seed; partial-coverage candidate split is invariant across k",
+  "torch": "2.14.0+cu130"
+}
