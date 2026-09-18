@@ -1652,6 +1652,14 @@ def main() -> None:
         saved.setdefault("rate_augmentation_probability", 0.0)
         saved.setdefault("modality_dropout_probability", 0.0)
         saved.setdefault("device_set_challenge_probability", 0.0)
+        saved.setdefault(
+            "polarization",
+            bool((resume_blob.get("config") or {}).get("use_polarization", True)),
+        )
+        saved.setdefault(
+            "polarization_energy_kappa",
+            float((resume_blob.get("config") or {}).get("polarization_energy_kappa", 0.05)),
+        )
         resume_fields = {
             "frontend": "--frontend", "patch_seconds": "--patch-seconds",
             "window_seconds": "--window-seconds", "resolutions": "--resolutions",
@@ -1673,6 +1681,8 @@ def main() -> None:
             "encoder_lr_scale": "--encoder-lr-scale",
             "frontend_lr_scale": "--frontend-lr-scale",
             "frontend_reg_weight": "--frontend-reg-weight", "spans": "--spans",
+            "polarization": "--polarization",
+            "polarization_energy_kappa": "--polarization-energy-kappa",
             "warmup_steps": "--warmup-steps", "grad_clip": "--grad-clip",
             "weight_decay": "--weight-decay", "seed": "--seed", "data_seed": "--data-seed",
             "max_per_stream": "--max-per-stream",
@@ -1975,7 +1985,9 @@ def main() -> None:
     text_of = make_label_text(
         list(corpus.all_labels) + list(val_corpus.all_labels), device,
     )
-    p_text_init = None
+    # Preserve the calibration audit record across resumes. The fitted weights already live in
+    # the classifier state dict; this metadata records how that initial state was obtained.
+    p_text_init = resume_blob.get("p_text_init") if resume_blob is not None else None
     if resume_blob is None and isinstance(classifier, (ResidualSupportClassifier, RegimeSplitSupportClassifier)):
         p_text_init = initialise_text_projection(
             classifier, encoder, dataset, corpus, collate, text_of, rng, device,
@@ -2056,6 +2068,8 @@ def main() -> None:
             "encoder_lr_scale": args.encoder_lr_scale,
             "frontend_lr_scale": args.frontend_lr_scale,
             "frontend_reg_weight": args.frontend_reg_weight,
+            "polarization": bool(args.polarization),
+            "polarization_energy_kappa": float(args.polarization_energy_kappa),
             "spans": list(args.spans) if args.frontend == "multispan" else None,
             "multispan_frame_rate_hz": (args.multispan_frame_rate_hz
                                          if args.frontend == "multispan" else None),
@@ -2096,6 +2110,14 @@ def main() -> None:
         saved_trajectory.setdefault("resolutions", legacy_resolutions)
         saved_trajectory.setdefault("frontend_lr_scale", 1.0)
         saved_trajectory.setdefault("frontend_reg_weight", 0.0)
+        saved_trajectory.setdefault(
+            "polarization",
+            bool((resume_blob.get("config") or {}).get("use_polarization", True)),
+        )
+        saved_trajectory.setdefault(
+            "polarization_energy_kappa",
+            float((resume_blob.get("config") or {}).get("polarization_energy_kappa", 0.05)),
+        )
         saved_trajectory.setdefault("spans", None)
         saved_trajectory.setdefault("multispan_frame_rate_hz", None)
         saved_trajectory.setdefault("multispan_centre_spacing", None)
