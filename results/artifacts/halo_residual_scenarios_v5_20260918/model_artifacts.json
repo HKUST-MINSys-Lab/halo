@@ -1,0 +1,6 @@
+{
+  "halo": {
+    "checkpoint": "/home/alex/code/HALO/halo/runs/support-classifier/halo_residual_stage_a_40k_20260918/last.pt",
+    "checkpoint_sha256": "56b2cb29fdf093bee26292987fae1048b701ef8560643f2e9868d7a7acf5cc74"
+  }
+}

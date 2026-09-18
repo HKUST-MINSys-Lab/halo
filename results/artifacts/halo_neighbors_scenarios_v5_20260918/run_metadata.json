@@ -1,0 +1,31 @@
+{
+  "complete": true,
+  "include_prospective_mobiact": false,
+  "k": [
+    0,
+    1,
+    4,
+    8,
+    32
+  ],
+  "models": [
+    "halo"
+  ],
+  "n_failed_rows": 0,
+  "n_rows": 1295,
+  "n_task_failures": 0,
+  "scenarios": [
+    "s1_partial_coverage",
+    "s2_cross_placement",
+    "s3_cross_dataset",
+    "s4_missing_modality",
+    "s5_rate_mismatch",
+    "s6_new_domain",
+    "s7_device_set"
+  ],
+  "schema": "deployment-scenarios-results-v5-20260918",
+  "status": "complete",
+  "window_seconds": [
+    8.0
+  ]
+}
