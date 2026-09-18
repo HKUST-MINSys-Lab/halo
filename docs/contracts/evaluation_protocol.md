@@ -170,6 +170,9 @@ Two evaluation regimes are retained:
    MM-Fit composite cell). MobiAct is a separately versioned prospective scope until its official
    archive is prepared; it never enters the sealed-six aggregate.
    The former compound cold-start scenario is retired because it duplicated these factors.
+   The scenario CLI defaults to the representative 8-second window and `k=0,1,4,8,32`.
+   Larger grids require explicit `--k` / `--window-seconds` overrides; the complete-enrollment
+   sealed runner retains its separately configured duration and support grid.
 
 For both regimes, the classifier-attribution experiment freezes each released baseline encoder,
 attaches the same HALO learnable classifier, trains only that classifier under the same training

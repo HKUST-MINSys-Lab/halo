@@ -36,6 +36,10 @@ uv run halo-scenarios --help
 uv run pytest -q
 ```
 
+For released-baseline evaluation, install `uv sync --extra model --extra dev --extra baselines`.
+The extra includes the CLIP and timm imports used by UniMTS and NormWear; released weights and
+their upstream source checkouts remain separate prerequisites.
+
 Generated datasets remain under `data/datasets/`. Checkpoints, feature caches, and local result
 artifacts are ignored and can be redirected with `HALO_RUNS_DIR`, `HALO_CACHE_DIR`, and
 `HALO_RESULTS_DIR`; all path variables are defined in `halo/paths.py`.

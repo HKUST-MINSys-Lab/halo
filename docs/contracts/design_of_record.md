@@ -94,10 +94,13 @@ is frozen. See
 [evaluation_protocol.md](evaluation_protocol.md).
 
 Training mixes single-device examples with exact event-aligned 2-4-device examples from `realdisp`,
-`xrf_v2`, `dsads`, and `forth_trace`. Device subsets are drawn independently whenever a query or
-support recording is loaded. Internal checkpoint validation stays single-device and deterministic;
-the sealed protocol measures both single placements and fixed all-device composites at 4, 8, and
-16 seconds.
+`xrf_v2`, `dsads`, and `forth_trace`. Eligible training support sets also receive coordinated
+query/support device-set challenges; other examples use independent composition. Both synchronous
+and worker-based loaders use the same seeded planner. Internal checkpoint validation is
+subject-disjoint, deterministic and unaugmented, but includes independently composed multi-device
+recordings at the configured composition probability. It does not currently use the coordinated
+training device-set planner. The sealed protocol measures both single placements and fixed
+all-device composites at 4, 8, and 16 seconds.
 
 ## Exclusions
 

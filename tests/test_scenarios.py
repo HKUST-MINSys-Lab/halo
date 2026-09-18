@@ -24,6 +24,25 @@ from training.support_classifier.run_scenarios import (
 CHANNELS = ["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"]
 
 
+def test_scenario_cli_defaults_to_the_representative_budget(monkeypatch):
+    import argparse
+    import sys
+    from training.support_classifier import run_scenarios as runner
+
+    class Parsed(Exception):
+        pass
+
+    def capture(parser):
+        assert parser.get_default("k") == [0, 1, 4, 8, 32]
+        assert parser.get_default("window_seconds") == [8.0]
+        raise Parsed
+
+    monkeypatch.setattr(argparse.ArgumentParser, "parse_args", capture)
+    monkeypatch.setattr(sys, "argv", ["halo-scenarios", "--out", "unused"])
+    with pytest.raises(Parsed):
+        runner.main()
+
+
 def test_active_scenario_roster_excludes_retired_compound_cold_start():
     assert ACTIVE_SCENARIOS == (
         "s1_partial_coverage",
@@ -85,6 +104,38 @@ def test_zero_support_cross_stream_does_not_require_support_features():
 
     assert not _requires_cross_support_features(task, 0)
     assert _requires_cross_support_features(task, 1)
+
+
+@pytest.mark.parametrize("coverage", [None, "partial"])
+def test_neighbor_encoder_zero_support_uses_training_bank_bridge(monkeypatch, tmp_path, coverage):
+    import torch
+    from training.support_classifier import run_scenarios as runner
+    from training.support_classifier.partial_coverage import CoverageCell
+    from training.support_classifier.sealed_eval import build_manifest
+
+    stream = make_stream()
+    task = Task(
+        scenario="s2_cross_placement", variant="zero_support",
+        query_stream=stream, support_stream=stream,
+        plans=tuple(build_manifest(stream, 0)), candidates=tuple(stream.eval_labels),
+        offset=0, severity={"L": 0, "S": 0, "P": 0, "C": 0},
+        coverage=(None if coverage is None else CoverageCell(
+            supported=("walking",), hidden=("running",), coverage=0.5, requested_coverage=0.5,
+        )),
+    )
+    features = np.ones((stream.n_windows, 4), dtype=np.float32)
+    monkeypatch.setattr(runner, "_load_or_encode", lambda **kwargs: (features, "features"))
+    monkeypatch.setattr(runner, "_parameter_count_m", lambda *args, **kwargs: 0.8)
+    monkeypatch.setattr(runner, "conse_scores", lambda *args: np.tile([1., 0.], (len(features), 1)))
+    banks = {"halo": (features, np.zeros(len(features), dtype=int), ["walking"], "bank")}
+    rows = runner.score_task(
+        task, models=["halo"], device=torch.device("cpu"), cache_dir=tmp_path,
+        halo_checkpoint=tmp_path / "neighbors.pt", halo_has_classifier=False,
+        banks=banks, k=0, window_seconds=2., bootstrap=0,
+    )
+    assert not any(row["status"] in {"failed", "inapplicable"} for row in rows)
+    assert any(row["readout"] == "zero-shot-native-or-bridge" and row["status"] == "ok"
+               for row in rows)
 
 
 # ------------------------------------------------------- Scenario 4: modality drop

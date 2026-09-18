@@ -9,7 +9,7 @@ training, evaluation, or a repository-wide refactor is in progress.
 
 Before merging:
 
-1. Run `uv sync --extra model --extra dev`.
+1. Run `uv sync --extra model --extra dev`; add `--extra baselines` when checking released adapters.
 2. Run focused tests while editing, then `uv run pytest -q`.
 3. Run `git diff --check` and confirm no generated data, checkpoints, caches, or debug plots are
    tracked. Promoted result JSON/Markdown and publication figures belong under `results/artifacts/`.

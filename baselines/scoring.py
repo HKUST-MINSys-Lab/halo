@@ -409,6 +409,18 @@ def subject_bootstrap_ci(
     subjects = np.asarray(subjects)
     uniq = np.unique(subjects)
 
+    if B < 0:
+        raise ValueError("bootstrap replicate count must be non-negative")
+    if B == 0:
+        return {
+            f"{metric}_ci_lo": float("nan"),
+            f"{metric}_ci_hi": float("nan"),
+            "bootstrap_B": 0,
+            "n_subjects": int(len(uniq)),
+            "ci_method": "disabled",
+            "ci_degenerate": True,
+        }
+
     if len(uniq) < 2:
         return {
             f"{metric}_ci_lo": float("nan"),

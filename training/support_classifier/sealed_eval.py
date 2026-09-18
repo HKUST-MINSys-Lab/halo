@@ -1321,10 +1321,12 @@ def main() -> None:
         parser.error("--models must not repeat a provider")
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
     halo_state: tuple[torch.nn.Module, str] | None = None
+    halo_has_classifier = False
     if "halo" in args.models:
         if args.halo_checkpoint is None:
             parser.error("--halo-checkpoint is required when model list includes halo")
         halo_blob = torch.load(args.halo_checkpoint, map_location="cpu", weights_only=False)
+        halo_has_classifier = halo_blob.get("classifier") is not None
         if "jepa_mode" in halo_blob.get("config", {}) \
                 and not args.allow_retired_jepa_checkpoint:
             parser.error(
@@ -1542,7 +1544,7 @@ def main() -> None:
                             "training_bank_fingerprint": bank_fingerprint,
                             "manifest": manifests[manifest_id]["fingerprint"],
                             **info,
-                            "diagnostic_only": True,
+                            "diagnostic_only": name != "halo" or halo_has_classifier,
                         })
                         all_rows.append(metric)
                         if name != "halo":

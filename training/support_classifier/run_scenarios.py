@@ -1030,7 +1030,8 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
                 or baseline_fusion_requested
             )
             if needs_text and (k == 0 or task.coverage is not None or baseline_fusion_requested):
-                if name in TRAINING_BANK_ZERO_SHOT and (name != "halo" or task.coverage is not None):
+                if name in TRAINING_BANK_ZERO_SHOT and (
+                        name != "halo" or not halo_has_classifier or task.coverage is not None):
                     if name not in banks:
                         banks[name] = _build_training_reference_bank(
                             name=name, device=device,
@@ -1438,8 +1439,10 @@ def main() -> None:
               "deployment classifier plus companion cosine 1-NN for HALO"),
     )
     parser.add_argument("--halo-checkpoint", type=Path, default=None)
-    parser.add_argument("--k", nargs="+", type=int, default=[0, 1, 2, 4, 8, 16, 32, 64])
-    parser.add_argument("--window-seconds", nargs="+", type=float, default=[4.0, 8.0, 16.0])
+    parser.add_argument("--k", nargs="+", type=int, default=[0, 1, 4, 8, 32],
+                        help="representative scenario curve; override explicitly for a wider sweep")
+    parser.add_argument("--window-seconds", nargs="+", type=float, default=[8.0],
+                        help="representative scenario duration; the sealed curve uses 4/8/16 seconds")
     parser.add_argument("--coverage", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--bootstrap", type=int, default=scoring.BOOTSTRAP_B)

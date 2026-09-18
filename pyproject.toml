@@ -20,6 +20,9 @@ dev = ["pytest", "matplotlib"]
 eda = ["matplotlib", "torch"]
 # Full training/eval stack: encoder text prototypes (sentence-transformers) + probes (scikit-learn).
 model = ["torch", "torchaudio", "sentence-transformers", "scikit-learn"]
+# Released UniMTS imports OpenAI CLIP; NormWear imports timm's patch utilities.
+# CLIP 1.0.1 still imports pkg_resources, removed in setuptools 81.
+baselines = ["halo[model]", "openai-clip==1.0.1", "timm>=1.0,<2", "setuptools>=68,<81"]
 
 [project.scripts]
 halo-train = "training.support_classifier.train:main"

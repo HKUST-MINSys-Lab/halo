@@ -156,3 +156,43 @@ def test_normal_worker_shutdown_discards_unused_queue_buffers(monkeypatch):
         SimpleNamespace(cancel_join_thread=lambda: cancelled.append(True)),
     )
     assert cancelled == [True]
+
+
+@pytest.mark.parametrize("challenge_probability", [0.0, 1.0])
+def test_synchronous_and_worker_batch_preparation_match(monkeypatch, challenge_probability):
+    import training.support_classifier.train as train
+    from training.support_classifier.sampling import Episode, Recording, SupportCorpus
+
+    class Dataset:
+        def aligned_device_members(self, position):
+            return {name: position * 10 + offset for offset, name in enumerate(("a", "b", "c"))}
+
+        def item_with_members(self, members, rng):
+            return ("planned", tuple(members), float(rng.random()))
+
+        def item_with_rng(self, position, rng):
+            return ("independent", position, float(rng.random()))
+
+    corpus = SupportCorpus(
+        recordings=[Recording(0, pos, "dsads", "stream", "walk", "s", f"e{pos}")
+                    for pos in range(3)], keys=[], stream_names=[],
+    )
+    episode = Episode(0, (1, 2), (0, 1), ("walk", "run"), 0, "compatible", 2,
+                      False, support_window_groups=((1,), (2,)), support_set_id=7)
+    monkeypatch.setattr(train, "draw_batch", lambda *a, **kw: ([episode], {"draw": 1}))
+    monkeypatch.setattr(train.torch, "set_num_threads", lambda _: None)
+    expected = train.prepare_training_batch(
+        corpus, Dataset(), list, 42, 1, 1, {}, challenge_probability,
+    )
+    requests = iter((1, None))
+    outputs = []
+    train._prefetch_worker(
+        corpus, Dataset(), list, 42, 1, {}, SimpleNamespace(get=lambda: next(requests)),
+        SimpleNamespace(put=outputs.append, cancel_join_thread=lambda: None),
+        challenge_probability,
+    )
+    assert outputs == [(1, *expected, None)]
+    assert {item[0] for item in expected[2]} == {
+        "planned" if challenge_probability else "independent"
+    }
+    assert (expected[3][0].relation != "not_applicable") == bool(challenge_probability)

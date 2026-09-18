@@ -82,6 +82,37 @@ def _stream() -> EvalStream:
     )
 
 
+def test_neighbor_checkpoint_zero_support_is_visible_in_results(tmp_path, monkeypatch):
+    import json
+    import sys
+    from training.support_classifier import sealed_eval as runner
+
+    checkpoint = tmp_path / "neighbors.pt"
+    torch.save({"config": {}, "classifier": None}, checkpoint)
+    stream = _stream()
+    stream.quality_screen = "applied"
+    stream.event_ids = np.arange(stream.n_windows)
+    features = np.eye(3, dtype=np.float32).repeat(3, axis=0)
+    monkeypatch.setattr(runner, "build_encoder", lambda *args: torch.nn.Linear(3, 3))
+    monkeypatch.setattr(runner, "evaluation_cells", lambda *args, **kwargs: [(6., "toy", "wrist", ())])
+    monkeypatch.setattr(runner, "load_eval_stream", lambda *args, **kwargs: stream)
+    monkeypatch.setattr(runner, "_load_or_encode", lambda **kwargs: (features, "features"))
+    monkeypatch.setattr(runner, "_build_training_reference_bank", lambda **kwargs: (
+        features, np.arange(3).repeat(3), stream.eval_labels, "bank",
+    ))
+    monkeypatch.setattr(runner, "_training_bank_conse_predictions", lambda *args, **kwargs: (stream.gt, {}))
+    out = tmp_path / "result"
+    monkeypatch.setattr(sys, "argv", [
+        "halo-sealed-eval", "--out", str(out), "--models", "halo",
+        "--halo-checkpoint", str(checkpoint), "--device", "cpu", "--k", "0", "--bootstrap", "0",
+    ])
+    runner.main()
+    rows = json.loads((out / "results.json").read_text())
+    assert len(rows) == 1
+    assert rows[0]["status"] == "ok" and not rows[0]["diagnostic_only"]
+    assert "training-bank-1nn-conse" in (out / "RESULTS.md").read_text()
+
+
 def test_manifest_is_execution_disjoint_and_deterministic():
     stream = _stream()
     first = build_manifest(stream, 1, seed=7)

@@ -129,6 +129,28 @@ def episode_rng(data_seed: int, step: int) -> np.random.Generator:
     return np.random.default_rng([int(data_seed), int(step)])
 
 
+def prepare_training_batch(corpus, dataset, collate, data_seed, step, batch_size,
+                           draw_kwargs, device_set_challenge_probability: float = 0.0):
+    """Keep episode drawing, device planning and augmentation identical for all loaders."""
+    episodes, telemetry = draw_batch(
+        corpus, episode_rng(data_seed, step), batch_size=batch_size, **draw_kwargs,
+    )
+    recording_indices = episode_recording_indices(episodes)
+    positions = [corpus.recordings[index].window_index for index in recording_indices]
+    composition, per_episode = plan_device_sets(
+        episodes, corpus, dataset, episode_rng(data_seed, step * 1_000_003 - 1),
+        probability=device_set_challenge_probability,
+    )
+    batch = collate([
+        (dataset.item_with_members(composition[recording],
+                                   episode_rng(data_seed, step * 1_000_003 + occurrence))
+         if recording in composition else dataset.item_with_rng(
+             position, episode_rng(data_seed, step * 1_000_003 + occurrence)))
+        for occurrence, (recording, position) in enumerate(zip(recording_indices, positions))
+    ])
+    return episodes, telemetry, batch, [per_episode[id(episode)] for episode in episodes]
+
+
 def _prefetch_worker(corpus, dataset, collate, data_seed, batch_size, draw_kwargs,
                      requests, results, device_set_challenge_probability: float = 0.0) -> None:
     torch.set_num_threads(1)          # forked workers must not oversubscribe the cores
@@ -139,26 +161,11 @@ def _prefetch_worker(corpus, dataset, collate, data_seed, batch_size, draw_kwarg
             results.cancel_join_thread()
             return
         try:
-            episodes, telemetry = draw_batch(
-                corpus, episode_rng(data_seed, step), batch_size=batch_size, **draw_kwargs,
+            prepared = prepare_training_batch(
+                corpus, dataset, collate, data_seed, step, batch_size, draw_kwargs,
+                device_set_challenge_probability,
             )
-            recording_indices = episode_recording_indices(episodes)
-            positions = [corpus.recordings[index].window_index for index in recording_indices]
-            composition, per_episode = plan_device_sets(
-                episodes, corpus, dataset, episode_rng(data_seed, step * 1_000_003 - 1),
-                probability=device_set_challenge_probability,
-            )
-            # Structural device selection belongs to the deterministic episode stream, not
-            # global NumPy state inherited by a forked worker.
-            batch = collate([
-                (dataset.item_with_members(composition[recording],
-                                           episode_rng(data_seed, step * 1_000_003 + occurrence))
-                 if recording in composition else dataset.item_with_rng(
-                     position, episode_rng(data_seed, step * 1_000_003 + occurrence)))
-                for occurrence, (recording, position) in enumerate(zip(recording_indices, positions))
-            ])
-            results.put((step, episodes, telemetry, batch,
-                         [per_episode[id(episode)] for episode in episodes], None))
+            results.put((step, *prepared, None))
         except Exception as error:      # noqa: BLE001 - surfaced in the parent, which re-raises
             results.put((step, None, None, None, None, repr(error)))
 
@@ -2252,12 +2259,10 @@ def main() -> None:
         if loader is not None:
             episodes, telemetry, batch, device_set_plans = loader.get(step)
         else:
-            episodes, telemetry = draw_batch(
-                corpus, episode_rng(args.data_seed, step),
-                batch_size=args.episodes_per_step, **draw_kwargs,
+            episodes, telemetry, batch, device_set_plans = prepare_training_batch(
+                corpus, dataset, collate.bucketed, args.data_seed, step,
+                args.episodes_per_step, draw_kwargs, args.device_set_challenge_probability,
             )
-            batch = None
-            device_set_plans = None
         log_step = step % args.log_every == 0 or step == 1
         if frontend is not None and hasattr(frontend, "request_runtime_telemetry"):
             frontend.request_runtime_telemetry(log_step)
