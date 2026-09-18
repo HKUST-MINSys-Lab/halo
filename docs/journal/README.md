@@ -59,3 +59,4 @@ entries preserve what was believed at the time; current behavior is defined only
 | 2026-09-18 | [2026-09-18-device-set-curriculum.md](2026-09-18-device-set-curriculum.md) | Joint Device-Set Curriculum And Evaluation |
 | 2026-09-18 | [2026-09-18-eval-dataset-text-audit.md](2026-09-18-eval-dataset-text-audit.md) | Evaluation-dataset expansion and text-pipeline audit |
 | 2026-09-18 | [2026-09-18-repo-docs-consolidation-plan.md](2026-09-18-repo-docs-consolidation-plan.md) | Repository, documentation and naming consolidation plan (2026-09-18, second pass) |
+| 2026-09-18 | [2026-09-18-repository-consolidation-executed.md](2026-09-18-repository-consolidation-executed.md) | Repository and documentation consolidation executed |
