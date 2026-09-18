@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
     "numpy",
     "pandas",
+    "pyarrow",
     "scipy>=1.11,<1.17",
 ]
 
@@ -20,8 +21,16 @@ eda = ["matplotlib", "torch"]
 # Full training/eval stack: encoder text prototypes (sentence-transformers) + probes (scikit-learn).
 model = ["torch", "torchaudio", "sentence-transformers", "scikit-learn"]
 
+[project.scripts]
+halo-train = "training.support_classifier.train:main"
+halo-sealed-eval = "training.support_classifier.sealed_eval:main"
+halo-scenarios = "training.support_classifier.run_scenarios:main"
+halo-audit-curriculum = "training.support_classifier.curriculum_audit:main"
+halo-dev-panel = "training.support_classifier.development_panel:main"
+
 [tool.setuptools.packages.find]
-include = ["baselines*", "data*", "eval*", "model*", "training*"]
+include = ["halo*", "baselines*", "data*", "model*", "training*"]
+namespaces = false
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

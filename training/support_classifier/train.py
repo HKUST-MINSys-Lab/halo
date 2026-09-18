@@ -76,6 +76,7 @@ from training.tokenizer.pretrain import (
     prepare_output_dir,
     write_source_provenance,
 )
+from halo.paths import REPO_ROOT
 
 TAU_SUPPORT = DEFAULT_TEMPERATURE  # compatibility alias for saved experiment notes
 def make_optimizer(param_groups, *, weight_decay: float, device: torch.device):
@@ -84,9 +85,9 @@ def make_optimizer(param_groups, *, weight_decay: float, device: torch.device):
         param_groups, weight_decay=weight_decay, fused=(device.type == "cuda"),
     )
 PROVENANCE_ROOTS = (
-    "training/support_classifier", "training/tokenizer", "model/support",
-    "model/tokenizer", "model/blocks.py", "data/scripts", "data/datasets",
-    "baselines/base.py",
+    REPO_ROOT / "training/support_classifier", REPO_ROOT / "training/tokenizer",
+    REPO_ROOT / "model/support", REPO_ROOT / "model/tokenizer", REPO_ROOT / "model/blocks.py",
+    REPO_ROOT / "data/scripts", REPO_ROOT / "data/datasets", REPO_ROOT / "baselines/base.py",
 )
 
 

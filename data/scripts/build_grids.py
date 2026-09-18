@@ -52,8 +52,9 @@ from data.scripts.curate.deployment_policy import (
     stream_specs,
 )
 from data.scripts.labels.canonical_labels import canonicalize
+from halo.paths import REPO_ROOT
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = REPO_ROOT  # compatibility alias for converter helpers
 HARMONISED_RATE_HZ = 60
 WINDOW_SECONDS = 6.0
 

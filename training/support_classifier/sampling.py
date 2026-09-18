@@ -36,7 +36,6 @@ from __future__ import annotations
 import json
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
-from pathlib import Path
 from typing import Iterable, Literal, Sequence
 
 import numpy as np
@@ -49,9 +48,7 @@ from data.scripts.curate.compatibility import (
     stream_key,
 )
 from data.scripts.eda.grid_io import discover_grids
-
-REPO = Path(__file__).resolve().parents[2]
-DATASETS_DIR = REPO / "data" / "datasets"
+from halo.paths import DATASETS_DIR
 
 SamplingMode = Literal[
     "compatible", "near_miss", "cross_placement", "cross_dataset", "unfiltered",

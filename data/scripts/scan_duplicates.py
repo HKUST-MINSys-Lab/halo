@@ -32,9 +32,9 @@ from pathlib import Path
 from typing import Sequence
 
 import numpy as np
+from halo.paths import DATA_DIR
 
-
-OUT = Path(__file__).resolve().parents[2] / "data" / "quality" / "duplicate_windows.json"
+OUT = DATA_DIR / "quality" / "duplicate_windows.json"
 
 
 def _duration_tag(window_seconds: float) -> str:

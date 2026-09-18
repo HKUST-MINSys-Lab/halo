@@ -13,7 +13,6 @@ assert.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Sequence
 
 import numpy as np
@@ -27,9 +26,6 @@ from training.support_classifier.sampling import (
     _execution_ids,
 )
 from training.tokenizer.pretrain_data import CorpusIndex
-
-REPO = Path(__file__).resolve().parents[2]
-
 
 def support_corpus_from_index(
     index: CorpusIndex,

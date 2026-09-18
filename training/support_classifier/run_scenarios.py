@@ -90,6 +90,7 @@ from data.datasets.mobiact.protocol import (
     partition_rows as mobiact_partition_rows,
 )
 from training.tokenizer.eval_transfer import build_encoder
+from halo.paths import CACHE_DIR
 
 # ------------------------------------------------------------------ cell rosters
 
@@ -140,7 +141,7 @@ ACTIVE_SCENARIOS = (
 )
 SCENARIO_PROTOCOL = "deployment-scenarios-v5-20260918"
 SCENARIO_RESULT_SCHEMA = "deployment-scenarios-results-v5-20260918"
-EVALUATION_ROOT = Path(__file__).resolve().parent / "evaluations"
+EVALUATION_ROOT = CACHE_DIR / "evaluations"
 DEFAULT_SHARED_FEATURE_CACHE = EVALUATION_ROOT / f"shared_{FEATURE_CACHE_SCHEMA}"
 _WITHIN_PLAN_CACHE: dict[tuple, tuple] = {}
 _WITHIN_CROSS_SUBJECT_CACHE: dict[tuple, tuple] = {}

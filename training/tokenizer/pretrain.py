@@ -40,6 +40,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from halo.paths import REPO_ROOT
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
@@ -829,7 +830,7 @@ _RUN_ARTIFACT_NAMES = {
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    return REPO_ROOT
 
 
 def _git(args: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
@@ -845,6 +846,11 @@ def capture_source_provenance(
     roots: tuple[str, ...] = _PHASE_A_SOURCE_ROOTS,
 ) -> dict:
     """Persist a reconstructable patch for tracked and untracked source files."""
+    roots = tuple(
+        str(Path(root).resolve().relative_to(_repo_root()))
+        if Path(root).is_absolute() else str(root)
+        for root in roots
+    )
     head = _git(["rev-parse", "HEAD"]).stdout.decode().strip()
     tracked = _git([
         "diff", "HEAD", "--binary", "--", *roots,

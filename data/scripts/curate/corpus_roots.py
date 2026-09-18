@@ -27,11 +27,12 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Iterator, Optional, Tuple
+from halo.paths import DATASETS_DIR, PRETRAINING_DIR, REPO_ROOT
 
-REPO = Path(__file__).resolve().parents[3]
+REPO = REPO_ROOT
 
-LABELLED_ROOT = REPO / "data" / "datasets"
-PRETRAIN_ROOT = REPO / "data" / "pretraining"
+LABELLED_ROOT = DATASETS_DIR
+PRETRAIN_ROOT = PRETRAINING_DIR
 
 #: Search order for :func:`dataset_root`. Labelled first only so the common case resolves
 #: in one stat call; ambiguity is an error, not a precedence rule.

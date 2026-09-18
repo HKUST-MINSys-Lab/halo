@@ -36,9 +36,9 @@ import argparse
 import importlib
 import json
 from pathlib import Path
+from halo.paths import DATASETS_DIR
 
-REPO = Path(__file__).resolve().parents[3]
-DATASETS = REPO / "data" / "datasets"
+DATASETS = DATASETS_DIR
 
 # Sources whose converter groups sessions onto a coarser physical capture. Keep this list explicit:
 # silently discovering `recording_id` would make a typo in a converter change the leakage unit.

@@ -33,10 +33,9 @@ from pathlib import Path
 from typing import List, Optional, Sequence
 
 import numpy as np
+from halo.paths import DATASETS_DIR, REPO_ROOT
 
-REPO = Path(__file__).resolve().parents[1]
-DATASETS_DIR = REPO / "data" / "datasets"
-GLOBAL_LABELS_PATH = REPO / "data" / "labels" / "global_labels.json"
+GLOBAL_LABELS_PATH = REPO_ROOT / "data" / "labels" / "global_labels.json"
 
 ALIGNMENTS = ("native", "non_harmonised", "harmonised")
 

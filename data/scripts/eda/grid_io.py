@@ -14,11 +14,10 @@ import numpy as np
 
 
 from data.scripts.curate.corpus_roots import grid_search_roots
+from halo.paths import DATASETS_DIR
 
-REPO = Path(__file__).resolve().parents[3]
 # Retained as the labelled-tree constant for callers that address it directly. Grid DISCOVERY
 # spans every corpus root (labelled + label-free pretraining) via ``grid_search_roots()``.
-DATASETS_DIR = REPO / "data" / "datasets"
 _FINGERPRINT_CACHE: dict[tuple, str] = {}
 _WINDOW_DIR_RE = re.compile(r"^w(?:\d+(?:p\d+)?|p\d+)$")
 

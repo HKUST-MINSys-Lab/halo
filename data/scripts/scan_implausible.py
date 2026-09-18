@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Sequence
 
 import numpy as np
+from halo.paths import DATA_DIR
 
 #: Widest consumer gyroscope full-scale range (+/-2000 degrees/second), in rad/s. A window whose
 #: |gyro| exceeds this on ANY axis/sample cannot have been produced by the declared hardware.
@@ -32,7 +33,7 @@ GYRO_RAIL_RAD_S = float(np.radians(2000.0))          # 34.907 rad/s
 #: unimib_shar) were passed through entirely unscreened.
 ACCEL_RAIL_G = 16.0
 
-OUT = Path(__file__).resolve().parents[2] / "data" / "quality" / "implausible_windows.json"
+OUT = DATA_DIR / "quality" / "implausible_windows.json"
 
 
 def _discover(discover_grids, alignment: str, window_seconds: float):

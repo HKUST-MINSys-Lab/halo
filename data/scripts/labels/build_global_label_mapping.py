@@ -36,9 +36,9 @@ from pathlib import Path
 from typing import List, Optional
 
 from data.scripts.labels.canonical_labels import NON_SEMANTIC_LABELS, canonicalize
+from halo.paths import DATA_DIR
 
-REPO = Path(__file__).resolve().parents[3]
-OUT_PATH = REPO / "data" / "labels" / "global_labels.json"
+OUT_PATH = DATA_DIR / "labels" / "global_labels.json"
 
 
 def _train_datasets() -> List[str]:

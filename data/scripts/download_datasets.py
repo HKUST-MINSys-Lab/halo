@@ -27,8 +27,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 from urllib.request import urlopen, Request
+from halo.paths import REPO_ROOT
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = REPO_ROOT
 
 
 @dataclass(frozen=True)
