@@ -45,6 +45,11 @@ from data.scripts.labels.canonical_labels import canonicalize
 from model.blocks import AttentionSpec
 from model.support.token_mixer import SupportTokenMixer, TokenMixerConfig
 from model.support.residual_classifier import ResidualClassifierConfig, build_support_classifier
+from model.support.contextual_classifier import ContextualSupportClassifier
+from model.support.factory import (
+    CONTEXTUAL_ARCHITECTURE, CONTEXTUAL_READOUTS, LEARNED_CLASSIFIER_ARCHITECTURES,
+    RESIDUAL_ARCHITECTURES, build_classifier_from_blob,
+)
 from training.support_classifier.train import make_label_text
 from training.support_classifier.neighbors import differentiable_neighbor_logits
 from training.support_classifier.representation_diagnostics import write_embedding_diagnostics
@@ -202,15 +207,9 @@ def _parameter_count_m(
         cache_key = str(halo_checkpoint.resolve())
         if cache_key not in _HALO_CLASSIFIER_PARAMETER_CACHE:
             blob = torch.load(halo_checkpoint, map_location="cpu", weights_only=False)
-            if blob.get("architecture_version") not in {"support_classifier_v2", "support_classifier_v3"}:
-                raise ValueError("only a residual support-classifier checkpoint exposes the learned count")
-            classifier_config = dict(blob["classifier_config"])
-            if blob.get("architecture_version") == "support_classifier_v2":
-                classifier_config.setdefault("normalized_token_composition", False)
-            head = build_support_classifier(
-                AttentionSpec(**blob["attention_spec"]),
-                ResidualClassifierConfig(**classifier_config),
-            )
+            if blob.get("architecture_version") not in LEARNED_CLASSIFIER_ARCHITECTURES:
+                raise ValueError("only a learned support-classifier checkpoint exposes the learned count")
+            head, _ = build_classifier_from_blob(blob)
             _HALO_CLASSIFIER_PARAMETER_CACHE[cache_key] = sum(
                 parameter.numel() for parameter in head.parameters()
             )
@@ -767,7 +766,12 @@ def _halo_residual_predictions(
     head = _HALO_RESIDUAL_HEAD_CACHE.get(cache_key)
     if head is None:
         blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
-        if blob.get("architecture_version") not in {"support_classifier_v2", "support_classifier_v3"}:
+        if blob.get("architecture_version") == CONTEXTUAL_ARCHITECTURE:
+            if not (residual_enabled and text_term_enabled):
+                raise ValueError("residual ablation flags are not defined for the contextual head")
+            return _halo_contextual_predictions(features, stream, plans, checkpoint, device,
+                                                batch_size=batch_size)
+        if blob.get("architecture_version") not in RESIDUAL_ARCHITECTURES:
             raise ValueError("residual readout requires a residual support-classifier checkpoint")
         classifier_config = dict(blob["classifier_config"])
         if blob.get("architecture_version") == "support_classifier_v2":
@@ -812,6 +816,71 @@ def _halo_residual_predictions(
             candidate_slot=torch.arange(1, c + 1, device=device).unsqueeze(0).expand(b, -1),
         )
         output.extend(candidates[index] for index in result["logits"].argmax(dim=1).cpu().tolist())
+    return output
+
+
+_HALO_CONTEXTUAL_HEAD_CACHE: dict[tuple, ContextualSupportClassifier] = {}
+
+
+@torch.no_grad()
+def _halo_contextual_predictions(
+    features: np.ndarray, stream: EvalStream, plans: Sequence[QueryPlan], checkpoint: Path,
+    device: torch.device, *, branch: str = "mixture", batch_size: int = 64,
+) -> list[str]:
+    """Score plans with the contextual mixture head.
+
+    Support-label text is gathered from a table built over the union of the candidate roster and
+    every actual support label in the manifest, so off-roster support labels are legal and no
+    candidate binding is ever used. At k=0 the head receives only the query and the candidates.
+    """
+    fingerprint = _file_hash(checkpoint)
+    cache_key = (fingerprint, str(device))
+    head = _HALO_CONTEXTUAL_HEAD_CACHE.get(cache_key)
+    if head is None:
+        blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        if blob.get("architecture_version") != CONTEXTUAL_ARCHITECTURE:
+            raise ValueError("contextual readout requires a contextual support-classifier checkpoint")
+        head, _ = build_classifier_from_blob(blob, device=device)
+        _HALO_CONTEXTUAL_HEAD_CACHE[cache_key] = head
+    candidates = tuple(stream.eval_labels)
+    extra = sorted({label for plan in plans for label in plan.support_labels} - set(candidates))
+    table = make_label_text(tuple(candidates) + tuple(extra), device)
+    candidate_text = table.matrix[torch.as_tensor(table.ids(candidates), device=device)].unsqueeze(0)
+    text_dim = candidate_text.shape[-1]
+    output: list[str] = []
+    for start in range(0, len(plans), batch_size):
+        chunk = plans[start:start + batch_size]
+        b, c = len(chunk), len(candidates)
+        width = max((len(plan.support) for plan in chunk), default=0)
+        rows = np.zeros((b, width), dtype=np.int64)
+        label_ids = np.zeros((b, width), dtype=np.int64)
+        support_mask = torch.zeros((b, width), dtype=torch.bool, device=device)
+        for row, plan in enumerate(chunk):
+            if plan.support:
+                rows[row, :len(plan.support)] = plan.support
+                label_ids[row, :len(plan.support)] = table.ids(list(plan.support_labels))
+                support_mask[row, :len(plan.support)] = True
+        # Fancy indexing already yields (b, width, feature_dim); an explicit reshape with -1 is
+        # ambiguous when width is 0, which is exactly the zero-enrollment scenario path.
+        support_feature = torch.as_tensor(
+            np.asarray(features)[rows], dtype=torch.float32, device=device,
+        ) * support_mask.unsqueeze(-1)
+        support_text = table.matrix[torch.as_tensor(label_ids, device=device)] \
+            * support_mask.unsqueeze(-1)
+        if support_feature.shape != (b, width, features.shape[-1]):
+            raise RuntimeError("contextual support gather produced an unexpected shape")
+        if support_text.shape != (b, width, text_dim):
+            raise RuntimeError("contextual support-label gather produced an unexpected shape")
+        result = head(
+            query_feature=torch.as_tensor(features[[plan.query for plan in chunk]], dtype=torch.float32, device=device),
+            support_feature=support_feature, support_label_text=support_text,
+            support_mask=support_mask,
+            support_pair_slot=torch.arange(1, width + 1, device=device).unsqueeze(0).expand(b, -1),
+            candidate_text=candidate_text.expand(b, -1, -1),
+            candidate_mask=torch.ones((b, c), dtype=torch.bool, device=device),
+        )
+        scores = ContextualSupportClassifier.branch_logits(result, branch)
+        output.extend(candidates[index] for index in scores.argmax(dim=1).cpu().tolist())
     return output
 
 
@@ -916,8 +985,10 @@ def _halo_token_mixer_predictions(
     it never has an implicit retrieval bank outside the manifest.
     """
     blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    if blob.get("architecture_version") in {"support_classifier_v2", "support_classifier_v3"}:
+    if blob.get("architecture_version") in RESIDUAL_ARCHITECTURES:
         return _halo_residual_predictions(features, stream, plans, checkpoint, device)
+    if blob.get("architecture_version") == CONTEXTUAL_ARCHITECTURE:
+        return _halo_contextual_predictions(features, stream, plans, checkpoint, device)
     if blob.get("architecture_version") != "support_token_mixer_v1" \
             or "classifier" not in blob or "classifier_config" not in blob \
             or "attention_spec" not in blob:
@@ -1473,9 +1544,11 @@ def main() -> None:
                     # works for single and native multi-device features alike.
                     if name == "halo" and name not in feature_errors:
                         features, fingerprint = features_by_model[name]
-                        is_v2 = torch.load(args.halo_checkpoint, map_location="cpu", weights_only=False).get(
-                            "architecture_version"
-                        ) in {"support_classifier_v2", "support_classifier_v3"}
+                        halo_architecture = torch.load(
+                            args.halo_checkpoint, map_location="cpu", weights_only=False,
+                        ).get("architecture_version")
+                        is_v2 = halo_architecture in LEARNED_CLASSIFIER_ARCHITECTURES
+                        is_residual = halo_architecture in RESIDUAL_ARCHITECTURES
                         try:
                             predicted = _halo_token_mixer_predictions(
                                 features, stream, plans, args.halo_checkpoint, device,
@@ -1736,9 +1809,11 @@ def main() -> None:
                     # encoder. Sealed reports use the deployment readouts: 1-NN, prototype,
                     # ridge, and the learned HALO classifier.
                     try:
-                        is_v2 = torch.load(args.halo_checkpoint, map_location="cpu", weights_only=False).get(
-                            "architecture_version"
-                        ) in {"support_classifier_v2", "support_classifier_v3"}
+                        halo_architecture = torch.load(
+                            args.halo_checkpoint, map_location="cpu", weights_only=False,
+                        ).get("architecture_version")
+                        is_v2 = halo_architecture in LEARNED_CLASSIFIER_ARCHITECTURES
+                        is_residual = halo_architecture in RESIDUAL_ARCHITECTURES
                         predicted = _halo_token_mixer_predictions(
                             features, stream, plans, args.halo_checkpoint, device,
                         )
@@ -1754,7 +1829,20 @@ def main() -> None:
                                        "status": "ok", "feature_fingerprint": fingerprint,
                                        "manifest": manifests[manifest_id]["fingerprint"]})
                         all_rows.append(metric)
-                        if is_v2:
+                        if is_v2 and not is_residual:
+                            # Contextual head: branch decompositions of the same forward.
+                            for readout, branch in zip(CONTEXTUAL_READOUTS,
+                                                       ("semantic", "support", "fixed_half")):
+                                branch_predicted = _halo_contextual_predictions(
+                                    features, stream, plans, args.halo_checkpoint, device, branch=branch,
+                                )
+                                branch_metric = _metric_row(stream, plans, branch_predicted,
+                                                            bootstrap=args.bootstrap)
+                                branch_metric.update({"model": name, "readout": readout, "k": k,
+                                                      "status": "ok", "feature_fingerprint": fingerprint,
+                                                      "manifest": manifests[manifest_id]["fingerprint"]})
+                                all_rows.append(branch_metric)
+                        if is_residual:
                             predicted = _halo_residual_predictions(
                                 features, stream, plans, args.halo_checkpoint, device,
                                 residual_enabled=False, text_term_enabled=False,
@@ -1792,7 +1880,7 @@ def main() -> None:
                 "halo-classifier", "halo-classifier-residual-off",
                 "halo-classifier-text-only", "halo-classifier-support-residual-only",
                 "halo-classifier-candidate-residual-only", "halo-classifier-residual-only",
-                "halo-classifier-support-label-shuffled",
+                "halo-classifier-support-label-shuffled", *CONTEXTUAL_READOUTS,
             }
             row["parameters_m"] = round(_parameter_count_m(
                 name, halo_state, halo_checkpoint=args.halo_checkpoint,

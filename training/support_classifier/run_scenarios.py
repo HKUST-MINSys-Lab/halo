@@ -89,6 +89,7 @@ from data.datasets.mobiact.protocol import (
     candidate_labels as mobiact_candidate_labels,
     partition_rows as mobiact_partition_rows,
 )
+from model.support.factory import LEARNED_CLASSIFIER_ARCHITECTURES
 from training.tokenizer.eval_transfer import build_encoder
 from halo.paths import CACHE_DIR
 
@@ -1500,9 +1501,7 @@ def main() -> None:
     if "halo" in args.models:
         blob = torch.load(args.halo_checkpoint, map_location="cpu", weights_only=False)
         halo_state = (build_encoder(blob, device).eval(), _file_hash(args.halo_checkpoint))
-        halo_has_classifier = blob.get("architecture_version") in {
-            "support_classifier_v2", "support_classifier_v3",
-        }
+        halo_has_classifier = blob.get("architecture_version") in LEARNED_CLASSIFIER_ARCHITECTURES
     args.out.mkdir(parents=True, exist_ok=True)
     cache_dir = args.feature_cache or DEFAULT_SHARED_FEATURE_CACHE
     cache_dir.mkdir(parents=True, exist_ok=True)

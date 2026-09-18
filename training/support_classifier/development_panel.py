@@ -18,7 +18,7 @@ from halo.paths import CACHE_DIR
 from data.scripts.augmentations import AugmentationConfig
 from data.scripts.curate.deployment_policy import SUPERVISED_HEAD_TRAIN_DATASETS
 from model.blocks import AttentionSpec
-from model.support.residual_classifier import ResidualClassifierConfig, build_support_classifier
+from model.support.factory import build_classifier_from_blob
 from model.tokenizer.sensor_tokens import CONDITIONING_SCHEMA_V2, LEGACY_CONDITIONING_SCHEMA
 from training.support_classifier.collate import SupportCollate
 from training.support_classifier.corpus import support_corpus_from_index
@@ -119,11 +119,7 @@ def evaluate_checkpoint(
     corpus = support_corpus_from_index(index, split="val")
     collate = SupportCollate(MultiResolutionCollate(fixed_patch_seconds=resolutions))
     encoder = build_encoder(blob, device, training=False)
-    classifier = build_support_classifier(
-        AttentionSpec(**blob["attention_spec"]),
-        ResidualClassifierConfig(**blob["classifier_config"]),
-    ).to(device).eval()
-    classifier.load_state_dict(blob["classifier"])
+    classifier, _ = build_classifier_from_blob(blob, device=device)
     text = make_label_text(corpus.all_labels, device)
     draw_kwargs = _draw_kwargs(blob)
     clean = _dataset(index, blob, rate_p=0.0, modality_p=0.0)

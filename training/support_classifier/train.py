@@ -28,6 +28,10 @@ from data.scripts.augmentations import AugmentationConfig
 from model.blocks import AttentionSpec
 from model.tokenizer.multispan_kernel import MS_SPANS_S, MS_FRAME_RATE_HZ
 from model.support.token_mixer import SupportTokenMixer, TokenMixerConfig
+from model.support.contextual_classifier import (
+    ARCHITECTURE_VERSION as CONTEXTUAL_ARCHITECTURE, ContextualClassifierConfig,
+    ContextualSupportClassifier,
+)
 from model.support.residual_classifier import (
     RegimeSplitSupportClassifier, ResidualClassifierConfig, ResidualSupportClassifier,
     build_support_classifier,
@@ -699,8 +703,8 @@ def draw_kwargs_from_args(args) -> dict:
         "require_query_support": args.classifier == "neighbors",
         "queries_per_support_set": args.queries_per_support_set,
         "windows_per_execution": args.windows_per_execution,
-        "p_mask_candidate": args.p_mask_candidate if args.classifier == "residual" else 0.0,
-        "p_mask_gt": args.p_mask_gt if args.classifier == "residual" else 0.0,
+        "p_mask_candidate": args.p_mask_candidate if args.classifier in ("residual", "contextual") else 0.0,
+        "p_mask_gt": args.p_mask_gt if args.classifier in ("residual", "contextual") else 0.0,
     }
 def run_step(
     *,
@@ -788,6 +792,15 @@ def run_step(
             support_mask=rows["support_mask"], support_pair_slot=text["support_pair_slot"],
             candidate_text=text["candidate_text"], candidate_mask=text["candidate_mask"],
             candidate_slot=text["candidate_slot"],
+        )
+    elif classifier_mode == "contextual":
+        if not isinstance(classifier, ContextualSupportClassifier):
+            raise ValueError("contextual mode requires ContextualSupportClassifier")
+        output = classifier(
+            query_feature=query, support_feature=rows["support_feature"],
+            support_label_text=text["support_label_text"], support_mask=rows["support_mask"],
+            support_pair_slot=text["support_pair_slot"],
+            candidate_text=text["candidate_text"], candidate_mask=text["candidate_mask"],
         )
     else:
         raise ValueError(f"unknown classifier mode {classifier_mode!r}")
@@ -1385,7 +1398,7 @@ def main() -> None:
                         help="override checkpoint acquisition-text mode; omitted inherits Phase-A")
     parser.add_argument("--freeze-encoder", action=argparse.BooleanOptionalAction, default=None,
                         help="default: train encoder and classifier together")
-    parser.add_argument("--classifier", choices=("token_mixer", "neighbors", "residual"),
+    parser.add_argument("--classifier", choices=("token_mixer", "neighbors", "residual", "contextual"),
                         default="residual",
                         help="residual is the identity-initialised unified support classifier; "
                              "neighbors is the parameter-free control")
@@ -1819,6 +1832,10 @@ def main() -> None:
             classifier = build_support_classifier(
                 spec, ResidualClassifierConfig(**classifier_config),
             ).to(device) if args.classifier == "residual" else None
+        elif version == CONTEXTUAL_ARCHITECTURE:
+            classifier = ContextualSupportClassifier(
+                spec, ContextualClassifierConfig(**resume_blob["classifier_config"]),
+            ).to(device) if args.classifier == "contextual" else None
         elif version == "support_token_mixer_v1":
             classifier = SupportTokenMixer(spec, TokenMixerConfig(**resume_blob["classifier_config"])).to(device) \
                 if args.classifier == "token_mixer" else None
@@ -1966,6 +1983,8 @@ def main() -> None:
                 text_temperature=args.text_temperature,
                 adaptive_text_gate=args.adaptive_text_gate,
             )).to(device) if args.classifier == "residual" else
+            ContextualSupportClassifier(spec, ContextualClassifierConfig()).to(device)
+            if args.classifier == "contextual" else
             SupportTokenMixer(spec, TokenMixerConfig()).to(device) if args.classifier == "token_mixer" else None)
     print(f"[compare] classifier={args.classifier}", flush=True)
     if hasattr(encoder, "mask_token"):
@@ -2221,6 +2240,7 @@ def main() -> None:
             "config": config,
             "encoder": encoder.state_dict(),
             "architecture_version": ("support_classifier_v3" if args.classifier == "residual"
+                                     else CONTEXTUAL_ARCHITECTURE if args.classifier == "contextual"
                                      else "support_token_mixer_v1"),
             "classifier": None if classifier is None else classifier.state_dict(),
             "classifier_config": None if classifier is None else dataclasses.asdict(classifier.cfg),
