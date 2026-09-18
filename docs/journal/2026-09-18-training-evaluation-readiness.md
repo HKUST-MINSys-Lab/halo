@@ -97,8 +97,10 @@ diagnostics, not publication artifacts. Their conclusions and test counts are pe
 After the initial sweep, the active branch received two checkpoint-persistence repairs. A resumed
 run now preserves the closed-form text-projection calibration record (`p_text_init`), and the
 polarization enable flag and energy-gate coefficient are part of the trajectory compatibility
-contract. This prevents run metadata from silently disagreeing with the restored encoder. The
-repairs are commit `8a30afa`.
+contract. Explicit negative Boolean overrides (`--no-polarization` and `--no-freeze-encoder`) are
+also checked rather than silently inherited. This prevents a resume command and its restored model
+from appearing to disagree. The first persistence repair is commit `8a30afa`; the Boolean-override
+guard landed in the subsequent readiness commit.
 
 The exact current residual recipe was then exercised on CUDA for three fresh optimizer steps and
 resumed for a fourth step. Calibration, worker-prefetched episode assembly, mixed-precision

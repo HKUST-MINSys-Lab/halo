@@ -1677,11 +1677,11 @@ def main() -> None:
             "device_set_challenge_probability": "--device-set-challenge-probability",
             "label_subset": "--label-subset", "mode": "--mode",
             "classifier": "--classifier",
-            "freeze_encoder": "--freeze-encoder", "lr": "--lr",
+            "freeze_encoder": ("--freeze-encoder", "--no-freeze-encoder"), "lr": "--lr",
             "encoder_lr_scale": "--encoder-lr-scale",
             "frontend_lr_scale": "--frontend-lr-scale",
             "frontend_reg_weight": "--frontend-reg-weight", "spans": "--spans",
-            "polarization": "--polarization",
+            "polarization": ("--polarization", "--no-polarization"),
             "polarization_energy_kappa": "--polarization-energy-kappa",
             "warmup_steps": "--warmup-steps", "grad_clip": "--grad-clip",
             "weight_decay": "--weight-decay", "seed": "--seed", "data_seed": "--data-seed",
@@ -1692,8 +1692,11 @@ def main() -> None:
                 continue
             saved_value = saved[field]
             current_value = getattr(args, field)
-            if option in sys.argv and current_value != saved_value:
-                parser.error(f"{option} differs from the resume checkpoint trajectory")
+            option_names = (option,) if isinstance(option, str) else option
+            if any(name in sys.argv for name in option_names) and current_value != saved_value:
+                parser.error(
+                    f"{'/'.join(option_names)} differs from the resume checkpoint trajectory"
+                )
             setattr(args, field, saved_value)
         # These values are captured in the residual classifier's state/config, not a mutable
         # run flag. Reject attempts to pretend they can be changed on an existing optimizer.
