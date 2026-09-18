@@ -68,6 +68,7 @@ from training.tokenizer.pretrain_data import (
     MultiScaleCollate,
     PretrainDataset,
 )
+from training.support_classifier.device_sets import DeviceSetPlan, plan_device_sets
 from training.tokenizer.pretrain import (
     capture_runtime_provenance,
     capture_source_provenance,
@@ -128,7 +129,7 @@ def episode_rng(data_seed: int, step: int) -> np.random.Generator:
 
 
 def _prefetch_worker(corpus, dataset, collate, data_seed, batch_size, draw_kwargs,
-                     requests, results) -> None:
+                     requests, results, device_set_challenge_probability: float = 0.0) -> None:
     torch.set_num_threads(1)          # forked workers must not oversubscribe the cores
     while True:
         step = requests.get()
@@ -140,18 +141,25 @@ def _prefetch_worker(corpus, dataset, collate, data_seed, batch_size, draw_kwarg
             episodes, telemetry = draw_batch(
                 corpus, episode_rng(data_seed, step), batch_size=batch_size, **draw_kwargs,
             )
-            positions = episode_positions(episodes, corpus)
+            recording_indices = episode_recording_indices(episodes)
+            positions = [corpus.recordings[index].window_index for index in recording_indices]
+            composition, per_episode = plan_device_sets(
+                episodes, corpus, dataset, episode_rng(data_seed, step * 1_000_003 - 1),
+                probability=device_set_challenge_probability,
+            )
             # Structural device selection belongs to the deterministic episode stream, not
             # global NumPy state inherited by a forked worker.
             batch = collate([
-                dataset.item_with_rng(
-                    position, episode_rng(data_seed, step * 1_000_003 + occurrence),
-                )
-                for occurrence, position in enumerate(positions)
+                (dataset.item_with_members(composition[recording],
+                                           episode_rng(data_seed, step * 1_000_003 + occurrence))
+                 if recording in composition else dataset.item_with_rng(
+                     position, episode_rng(data_seed, step * 1_000_003 + occurrence)))
+                for occurrence, (recording, position) in enumerate(zip(recording_indices, positions))
             ])
-            results.put((step, episodes, telemetry, batch, None))
+            results.put((step, episodes, telemetry, batch,
+                         [per_episode[id(episode)] for episode in episodes], None))
         except Exception as error:      # noqa: BLE001 - surfaced in the parent, which re-raises
-            results.put((step, None, None, None, repr(error)))
+            results.put((step, None, None, None, None, repr(error)))
 
 
 class PrefetchLoader:
@@ -168,7 +176,8 @@ class PrefetchLoader:
     """
 
     def __init__(self, corpus, dataset, collate, *, data_seed: int, batch_size: int,
-                 draw_kwargs: dict, workers: int = 4, depth: int = 1, start_step: int = 1):
+                 draw_kwargs: dict, device_set_challenge_probability: float = 0.0,
+                 workers: int = 4, depth: int = 1, start_step: int = 1):
         if workers < 1:
             raise ValueError("PrefetchLoader needs at least one worker; use draw_batch directly")
         import torch.multiprocessing as mp
@@ -185,7 +194,7 @@ class PrefetchLoader:
             context.Process(
                 target=_prefetch_worker,
                 args=(corpus, dataset, collate, data_seed, batch_size, draw_kwargs,
-                      self._requests, self._results),
+                      self._requests, self._results, device_set_challenge_probability),
                 daemon=True,
             )
             for _ in range(int(workers))
@@ -213,7 +222,14 @@ class PrefetchLoader:
             from queue import Empty
 
             try:
-                done, episodes, telemetry, batch, error = self._results.get(timeout=1.0)
+                message = self._results.get(timeout=1.0)
+                # Accept the historical five-field worker message in unit tests and during a
+                # rolling code update; production workers always send device plans.
+                if len(message) == 5:
+                    done, episodes, telemetry, batch, error = message
+                    device_plans = None
+                else:
+                    done, episodes, telemetry, batch, device_plans, error = message
             except Empty:
                 dead = [p for p in self._processes if not p.is_alive()]
                 if dead:
@@ -224,9 +240,10 @@ class PrefetchLoader:
                 continue
             if error is not None:
                 raise RuntimeError(f"prefetch worker failed at step {done}: {error}")
-            self._pending[done] = (episodes, telemetry, batch)
+            self._pending[done] = (episodes, telemetry, batch, device_plans)
         self._consumed.add(step)
-        return self._pending.pop(step)
+        value = self._pending.pop(step)
+        return value[:3] if value[3] is None else value
 
     def close(self) -> None:
         for _ in self._processes:
@@ -651,6 +668,7 @@ def build_dataset(index: CorpusIndex, args) -> PretrainDataset:
         conditioning_schema=getattr(args, "conditioning_schema", CONDITIONING_SCHEMA_V2),
         multi_device_probability=args.multi_device_probability,
         max_devices=args.max_devices,
+        build_aligned_device_index=getattr(args, "device_set_challenge_probability", 0.0) > 0,
     )
 
 
@@ -689,6 +707,7 @@ def run_step(
     device: torch.device,
     executor: ThreadPoolExecutor | None = None,
     batch: dict | None = None,
+    device_set_plans: list[DeviceSetPlan] | None = None,
 ) -> dict:
     """``batch`` lets a prefetching loader hand over an already-collated batch for these episodes;
     otherwise the windows are loaded and collated here, on the calling thread."""
@@ -769,7 +788,8 @@ def run_step(
             "device_count": device_count, "readout": classifier_mode,
             "augmentation_rows": augmentation_rows,
             "episode_perturbations": episode_perturbations,
-            "episode_support_perturbation_fractions": episode_support_perturbation_fractions}
+            "episode_support_perturbation_fractions": episode_support_perturbation_fractions,
+            "device_set_plans": (device_set_plans or [DeviceSetPlan("not_applicable")] * len(episodes))}
 
 
 def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, float]:
@@ -822,6 +842,23 @@ def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, flo
         "enrollment", [episode.enrollment_regime for episode in episodes],
         ("complete", "partial", "zero"),
     )
+    device_plans = result.get("device_set_plans", ())
+    if device_plans and len(device_plans) == len(episodes):
+        relations = tuple("not_applicable", "matched_single", "matched_composite",
+                          "query_superset", "support_superset", "partial_overlap", "disjoint")
+        add_scenario("device_relation", [plan.relation for plan in device_plans], relations)
+        metrics["scenario/device_relation/query_device_count"] = float(np.mean([
+            len(plan.query_devices) for plan in device_plans
+        ]))
+        metrics["scenario/device_relation/support_device_count"] = float(np.mean([
+            len(plan.support_devices) for plan in device_plans
+        ]))
+        metrics["scenario/device_relation/jaccard"] = float(np.mean([
+            plan.jaccard for plan in device_plans if plan.relation != "not_applicable"
+        ])) if any(plan.relation != "not_applicable" for plan in device_plans) else 0.0
+        metrics["scenario/device_relation/fallback_fraction"] = float(np.mean([
+            plan.fallback for plan in device_plans
+        ]))
     truth_enrollment = []
     for episode in episodes:
         supported = (
@@ -886,6 +923,16 @@ def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, flo
                     dtype=torch.bool, device=target.device,
                 ),
             )
+        if device_plans and len(device_plans) == len(episodes):
+            for name in ("matched_single", "matched_composite", "query_superset",
+                         "support_superset", "partial_overlap", "disjoint"):
+                add_comparison(
+                    "device_relation", name,
+                    torch.tensor(
+                        [plan.relation == name for plan in device_plans],
+                        dtype=torch.bool, device=target.device,
+                    ),
+                )
 
     augmentation_rows = result.get("augmentation_rows", ())
     episode_perturbations = result.get("episode_perturbations", ())
@@ -1368,6 +1415,9 @@ def main() -> None:
                              "(default 64)")
     parser.add_argument("--multi-device-probability", type=float, default=0.5,
                         help="probability that an aligned training row uses 2..max devices")
+    parser.add_argument("--device-set-challenge-probability", type=float, default=0.5,
+                        help="probability that an eligible support set receives one jointly planned "
+                             "query/support device relationship; ineligible sets are reported as such")
     parser.add_argument("--max-devices", type=int, default=4,
                         help="largest random aligned device subset used for one recording")
     parser.add_argument("--val-repeats-per-dataset", type=int, default=8,
@@ -1482,8 +1532,9 @@ def main() -> None:
         parser.error("episode, support, validation, checkpoint and calibration counts must be positive")
     if args.loader_workers < 0:
         parser.error("loader-workers must be nonnegative")
-    if not 0.0 <= args.multi_device_probability <= 1.0 or args.max_devices < 2:
-        parser.error("multi-device-probability must be in [0,1] and max-devices at least 2")
+    if not 0.0 <= args.multi_device_probability <= 1.0 \
+            or not 0.0 <= args.device_set_challenge_probability <= 1.0 or args.max_devices < 2:
+        parser.error("device probabilities must be in [0,1] and max-devices at least 2")
     if not 0.0 <= args.p_gt_present <= 1.0:
         parser.error("p-gt-present must be in [0,1]")
     if not 0.0 <= args.same_subject_probability <= 1.0:
@@ -1576,6 +1627,7 @@ def main() -> None:
         saved.setdefault("variable_support_probability", 0.0)
         saved.setdefault("rate_augmentation_probability", 0.0)
         saved.setdefault("modality_dropout_probability", 0.0)
+        saved.setdefault("device_set_challenge_probability", 0.0)
         resume_fields = {
             "frontend": "--frontend", "patch_seconds": "--patch-seconds",
             "window_seconds": "--window-seconds", "resolutions": "--resolutions",
@@ -1590,6 +1642,7 @@ def main() -> None:
             "p_gt_present": "--p-gt-present", "p_mask_candidate": "--p-mask-candidate",
             "p_mask_gt": "--p-mask-gt", "same_subject_probability": "--same-subject-probability",
             "multi_device_probability": "--multi-device-probability", "max_devices": "--max-devices",
+            "device_set_challenge_probability": "--device-set-challenge-probability",
             "label_subset": "--label-subset", "mode": "--mode",
             "classifier": "--classifier",
             "freeze_encoder": "--freeze-encoder", "lr": "--lr",
@@ -1702,6 +1755,7 @@ def main() -> None:
         PrefetchLoader(
             corpus, dataset, collate.bucketed, data_seed=args.data_seed,
             batch_size=args.episodes_per_step, draw_kwargs=draw_kwargs,
+            device_set_challenge_probability=args.device_set_challenge_probability,
             workers=args.loader_workers,
             start_step=(int(resume_blob["step"]) if resume_blob is not None else 0) + 1,
         )
@@ -1964,8 +2018,9 @@ def main() -> None:
             "p_mask_gt": args.p_mask_gt,
             "same_subject_probability": args.same_subject_probability,
             "multi_device_probability": args.multi_device_probability,
+            "device_set_challenge_probability": args.device_set_challenge_probability,
             "max_devices": args.max_devices,
-            "device_sampling_version": 2,
+            "device_sampling_version": 3,
             "label_subset": list(args.label_subset),
             "mode": args.mode,
             "neutral_acquisition_text": args.neutral_acquisition_text,
@@ -2008,6 +2063,7 @@ def main() -> None:
         saved_trajectory.setdefault("windows_per_execution", DEFAULT_WINDOWS_PER_EXECUTION)
         saved_trajectory.setdefault("patch_seconds", PATCH_SECONDS)
         saved_trajectory.setdefault("window_seconds", 6.0)
+        saved_trajectory.setdefault("device_set_challenge_probability", 0.0)
         saved_trajectory.setdefault(
             "max_per_stream", (resume_blob.get("args") or {}).get("max_per_stream"),
         )
@@ -2177,13 +2233,14 @@ def main() -> None:
             group["lr"] = base_lrs[group["name"]] * scale
 
         if loader is not None:
-            episodes, telemetry, batch = loader.get(step)
+            episodes, telemetry, batch, device_set_plans = loader.get(step)
         else:
             episodes, telemetry = draw_batch(
                 corpus, episode_rng(args.data_seed, step),
                 batch_size=args.episodes_per_step, **draw_kwargs,
             )
             batch = None
+            device_set_plans = None
         log_step = step % args.log_every == 0 or step == 1
         if frontend is not None and hasattr(frontend, "request_runtime_telemetry"):
             frontend.request_runtime_telemetry(log_step)
@@ -2193,6 +2250,7 @@ def main() -> None:
                 episodes=episodes, corpus=corpus, dataset=dataset, collate=collate,
                 encoder=encoder, classifier=classifier, classifier_mode=args.classifier,
                 text_of=text_of, device=device, executor=executor, batch=batch,
+                device_set_plans=device_set_plans,
             )
         frontend_reg = None
         if args.frontend_reg_weight > 0 and frontend is not None \

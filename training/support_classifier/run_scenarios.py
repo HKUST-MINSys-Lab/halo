@@ -260,6 +260,36 @@ def _within_cross_subject(stream, k: int, seed: int) -> tuple:
     return plans
 
 
+def device_set_variants(device_ids: tuple[str, ...]) -> tuple[tuple[str, tuple[str, ...], tuple[str, ...], int], ...]:
+    """Deterministic, rotation-balanced Scenario 7 subset pairs.
+
+    Every source placement takes each directional role where the available device count permits.
+    The output contains only mismatches; the caller constructs a same-query-set matched control
+    for every returned pair.
+    """
+    devices = tuple(device_ids)
+    if len(devices) < 2:
+        return ()
+    order = {device: index for index, device in enumerate(devices)}
+    canonical = lambda values: tuple(sorted(values, key=order.__getitem__))
+    full = devices
+    rows: list[tuple[str, tuple[str, ...], tuple[str, ...], int]] = []
+    for device in devices:
+        rows.append(("support_single_query_full", full, (device,), 1))
+        rows.append(("support_full_query_single", (device,), full, 1))
+    if len(devices) >= 3:
+        for device in devices:
+            leave_one = tuple(value for value in devices if value != device)
+            rows.append(("support_leave_one_out_query_full", full, leave_one, 2))
+        for i, device in enumerate(devices):
+            query = canonical((device, devices[(i + 1) % len(devices)]))
+            support = canonical((devices[(i + 1) % len(devices)], devices[(i + 2) % len(devices)]))
+            rows.append(("partial_overlap", query, support, 2))
+    for i, device in enumerate(devices):
+        rows.append(("disjoint_single", (device,), (devices[(i + 1) % len(devices)],), 3))
+    return tuple(rows)
+
+
 def _partitioned_plans(stream, k: int, seed: int, *, query_rows, support_rows, relation: str) -> tuple[QueryPlan, ...]:
     """Build a single-stream manifest with explicit reference/query partitions."""
     if k == 0:
@@ -751,32 +781,36 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
         for cell_spec in MULTI_DEVICE_EVAL_CELLS:
             dataset, device_ids = cell_spec.dataset, tuple(cell_spec.stream_ids)
             composite = safe_composite(dataset, device_ids)
-            single = safe_load(dataset, device_ids[0])
-            if composite is None or single is None:
-                continue
-            partial = safe_composite(dataset, device_ids[:2])
-            if partial is None:
+            if composite is None:
                 continue
             if k == 0:
                 if dataset == "mmfit":
                     plans, candidates = _partitioned_zero_support_cross(
-                        composite, single, mmfit_partition_rows(composite, "query"),
+                        composite, composite, mmfit_partition_rows(composite, "query"),
                     )
                 else:
-                    plans, candidates = _zero_support_cross_plans(composite, single)
+                    plans, candidates = _zero_support_cross_plans(composite, composite)
                 if plans:
                     tasks.append(Task(
-                        scenario, f"{dataset}/zero_support", composite, single, plans,
+                        scenario, f"{dataset}/zero_support", composite, composite, plans,
                         candidates, stream_rows(composite), {"L": 0, "S": 3, "P": 0, "C": 3},
                         meta={"device_variant": "zero_support",
                               "subject_relation": "not_applicable_zero_support"}))
                     if complete():
                         return tasks
                 continue
-            for variant, query, support in (
-                    ("support_single_query_composite", composite, single),
-                    ("support_composite_query_single", single, composite),
-                    ("support_two_devices_query_all", composite, partial)):
+            stream_cache: dict[tuple[str, ...], object] = {device_ids: composite}
+
+            def subset_stream(subset: tuple[str, ...]):
+                if subset not in stream_cache:
+                    stream_cache[subset] = (safe_load(dataset, subset[0]) if len(subset) == 1
+                                            else safe_composite(dataset, subset))
+                return stream_cache[subset]
+
+            for variant, query_ids, support_ids, severity in device_set_variants(device_ids):
+                query, support = subset_stream(query_ids), subset_stream(support_ids)
+                if query is None or support is None:
+                    continue
                 if dataset == "mmfit":
                     query_rows = mmfit_partition_rows(query, "query")
                     support_rows = mmfit_partition_rows(support, "reference")
@@ -800,7 +834,7 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                 )
                 if not cross_plans:
                     continue
-                matched_group = f"{dataset}/{variant}/k{k}"
+                matched_group = f"{dataset}/{variant}/{'+'.join(query_ids)}<-{'+'.join(support_ids)}/k{k}"
                 tasks.append(Task(
                     scenario, f"{dataset}/{variant}/matched_control", query, query,
                     reference_plans, cross.candidates, stream_rows(query),
@@ -810,14 +844,16 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                           "subject_relation": ("published_participant_split" if dataset == "mmfit"
                                                else "cross_subject")},
                 ))
-                if complete():
-                    return tasks
                 tasks.append(Task(
                     scenario, f"{dataset}/{variant}", query, support, cross_plans,
-                    cross.candidates, cross.offset, {"L": 0, "S": 0, "P": 0, "C": 3},
+                    cross.candidates, cross.offset, {"L": 0, "S": 0, "P": 0, "C": severity},
                     meta={"device_variant": variant,
                           "query_devices": len(getattr(query, "devices", [1])),
                           "support_devices": len(getattr(support, "devices", [1])),
+                          "query_device_ids": query_ids, "support_device_ids": support_ids,
+                          "device_jaccard": len(set(query_ids) & set(support_ids)) /
+                          len(set(query_ids) | set(support_ids)),
+                          "device_mismatch_severity": severity,
                           "condition": "scenario", "matched_group": matched_group,
                           "subject_relation": ("published_participant_split" if dataset == "mmfit"
                                                else "cross_subject")}))

@@ -18,6 +18,7 @@ from training.support_classifier.run_scenarios import (
     Task,
     _matched_within_reference,
     _requires_cross_support_features,
+    device_set_variants,
 )
 
 CHANNELS = ["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"]
@@ -33,6 +34,18 @@ def test_active_scenario_roster_excludes_retired_compound_cold_start():
         "s6_new_domain",
         "s7_device_set",
     )
+
+
+def test_device_set_variants_rotate_all_devices_and_have_exact_relation_shapes():
+    variants = device_set_variants(("forearm", "thigh", "waist"))
+    singles = [row for row in variants if row[0] == "support_single_query_full"]
+    assert {row[2][0] for row in singles} == {"forearm", "thigh", "waist"}
+    assert all(len(query) > len(support) for name, query, support, _ in variants
+               if name == "support_single_query_full")
+    assert all(len(query) == len(support) == 2 and len(set(query) & set(support)) == 1
+               for name, query, support, _ in variants if name == "partial_overlap")
+    assert all(not (set(query) & set(support))
+               for name, query, support, _ in variants if name == "disjoint_single")
 
 
 def make_stream(

@@ -780,7 +780,8 @@ class PretrainDataset(Dataset):
                  neutral_acquisition_text: bool = False,
                  conditioning_schema: str = CONDITIONING_SCHEMA_V2,
                  multi_device_probability: float = 0.0,
-                 max_devices: int = 4):
+                 max_devices: int = 4,
+                 build_aligned_device_index: bool = False):
         self.index = index
         self.keys = keys
         self.two_view = two_view
@@ -809,7 +810,7 @@ class PretrainDataset(Dataset):
         self._data_cache: dict[int, np.ndarray] = {}
         self._length_cache: dict[int, np.ndarray] = {}
         self._aligned_devices = self._build_aligned_device_index() \
-            if self.multi_device_probability > 0 else {}
+            if self.multi_device_probability > 0 or build_aligned_device_index else {}
 
     def _build_aligned_device_index(self) -> dict[int, tuple[int, ...]]:
         groups: dict[tuple[str, str], list[int]] = {}
@@ -830,6 +831,19 @@ class PretrainDataset(Dataset):
             for position in ordered:
                 result[position] = ordered
         return result
+
+    def aligned_device_members(self, position: int) -> dict[str, int]:
+        """Return this window's exact-time-aligned devices by stable stream identifier.
+
+        This small public contract is intentionally separate from ``item_with_rng``.  Episode
+        construction can therefore select one device relationship for a whole query/support set
+        before any signal is loaded, rather than independently composing every row.
+        """
+        peers = self._aligned_devices.get(int(position), ())
+        return {
+            self.index.refs[self.keys[peer].stream_i].stream: int(peer)
+            for peer in peers
+        }
 
     def __len__(self) -> int:
         return len(self.keys)
@@ -1144,6 +1158,33 @@ class PretrainDataset(Dataset):
             with _item_randomness(seed):
                 items.append(self._single_item(position))
         return merge_device_items(items)
+
+    def item_with_members(self, members: Sequence[int], rng: np.random.Generator) -> dict:
+        """Load a pre-planned aligned device subset with one shared augmentation replay.
+
+        ``members`` must describe one physical event.  The planner supplies canonical stream
+        order, but we enforce that invariant here too because a malformed composite would make
+        device-set evaluation deceptively easy.
+        """
+        chosen = tuple(int(position) for position in members)
+        if not chosen:
+            raise ValueError("a device-set plan needs at least one member")
+        maps = [self.aligned_device_members(position) for position in chosen]
+        if len(chosen) > 1 and (not maps[0] or any(position not in maps[0].values() for position in chosen)):
+            raise ValueError("device-set members must be exact-time-aligned peers")
+        ordered = tuple(sorted(chosen, key=lambda p: self.index.refs[self.keys[p].stream_i].stream))
+        shadow = np.random.default_rng()
+        shadow.bit_generator.state = rng.bit_generator.state
+        seed = int(shadow.integers(0, np.iinfo(np.int64).max, dtype=np.int64))
+        items = []
+        for position in ordered:
+            with _item_randomness(seed):
+                items.append(self._single_item(position))
+        out = items[0] if len(items) == 1 else merge_device_items(items)
+        out["device_set"] = tuple(
+            self.index.refs[self.keys[position].stream_i].stream for position in ordered
+        )
+        return out
 
     def __getitem__(self, i: int) -> dict:
         # DataLoader compatibility. Trainer prefetch uses a step-owned generator instead.
