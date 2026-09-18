@@ -24,4 +24,3 @@ RUNS_DIR = _path("HALO_RUNS_DIR", REPO_ROOT / "runs")
 CACHE_DIR = _path("HALO_CACHE_DIR", REPO_ROOT / "cache")
 RESULTS_DIR = _path("HALO_RESULTS_DIR", REPO_ROOT / "results")
 REFERENCES_DIR = _path("HALO_REFERENCES_DIR", REPO_ROOT / "references")
-

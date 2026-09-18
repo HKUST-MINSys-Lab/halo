@@ -78,7 +78,7 @@ has support. No per-model or test-selected fusion weight is used.
 ## Artifacts
 
 The source artifact's complete rows and immutable manifests are tracked in
-`docs/results/artifacts/scenarios_halo_classifier_v3_20260917/`.
+`results/artifacts/scenarios_halo_classifier_v3_20260917/`.
 
 That immutable v3 artifact retains 65 cold-start rows for reproducibility. Readers and summary
 generators must exclude `scenario == "s8_cold_start"`; new runs use v4 and cannot generate it.

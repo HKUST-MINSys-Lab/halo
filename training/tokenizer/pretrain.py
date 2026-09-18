@@ -40,7 +40,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from halo.paths import REPO_ROOT
+from halo.paths import REPO_ROOT, RUNS_DIR
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
@@ -107,7 +107,7 @@ from training.tokenizer.pretrain_data import (
 )
 
 GYRO_IDX = [3, 4, 5]
-OUT_DIR = Path(__file__).resolve().parent / "outputs" / "pretrain"
+OUT_DIR = RUNS_DIR / "tokenizer" / "pretrain"
 # Multi-span tokens carry a materially cheaper activation footprint than fixed-filterbank tokens.
 # On the 24 GiB reference RTX 4090, 384 windows / 45,312 tokens used 8.62 GiB and was within 1.3%
 # of batch 512 throughput. A 60 Ki-token ceiling keeps the measured 512-window configuration

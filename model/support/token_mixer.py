@@ -15,10 +15,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from model.blocks import AttentionSpec, SetAttentionStack
-
-
-ROLE_QUERY, ROLE_SUPPORT, ROLE_SUPPORT_LABEL, ROLE_CANDIDATE = range(4)
-N_ROLES = 4
+from model.support.roles import (
+    N_ROLES, ROLE_CANDIDATE, ROLE_QUERY, ROLE_SUPPORT, ROLE_SUPPORT_LABEL,
+)
 
 
 @dataclass(frozen=True)

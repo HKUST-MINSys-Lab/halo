@@ -4,6 +4,7 @@ import torch
 from model.blocks import AttentionSpec
 from model.support.residual_classifier import ResidualClassifierConfig, ResidualSupportClassifier
 from training.support_classifier.neighbors import differentiable_neighbor_logits
+from training.support_classifier.device_sets import DeviceSetPlan
 from training.support_classifier.sampling import Episode
 from training.support_classifier.train import (
     episode_loss, fit_text_projection, prediction_telemetry, weighted_present_metrics,
@@ -153,6 +154,13 @@ def test_prediction_telemetry_reports_neighbor_rescues_and_overturns():
         "rows": {"support_mask": torch.ones(4, 2, dtype=torch.bool)},
         "text": {"candidate_mask": torch.ones(4, 2, dtype=torch.bool)},
         "device_count": torch.ones(4),
+        "device_set_plans": tuple(
+            DeviceSetPlan(
+                relation="matched_single", query_devices=("watch",),
+                support_devices=("watch",), fallback=False,
+            )
+            for _ in episodes
+        ),
     }
     got = prediction_telemetry(result, episodes)
     prefix = "scenario/comparison/all/enrolled"
@@ -163,6 +171,7 @@ def test_prediction_telemetry_reports_neighbor_rescues_and_overturns():
     assert got[f"{prefix}/preserve_rate"] == pytest.approx(0.25)
     assert got[f"{prefix}/both_wrong_rate"] == pytest.approx(0.25)
     assert got[f"{prefix}/net_gain"] == pytest.approx(0.0)
+    assert got["scenario/device_relation/matched_single/fraction"] == pytest.approx(1.0)
 
 
 def test_mixed_support_backward_reaches_every_trainable_parameter():

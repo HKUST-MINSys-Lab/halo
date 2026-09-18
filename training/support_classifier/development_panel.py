@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import torch
 
+from halo.paths import CACHE_DIR
 from data.scripts.augmentations import AugmentationConfig
 from data.scripts.curate.deployment_policy import SUPERVISED_HEAD_TRAIN_DATASETS
 from model.blocks import AttentionSpec
@@ -318,7 +319,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--out", type=Path,
-        default=Path("training/support_classifier/evaluations/development_panel_20260917"),
+        default=CACHE_DIR / "evaluations" / "development_panel_20260917",
     )
     args = parser.parse_args()
     if args.support_sets < 1 or args.support_sets > 256:

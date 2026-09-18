@@ -21,6 +21,7 @@ import torch
 
 from baselines import scoring
 from baselines.data import load_eval_stream, load_multi_device_stream, source_slice_fingerprint
+from halo.paths import CACHE_DIR
 from training.support_classifier.sealed_eval import (
     SEED, _aligned_labels, _differentiable_neighbor_predictions, _readout_predictions,
     _neighbor_prototype_predictions_batched, _normalise, build_manifest, evaluation_cells,
@@ -195,9 +196,9 @@ def _markdown(result: dict) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--eval-dir", type=Path,
-                        default=Path("training/support_classifier/evaluations/sealed_halo_fixed_mr_neighbors_8s_4res_e2e_20260913"))
+                        default=CACHE_DIR / "evaluations" / "sealed_halo_fixed_mr_neighbors_8s_4res_e2e_20260913")
     parser.add_argument("--out", type=Path,
-                        default=Path("training/support_classifier/evaluations/neighbor_diagnostics_20260914"))
+                        default=CACHE_DIR / "evaluations" / "neighbor_diagnostics_20260914")
     parser.add_argument("--window-seconds", type=float, default=8.0)
     parser.add_argument("--k", type=int, nargs="+", default=[1, 8])
     parser.add_argument("--seeds", type=int, nargs="+", default=[20260912, 20260913, 20260914])

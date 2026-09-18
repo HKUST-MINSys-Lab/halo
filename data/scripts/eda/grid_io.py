@@ -95,11 +95,8 @@ class GridRef:
 
     @property
     def store_dtype(self) -> np.dtype:
-        """On-disk sample dtype, read without mapping the whole grid."""
-        with open(self.grid_dir / "data.npy", "rb") as handle:
-            version = np.lib.format.read_magic(handle)
-            header = np.lib.format._read_array_header(handle, version)
-        return np.dtype(header[2])
+        """On-disk sample dtype, read through NumPy's stable memory-map API."""
+        return np.dtype(np.load(self.grid_dir / "data.npy", mmap_mode="r").dtype)
 
     def load_lengths(self) -> np.ndarray:
         """True samples per row; legacy grids without the sidecar are all full-length."""

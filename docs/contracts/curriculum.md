@@ -156,7 +156,7 @@ the acquisition curriculum improves the encoder geometry that a plain 1-NN reado
 ### Stage A - completed 2026-09-16
 
 - Output: `training/support_classifier/outputs/halo_fixed_mr_residual_v3_curriculum12_40k_20260916`
-- Scenario evaluation: `training/support_classifier/evaluations/scenarios_curriculum12_20260916`
+- Scenario evaluation: `results/artifacts/historical-evaluations/scenarios_curriculum12_20260916`
 - Best internal checkpoint: step 30,000, selected on subject-held-out validation only
 - Best validation macro-F1: 0.760
 - Validation macro-F1 rose from 0.518 at step 2,500 to 0.760 at step 30,000; it did not
@@ -206,13 +206,13 @@ Two cheap diagnostics now gate any replacement 40,000-step run:
 
 - `training/support_classifier/curriculum_audit.py` samples the active curriculum without loading
   sensor tensors. Its 2,000-support-set report is stored in
-  `training/support_classifier/evaluations/curriculum_audit_20260917.{md,json}`.
+  `results/artifacts/historical-evaluations/curriculum_audit_20260917.{md,json}`.
 - `training/support_classifier/development_panel.py` scores checkpoints on at least three
   deterministic, subject-held-out episode panels under clean, rate-resampled, and
   gyroscope-dropout recording conditions. It reports exact neighbour-to-classifier rescues,
   harmful overturns, sample variation, and paired arm-minus-reference deltas. Its
   report is stored in
-  `training/support_classifier/evaluations/development_panel_20260917.{md,json}`.
+  `results/artifacts/historical-evaluations/development_panel_20260917.{md,json}`.
 
 The historical sampler audit measured 2,000 support sets and 7,457 queries. Its zero-support mass
 was inflated because zero enrollment appeared once for each acquisition mode in a Cartesian

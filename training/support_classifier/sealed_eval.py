@@ -22,6 +22,7 @@ import torch
 
 import baselines
 from baselines import scoring
+from halo.paths import CACHE_DIR
 from baselines.data import (
     EvalStream, MultiDeviceEvalStream, list_streams, load_eval_stream, load_global_labels,
     load_multi_device_stream, source_slice_fingerprint,
@@ -1290,7 +1291,7 @@ def main() -> None:
     parser.add_argument(
         "--zero-shot-bank-cache",
         type=Path,
-        default=Path("training/support_classifier/evaluations/zero_shot_feature_cache"),
+        default=CACHE_DIR / "evaluations" / "zero_shot_feature_cache",
         help="shared cache for labelled training-corpus representations used only at k=0",
     )
     parser.add_argument("--embedding-diagnostics", action="store_true",

@@ -28,8 +28,8 @@ replace the representative tables.
 The concise results, readout-fairness diagnostic, limitations, hashes, and tracked machine-readable
 artifacts are in the
 [2026-09-17 scenario results](../journal/2026-09-17-scenario-evaluation-results.md). The original local
-run is
-`training/support_classifier/evaluations/scenarios_halo_classifier_v3_20260917_profiled_v2_k0_1_4_8_32/`.
+run is preserved under `cache/evaluations/`; the promoted machine-readable subset is
+[`results/artifacts/scenarios_halo_classifier_v3_20260917`](../../results/artifacts/scenarios_halo_classifier_v3_20260917/).
 
 Every scenario run writes `progress.json` after each scored task. It records exact completed and
 total protocol cells, progress within the current cell, elapsed time, a rolling task rate, ETA,
@@ -46,17 +46,18 @@ retired; active v4 runs test the seven nonredundant conditions. The concise summ
 scenario glossary, aggregate comparisons against every released baseline, and per-dataset tables;
 the adjacent exhaustive artifact retains every split, readout, and confidence interval:
 
-- [Stage A scenario summary](../../training/support_classifier/evaluations/scenarios_curriculum12_20260916/SUMMARY.md)
-- [Stage A exhaustive scenario results](../../training/support_classifier/evaluations/scenarios_curriculum12_20260916/RESULTS.md)
+- [Stage A scenario summary](../../results/artifacts/historical-evaluations/scenarios_curriculum12_20260916/SUMMARY.md)
+- [Stage A exhaustive scenario results](../../results/artifacts/historical-evaluations/scenarios_curriculum12_20260916/RESULTS.md)
 
 These rows use the same immutable manifests as the released-baseline scenario run. They are not
 mixed numerically with the ordinary 4/8/16-second sealed comparison below. In the scenario summary,
 `HALO 1-NN` is a diagnostic readout of the encoder jointly trained with the residual classifier;
 it is not the older differentiable-neighbours-trained encoder.
 
-## Current sealed comparison - 2026-09-14
+## Historical sealed comparison - 2026-09-14
 
-This supersedes the 2026-09-13 summary below. It evaluates the validation-selected checkpoint from
+This table predates the current v5 protocol and must not be extended with new checkpoints. It
+evaluates the validation-selected checkpoint from
 the direct end-to-end fixed multi-resolution filterbank run with the **learned residual support
 classifier**: 8-second training windows, `0.5/1/2/4 s` patch durations, gravity-referenced
 polarization features, multi-device training. The encoder has **0.789M parameters**; the learned
@@ -66,9 +67,9 @@ result selected the checkpoint.
 
 Full per-dataset matrices for all `k` and every readout, with confidence intervals, device
 disclosures and padding flags, are in
-[the canonical combined artifact](../../training/support_classifier/evaluations/sealed_comparison_residual_v3_8s_4res_40k_20260914/combined/RESULTS.md).
+[the canonical combined artifact](../../results/artifacts/historical-evaluations/sealed_comparison_residual_v3_8s_4res_40k_20260914/combined/RESULTS.md).
 
-![k-curve](assets/k_curve_residual_v3_20260914.png)
+![k-curve](../../results/artifacts/promoted-figures/k_curve_residual_v3_20260914.png)
 
 Dataset-balanced macro F1, single-device cells. HALO rows name their readout: `classifier` is the
 learned head; `centred neighbours` is the same head with the residual and text term disabled, which

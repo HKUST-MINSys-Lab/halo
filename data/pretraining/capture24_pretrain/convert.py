@@ -40,8 +40,11 @@ def _timestamp_seconds(series: pd.Series) -> np.ndarray:
     # warning-producing elementwise dateutil parsing.
     parsed = pd.to_datetime(series, format="mixed", errors="coerce")
     # datetime64 NaT has int64.min. Convert it to NaN before differencing.
-    values = parsed.astype("int64", copy=False).to_numpy(dtype=np.float64) / 1e9
-    values[values < 0] = np.nan
+    # Pandas 3 may preserve microsecond storage for parsed strings, so ``astype(int64)`` no
+    # longer implies nanoseconds. Normalize explicitly before converting to Unix seconds.
+    raw_ns = parsed.to_numpy(dtype="datetime64[ns]").astype(np.int64)
+    values = raw_ns.astype(np.float64) / 1e9
+    values[raw_ns == np.iinfo(np.int64).min] = np.nan
     return values
 
 

@@ -23,6 +23,7 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
+from halo.paths import DATASETS_DIR
 from data.scripts.curate import deployment_policy
 from data.scripts.curate.compatibility import (
     AcquisitionKey,
@@ -31,8 +32,7 @@ from data.scripts.curate.compatibility import (
     is_near_miss,
 )
 
-REPO = Path(__file__).resolve().parents[3]
-GRIDS = REPO / "data" / "datasets"
+GRIDS = DATASETS_DIR
 
 
 def window_count(dataset: str, stream: str, alignment: str = "native") -> int | None:

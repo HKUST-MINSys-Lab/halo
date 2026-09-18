@@ -185,8 +185,6 @@ def load(alignment: str = "native", *, require: bool = False,
 
 def main() -> None:
     import argparse
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--alignment", default="native",
                         choices=("native", "harmonised", "non_harmonised"))

@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
+from halo.paths import CACHE_DIR
 from data.scripts.curate.deployment_policy import SUPERVISED_HEAD_TRAIN_DATASETS
 from training.support_classifier.corpus import support_corpus_from_index
 from training.support_classifier.sampling import (
@@ -245,7 +246,7 @@ def main() -> None:
     parser.add_argument("--window-seconds", type=float, default=8.0)
     parser.add_argument(
         "--out", type=Path,
-        default=Path("training/support_classifier/evaluations/curriculum_audit_20260917"),
+        default=CACHE_DIR / "evaluations" / "curriculum_audit_20260917",
     )
     args = parser.parse_args()
     if args.support_sets < 1 or args.batch_size < 1:

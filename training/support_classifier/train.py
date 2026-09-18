@@ -1,9 +1,9 @@
 """Train HALO's support-conditioned semantic classifier.
 
 Each episode contains a query recording, enrolled support recordings with their labels, and a
-declared candidate roster. A shared motion encoder produces one vector per recording. Separate
-zero-shot and enrolled token-mixer heads then contextualise the relevant token set before scoring.
-The optional ``neighbors`` mode is the deliberately simpler differentiable support-vote control.
+declared candidate roster. A shared motion encoder produces one vector per recording. The default
+residual classifier contextualizes the episode before scoring; ``neighbors`` is the deliberately
+simpler differentiable support-vote control. The old token mixer is reproduction-only.
 """
 
 from __future__ import annotations
@@ -845,8 +845,10 @@ def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, flo
     )
     device_plans = result.get("device_set_plans", ())
     if device_plans and len(device_plans) == len(episodes):
-        relations = tuple("not_applicable", "matched_single", "matched_composite",
-                          "query_superset", "support_superset", "partial_overlap", "disjoint")
+        relations = (
+            "not_applicable", "matched_single", "matched_composite", "query_superset",
+            "support_superset", "partial_overlap", "disjoint",
+        )
         add_scenario("device_relation", [plan.relation for plan in device_plans], relations)
         metrics["scenario/device_relation/query_device_count"] = float(np.mean([
             len(plan.query_devices) for plan in device_plans
@@ -1302,6 +1304,10 @@ def main() -> None:
                              "checkpoint on disk actually used")
     parser.add_argument("--allow-retired-jepa-checkpoint", action="store_true",
                         help="allow a future-JEPA checkpoint only to reproduce a historical run")
+    parser.add_argument("--allow-retired-frontend", action="store_true",
+                        help="allow continuous/multispan frontends only for historical reproduction")
+    parser.add_argument("--allow-retired-classifier", action="store_true",
+                        help="allow the old token mixer only for historical reproduction")
     parser.add_argument("--encoder-arch", default="halo", choices=("halo", "limubert", "harnet", "unimts"),
                         help="matched-corpus M2 arm: train a baseline architecture under HALO's "
                              "objective, corpus, episodes and readouts (default: HALO's encoder)")
@@ -1562,6 +1568,16 @@ def main() -> None:
         parser.error("label-subset must be LOW HIGH with 2 <= LOW <= HIGH")
     if args.label_subset[1] > TokenMixerConfig().max_candidates:
         parser.error("label-subset HIGH exceeds the token mixer's candidate capacity")
+    if args.frontend in {"continuous", "multispan"} and not args.allow_retired_frontend:
+        parser.error(
+            "continuous and multispan frontends are retired; pass --allow-retired-frontend "
+            "only to reproduce a historical run"
+        )
+    if args.classifier == "token_mixer" and not args.allow_retired_classifier:
+        parser.error(
+            "the token mixer is retired; pass --allow-retired-classifier only to reproduce a "
+            "historical run"
+        )
     if args.patch_seconds <= 0 or args.window_seconds <= 0:
         parser.error("patch-seconds and window-seconds must be positive")
     if not math.isfinite(args.polarization_energy_kappa) or args.polarization_energy_kappa < 0:

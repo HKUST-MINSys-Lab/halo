@@ -25,4 +25,3 @@ The active research questions are:
 The project no longer presents itself as a universal IMU foundation model. Its strongest claim is
 the complete lightweight system, its explicit deployment protocol, and transparent per-dataset and
 per-scenario evidence.
-

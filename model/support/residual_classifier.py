@@ -14,7 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from model.blocks import AttentionSpec, ScaledSum, SetAttentionStack
-from model.support.token_mixer import (
+from model.support.roles import (
     N_ROLES, ROLE_CANDIDATE, ROLE_QUERY, ROLE_SUPPORT, ROLE_SUPPORT_LABEL,
 )
 from training.support_classifier.neighbors import differentiable_neighbor_logits

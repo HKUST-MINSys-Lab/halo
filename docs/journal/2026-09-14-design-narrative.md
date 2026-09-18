@@ -138,7 +138,7 @@ candidates must be scored from their name alone.
 | UniMTS | 30.7 | 52.4 | 66.0 | 70.6 | 75.1 |
 | HARNet | 35.6 | 44.4 | 56.4 | 62.0 | 66.3 |
 
-![k-curve](../results/assets/k_curve_residual_v3_20260914.png)
+![k-curve](../../results/artifacts/promoted-figures/k_curve_residual_v3_20260914.png)
 
 ## 7. What went well
 

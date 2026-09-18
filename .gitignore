@@ -96,6 +96,7 @@ credentials*.json
 .vscode/
 *.swp
 training/tokenizer/outputs/**/*.pt
+training/tokenizer/outputs/*
 
 # Per-run training/eval artifacts (logs, eval jsons); .pt already ignored above.
 # Keep one-time analysis deliverables (m0_probe/, m2_gate/, corpus_audit/, objective_health/).
@@ -145,7 +146,9 @@ references/**/paper.txt
 # Mirrors the tokenizer rules above. The single promoted result artifact is force-added when a
 # run is promoted in docs/results/RESULTS.md; everything else stays local.
 training/support_classifier/outputs/*/
+training/support_classifier/outputs/*
 training/support_classifier/evaluations/*/
+training/support_classifier/evaluations/*
 
 # Converter backups taken before a schema change (e.g. the 2026-09-13 grid-clock rebuild).
 data/datasets/*/grids_legacy_*/

@@ -12,15 +12,15 @@ from pathlib import Path
 import shutil
 from typing import Iterable
 
+from halo.paths import DATASETS_DIR, REPO_ROOT, RUNS_DIR
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-CORE_DATASETS = REPO_ROOT / "data" / "datasets"
+CORE_DATASETS = DATASETS_DIR
 APPLICATION_SOURCES = (
     REPO_ROOT / "applications" / "motion_monitoring" / "data" / "sources"
 )
 DEFAULT_OUTPUT = REPO_ROOT / "data" / "quality" / "storage_inventory.json"
 OUTPUT_ROOTS = (
-    REPO_ROOT / "training" / "tokenizer" / "outputs",
+    RUNS_DIR / "tokenizer",
     REPO_ROOT / "training" / "evidence" / "outputs",
     REPO_ROOT / "applications" / "motion_monitoring" / "artifacts",
 )

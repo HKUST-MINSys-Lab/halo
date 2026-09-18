@@ -24,4 +24,3 @@ zero-support panels reported separately.
 Future-JEPA, continuous/multispan kernels, the old token mixer, explicit admissibility gates, and
 hidden memory-bank retrieval are retired. Their code and rationale are preserved under
 `docs/archive/`, `docs/journal/`, and historical Git tags.
-

@@ -26,6 +26,7 @@ import torch
 
 import baselines
 from baselines import scoring
+from halo.paths import CACHE_DIR
 from baselines.data import load_eval_stream, load_global_labels, load_multi_device_stream
 from data.scripts.labels.canonical_labels import canonicalize
 
@@ -257,7 +258,7 @@ def main() -> None:
     parser.add_argument("--bootstrap", type=int, default=scoring.BOOTSTRAP_B)
     parser.add_argument("--feature-cache", type=Path, default=None)
     parser.add_argument("--zero-shot-bank-cache", type=Path,
-                        default=Path("training/support_classifier/evaluations/zero_shot_feature_cache"))
+                        default=CACHE_DIR / "evaluations" / "zero_shot_feature_cache")
     parser.add_argument("--smoke", action="store_true",
                         help="one cell, one k, no bootstrap: wiring check only")
     args = parser.parse_args()
