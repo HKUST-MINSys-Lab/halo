@@ -22,9 +22,14 @@ import torch
 from data.scripts.eda.grid_io import discover_grids
 from model.tokenizer.encoder import SetTokenizerEncoder
 from model.tokenizer.filterbank import FB_DFT_SIZE
+from model.tokenizer.sensor_tokens import (
+    CONDITIONING_SCHEMA_V2,
+    LEGACY_CONDITIONING_SCHEMA,
+)
 from training.tokenizer.pretrain_data import (DFT_SIZE, modalities_present,
                                               stream_channel_descriptions,
                                               stream_sensor_bias, stream_sensor_texts,
+                                              structured_sensor_metadata,
                                               _stream_gravity_state,
                                               MultiResolutionCollate, MultiScaleCollate,
                                               STREAM_SOURCE_RATE_HZ, VAL_RESOLUTION_PAIR,
@@ -163,6 +168,13 @@ def build_encoder(
         use_sensor_bias_conditioning = any(
             key.startswith("bias_proj.") for key in ckpt.get("encoder", {})
         )
+    conditioning_schema = c.get("conditioning_schema")
+    if conditioning_schema is None:
+        conditioning_schema = (
+            CONDITIONING_SCHEMA_V2
+            if any(key.startswith("structured_conditioner.") for key in ckpt.get("encoder", {}))
+            else LEGACY_CONDITIONING_SCHEMA
+        )
     descriptor_prediction = c.get("descriptor_prediction")
     if descriptor_prediction is None:
         descriptor_prediction = any(
@@ -206,6 +218,9 @@ def build_encoder(
         token_granularity=c.get("token_granularity", "channel"),
         sensor_bias_dim=int(sensor_bias_dim),
         use_sensor_bias_conditioning=bool(use_sensor_bias_conditioning),
+        # A missing field means the checkpoint predates acquisition-conditioning-v2. Rebuild it
+        # with its historical combined-text contract rather than silently reinterpreting weights.
+        conditioning_schema=conditioning_schema,
         use_sensor_isolated_retrieval=bool(c.get("use_sensor_isolated_retrieval", False)),
         gate_bias_init=c.get("gate_bias_init", -2.0),
         learnable_recording_pool=bool(c.get("learnable_recording_pool", False))
@@ -450,9 +465,19 @@ def encode_dataset_detailed(enc, data, texts, device, rate: float, gravity_state
             has_accel="accel" in modalities,
             has_gyro="gyro" in modalities,
             neutral=neutral_text,
+            conditioning_schema=getattr(enc, "conditioning_schema", CONDITIONING_SCHEMA_V2),
         )
         sensor_id_t = torch.tensor(sensor_id_list, dtype=torch.long)
-        sensor_bias = stream_sensor_bias(dataset, stream, modalities)
+        sensor_bias = (stream_sensor_bias(dataset, stream, modalities)
+                       if getattr(enc, "use_sensor_bias_conditioning", False) else None)
+        sensor_modality, sensor_gravity = structured_sensor_metadata(
+            has_accel="accel" in modalities,
+            has_gyro="gyro" in modalities,
+            gravity_state=gravity_state or _stream_gravity_state(dataset, stream),
+        )
+        sensor_rates_hz = torch.tensor(
+            [[float(rate), source_rate]] * len(sensor_texts), dtype=torch.float32,
+        )
     embs = []
     sensor_z_parts, sensor_window_parts, sensor_slot_parts = [], [], []
     sensor_time_parts, sensor_duration_parts, sensor_resolution_parts = [], [], []
@@ -482,7 +507,11 @@ def encode_dataset_detailed(enc, data, texts, device, rate: float, gravity_state
                     item["role_texts"] = role_texts
                     item["sensor_texts"] = sensor_texts
                     item["sensor_id"] = sensor_id_t
-                    item["sensor_bias"] = sensor_bias
+                    if sensor_bias is not None:
+                        item["sensor_bias"] = sensor_bias
+                    item["sensor_modality"] = sensor_modality
+                    item["sensor_gravity"] = sensor_gravity
+                    item["sensor_rates_hz"] = sensor_rates_hz
                 items.append(item)
             batch = collate(items)
             plen = batch["patch_len"]
@@ -504,11 +533,18 @@ def encode_dataset_detailed(enc, data, texts, device, rate: float, gravity_state
                     patch_padding_mask=batch["patch_padding_mask"].to(device),
                     sensor_texts=(batch["sensor_texts"] if factored else None),
                     sensor_id=(batch["sensor_id"].to(device) if factored else None),
+                    sensor_modality=(batch["sensor_modality"].to(device)
+                                     if factored and "sensor_modality" in batch else None),
+                    sensor_gravity=(batch["sensor_gravity"].to(device)
+                                    if factored and "sensor_gravity" in batch else None),
+                    sensor_rates_hz=(batch["sensor_rates_hz"].to(device)
+                                     if factored and "sensor_rates_hz" in batch else None),
                     source_rate_hz=(batch["channel_source_rates"]
                                     if batch.get("channel_source_rates") is not None
                                     else batch["source_rates"]).to(device),
                     sensor_bias=(batch["sensor_bias"].to(device)
-                                 if getattr(enc, "token_granularity", "channel") == "sensor" else None),
+                                 if getattr(enc, "use_sensor_bias_conditioning", False)
+                                 and batch.get("sensor_bias") is not None else None),
                 )
             embs.append(out["pooled"] if requires_grad else out["pooled"].cpu())
             if "per_patch" not in out:
@@ -685,6 +721,20 @@ def encode_multi_device_dataset(enc, members, device,
                     member.dataset, member.stream,
                     gravity_removed=gravity == "removed",
                     has_accel="accel" in modalities, has_gyro="gyro" in modalities,
+                    conditioning_schema=getattr(
+                        enc, "conditioning_schema", CONDITIONING_SCHEMA_V2,
+                    ),
+                )
+                sensor_modality, sensor_gravity = structured_sensor_metadata(
+                    has_accel="accel" in modalities,
+                    has_gyro="gyro" in modalities,
+                    gravity_state=gravity,
+                )
+                effective_rate = min(
+                    float(member.rate_hz),
+                    float(STREAM_SOURCE_RATE_HZ.get(
+                        f"{member.dataset}/{member.stream}", member.rate_hz,
+                    )),
                 )
                 device_items.append({
                     "data": torch.as_tensor(np.asarray(member.windows[row, :valid]), dtype=torch.float32),
@@ -707,10 +757,19 @@ def encode_multi_device_dataset(enc, members, device,
                     "role_texts": roles, "sensor_texts": sensors,
                     "sensor_target_texts": sensors,
                     "sensor_id": torch.as_tensor(sensor_ids),
-                    "sensor_bias": stream_sensor_bias(member.dataset, member.stream, modalities),
+                    "sensor_modality": sensor_modality,
+                    "sensor_gravity": sensor_gravity,
+                    "sensor_rates_hz": torch.tensor(
+                        [[float(member.rate_hz), effective_rate]] * len(sensors),
+                        dtype=torch.float32,
+                    ),
                     "channel_mask": mask, "gravity_state": gravity,
                     "label_id": 0, "source": member.dataset, "stream": member.stream,
                 })
+                if getattr(enc, "use_sensor_bias_conditioning", False):
+                    device_items[-1]["sensor_bias"] = stream_sensor_bias(
+                        member.dataset, member.stream, modalities,
+                    )
             items.append(merge_device_items(device_items))
         batch = collate(items)
         with torch.amp.autocast(device.type, enabled=device.type == "cuda" and amp_dtype is not None,
@@ -723,6 +782,9 @@ def encode_multi_device_dataset(enc, members, device,
                 channel_mask=batch["channel_mask"].to(device),
                 patch_padding_mask=batch["patch_padding_mask"].to(device),
                 sensor_texts=batch["sensor_texts"], sensor_id=batch["sensor_id"].to(device),
+                sensor_modality=batch["sensor_modality"].to(device),
+                sensor_gravity=batch["sensor_gravity"].to(device),
+                sensor_rates_hz=batch["sensor_rates_hz"].to(device),
                 device_id=batch["device_id"].to(device), source_rate_hz=(
                     batch["channel_source_rates"] if batch.get("channel_source_rates") is not None
                     else batch["source_rates"]).to(device),

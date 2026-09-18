@@ -73,6 +73,7 @@ DEFAULT_ENROLLMENT_K = (1, 2, 4, 8, 16, 32)
 DEFAULT_QUERIES_PER_SUPPORT_SET = 4
 DEFAULT_WINDOWS_PER_EXECUTION = 2
 DEFAULT_ACQUISITION_MIX = (0.50, 0.25, 0.25)  # compatible, cross-placement, cross-dataset
+DEPLOYMENT_SAMPLER_SCHEMA = "independent-enrollment-acquisition-v2-20260918"
 DEFAULT_ENROLLMENT_MIX = (0.50, 0.25, 0.25)   # complete, partial, zero
 DEFAULT_PARTIAL_COVERAGE = (0.25, 0.75)
 DEFAULT_VARIABLE_SUPPORT_PROBABILITY = 0.50
@@ -1211,13 +1212,27 @@ def draw_batch(
         enrollment_probability = probabilities(
             enrollment_mix, len(enrollment_names), "enrollment_mix",
         )
-        pair_weight = {
-            (mode_name, regime): float(acquisition_probability[mode_index]
-                                       * enrollment_probability[regime_index])
-            for mode_index, mode_name in enumerate(acquisition_names)
-            for regime_index, regime in enumerate(enrollment_names)
-        }
-        active_pairs = tuple(pair for pair, weight in pair_weight.items() if weight > 0.0)
+        # Acquisition has no meaning when there is no support. Represent zero enrollment once,
+        # rather than once per acquisition mode: the old Cartesian product multiplied zero-shot
+        # mass whenever a dataset could not form a requested mismatch regime.
+        active_pairs: list[tuple[SamplingMode, EnrollmentRegime | None]] = []
+        pair_weight: dict[tuple[SamplingMode, EnrollmentRegime | None], float] = {}
+        for regime_index, regime in enumerate(enrollment_names):
+            if enrollment_probability[regime_index] <= 0:
+                continue
+            if regime == "zero":
+                pair = ("compatible", regime)
+                active_pairs.append(pair)
+                pair_weight[pair] = float(enrollment_probability[regime_index])
+                continue
+            for mode_index, mode_name in enumerate(acquisition_names):
+                if acquisition_probability[mode_index] <= 0:
+                    continue
+                pair = (mode_name, regime)
+                active_pairs.append(pair)
+                pair_weight[pair] = float(
+                    acquisition_probability[mode_index] * enrollment_probability[regime_index]
+                )
         eligible_by_pair: dict[tuple[SamplingMode, EnrollmentRegime | None], tuple[str, ...]] = {}
         for pair in active_pairs:
             mode_name, regime = pair
@@ -1248,23 +1263,60 @@ def draw_batch(
         while len(schedule) < batch_size:
             schedule.extend(str(value) for value in rng.permutation(datasets))
         for support_set_id, query_dataset in enumerate(schedule[:batch_size]):
-            requested_pair = (
-                acquisition_names[int(rng.choice(len(acquisition_names), p=acquisition_probability))],
-                enrollment_names[int(rng.choice(len(enrollment_names), p=enrollment_probability))],
-            )
             feasible_pairs = [pair for pair, datasets_for_pair in eligible_by_pair.items()
                               if query_dataset in datasets_for_pair]
             if not feasible_pairs:
                 raise RuntimeError(f"dataset {query_dataset!r} has no feasible curriculum condition")
-            initial_fallback = requested_pair not in feasible_pairs
-            if initial_fallback:
-                weights = np.asarray([pair_weight[pair] for pair in feasible_pairs], dtype=np.float64)
-                weights /= weights.sum()
-                actual_pair = feasible_pairs[int(rng.choice(len(feasible_pairs), p=weights))]
+
+            requested_enrollment = enrollment_names[int(rng.choice(
+                len(enrollment_names), p=enrollment_probability,
+            ))]
+            feasible_enrollments = tuple(dict.fromkeys(pair[1] for pair in feasible_pairs))
+            enrollment_fallback = requested_enrollment not in feasible_enrollments
+            if enrollment_fallback:
+                enrollment_weights = np.asarray([
+                    enrollment_probability[enrollment_names.index(regime)]
+                    for regime in feasible_enrollments
+                ], dtype=np.float64)
+                enrollment_weights /= enrollment_weights.sum()
+                actual_enrollment = feasible_enrollments[int(rng.choice(
+                    len(feasible_enrollments), p=enrollment_weights,
+                ))]
             else:
-                actual_pair = requested_pair
+                actual_enrollment = requested_enrollment
+
+            if actual_enrollment == "zero":
+                requested_mode: SamplingMode = "compatible"
+                actual_pair = ("compatible", actual_enrollment)
+                acquisition_fallback = False
+            else:
+                requested_mode = acquisition_names[int(rng.choice(
+                    len(acquisition_names), p=acquisition_probability,
+                ))]
+                feasible_modes = [
+                    pair[0] for pair in feasible_pairs if pair[1] == actual_enrollment
+                ]
+                acquisition_fallback = requested_mode not in feasible_modes
+                if acquisition_fallback:
+                    mode_weights = np.asarray([
+                        acquisition_probability[acquisition_names.index(mode_name)]
+                        for mode_name in feasible_modes
+                    ], dtype=np.float64)
+                    mode_weights /= mode_weights.sum()
+                    requested_mode = feasible_modes[int(rng.choice(
+                        len(feasible_modes), p=mode_weights,
+                    ))]
+                actual_pair = (requested_mode, actual_enrollment)
+            initial_fallback = enrollment_fallback or acquisition_fallback
             group = None
-            alternatives = [pair for pair in feasible_pairs if pair != actual_pair]
+            alternatives = [
+                pair for pair in feasible_pairs
+                if pair != actual_pair and pair[1] == actual_enrollment
+            ]
+            alternatives.extend(
+                pair for pair in feasible_pairs
+                if pair != actual_pair and pair[1] != actual_enrollment
+            )
             rng.shuffle(alternatives)
             attempted_pairs = [actual_pair, *alternatives]
             for pair_index, attempted_pair in enumerate(attempted_pairs):

@@ -156,7 +156,7 @@ def test_prediction_telemetry_reports_neighbor_rescues_and_overturns():
     }
     got = prediction_telemetry(result, episodes)
     prefix = "scenario/comparison/all/enrolled"
-    assert got[f"{prefix}/neighbor_accuracy"] == pytest.approx(0.5)
+    assert got[f"{prefix}/soft_vote_accuracy"] == pytest.approx(0.5)
     assert got[f"{prefix}/classifier_accuracy"] == pytest.approx(0.5)
     assert got[f"{prefix}/rescue_rate"] == pytest.approx(0.25)
     assert got[f"{prefix}/overturn_rate"] == pytest.approx(0.25)

@@ -12,6 +12,7 @@ from contextlib import nullcontext
 import torch
 
 from model.tokenizer.encoder import ROPE_MIN_PERIOD_S, SetTokenizerEncoder
+from model.tokenizer.sensor_tokens import CONDITIONING_SCHEMA_V2
 from training.tokenizer.pretrain import DFT_SIZE, TRAIN_DATASETS
 
 
@@ -60,6 +61,9 @@ def encode_batch(encoder: SetTokenizerEncoder, batch: dict, device: torch.device
         patch_padding_mask=batch["patch_padding_mask"].to(device, non_blocking=True),
         sensor_texts=batch["sensor_texts"],
         sensor_id=batch["sensor_id"].to(device, non_blocking=True),
+        sensor_modality=batch["sensor_modality"].to(device, non_blocking=True),
+        sensor_gravity=batch["sensor_gravity"].to(device, non_blocking=True),
+        sensor_rates_hz=batch["sensor_rates_hz"].to(device, non_blocking=True),
         device_id=(batch["device_id"].to(device, non_blocking=True)
                    if batch.get("device_id") is not None else None),
         source_rate_hz=(batch["channel_source_rates"] if batch.get("channel_source_rates") is not None
@@ -127,6 +131,7 @@ def build_random_encoder(
         "token_granularity": "sensor",
         "sensor_bias_dim": 14,
         "use_sensor_bias_conditioning": False,
+        "conditioning_schema": CONDITIONING_SCHEMA_V2,
         "use_sensor_isolated_retrieval": False,
         "neutral_acquisition_text": bool(neutral_acquisition_text),
         "learnable_recording_pool": True,
@@ -159,6 +164,7 @@ def build_random_encoder(
         text_conditioning="factored",
         token_granularity="sensor",
         use_sensor_bias_conditioning=False,
+        conditioning_schema=CONDITIONING_SCHEMA_V2,
         learnable_recording_pool=True,
         use_duration_embedding=use_duration_embedding,
         duration_min_seconds=duration_min,

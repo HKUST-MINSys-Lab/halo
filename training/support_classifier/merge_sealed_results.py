@@ -46,6 +46,7 @@ _PARAMETER_BREAKDOWN_M = {
         "frozen_tinyllama_text_tower": 1100.06,
     },
 }
+SEALED_RESULT_SCHEMA = "sealed-results-v3-20260916"
 
 
 def _table(columns: tuple[str, ...], rows: list[dict]) -> list[str]:
@@ -124,21 +125,45 @@ def main() -> None:
 
     rows = []
     sources = []
+    combined_source = args.root / "results.json"
+    combined_metadata = args.root / "run_metadata.json"
+    if combined_source.exists() or combined_metadata.exists():
+        if not combined_source.exists() or not combined_metadata.exists():
+            raise FileNotFoundError("combined sealed run needs results.json and run_metadata.json")
+        run = json.loads(combined_metadata.read_text())
+        if not run.get("complete") or run.get("result_schema") != SEALED_RESULT_SCHEMA:
+            raise ValueError(f"{combined_metadata}: stale or incomplete sealed run")
+        available = set(run.get("models", ()))
+        missing = sorted(set(args.models) - available)
+        if missing:
+            raise ValueError(f"combined sealed run is missing requested providers: {missing}")
+        combined_rows = json.loads(combined_source.read_text())
+        rows_by_model = {
+            model: [row for row in combined_rows if row.get("model") == model]
+            for model in args.models
+        }
+        sources.append(str(combined_source))
+    else:
+        rows_by_model = {}
+        for model in args.models:
+            source = args.root / model / "results.json"
+            metadata = args.root / model / "run_metadata.json"
+            if not source.exists():
+                raise FileNotFoundError(f"{model}: completed sealed result missing: {source}")
+            if not metadata.exists():
+                raise FileNotFoundError(f"{model}: run metadata missing: {metadata}")
+            run = json.loads(metadata.read_text())
+            if not run.get("complete") or run.get("result_schema") != SEALED_RESULT_SCHEMA:
+                raise ValueError(f"{metadata}: stale or incomplete sealed run")
+            rows_by_model[model] = json.loads(source.read_text())
+            sources.append(str(source))
+
     for model in args.models:
-        source = args.root / model / "results.json"
-        metadata = args.root / model / "run_metadata.json"
-        if not source.exists():
-            raise FileNotFoundError(f"{model}: completed sealed result missing: {source}")
-        if not metadata.exists():
-            raise FileNotFoundError(f"{model}: run metadata missing: {metadata}")
-        run = json.loads(metadata.read_text())
-        if not run.get("complete") or run.get("result_schema") != "sealed-results-v2-20260916":
-            raise ValueError(f"{metadata}: stale or incomplete sealed run")
-        provider_rows = json.loads(source.read_text())
+        provider_rows = rows_by_model[model]
         if any(row.get("model") != model for row in provider_rows):
-            raise ValueError(f"{source}: contains rows for a different provider")
+            raise ValueError(f"sealed rows selected for {model} contain a different provider")
         if any(row.get("status") not in {"ok", "n/a"} for row in provider_rows):
-            raise ValueError(f"{source}: contains failed or unfinished rows")
+            raise ValueError(f"{model}: contains failed or unfinished sealed rows")
         # Differentiable neighbours is an encoder-training control, not a deployment
         # readout. Historical evaluator output may contain it; never include it in reports.
         provider_rows = [row for row in provider_rows
@@ -155,7 +180,6 @@ def main() -> None:
             elif "parameters_m" not in row:
                 raise ValueError(f"{model}: result rows must declare checkpoint parameter count")
         rows.extend(provider_rows)
-        sources.append(str(source))
 
     output = args.out or args.root / "combined"
     output.mkdir(parents=True, exist_ok=True)

@@ -82,7 +82,16 @@ _HALO_RESIDUAL_HEAD_CACHE: dict[tuple[str, str, bool, bool], torch.nn.Module] = 
 TRAINING_BANK_ZERO_SHOT = frozenset({"halo", "harnet5", "harnet10", "limubert_x"})
 # Bump whenever feature extraction semantics, cache inputs, or pooling changes.  This avoids
 # treating an old embedding array as valid after a code-only correction.
-FEATURE_CACHE_SCHEMA = "sealed-feature-v5-20260916"
+# v6 includes the acquisition-conditioning schema in the encoder reconstruction contract. v5
+# caches cannot distinguish historical combined sensor prose from v2 device/placement text.
+FEATURE_CACHE_SCHEMA = "sealed-feature-v6-20260918"
+UNCHANGED_BASELINE_FEATURE_CACHE_SCHEMA = "sealed-feature-v5-20260916"
+
+
+def feature_cache_schema(model_name: str) -> str:
+    """Invalidate HALO text-conditioned features without discarding unchanged baseline work."""
+    return (FEATURE_CACHE_SCHEMA if model_name == "halo"
+            else UNCHANGED_BASELINE_FEATURE_CACHE_SCHEMA)
 MAX_EXACT_RIDGE_SYSTEM = 512
 
 
@@ -690,7 +699,7 @@ def _cache_key(
 ) -> str:
     devices = tuple(getattr(stream, "device_ids", (stream.stream,)))
     source_fingerprint = source_fingerprint or source_slice_fingerprint(stream)
-    text = (f"{FEATURE_CACHE_SCHEMA}|{feature_role}|{name}|{stream.dataset}|{stream.stream}|{stream.alignment}|"
+    text = (f"{feature_cache_schema(name)}|{feature_role}|{name}|{stream.dataset}|{stream.stream}|{stream.alignment}|"
             f"{stream.window_seconds:g}|{devices}|{fingerprint}|{source_fingerprint}")
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
@@ -973,7 +982,7 @@ def _baseline_feature_state(
     if reason is not None:
         raise baselines.UnsupportedEvaluationCell(reason)
     state = adapter.setup_features(device) if state is None else state
-    fingerprint_key = f"_feature_fingerprint_{FEATURE_CACHE_SCHEMA}_{feature_role}"
+    fingerprint_key = f"_feature_fingerprint_{feature_cache_schema(name)}_{feature_role}"
     fingerprint = state.get(fingerprint_key)
     if fingerprint is None:
         artifacts = (adapter.native_feature_artifacts(state) if feature_role == "native_zero_shot"
@@ -1010,6 +1019,7 @@ def _load_or_encode(
                           else source_slice_fingerprint(stream))
     key = _cache_key(name, stream, probe, source_fingerprint=source_fingerprint,
                      feature_role=feature_role)
+    cache_schema = feature_cache_schema(name)
     filename = f"{stream.dataset}__{stream.stream}__{name}__{key}.npy"
     memory_key = f"{name}:{key}"
     if memory_cache is not None:
@@ -1024,7 +1034,7 @@ def _load_or_encode(
         if not candidate.exists() or not candidate_meta.exists():
             continue
         meta = json.loads(candidate_meta.read_text())
-        if (meta.get("cache_schema") != FEATURE_CACHE_SCHEMA or meta.get("cache_key") != key
+        if (meta.get("cache_schema") != cache_schema or meta.get("cache_key") != key
                 or meta.get("n_windows") != stream.n_windows
                 or meta.get("source_slice_fingerprint") != source_fingerprint):
             continue
@@ -1048,7 +1058,7 @@ def _load_or_encode(
     array_path = cache_dir / filename
     meta_path = array_path.with_suffix(".json")
     np.save(array_path, values)
-    meta_path.write_text(json.dumps({"cache_schema": FEATURE_CACHE_SCHEMA, "cache_key": key, "n_windows": stream.n_windows,
+    meta_path.write_text(json.dumps({"cache_schema": cache_schema, "cache_key": key, "n_windows": stream.n_windows,
                                      "artifact_fingerprint": fingerprint,
                                      "source_slice_fingerprint": source_fingerprint},
                                     indent=2) + "\n")

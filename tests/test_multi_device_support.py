@@ -155,6 +155,9 @@ def test_composite_collate_pads_channels_and_preserves_device_ids():
             "texts": ["axis"] * channels, "role_texts": ["axis"] * channels,
             "sensor_texts": ["sensor"] * sensors, "sensor_target_texts": ["sensor"] * sensors,
             "sensor_id": torch.arange(sensors).repeat_interleave(3),
+            "sensor_modality": torch.tensor([0, 1][:sensors]),
+            "sensor_gravity": torch.tensor([0, 3][:sensors]),
+            "sensor_rates_hz": torch.tensor([[4.0, 4.0]] * sensors),
             "device_id": torch.zeros(sensors, dtype=torch.long),
             "sensor_bias": torch.zeros(sensors, 14), "sensor_placement": torch.zeros(sensors, dtype=torch.long),
             "channel_mask": torch.ones(channels, dtype=torch.bool), "label_id": 0,
@@ -164,6 +167,8 @@ def test_composite_collate_pads_channels_and_preserves_device_ids():
     assert output["patches"].shape[-1] == 9
     assert output["channel_mask"].sum(1).tolist() == [6, 9]
     assert output["device_id"][1].tolist() == [0, 0, 1]
+    assert output["sensor_modality"][1].tolist() == [0, 1, 0]
+    assert output["sensor_rates_hz"].shape == (2, 3, 2)
 
 
 def test_quality_artifacts_are_duration_qualified_without_moving_legacy_six_second_path():

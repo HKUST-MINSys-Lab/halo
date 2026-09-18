@@ -34,6 +34,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 AXES_PER_SENSOR = 3
+CONDITIONING_SCHEMA_V2 = "acquisition-conditioning-v2"
+LEGACY_CONDITIONING_SCHEMA = "combined-text-v1"
+
+MODALITY_ACCELEROMETER = 0
+MODALITY_GYROSCOPE = 1
+N_MODALITIES = 2
+
+GRAVITY_PRESENT = 0
+GRAVITY_REMOVED = 1
+GRAVITY_UNKNOWN = 2
+GRAVITY_NOT_APPLICABLE = 3
+N_GRAVITY_STATES = 4
+RATE_REFERENCE_HZ = 50.0
 
 
 class SensorFold(nn.Module):
@@ -142,13 +155,108 @@ class ConditioningProjection(nn.Module):
         artifact: torch.Tensor,          # (B,S,in_dim) frozen
         valid: torch.Tensor | None = None,   # (B,S) True = artifact present
     ) -> torch.Tensor:
+        return sensor_tokens + self.delta(sensor_tokens, artifact, valid)
+
+    def delta(
+        self,
+        sensor_tokens: torch.Tensor,
+        artifact: torch.Tensor,
+        valid: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return only the gated residual, permitting parallel conditioners."""
         emb = self.embed(artifact)                                   # (B,S,d)
         if valid is not None:
             emb = emb * valid.unsqueeze(-1).to(emb.dtype)
         B, P, S, d = sensor_tokens.shape
         e = emb.unsqueeze(1).expand(B, P, S, d)
         gate = torch.sigmoid(self.gate(torch.cat([sensor_tokens, e], dim=-1)))
-        return sensor_tokens + gate * e
+        return gate * e
+
+
+class StructuredSensorConditioner(nn.Module):
+    """Exact runtime acquisition facts, kept separate from natural-language semantics.
+
+    Supported modalities are deliberately closed to accelerometer and gyroscope. Rates use a
+    fixed physical reference rather than corpus-fitted normalization, so a new dataset requires no
+    refitting. Gravity is four-way because it is inapplicable to gyroscopes rather than unknown.
+    """
+
+    def __init__(self, d_model: int, dropout: float = 0.1, gate_bias_init: float = -2.0):
+        super().__init__()
+        self.modality = nn.Embedding(N_MODALITIES, d_model)
+        self.gravity = nn.Embedding(N_GRAVITY_STATES, d_model)
+        self.rate = nn.Sequential(
+            nn.Linear(1, d_model), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+        )
+        self.norm = nn.LayerNorm(d_model)
+        self.gate = nn.Linear(d_model * 2, d_model)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(self.gate.bias, float(gate_bias_init))
+
+    def embed(
+        self,
+        modality: torch.Tensor,
+        gravity: torch.Tensor,
+        rates_hz: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        if modality.shape != gravity.shape or rates_hz.shape != (*modality.shape, 2):
+            raise ValueError("structured sensor metadata has inconsistent shapes")
+        if valid.shape != modality.shape:
+            raise ValueError("structured sensor validity mask has inconsistent shape")
+
+        # Ragged sensor batches use zero padding. Validate only live rows and replace padding with
+        # legal neutral values before embedding so padding cannot trigger an error or NaN. Avoid
+        # Python truth tests on CUDA tensors: those synchronize every training step. The loader
+        # performs the full semantic validation on CPU; embedding lookup still fails loudly for a
+        # live out-of-range id if a custom caller violates the contract.
+        live_modality = modality[valid]
+        live_gravity = gravity[valid]
+        live_rates = rates_hz[valid]
+        if modality.device.type == "cpu":
+            if not torch.isfinite(live_rates).all() or not (live_rates > 0).all():
+                raise ValueError("stored and effective sensor rates must be finite and positive")
+            if not ((live_modality >= 0) & (live_modality < N_MODALITIES)).all():
+                raise ValueError("unsupported modality: HALO currently accepts only accel and gyro")
+            if not ((live_gravity >= 0) & (live_gravity < N_GRAVITY_STATES)).all():
+                raise ValueError("invalid gravity-state id")
+            accel = live_modality.eq(MODALITY_ACCELEROMETER)
+            if not torch.where(accel, live_gravity.ne(GRAVITY_NOT_APPLICABLE),
+                               live_gravity.eq(GRAVITY_NOT_APPLICABLE)).all():
+                raise ValueError("gravity must be present/removed/unknown for accel and N/A for gyro")
+
+        safe_modality = torch.where(valid, modality, torch.zeros_like(modality))
+        safe_gravity = torch.where(valid, gravity, torch.full_like(gravity, GRAVITY_UNKNOWN))
+        safe_rates = torch.where(
+            valid.unsqueeze(-1), rates_hz, torch.full_like(rates_hz, RATE_REFERENCE_HZ),
+        )
+        # Only effective source rate carries physical bandwidth information. Stored rate is kept
+        # in the transport contract for resampling provenance, but feeding it to the model creates
+        # an avoidable dataset-identity shortcut. Compute the physical feature in float32 even
+        # under autocast; ``delta`` casts the combined structured embedding back to the token
+        # dtype before it enters the gated residual path.
+        rate_features = torch.log2(
+            safe_rates[..., 1:2].float() / RATE_REFERENCE_HZ,
+        )
+        rate_embedding = self.rate(rate_features)
+        return self.norm(
+            self.modality(safe_modality) + self.gravity(safe_gravity) + rate_embedding
+        )
+
+    def delta(
+        self,
+        sensor_tokens: torch.Tensor,
+        modality: torch.Tensor,
+        gravity: torch.Tensor,
+        rates_hz: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        emb = self.embed(modality, gravity, rates_hz, valid).to(sensor_tokens.dtype)
+        emb = emb * valid.unsqueeze(-1).to(emb.dtype)
+        expanded = emb.unsqueeze(1).expand_as(sensor_tokens)
+        gate = torch.sigmoid(self.gate(torch.cat([sensor_tokens, expanded], dim=-1)))
+        return gate * expanded
 
 
 class DescriptorHead(nn.Module):

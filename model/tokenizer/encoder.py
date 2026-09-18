@@ -37,7 +37,14 @@ from .channel_text import ChannelTextFusion, FactoredChannelTextFusion, TokenTex
 from .continuous_kernel import ContinuousKernelTokenizer
 from .multispan_kernel import MultiSpanKernelTokenizer
 from .filterbank import PhysicalFilterbankTokenizer
-from .sensor_tokens import ConditioningProjection, DescriptorHead, SensorFold
+from .sensor_tokens import (
+    CONDITIONING_SCHEMA_V2,
+    LEGACY_CONDITIONING_SCHEMA,
+    ConditioningProjection,
+    DescriptorHead,
+    SensorFold,
+    StructuredSensorConditioner,
+)
 from ..blocks import AttentionSpec
 from .transformer import DualBranchTransformer, TemporalTrunk
 
@@ -137,6 +144,7 @@ class SetTokenizerEncoder(nn.Module):
         token_granularity: str = "channel",      # direct-constructor compatibility; CLI uses sensor
         sensor_bias_dim: int = 14,               # 7 standardized values + 7 support bits
         use_sensor_bias_conditioning: bool = False,
+        conditioning_schema: str = CONDITIONING_SCHEMA_V2,
         use_sensor_isolated_retrieval: bool = False,
         gate_bias_init: float = -2.0,             # factored: negative => identity lightly injected @ init
         use_duration_embedding: bool = False,
@@ -167,6 +175,9 @@ class SetTokenizerEncoder(nn.Module):
         self.learnable_recording_pool_enabled = bool(learnable_recording_pool)
         self.sensor_bias_dim = int(sensor_bias_dim)
         self.use_sensor_bias_conditioning = bool(use_sensor_bias_conditioning)
+        if conditioning_schema not in {CONDITIONING_SCHEMA_V2, LEGACY_CONDITIONING_SCHEMA}:
+            raise ValueError(f"unsupported conditioning schema {conditioning_schema!r}")
+        self.conditioning_schema = conditioning_schema
         if trunk not in ("dual", "temporal"):
             raise ValueError("trunk must be 'dual' or 'temporal'")
         self.trunk = trunk
@@ -218,6 +229,10 @@ class SetTokenizerEncoder(nn.Module):
             )
             self.descriptor_proj = ConditioningProjection(384, d_model, dropout=dropout,
                                                           gate_bias_init=gate_bias_init)
+            if self.conditioning_schema == CONDITIONING_SCHEMA_V2:
+                self.structured_conditioner = StructuredSensorConditioner(
+                    d_model, dropout=dropout, gate_bias_init=gate_bias_init,
+                )
             if self.use_sensor_bias_conditioning:
                 self.bias_proj = ConditioningProjection(
                     self.sensor_bias_dim, d_model, dropout=dropout,
@@ -540,6 +555,9 @@ class SetTokenizerEncoder(nn.Module):
         sensor_text_ids: Optional[torch.Tensor] = None,    # (B,N_sensors), -1 = padding
         # --- sensor granularity (token_granularity='sensor') ---
         sensor_bias: Optional[torch.Tensor] = None,        # (B,N_sensors,sensor_bias_dim) frozen
+        sensor_modality: Optional[torch.Tensor] = None,    # (B,N_sensors) accel=0, gyro=1
+        sensor_gravity: Optional[torch.Tensor] = None,     # (B,N_sensors) structured gravity state
+        sensor_rates_hz: Optional[torch.Tensor] = None,    # (B,N_sensors,2) stored/effective Hz
         descriptor_mask: Optional[torch.Tensor] = None,    # (B,N_sensors) True = hide the descriptor
         return_retrieval_tokens: bool = True,
         retrieval_only: bool = False,
@@ -554,7 +572,9 @@ class SetTokenizerEncoder(nn.Module):
                 sensor_text_embs=sensor_text_embs, sensor_text_masks=sensor_text_masks,
                 sensor_descriptors=sensor_descriptors,
                 sensor_id=sensor_id, sensor_text_ids=sensor_text_ids,
-                sensor_bias=sensor_bias, descriptor_mask=descriptor_mask,
+                sensor_bias=sensor_bias,
+                sensor_modality=sensor_modality, sensor_gravity=sensor_gravity,
+                sensor_rates_hz=sensor_rates_hz, descriptor_mask=descriptor_mask,
                 return_retrieval_tokens=return_retrieval_tokens,
                 retrieval_only=retrieval_only,
                 return_layer_states=return_layer_states,
@@ -672,6 +692,9 @@ class SetTokenizerEncoder(nn.Module):
         device_id: Optional[torch.Tensor] = None,          # (B,N), sensor slot -> physical device
         sensor_text_ids: Optional[torch.Tensor] = None,
         sensor_bias: Optional[torch.Tensor] = None,        # (B,N,sensor_bias_dim)
+        sensor_modality: Optional[torch.Tensor] = None,    # (B,N) accel=0, gyro=1
+        sensor_gravity: Optional[torch.Tensor] = None,     # (B,N) structured gravity state
+        sensor_rates_hz: Optional[torch.Tensor] = None,    # (B,N,2) stored/effective Hz
         descriptor_mask: Optional[torch.Tensor] = None,    # (B,N) True = hide the descriptor
         return_retrieval_tokens: bool = True,
         retrieval_only: bool = False,
@@ -763,7 +786,26 @@ class SetTokenizerEncoder(nn.Module):
         descriptor_visible = sensor_present
         if descriptor_mask is not None:
             descriptor_visible = descriptor_visible & ~descriptor_mask.to(sensor_present.device)
-        tokens = self.descriptor_proj(tokens, descriptor, descriptor_visible)
+        if self.conditioning_schema == CONDITIONING_SCHEMA_V2:
+            if sensor_modality is None or sensor_gravity is None or sensor_rates_hz is None:
+                raise ValueError(
+                    "conditioning v2 requires sensor_modality, sensor_gravity and sensor_rates_hz"
+                )
+            expected = (B, N)
+            if sensor_modality.shape != expected or sensor_gravity.shape != expected \
+                    or sensor_rates_hz.shape != (B, N, 2):
+                raise ValueError("conditioning-v2 metadata does not match the sensor layout")
+            text_delta = self.descriptor_proj.delta(tokens, descriptor, descriptor_visible)
+            structured_delta = self.structured_conditioner.delta(
+                tokens,
+                sensor_modality.to(device=tokens.device, dtype=torch.long),
+                sensor_gravity.to(device=tokens.device, dtype=torch.long),
+                sensor_rates_hz.to(device=tokens.device, dtype=tokens.dtype),
+                sensor_present,
+            )
+            tokens = tokens + text_delta + structured_delta
+        else:
+            tokens = self.descriptor_proj(tokens, descriptor, descriptor_visible)
         if self.use_sensor_bias_conditioning:
             if sensor_bias is None:
                 raise ValueError("this legacy checkpoint requires sensor_bias conditioning")
@@ -872,6 +914,9 @@ class SetTokenizerEncoder(nn.Module):
         device_id: Optional[torch.Tensor] = None,                # sensor granularity: (B,N)
         source_rate_hz=None,                         # scalar | (B,) acquisition bandwidth bound
         sensor_bias: Optional[torch.Tensor] = None,  # sensor granularity: (B, N, sensor_bias_dim)
+        sensor_modality: Optional[torch.Tensor] = None,
+        sensor_gravity: Optional[torch.Tensor] = None,
+        sensor_rates_hz: Optional[torch.Tensor] = None,
         descriptor_mask: Optional[torch.Tensor] = None,  # sensor granularity: (B, N)
         return_retrieval_tokens: bool = True,
         retrieval_only: bool = False,
@@ -927,6 +972,8 @@ class SetTokenizerEncoder(nn.Module):
                 sensor_id=sensor_id, sensor_text_ids=sensor_text_ids,
                 device_id=device_id,
                 sensor_bias=sensor_bias, descriptor_mask=descriptor_mask,
+                sensor_modality=sensor_modality, sensor_gravity=sensor_gravity,
+                sensor_rates_hz=sensor_rates_hz,
                 return_retrieval_tokens=return_retrieval_tokens,
                 retrieval_only=retrieval_only,
             )

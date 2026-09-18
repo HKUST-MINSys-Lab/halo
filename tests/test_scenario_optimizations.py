@@ -17,10 +17,12 @@ from training.support_classifier.partial_coverage import zscore
 from training.support_classifier.run_scenarios import _PairedDeltaTracker, _paired_deltas
 from training.support_classifier.sealed_eval import (
     FEATURE_CACHE_SCHEMA,
+    UNCHANGED_BASELINE_FEATURE_CACHE_SCHEMA,
     FeatureMemoryCache,
     _cache_key,
     _file_hash,
     _load_or_encode,
+    feature_cache_schema,
 )
 
 
@@ -81,6 +83,12 @@ def test_feature_memory_cache_is_bounded_and_lru():
     assert cache.get("second") is None
     assert cache.get("first") is first
     assert cache.get("third") is third
+
+
+def test_conditioning_cache_bump_invalidates_halo_without_discarding_baselines():
+    assert feature_cache_schema("halo") == FEATURE_CACHE_SCHEMA
+    assert feature_cache_schema("unimts") == UNCHANGED_BASELINE_FEATURE_CACHE_SCHEMA
+    assert feature_cache_schema("harnet5") != feature_cache_schema("halo")
 
 
 def test_stream_fingerprint_cache_does_not_retain_raw_streams():

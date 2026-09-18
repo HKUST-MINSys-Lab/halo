@@ -8,6 +8,8 @@ Live documents:
 - [Readiness repair plan](design/READINESS_REPAIR_PLAN_20260913.md): consolidated verified
   training/evaluation fixes and acceptance gates; pending implementation, not a new model design;
 - `design/DESIGN_OF_RECORD.md`: current encoder and support-classifier architecture;
+- `design/ACQUISITION_CONDITIONING_CONTRACT.md`: mandatory device/placement text and exact
+  modality, gravity, and rate metadata contract for every dataset;
 - `design/EXPERIMENT_ROADMAP.md`: active experiment sequence and result-promotion rules;
 - `design/EVALUATION_PROTOCOL.md`: support-classification splits, metrics, and reporting rules;
 - `baselines/`: retained released-checkpoint roster and comparison policy; and

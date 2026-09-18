@@ -75,7 +75,7 @@ the primary results. Its partial run remains a diagnostic artifact only.
 
 The stopped Stage B run predates the 2026-09-16 sampler corrections and is not a valid matched
 ablation of the current curriculum. A new comparison must train both arms from scratch on the
-current sampler and score both on `deployment-scenarios-v4-20260917` manifests.
+current sampler and score both on `deployment-scenarios-v5-20260918` manifests.
 
 The command line does not infer an experiment stage. A Stage B run must explicitly include
 `--rate-augmentation-probability 0.25 --modality-dropout-probability 0.20
@@ -204,17 +204,20 @@ Two cheap diagnostics now gate any replacement 40,000-step run:
 - `training/support_classifier/curriculum_audit.py` samples the active curriculum without loading
   sensor tensors. Its 2,000-support-set report is stored in
   `training/support_classifier/evaluations/curriculum_audit_20260917.{md,json}`.
-- `training/support_classifier/development_panel.py` scores checkpoints on one deterministic,
-  subject-held-out episode panel under clean, rate-resampled, and gyroscope-dropout recording
-  conditions. It also reports exact neighbour-to-classifier rescues and harmful overturns. Its
+- `training/support_classifier/development_panel.py` scores checkpoints on at least three
+  deterministic, subject-held-out episode panels under clean, rate-resampled, and
+  gyroscope-dropout recording conditions. It reports exact neighbour-to-classifier rescues,
+  harmful overturns, sample variation, and paired arm-minus-reference deltas. Its
   report is stored in
   `training/support_classifier/evaluations/development_panel_20260917.{md,json}`.
 
-The sampler audit measured 2,000 support sets and 7,457 queries. Among enrolled sets, the realized
-acquisition mixture was 74.8% compatible, 15.1% cross-placement, and 10.1% cross-dataset, rather
-than the requested 50/25/25. Cross-placement was feasible for four datasets and cross-dataset for
-three. The strict corrected cross-placement path had zero sets containing support from another
-dataset. These are corpus feasibility limits, not sampler leakage.
+The historical sampler audit measured 2,000 support sets and 7,457 queries. Its zero-support mass
+was inflated because zero enrollment appeared once for each acquisition mode in a Cartesian
+fallback table. The active v2 sampler draws enrollment first and acquisition only for enrolled
+sets, preserving the requested zero-support share while renormalizing acquisition modes over those
+feasible for each dataset. Cross-placement remains feasible for four datasets and cross-dataset for
+three; phone/watch training sources therefore receive compatible enrollment rather than a falsely
+stamped mismatch. This is a corpus coverage limit, not sampler leakage.
 
 The development panel is diagnostic because both evaluated checkpoints predate the corrected
 sampler. On the identical clean panel, Stage A improved over its own neighbour floor by 11.1

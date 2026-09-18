@@ -59,7 +59,7 @@ class ResidualClassifierConfig:
 
 
 class ResidualSupportClassifier(nn.Module):
-    """One k-agnostic set-attention scorer with an exact neighbour floor at initialization."""
+    """One k-agnostic set-attention scorer with its differentiable support vote as the floor."""
 
     def __init__(self, spec: AttentionSpec, cfg: ResidualClassifierConfig | None = None):
         super().__init__()

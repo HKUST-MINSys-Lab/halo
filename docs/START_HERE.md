@@ -24,11 +24,12 @@ reproducibility code; neither is an active recipe or model reference.
 ## Read in this order
 
 1. [DESIGN_OF_RECORD.md](design/DESIGN_OF_RECORD.md)
-2. [EXPERIMENT_ROADMAP.md](design/EXPERIMENT_ROADMAP.md)
-3. [EVALUATION_PROTOCOL.md](design/EVALUATION_PROTOCOL.md)
-4. [BASELINES.md](baselines/BASELINES.md)
-5. [RESULTS.md](results/RESULTS.md)
-6. [journal/README.md](journal/README.md) — dated, append-only record of how the design got
+2. [ACQUISITION_CONDITIONING_CONTRACT.md](design/ACQUISITION_CONDITIONING_CONTRACT.md)
+3. [EXPERIMENT_ROADMAP.md](design/EXPERIMENT_ROADMAP.md)
+4. [EVALUATION_PROTOCOL.md](design/EVALUATION_PROTOCOL.md)
+5. [BASELINES.md](baselines/BASELINES.md)
+6. [RESULTS.md](results/RESULTS.md)
+7. [journal/README.md](journal/README.md) — dated, append-only record of how the design got
    here. Start with [the design narrative](journal/2026-09-14-design-narrative.md) for the
    argument end to end; individual entries carry the measurements behind each decision.
 

@@ -45,6 +45,7 @@ from training.support_classifier.sampling import (
     DEFAULT_SUPPORT,
     DEFAULT_WINDOWS_PER_EXECUTION,
     DEFAULT_VARIABLE_SUPPORT_PROBABILITY,
+    DEPLOYMENT_SAMPLER_SCHEMA,
     Episode,
     SupportCorpus,
     balanced_query_indices,
@@ -59,6 +60,7 @@ from training.support_classifier.encoding import (
 )
 from training.support_classifier.neighbors import DEFAULT_TEMPERATURE, differentiable_neighbor_logits
 from training.tokenizer.eval_transfer import build_encoder
+from model.tokenizer.sensor_tokens import CONDITIONING_SCHEMA_V2, LEGACY_CONDITIONING_SCHEMA
 from training.tokenizer.pretrain_data import (
     PATCH_SECONDS,
     CorpusIndex,
@@ -286,11 +288,11 @@ def make_label_text(labels, device) -> LabelTextTable:
 
 # ------------------------------------------------------------------ batching
 def recording_rows(encoded: dict) -> tuple[torch.Tensor, torch.Tensor]:
-    """One pooled feature and one acquisition descriptor per encoded recording.
+    """One pooled feature and one device/placement text descriptor per encoded recording.
 
-    The descriptor is the normalised mean over the sensors that are actually present. A recording
-    may carry both an accelerometer and a gyroscope, so acquisition metadata lives in this vector
-    rather than in a scalar modality code.
+    The descriptor is the normalized mean over sensors that are actually present. Exact modality,
+    gravity and rate facts condition the encoder through a separate structured branch; this vector
+    carries only the natural-language context exposed to the support classifier.
     """
     pooled = encoded.get("pooled")
     descriptor = encoded.get("descriptor")
@@ -612,7 +614,7 @@ def weighted_present_metrics(
         # as a common condition. Its sibling fraction recovers the honest selected-row count.
         suffix = key.rsplit("/", 1)[-1]
         conditional = key.startswith("scenario/") and suffix in {
-            "loss", "accuracy", "semantic_weight", "neighbor_accuracy",
+            "loss", "accuracy", "semantic_weight", "soft_vote_accuracy",
             "classifier_accuracy", "rescue_rate", "overturn_rate", "preserve_rate",
             "both_wrong_rate", "net_gain",
         }
@@ -646,6 +648,7 @@ def build_dataset(index: CorpusIndex, args) -> PretrainDataset:
                  or args.modality_dropout_probability > 0),
         two_view=False, augmentation_config=augmentation,
         neutral_acquisition_text=args.neutral_acquisition_text,
+        conditioning_schema=getattr(args, "conditioning_schema", CONDITIONING_SCHEMA_V2),
         multi_device_probability=args.multi_device_probability,
         max_devices=args.max_devices,
     )
@@ -830,8 +833,10 @@ def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, flo
 
     neighbor_logits = result.get("neighbor_logits")
     if neighbor_logits is not None:
-        neighbor = neighbor_logits.detach().masked_fill(~mask, float("-inf")).argmax(dim=-1)
-        neighbor_correct = neighbor.eq(target)
+        # This is the temperature-scaled differentiable class vote used by the classifier, not
+        # literal cosine 1-NN. Keep its telemetry name distinct from the sealed 1-NN readout.
+        soft_vote = neighbor_logits.detach().masked_fill(~mask, float("-inf")).argmax(dim=-1)
+        soft_vote_correct = soft_vote.eq(target)
         classifier_correct = learned.eq(target)
 
         def add_comparison(axis: str, name: str, selected: torch.Tensor) -> None:
@@ -843,9 +848,9 @@ def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, flo
             metrics[f"{prefix}/fraction"] = float(selected.float().mean())
             if not bool(selected.any()):
                 return
-            base = neighbor_correct[selected]
+            base = soft_vote_correct[selected]
             learned_ok = classifier_correct[selected]
-            metrics[f"{prefix}/neighbor_accuracy"] = float(base.float().mean())
+            metrics[f"{prefix}/soft_vote_accuracy"] = float(base.float().mean())
             metrics[f"{prefix}/classifier_accuracy"] = float(learned_ok.float().mean())
             metrics[f"{prefix}/rescue_rate"] = float((~base & learned_ok).float().mean())
             metrics[f"{prefix}/overturn_rate"] = float((base & ~learned_ok).float().mean())
@@ -1613,11 +1618,20 @@ def main() -> None:
                     parser.error(f"{option} cannot change a resumed residual classifier")
         if args.steps < 1 or not 0 <= args.warmup_steps < args.steps:
             parser.error("resume checkpoint warmup-steps must be in [0, --steps)")
-    source_config = (
-        dict(resume_blob["config"]) if resume_blob is not None
-        else dict(torch.load(args.phase_a, map_location="cpu", weights_only=False)["config"])
+    source_blob = (
+        resume_blob if resume_blob is not None
+        else torch.load(args.phase_a, map_location="cpu", weights_only=False)
         if args.phase_a is not None else None
     )
+    source_config = dict(source_blob["config"]) if source_blob is not None else None
+    args.conditioning_schema = CONDITIONING_SCHEMA_V2
+    if source_blob is not None:
+        args.conditioning_schema = source_config.get("conditioning_schema") or (
+            CONDITIONING_SCHEMA_V2
+            if any(key.startswith("structured_conditioner.")
+                   for key in source_blob.get("encoder", {}))
+            else LEGACY_CONDITIONING_SCHEMA
+        )
     checkpoint_neutral = (
         bool(source_config.get("neutral_acquisition_text", False))
         if source_config is not None else False
@@ -1656,6 +1670,7 @@ def main() -> None:
     val_dataset = PretrainDataset(
         index, index.val, augment=False, two_view=False,
         neutral_acquisition_text=args.neutral_acquisition_text,
+        conditioning_schema=args.conditioning_schema,
         # Use the same deterministic structural-composition policy as training.  Validation
         # remains subject-disjoint and non-augmented, but must exercise a declared deployed
         # multi-device regime before a sealed composite cell is attempted.
@@ -1937,6 +1952,7 @@ def main() -> None:
                                 if args.acquisition_mix is not None else None),
             "enrollment_mix": (list(args.enrollment_mix)
                                if args.enrollment_mix is not None else None),
+            "curriculum_sampler_schema": DEPLOYMENT_SAMPLER_SCHEMA,
             "partial_coverage": list(args.partial_coverage),
             "variable_support_probability": args.variable_support_probability,
             "rate_augmentation_probability": args.rate_augmentation_probability,
@@ -2010,6 +2026,10 @@ def main() -> None:
         # residual snapshots predate explicit trajectory fields but used these initial defaults.
         saved_trajectory.setdefault("p_mask_candidate", 0.25)
         saved_trajectory.setdefault("p_mask_gt", 0.10)
+        # The v2 sampler removes duplicated zero-support mass and changes episode order. A legacy
+        # checkpoint remains evaluable, but resuming it under a different sampler would not be a
+        # continuation of the same experiment.
+        saved_trajectory.setdefault("curriculum_sampler_schema", "cartesian-fallback-v1")
         saved_args = resume_blob.get("args") or {}
         for field, default in (
             ("acquisition_mix", None),
@@ -2190,6 +2210,14 @@ def main() -> None:
             if getattr(encoder, "use_duration_embedding", False) else []
         )
         duration_grad = _parameter_grad_norm(duration_parameters) if log_step else 0.0
+        text_conditioner = getattr(encoder, "descriptor_proj", None)
+        structured_conditioner = getattr(encoder, "structured_conditioner", None)
+        text_conditioner_grad = (_parameter_grad_norm(list(text_conditioner.parameters()))
+                                 if log_step and text_conditioner is not None else 0.0)
+        structured_conditioner_grad = (
+            _parameter_grad_norm(list(structured_conditioner.parameters()))
+            if log_step and structured_conditioner is not None else 0.0
+        )
         frontend_grad = _parameter_grad_norm(frontend_params) if log_step and frontend_params else 0.0
         frontend_summary = {}
         if log_step and frontend is not None:
@@ -2215,6 +2243,8 @@ def main() -> None:
                 "gradient/encoder_norm": encoder_grad,
                 "gradient/classifier_norm": classifier_grad,
                 "gradient/duration_embedding_norm": duration_grad,
+                "gradient/acquisition_text_conditioner_norm": text_conditioner_grad,
+                "gradient/acquisition_structured_conditioner_norm": structured_conditioner_grad,
                 "gradient/frontend_norm": frontend_grad,
                 "loss/frontend_reg": (
                     float(frontend_reg.detach()) if frontend_reg is not None else 0.0
@@ -2230,6 +2260,14 @@ def main() -> None:
                 "encoder/duration_gate": (
                     float(torch.sigmoid(encoder.duration_gate_logit.detach()))
                     if getattr(encoder, "use_duration_embedding", False) else 0.0
+                ),
+                "encoder/acquisition_text_gate_prior": (
+                    float(torch.sigmoid(text_conditioner.gate.bias.detach()).mean())
+                    if text_conditioner is not None else 0.0
+                ),
+                "encoder/acquisition_structured_gate_prior": (
+                    float(torch.sigmoid(structured_conditioner.gate.bias.detach()).mean())
+                    if structured_conditioner is not None else 0.0
                 ),
                 "elapsed_s": round(time.perf_counter() - started, 1),
                 **telemetry,

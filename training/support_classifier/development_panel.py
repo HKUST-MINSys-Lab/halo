@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +18,7 @@ from data.scripts.augmentations import AugmentationConfig
 from data.scripts.curate.deployment_policy import SUPERVISED_HEAD_TRAIN_DATASETS
 from model.blocks import AttentionSpec
 from model.support.residual_classifier import ResidualClassifierConfig, build_support_classifier
+from model.tokenizer.sensor_tokens import CONDITIONING_SCHEMA_V2, LEGACY_CONDITIONING_SCHEMA
 from training.support_classifier.collate import SupportCollate
 from training.support_classifier.corpus import support_corpus_from_index
 from training.support_classifier.sampling import (
@@ -38,6 +40,17 @@ from training.tokenizer.pretrain_data import CorpusIndex, MultiResolutionCollate
 
 def _value(blob: dict, name: str, default):
     return blob.get("trajectory", {}).get(name, blob.get("args", {}).get(name, default))
+
+
+def _conditioning_schema(blob: dict) -> str:
+    configured = blob.get("config", {}).get("conditioning_schema")
+    if configured is not None:
+        return str(configured)
+    return (
+        CONDITIONING_SCHEMA_V2
+        if any(key.startswith("structured_conditioner.") for key in blob.get("encoder", {}))
+        else LEGACY_CONDITIONING_SCHEMA
+    )
 
 
 def _draw_kwargs(blob: dict) -> dict:
@@ -79,6 +92,7 @@ def _dataset(index: CorpusIndex, blob: dict, *, rate_p: float, modality_p: float
             if augmented else None
         ),
         neutral_acquisition_text=bool(_value(blob, "neutral_acquisition_text", False)),
+        conditioning_schema=_conditioning_schema(blob),
         multi_device_probability=float(_value(blob, "multi_device_probability", 0.5)),
         max_devices=int(_value(blob, "max_devices", 4)),
     )
@@ -86,6 +100,7 @@ def _dataset(index: CorpusIndex, blob: dict, *, rate_p: float, modality_p: float
 
 def evaluate_checkpoint(
     path: Path, *, device: torch.device, support_sets: int,
+    panel_seeds: tuple[int, ...],
 ) -> dict:
     blob = torch.load(path, map_location="cpu", weights_only=False)
     seed = int(_value(blob, "data_seed", 20260901))
@@ -129,7 +144,7 @@ def evaluate_checkpoint(
 
     conditions = {
         "clean_mixed": (clean, draw_kwargs),
-        "rate_downsample_mixture": (rate, draw_kwargs),
+        "rate_resample_mixture": (rate, draw_kwargs),
         "gyro_dropout_mixture": (modality, draw_kwargs),
         "clean_acquisition_compatible": (
             clean, forced(acquisition="compatible"),
@@ -144,29 +159,47 @@ def evaluate_checkpoint(
         "clean_enrollment_partial": (clean, forced(enrollment="partial")),
         "clean_enrollment_zero": (clean, forced(enrollment="zero")),
     }
-    metrics = {}
-    for name, (dataset, panel_draw_kwargs) in conditions.items():
-        metrics[name] = validate(
-            encoder=encoder,
-            classifier=classifier,
-            classifier_mode="residual",
-            corpus=corpus,
-            dataset=dataset,
-            collate=collate,
-            text_of=text,
-            device=device,
-            episodes_count=support_sets,
-            episodes_per_step=int(_value(blob, "episodes_per_step", 4)),
-            seed=seed + 91_003,
-            draw_kwargs=panel_draw_kwargs,
-            executor=None,
-            deployment_matched=True,
-        )
+    replicates: dict[str, dict[str, dict]] = {}
+    for panel_seed in panel_seeds:
+        seed_metrics = {}
+        for name, (dataset, panel_draw_kwargs) in conditions.items():
+            seed_metrics[name] = validate(
+                encoder=encoder,
+                classifier=classifier,
+                classifier_mode="residual",
+                corpus=corpus,
+                dataset=dataset,
+                collate=collate,
+                text_of=text,
+                device=device,
+                episodes_count=support_sets,
+                episodes_per_step=int(_value(blob, "episodes_per_step", 4)),
+                seed=seed + 91_003 + int(panel_seed),
+                draw_kwargs=panel_draw_kwargs,
+                executor=None,
+                deployment_matched=True,
+            )
+        replicates[str(panel_seed)] = seed_metrics
+
+    metrics: dict[str, dict[str, float]] = {}
+    metrics_sd: dict[str, dict[str, float]] = {}
+    for condition in conditions:
+        rows = [replicates[str(panel_seed)][condition] for panel_seed in panel_seeds]
+        keys = sorted(set.intersection(*(set(row) for row in rows)))
+        metrics[condition] = {}
+        metrics_sd[condition] = {}
+        for key in keys:
+            values = [row[key] for row in rows]
+            if not values or not all(isinstance(value, (int, float)) for value in values):
+                continue
+            metrics[condition][key] = float(statistics.fmean(values))
+            metrics_sd[condition][key] = float(statistics.stdev(values)) if len(values) > 1 else 0.0
     return {
         "checkpoint": str(path),
         "step": int(blob.get("step", -1)),
         "source_commit": blob.get("git", {}).get("commit"),
         "support_sets_per_condition": support_sets,
+        "panel_seed_offsets": list(panel_seeds),
         "window_seconds": window_seconds,
         "resolutions": list(resolutions),
         "panel_contracts": {
@@ -175,12 +208,54 @@ def evaluate_checkpoint(
             "enrollment": "named enrollment regime; default acquisition mixture",
         },
         "metrics": metrics,
+        "metrics_sd": metrics_sd,
+        "replicates": replicates,
     }
 
 
-def _metric(row: dict, key: str) -> str:
+def _metric(row: dict, key: str, sd_row: dict | None = None) -> str:
     value = row.get(key)
-    return "n/a" if value is None else f"{100 * float(value):.2f}"
+    if value is None:
+        return "n/a"
+    if sd_row is None or key not in sd_row:
+        return f"{100 * float(value):.2f}"
+    return f"{100 * float(value):.2f} +/- {100 * float(sd_row[key]):.2f}"
+
+
+def _paired_arm_deltas(runs: list[dict]) -> list[dict]:
+    """Arm-minus-reference deltas on identical panel draws, never unpaired endpoint ranks."""
+    if len(runs) < 2:
+        return []
+    reference = runs[0]
+    keys = (
+        "validation/enrolled_dataset_macro_f1",
+        "validation/zero_shot_dataset_macro_f1",
+        "validation/scenario/comparison/all/enrolled/net_gain",
+    )
+    output = []
+    for run in runs[1:]:
+        common_seeds = sorted(set(reference["replicates"]) & set(run["replicates"]))
+        for condition in sorted(set(reference["metrics"]) & set(run["metrics"])):
+            for key in keys:
+                deltas = []
+                for panel_seed in common_seeds:
+                    left = reference["replicates"][panel_seed][condition].get(key)
+                    right = run["replicates"][panel_seed][condition].get(key)
+                    if left is not None and right is not None:
+                        deltas.append(float(right) - float(left))
+                if not deltas:
+                    continue
+                output.append({
+                    "reference": reference["checkpoint"],
+                    "checkpoint": run["checkpoint"],
+                    "condition": condition,
+                    "metric": key,
+                    "n_panel_seeds": len(deltas),
+                    "mean_delta": float(statistics.fmean(deltas)),
+                    "sd_delta": float(statistics.stdev(deltas)) if len(deltas) > 1 else 0.0,
+                    "deltas": deltas,
+                })
+    return output
 
 
 def _markdown(report: dict) -> str:
@@ -190,7 +265,7 @@ def _markdown(report: dict) -> str:
         "Subject-held-out development data only. Values are percentages. Clean/rate/dropout "
         "reuse one episode panel; each condition-specific panel is fixed across checkpoints.",
         "",
-        "| checkpoint | condition | enrolled macro-F1 | zero-shot macro-F1 | neighbor acc. | "
+        "| checkpoint | condition | enrolled macro-F1 | zero-shot macro-F1 | soft-vote acc. | "
         "classifier acc. | rescue | overturn | net gain |",
         "|---|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
@@ -198,22 +273,38 @@ def _markdown(report: dict) -> str:
     for run in report["runs"]:
         checkpoint = Path(run["checkpoint"]).parent.name
         for condition, row in run["metrics"].items():
+            sd_row = run["metrics_sd"].get(condition, {})
             lines.append(
                 f"| {checkpoint} @ {run['step']} | {condition} | "
-                f"{_metric(row, 'validation/enrolled_dataset_macro_f1')} | "
-                f"{_metric(row, 'validation/zero_shot_dataset_macro_f1')} | "
-                f"{_metric(row, prefix + '/neighbor_accuracy')} | "
-                f"{_metric(row, prefix + '/classifier_accuracy')} | "
-                f"{_metric(row, prefix + '/rescue_rate')} | "
-                f"{_metric(row, prefix + '/overturn_rate')} | "
-                f"{_metric(row, prefix + '/net_gain')} |"
+                f"{_metric(row, 'validation/enrolled_dataset_macro_f1', sd_row)} | "
+                f"{_metric(row, 'validation/zero_shot_dataset_macro_f1', sd_row)} | "
+                f"{_metric(row, prefix + '/soft_vote_accuracy', sd_row)} | "
+                f"{_metric(row, prefix + '/classifier_accuracy', sd_row)} | "
+                f"{_metric(row, prefix + '/rescue_rate', sd_row)} | "
+                f"{_metric(row, prefix + '/overturn_rate', sd_row)} | "
+                f"{_metric(row, prefix + '/net_gain', sd_row)} |"
             )
     lines.extend([
         "",
-        "`rescue` means neighbor wrong and classifier correct. `overturn` means neighbor correct "
-        "and classifier wrong. `net gain = classifier accuracy - neighbor accuracy` on enrolled "
+        "Cells are mean +/- sample SD across the declared panel seeds. The `soft vote` column is "
+        "the temperature-0.07 differentiable support vote, not literal cosine 1-NN. `rescue` means "
+        "soft vote wrong and classifier correct. `overturn` means soft vote correct "
+        "and classifier wrong. `net gain = classifier accuracy - soft-vote accuracy` on enrolled "
         "episodes only.",
     ])
+    if report.get("paired_arm_deltas"):
+        lines.extend([
+            "", "## Paired Arm Deltas", "",
+            "Each value is arm minus the first checkpoint on the identical panel draw.", "",
+            "| checkpoint | condition | metric | mean delta | SD | panel seeds |",
+            "|---|---|---|---:|---:|---:|",
+        ])
+        for row in report["paired_arm_deltas"]:
+            lines.append(
+                f"| {Path(row['checkpoint']).parent.name} | {row['condition']} | "
+                f"{row['metric']} | {100 * row['mean_delta']:.2f} | "
+                f"{100 * row['sd_delta']:.2f} | {row['n_panel_seeds']} |"
+            )
     return "\n".join(lines) + "\n"
 
 
@@ -222,24 +313,35 @@ def main() -> None:
     parser.add_argument("checkpoints", type=Path, nargs="+")
     parser.add_argument("--support-sets", type=int, default=64)
     parser.add_argument(
+        "--panel-seeds", type=int, nargs="+", default=[0, 1, 2],
+        help="deterministic panel-seed offsets; at least three are required for decisions",
+    )
+    parser.add_argument(
         "--out", type=Path,
         default=Path("training/support_classifier/evaluations/development_panel_20260917"),
     )
     args = parser.parse_args()
     if args.support_sets < 1 or args.support_sets > 256:
         parser.error("support-sets must be in [1, 256]")
+    if len(set(args.panel_seeds)) < 3:
+        parser.error("at least three distinct panel seeds are required")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.set_num_threads(2)
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+    runs = [
+        evaluate_checkpoint(
+            path, device=device, support_sets=args.support_sets,
+            panel_seeds=tuple(dict.fromkeys(args.panel_seeds)),
+        )
+        for path in args.checkpoints
+    ]
     report = {
-        "protocol": "internal-classifier-development-panel-v1-20260917",
+        "protocol": "internal-classifier-development-panel-v2-20260918",
         "device": str(device),
-        "runs": [
-            evaluate_checkpoint(path, device=device, support_sets=args.support_sets)
-            for path in args.checkpoints
-        ],
+        "runs": runs,
+        "paired_arm_deltas": _paired_arm_deltas(runs),
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.with_suffix(".json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")

@@ -3,8 +3,10 @@
 **Status:** implemented and smoke-tested. This note resolves the second evaluation/curriculum
 debug sweep and defines the protocol boundary for subsequent scenario and sealed runs.
 
-> **Later protocol update:** v4 (`deployment-scenarios-v4-20260917`) differs only by retiring the
-> redundant compound cold-start scenario. The seven retained scenario constructions are unchanged.
+> **Later protocol update:** v5 (`deployment-scenarios-v5-20260918`) retires the redundant compound
+> cold-start scenario, moves new-domain scoring to MM-Fit, adds MM-Fit cross-device/device-set
+> cells, and keeps MobiAct in a separate prospective scope. It is not cell-for-cell comparable to
+> the historical v4 artifact.
 
 ## Protocol and fairness
 

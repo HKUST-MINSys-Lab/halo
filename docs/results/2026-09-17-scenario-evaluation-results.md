@@ -3,6 +3,11 @@
 This is the durable result record for the completed representative deployment-scenario run. It is
 not a checkpoint-selection result.
 
+> **Historical/provisional comparison.** This v4 artifact predates mandatory companion cosine
+> 1-NN rows and evaluates a HALO checkpoint trained with the superseded Cartesian-fallback sampler.
+> Its fusion-only headline table must not be cited as evidence that HALO leads every baseline. The
+> current v5 protocol requires both fusion and 1-NN and uses a changed MM-Fit roster.
+
 ## Protocol
 
 - Active protocol: `deployment-scenarios-v4-20260917`
@@ -43,9 +48,10 @@ artifact retains every model, variant, coverage split, and enrollment count.
 | New domain | 50.36 | 27.98 | UniMTS | +22.39 |
 | Device-set mismatch | 71.60 | 46.90 | UniMTS | +24.69 |
 
-HALO leads all seven retained scenarios. These are system-level comparisons: HALO received
-task-specific episodic training, while the external encoders use released weights with the fixed
-common adapter. They do not by themselves attribute the gain to HALO's encoder or classifier.
+HALO leads the fixed-fusion rows shown above. This is not the same claim as leading each baseline's
+cosine 1-NN companion: the available matched controls reverse the ordering for cross placement and
+missing modality at several k values. These are system-level comparisons and are retained only to
+document the historical run.
 
 ## Readout fairness control
 
@@ -95,6 +101,9 @@ working-tree diff hash. The raw local evaluation directory remains
 The evaluated HALO checkpoint predates the final sampler corrections. Its evaluation is valid, but
 it must not be described as trained with the final corrected curriculum. The matching
 differentiable-neighbours-trained HALO encoder arm also remains pending.
+
+The checkpoint also uses the perturbation-plus-adaptive-gate arm that the replicated development
+screen did not promote. A current headline requires a new v5 run; this file is not that headline.
 
 The next controlled attribution experiment freezes each released encoder and trains the identical
 HALO classifier, input projection, curriculum, optimizer schedule, and checkpoint-selection rule.

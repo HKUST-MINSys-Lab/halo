@@ -67,6 +67,9 @@ def run_audit(*, support_sets: int, batch_size: int, seed: int, window_seconds: 
     acquisition = collections.Counter()
     enrollment = collections.Counter()
     datasets = collections.Counter()
+    per_dataset_acquisition: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
+    per_dataset_enrollment: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
+    per_dataset_fallback = collections.Counter()
     labels_by_acquisition: dict[str, set[str]] = collections.defaultdict(set)
     datasets_by_acquisition: dict[str, set[str]] = collections.defaultdict(set)
     key_families_by_acquisition: dict[str, set[str]] = collections.defaultdict(set)
@@ -91,6 +94,9 @@ def run_audit(*, support_sets: int, batch_size: int, seed: int, window_seconds: 
             acquisition[representative.acquisition_regime] += 1
             enrollment[representative.enrollment_regime] += 1
             datasets[query.dataset] += 1
+            per_dataset_acquisition[query.dataset][representative.acquisition_regime] += 1
+            per_dataset_enrollment[query.dataset][representative.enrollment_regime] += 1
+            per_dataset_fallback[query.dataset] += int(representative.curriculum_fallback)
             labels_by_acquisition[representative.acquisition_regime].add(query.label)
             datasets_by_acquisition[representative.acquisition_regime].add(query.dataset)
             key_families_by_acquisition[representative.acquisition_regime].add(
@@ -125,7 +131,7 @@ def run_audit(*, support_sets: int, batch_size: int, seed: int, window_seconds: 
     }
     enrolled_sets = sampled_sets - enrollment["zero"]
     return {
-        "protocol": "support-curriculum-audit-v1-20260917",
+        "protocol": "support-curriculum-audit-v2-20260918",
         "seed": seed,
         "window_seconds": window_seconds,
         "requested_support_sets": support_sets,
@@ -140,6 +146,15 @@ def run_audit(*, support_sets: int, batch_size: int, seed: int, window_seconds: 
         },
         "enrollment_share": _shares(enrollment, sampled_sets),
         "query_dataset_share": _shares(datasets, sampled_sets),
+        "per_dataset": {
+            dataset: {
+                "n_support_sets": int(count),
+                "fallback_share": per_dataset_fallback[dataset] / max(count, 1),
+                "acquisition_share": _shares(per_dataset_acquisition[dataset], count),
+                "enrollment_share": _shares(per_dataset_enrollment[dataset], count),
+            }
+            for dataset, count in sorted(datasets.items())
+        },
         "candidate_count_share": _shares(candidate_counts, sampled_sets),
         "support_k_share_enrolled": _shares(support_k, sum(support_k.values())),
         "curriculum_fallback_share": fallback / sampled_sets,
@@ -197,6 +212,21 @@ def _markdown(report: dict) -> str:
     for name in ("compatible", "cross_placement", "cross_dataset"):
         coverage = report["coverage"][name]
         lines.append(f"- `{name}`: {', '.join(coverage['datasets']) or 'none'}")
+    lines.extend([
+        "", "## Per-Dataset Delivered Curriculum", "",
+        "| dataset | sets | fallback | compatible | cross placement | cross dataset | zero |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ])
+    for dataset, row in report["per_dataset"].items():
+        acquisition = row["acquisition_share"]
+        enrollment = row["enrollment_share"]
+        lines.append(
+            f"| {dataset} | {row['n_support_sets']} | {row['fallback_share']:.3f} | "
+            f"{acquisition.get('compatible', 0.0):.3f} | "
+            f"{acquisition.get('cross_placement', 0.0):.3f} | "
+            f"{acquisition.get('cross_dataset', 0.0):.3f} | "
+            f"{enrollment.get('zero', 0.0):.3f} |"
+        )
     lines.extend(["", "## Candidate And Support Distributions", ""])
     lines.append("- Candidate count: " + ", ".join(
         f"C={key}: {value:.3f}" for key, value in report["candidate_count_share"].items()

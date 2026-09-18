@@ -107,11 +107,19 @@ Report MM-Fit as a **scenario benchmark**, not in the six-dataset mean. Include:
 Disclose that workout IDs are not participant IDs and that only the publication's split certifies
 the held-out people. Do not use arbitrary local subject splits for a cross-subject claim.
 
-## 5. Current text pipeline
+## 5. Pre-v2 text pipeline (historical audit input)
+
+**Superseded on 2026-09-18.** The acquisition pipeline described in sections 5.1, 6, 7, and the
+T0/T1 proposals below motivated `acquisition-conditioning-v2`; it is not the current runtime
+contract. The implemented design is specified in
+[ACQUISITION_CONDITIONING_CONTRACT.md](ACQUISITION_CONDITIONING_CONTRACT.md): text carries only
+device role and placement, while modality, gravity, and effective source rate use an independent
+exact structured branch. Stored rate is retained for provenance but deliberately excluded from
+the learned input. Activity-label text remains a separate classifier input.
 
 There are two distinct language paths.
 
-### 5.1 Acquisition descriptions
+### 5.1 Acquisition descriptions before schema v2
 
 `stream_sensor_texts` creates axis-role strings and one sensor string per present modality. The
 sensor string contains deployment device, modality, placement, gravity convention and paired-
@@ -175,7 +183,7 @@ Sources: [MiniLM model card](https://huggingface.co/sentence-transformers/all-Mi
 [MPNet model card](https://huggingface.co/sentence-transformers/all-mpnet-base-v2/blob/main/README.md),
 and [Sentence-Transformers model guidance](https://github.com/UKPLab/sentence-transformers/blob/04ae2e06/docs/sentence_transformer/pretrained_models.md).
 
-## 7. Text-pipeline findings
+## 7. Pre-v2 text-pipeline findings
 
 ### Sound today
 
@@ -202,7 +210,10 @@ and [Sentence-Transformers model guidance](https://github.com/UKPLab/sentence-tr
 6. Residual-v3 does not compare post-attention query/candidate states in its semantic path. The
    already-approved contextual classifier plan is the targeted architectural correction.
 
-## 8. Minimal experiment plan
+## 8. Historical experiment plan
+
+T0's acquisition-contract work is implemented by schema v2. The remaining language-backend and
+activity-label experiments are optional future ablations, not missing runtime plumbing.
 
 Keep dataset expansion and text changes in separate commits/runs.
 

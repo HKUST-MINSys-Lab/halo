@@ -30,14 +30,13 @@ def _sample() -> IMUSample:
     )
 
 
-def test_gravity_removal_updates_factored_sensor_text_and_state():
+def test_gravity_removal_updates_structured_state_without_polluting_natural_text():
     cfg = AugmentationConfig.none()
     cfg.gravity.enabled = True
     cfg.gravity.p = 1.0
     out = IMUAugmenter(cfg)(_sample())
     assert out.gravity_state == "removed"
-    assert "gravity removed" in out.sensor_descriptions[0].lower()
-    assert "includes gravity" not in out.sensor_descriptions[0].lower()
+    assert out.sensor_descriptions[0] == "a phone located at the waist"
     assert out.data[:, :3].mean(0).norm() < 0.1
     assert out.applied_augmentations == ["gravity"]
 
@@ -52,9 +51,7 @@ def test_gyro_dropout_drops_the_gyro_sensor():
     # accel & gyro are separate modality-level sensors: dropping the gyro group REMOVES the gyro
     # sensor entirely (no phantom "accelerometer only" phrase on a shared description).
     assert len(out.sensor_descriptions) == 1
-    assert "accelerometer" in out.sensor_descriptions[0].lower()
-    assert "recorded without a gyroscope" in out.sensor_descriptions[0].lower()
-    assert "alongside a gyroscope" not in out.sensor_descriptions[0].lower()
+    assert out.sensor_descriptions == ["a phone located at the waist"]
     assert out.applied_augmentations == ["channel_dropout"]
 
 
@@ -149,7 +146,7 @@ def test_padding_only_accelerometer_is_not_treated_as_physical_gravity():
     cfg.gravity.enabled = True
     cfg.gravity.p = 1.0
     roles, sensors, sensor_id = stream_sensor_texts(
-        "synthetic", "watch_wrist", has_accel=False, has_gyro=True
+        "hhar", "phone_waist", has_accel=False, has_gyro=True
     )
     sample = IMUSample(
         data=torch.zeros(120, 6),
@@ -166,6 +163,4 @@ def test_padding_only_accelerometer_is_not_treated_as_physical_gravity():
     assert out.gravity_state is None
     # has_accel=False -> only a gyroscope sensor is advertised; no phantom accelerometer sensor.
     assert len(out.sensor_descriptions) == 1
-    assert "gyroscope" in out.sensor_descriptions[0].lower()
-    assert "recorded without an accelerometer" in out.sensor_descriptions[0].lower()
-    assert any("gyroscope" in s.lower() for s in out.sensor_descriptions)
+    assert out.sensor_descriptions == ["a phone located at the waist"]

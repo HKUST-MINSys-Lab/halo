@@ -1,12 +1,13 @@
-"""Tests for factored text conditioning (docs/design/TEXT_CONDITIONING.md).
+"""Tests for factored text conditioning and acquisition-conditioning-v2.
 
 The refactor splits the tokenizer's per-channel placement-repeating text into:
-  * per-CHANNEL role text (axis/modality only), and
-  * per-SENSOR identity text (device/placement/gravity), broadcast to that sensor's channels.
+  * per-CHANNEL role text (axis only),
+  * per-SENSOR natural text (device role and placement only), and
+  * exact structured modality, gravity, and rate fields.
 
 These tests pin the properties that make the change safe and honest: the sensor identity really is
-broadcast by ``sensor_id``; the two sources are summed (no double-injection); the gated residual is
-do-no-harm / ablatable at init; and the legacy per-channel path is byte-for-byte unchanged.
+broadcast by ``sensor_id``; independent residual branches avoid double-injection; and the legacy
+per-channel path remains reconstructible for old checkpoints.
 """
 
 import numpy as np
@@ -27,11 +28,11 @@ def test_role_text_is_axis_only_and_sensor_text_carries_device_placement():
     for r in role:
         assert r in {"x", "y", "z"}, f"role must be axis-only, got {r!r}"
     accel_s, gyro_s = sensor
-    assert "accelerometer" in accel_s and "gyroscope" in gyro_s
+    assert accel_s == gyro_s
     for s in sensor:
         assert "wrist" in s and "watch" in s          # placement + device on each sensor
         assert "axis" not in s                        # axis lives only in the role text
-    assert "gravity" in accel_s and "gravity" not in gyro_s   # gravity rides on accel only
+        assert all(word not in s for word in ("accelerometer", "gyroscope", "gravity", "hz"))
 
 
 def test_role_text_is_constant_across_streams_sensor_text_is_not():
@@ -47,9 +48,8 @@ def test_accel_only_stream_advertises_one_sensor_with_gravity_state():
         gravity_removed=True,
     )
     assert len(sensor) == 1                            # no phantom gyroscope sensor
-    assert "accelerometer" in sensor[0]
-    assert "recorded without a gyroscope" in sensor[0]
-    assert "gravity removed" in sensor[0]
+    assert "watch" in sensor[0] and "wrist" in sensor[0]
+    assert "accelerometer" not in sensor[0] and "gravity" not in sensor[0]
     assert sensor_id == [0, 0, 0, 0, 0, 0]             # every slot -> the single accel sensor
 
 
@@ -62,9 +62,11 @@ def test_eval_encoding_builds_factored_text_from_actual_channel_mask():
 
         def __init__(self):
             self.sensor_texts = None
+            self.kwargs = None
 
         def __call__(self, patches, rates, patch_len, role_texts, positions, **kwargs):
             self.sensor_texts = kwargs["sensor_texts"]
+            self.kwargs = kwargs
             return {"pooled": torch.zeros(len(patches), 4)}
 
     enc = SpyEncoder()
@@ -80,10 +82,11 @@ def test_eval_encoding_builds_factored_text_from_actual_channel_mask():
         stream="watch_wrist",
     )
     text = enc.sensor_texts[0][0]
-    assert "accelerometer" in text
-    assert "recorded without a gyroscope" in text
-    assert "gravity removed" in text
+    assert "watch" in text and "wrist" in text
+    assert all(word not in text for word in ("accelerometer", "gyroscope", "gravity", "hz"))
     assert len(enc.sensor_texts[0]) == 1               # acc-only mask -> one advertised sensor
+    assert enc.kwargs["sensor_modality"].tolist() == [[0], [0]]
+    assert enc.kwargs["sensor_gravity"].tolist() == [[1], [1]]
 
 
 # ------------------------------------------------------------------------------------ the pooler

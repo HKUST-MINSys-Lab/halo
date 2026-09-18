@@ -162,8 +162,12 @@ Two evaluation regimes are retained:
    report equal-weight normalized fusion and the released native method where one exists.
 2. **Deployment-scenario evaluation:** partial enrollment and the six other preregistered
    heterogeneity scenarios use equal-weight normalized fusion as the default external-baseline
-   readout. The active `deployment-scenarios-v4-20260917` roster is partial enrollment, cross
-   placement, cross dataset, missing modality, rate mismatch, new domain, and device-set mismatch.
+   readout, with cosine 1-NN always emitted beside every enrolled fusion row. HALO classifier rows
+   likewise carry the same-encoder cosine 1-NN floor. The active
+   `deployment-scenarios-v5-20260918` roster is partial enrollment, cross placement, cross dataset,
+   missing modality, rate mismatch, MM-Fit new domain, and device-set mismatch (including the
+   MM-Fit composite cell). MobiAct is a separately versioned prospective scope until its official
+   archive is prepared; it never enters the sealed-six aggregate.
    The former compound cold-start scenario is retired because it duplicated these factors.
 
 For both regimes, the classifier-attribution experiment freezes each released baseline encoder,

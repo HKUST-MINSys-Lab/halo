@@ -470,6 +470,9 @@ def _forward(encoder, patches, rate=50.0):
         patch_padding_mask=torch.ones(B, P, dtype=torch.bool),
         sensor_texts=[["accelerometer on the wrist", "gyroscope on the wrist"]] * B,
         sensor_id=torch.tensor([[0, 0, 0, 1, 1, 1]] * B),
+        sensor_modality=torch.tensor([[0, 1]] * B),
+        sensor_gravity=torch.tensor([[0, 3]] * B),
+        sensor_rates_hz=torch.tensor([[[rate, rate], [rate, rate]]] * B),
         source_rate_hz=torch.full((B,), rate),
     )
 

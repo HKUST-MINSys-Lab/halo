@@ -138,6 +138,8 @@ ACTIVE_SCENARIOS = (
     "s6_new_domain",
     "s7_device_set",
 )
+SCENARIO_PROTOCOL = "deployment-scenarios-v5-20260918"
+SCENARIO_RESULT_SCHEMA = "deployment-scenarios-results-v5-20260918"
 EVALUATION_ROOT = Path(__file__).resolve().parent / "evaluations"
 DEFAULT_SHARED_FEATURE_CACHE = EVALUATION_ROOT / f"shared_{FEATURE_CACHE_SCHEMA}"
 _WITHIN_PLAN_CACHE: dict[tuple, tuple] = {}
@@ -911,6 +913,12 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
                 default_baseline_fusion
                 or "equal-weight-normalized-fusion" in (selected_readouts or ())
             )
+            halo_classifier_requested = name == "halo" and halo_has_classifier and (
+                selected_readouts is None or "halo-classifier" in selected_readouts
+            )
+            companion_1nn_required = k > 0 and (
+                baseline_fusion_requested or halo_classifier_requested
+            )
             if name != "halo" and name not in provider_states:
                 provider_states[name] = baselines.REGISTRY[name].setup_features(device)
             query_features, query_fingerprint = _load_or_encode(
@@ -954,21 +962,24 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
                           ), 6), **_native_capabilities(name)}
 
             neighbor_scores = None
-            if k > 0 and (selected_readouts is None or bool(
+            if k > 0 and (companion_1nn_required or selected_readouts is None or bool(
                     {"1nn", "equal-weight-normalized-fusion"} & selected_readouts)):
                 neighbor_scores = classwise_neighbor_scores(
                     features, task.candidates, task.plans, device=device,
                 )
 
             if k > 0:
-                support_readouts = (
-                    # Baselines use the fixed fusion readout as their declared result. Their
-                    # representation-only 1-NN is a HALO development diagnostic, not a baseline
-                    # headline row; request it explicitly when needed.
-                    frozenset() if default_baseline_fusion else
-                    None if selected_readouts is None else
-                    frozenset(selected_readouts & {"1nn", "prototype", "ridge"})
+                # Cosine 1-NN is a mandatory companion whenever a fixed fusion or learned HALO
+                # classifier row is reported. It exposes whether semantic fusion/classification
+                # helps or merely dilutes the underlying representation. Explicit readout subsets
+                # may add prototype/ridge but cannot suppress this fairness control.
+                requested_support = (
+                    {"1nn"} if selected_readouts is None else
+                    set(selected_readouts & {"1nn", "prototype", "ridge"})
                 )
+                if companion_1nn_required:
+                    requested_support.add("1nn")
+                support_readouts = frozenset(requested_support)
                 if support_readouts is None or support_readouts:
                     for readout, predicted in support_only_predictions(
                             features, task.candidates, task.plans, coverage, device=device,
@@ -1169,7 +1180,7 @@ def _run_provenance(argv: list[str], *, device: torch.device, halo_checkpoint: P
     except (OSError, subprocess.CalledProcessError):
         dirty_digest = None
     return {
-        "protocol": "deployment-scenarios-v4-20260917",
+        "protocol": SCENARIO_PROTOCOL,
         "manifest_generator": "numpy-choice-json-fingerprint-v1",
         "argv": argv,
         "git_revision": revision,
@@ -1386,8 +1397,8 @@ def main() -> None:
             "zero-shot-native-or-bridge", "halo-classifier",
         ), default=None,
         help=("optional readout subset for a controlled diagnostic; omitted reports only "
-              "equal-weight normalized fusion for baselines and the deployment classifier for "
-              "HALO"),
+              "equal-weight normalized fusion plus companion cosine 1-NN for baselines, and the "
+              "deployment classifier plus companion cosine 1-NN for HALO"),
     )
     parser.add_argument("--halo-checkpoint", type=Path, default=None)
     parser.add_argument("--k", nargs="+", type=int, default=[0, 1, 2, 4, 8, 16, 32, 64])
@@ -1485,6 +1496,16 @@ def main() -> None:
     task_seconds: list[float] = []
     build_seconds: dict[str, float] = {}
     model_seconds: dict[str, float] = {}
+    _atomic_json(args.out / "run_metadata.json", {
+        "schema": SCENARIO_RESULT_SCHEMA,
+        "complete": False,
+        "status": "running_or_interrupted",
+        "models": list(args.models),
+        "scenarios": list(args.scenarios),
+        "k": ks,
+        "window_seconds": windows,
+        "include_prospective_mobiact": bool(args.include_prospective_mobiact),
+    })
 
     def checkpoint_progress(*, scenario: str | None, k: int | None,
                             window_seconds: float | None, task_done: int = 0,
@@ -1655,8 +1676,9 @@ def main() -> None:
     failed_rows = [row for row in rows if row.get("status") == "failed"]
     complete = not failures and not failed_rows
     _atomic_json(args.out / "run_metadata.json", {
-        "schema": "deployment-scenarios-results-v4-20260918",
+        "schema": SCENARIO_RESULT_SCHEMA,
         "complete": complete,
+        "status": "complete" if complete else "failed",
         "n_rows": len(rows),
         "n_task_failures": len(failures),
         "n_failed_rows": len(failed_rows),

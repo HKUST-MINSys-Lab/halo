@@ -292,6 +292,22 @@ def test_zero_enrollment_does_not_claim_an_acquisition_mismatch():
     assert telemetry["sampler/acquisition_cross_placement_fraction"] == 0.0
 
 
+def test_zero_enrollment_probability_is_not_multiplied_by_infeasible_acquisition_modes():
+    corpus = _corpus(subjects_per_label=8, windows_per_subject=2)
+    episodes, telemetry = draw_batch(
+        corpus, _rng(926), batch_size=400, deployment_matched=True,
+        enrollment_k=(1,), queries_per_support_set=1, windows_per_execution=1,
+        p_gt_present=1.0, label_subset=(2, 4), mode="compatible",
+        same_subject_probability=0.0, semantic_zero_shot=True,
+        acquisition_mix=(0.5, 0.25, 0.25), enrollment_mix=(0.5, 0.25, 0.25),
+        variable_support_probability=0.0,
+    )
+    assert episodes
+    # This synthetic corpus has no within-dataset placement alternative. The old Cartesian
+    # fallback duplicated the zero regime across acquisition modes and yielded about 40% zero.
+    assert telemetry["sampler/enrollment_zero_fraction"] == pytest.approx(0.25, abs=0.06)
+
+
 def test_variable_support_counts_preserve_distinct_executions():
     corpus = _corpus(subjects_per_label=40, windows_per_subject=2)
     episodes, telemetry = draw_batch(

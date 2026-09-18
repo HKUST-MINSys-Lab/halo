@@ -63,7 +63,8 @@ lower, so it is not uniformly better.
 
 ## Classifier Corrections
 
-On the clean mixed panel, relative to each arm's exact neighbor floor:
+On the clean mixed panel, relative to each arm's temperature-0.07 differentiable support vote
+(historically called the "neighbor floor" here; it is not literal cosine 1-NN):
 
 | arm | neighbor accuracy | classifier accuracy | rescue | overturn | net gain |
 |---|---:|---:|---:|---:|---:|
@@ -79,9 +80,11 @@ more correct neighbors and extracts little benefit from the classifier.
 
 ## Decision
 
-- Do not promote or extend the combined perturbation-plus-gate recipe as currently configured.
-- The adaptive gate alone is the best candidate for a longer matched run because it targets the
-  deployment conditions where semantic reasoning is needed and remains close on clean data.
+- This one-panel screen is insufficient to rank the four arms. Do not promote any arm from the
+  table above without replicated paired panel deltas.
+- The adaptive gate's repeatable signals are narrower than the original screen implied: improved
+  partial enrollment and degraded cross placement. Its apparent cross-dataset and zero-enrollment
+  wins were not stable across subsequent panel draws.
 - Modality perturbation is promising for robustness, but separate rate-only and modality-only
   screens should precede any long perturbation run.
 - Explicit metadata tokens remain deferred. The current gate already produces measurable gains in
@@ -99,3 +102,12 @@ generated table is beside it as `.md`. The sampler feasibility audit is in
 - The perturbation arm bundles rate and modality transforms.
 - Selected steps differ because the declared validation rule, rather than the final step, chooses
   each checkpoint.
+
+## 2026-09-18 Replication Correction
+
+A three-panel-seed paired audit showed that most original arm differences were within panel-draw
+variation. The stable directional findings were approximately +4 macro-F1 points for the adaptive
+gate on partial enrollment, -3 on cross placement, and a zero-shot gyro-dropout gain for the
+perturbation arms. The original claim that the gate was a general targeted winner, and that the
+combined arm had an established interaction failure, is withdrawn. The development-panel runner
+now requires at least three panel seeds and reports paired arm-minus-reference deltas.

@@ -14,9 +14,9 @@ Design decisions carried in from the gates:
     signal, sensor, rate, crop, and text transforms remain explicit ablations.
   * Fixed one-second patches by default. Native sampling RATE still varies per sample and true patch
     lengths vary for final partial contexts; the filterbank consumes both explicitly.
-  * Channel role and sensor identity/config come from deployment-policy text. Text augmentation is
-    disabled in the reference recipe; absent channels carry a channel_mask and never fake text
-    confidence.
+  * Axis role plus device/placement text come from deployment policy; exact modality, gravity and
+    rate facts use acquisition-conditioning-v2 structured tensors. Text augmentation is disabled
+    in the reference recipe; absent channels carry a channel_mask and never fake confidence.
 """
 
 from __future__ import annotations
@@ -39,6 +39,16 @@ from data.scripts.curate.deployment_policy import (
 )
 from data.scripts.eda.grid_io import GridRef, discover_grids
 from data.scripts.labels.canonical_labels import canonicalize
+from model.tokenizer.sensor_tokens import (
+    CONDITIONING_SCHEMA_V2,
+    GRAVITY_NOT_APPLICABLE,
+    GRAVITY_PRESENT,
+    GRAVITY_REMOVED,
+    GRAVITY_UNKNOWN,
+    MODALITY_ACCELEROMETER,
+    MODALITY_GYROSCOPE,
+    LEGACY_CONDITIONING_SCHEMA,
+)
 
 # ----------------------------------------------------------------------------------------------
 # Corpus configuration
@@ -311,6 +321,40 @@ def _pad_sensor_rows(batch: list[dict], key: str, width: int | None = None) -> t
     return out
 
 
+def _attach_conditioning_metadata(out: dict, batch: list[dict]) -> None:
+    """Attach conditioning-v2 fields when present, rejecting partially populated batches.
+
+    The collators also serve channel-granularity baselines and small frontend unit tests that do
+    not consume sensor metadata. Keeping the fields optional here preserves that generic surface;
+    the v2 HALO encoder itself requires all three and fails before use if they are absent.
+    """
+    keys = ("sensor_modality", "sensor_gravity", "sensor_rates_hz")
+    present = [[item.get(key) is not None for item in batch] for key in keys]
+    if any(any(rows) and not all(rows) for rows in present):
+        raise ValueError("conditioning-v2 metadata must be populated for every row or no rows")
+    if any(all(rows) for rows in present) and not all(all(rows) for rows in present):
+        raise ValueError("conditioning-v2 requires modality, gravity and rates together")
+    if all(all(rows) for rows in present):
+        for key in keys:
+            value = _pad_sensor_rows(batch, key)
+            if value is None:
+                raise RuntimeError(f"failed to collate conditioning-v2 field {key!r}")
+            out[key] = value
+
+
+def _merge_conditioning_metadata(out: dict, items: Sequence[dict]) -> None:
+    """Concatenate per-device conditioning rows into one composite recording."""
+    keys = ("sensor_modality", "sensor_gravity", "sensor_rates_hz")
+    present = [[item.get(key) is not None for item in items] for key in keys]
+    if any(any(rows) and not all(rows) for rows in present):
+        raise ValueError("conditioning-v2 metadata must be populated for every device or no devices")
+    if any(all(rows) for rows in present) and not all(all(rows) for rows in present):
+        raise ValueError("conditioning-v2 requires modality, gravity and rates together")
+    if all(all(rows) for rows in present):
+        for key in keys:
+            out[key] = torch.cat([torch.as_tensor(item[key]) for item in items], dim=0)
+
+
 def _pad_channel_rows(batch: list[dict], key: str, *, value=0) -> torch.Tensor | None:
     """Pad a ragged per-channel tensor; composite recordings may carry more than six slots."""
     if key not in batch[0] or batch[0][key] is None:
@@ -336,68 +380,95 @@ def stream_sensor_texts(
     has_accel: bool = True,
     has_gyro: bool = True,
     neutral: bool = False,
+    conditioning_schema: str = CONDITIONING_SCHEMA_V2,
 ) -> tuple[list[str], list[str], list[int]]:
-    """Factored config text for a stream (docs/design/TEXT_CONDITIONING.md).
+    """Runtime device/placement text for each present modality-level sensor.
 
     Accel and gyro are modelled as two distinct modality-level SENSORS, so a stream factors as:
       * ``role_texts``  — one string per CHANNELS slot, AXIS ONLY ("x"/"y"/"z"); corpus-constant.
-      * ``sensor_texts``— one string per PRESENT modality: ``[accel_sensor, gyro_sensor]`` when the
-                          stream carries both, each with device + modality + placement (the gravity
-                          convention rides on the ACCEL sensor only — the gyroscope has no gravity
-                          component). An accel-only stream (capture24, unimib_shar) emits just
-                          ``[accel_sensor]`` — no phantom gyroscope; the ragged sensor count is padded
-                          by encode_texts_factored.
+      * ``sensor_texts``— one device/placement sentence per PRESENT modality. Co-located accel and
+                          gyro intentionally receive the same sentence; modality, gravity and rate
+                          are exact structured fields under acquisition-conditioning-v2.
       * ``sensor_id``   — length-6 map: accel channels -> the accel sensor's index, gyro channels ->
                           the gyro sensor's index. Absent-modality channels are ``channel_mask``-masked
                           and pool to nothing, so their id only needs to be a valid index.
 
-    Placement/device/modality live ONLY in the sensor text and axis ONLY in the role text, so no config
-    fact is injected twice when the two are summed (the compounding hazard of §6).
+    Dataset, subject, activity, modality, gravity and rate must never enter this text.
     """
+    if conditioning_schema not in {CONDITIONING_SCHEMA_V2, LEGACY_CONDITIONING_SCHEMA}:
+        raise ValueError(f"unsupported conditioning schema {conditioning_schema!r}")
     role_texts = [_CHANNEL_ROLE_TEXT[c] for c in CHANNELS]
-    try:
-        from data.scripts.curate.deployment_policy import get_stream_spec
-        spec = get_stream_spec(dataset, stream)
-        place = spec.placement if spec.placement.startswith(("the ", "a ", "an ", "smart")) \
-            else f"the {spec.placement}"
-        device = _DEVICE_WORDS.get(spec.device_profile, spec.device_profile.replace("_", " "))
-        stream_gravity_removed = (spec.gravity_state == "removed")
-    except (KeyError, ValueError, ImportError):
-        tokens = stream.lower().split("_")
-        device = "phone" if "phone" in tokens else ("watch" if "watch" in tokens else "device")
-        place = next((PLACEMENT_WORDS[w] for w in tokens if w in PLACEMENT_WORDS), "the body")
-        stream_gravity_removed = False
-    removed = stream_gravity_removed if gravity_removed is None else bool(gravity_removed)
-    grav = "gravity removed" if removed else "includes gravity"
+    from data.scripts.curate.deployment_policy import get_stream_spec
+    spec = get_stream_spec(dataset, stream)
+    if spec.device_profile not in _DEVICE_WORDS:
+        raise ValueError(
+            f"{dataset}/{stream} has non-runtime device profile {spec.device_profile!r}; "
+            "register a supported runtime device role before using it with HALO"
+        )
+    place = spec.placement if spec.placement.startswith(("the ", "a ", "an ", "smart")) \
+        else f"the {spec.placement}"
+    device = _DEVICE_WORDS[spec.device_profile]
     if neutral:
-        # PARITY ARM — see stream_channel_descriptions. Modality survives (it is sensor IDENTITY, and
-        # the masked-sensor objective needs it to know what it must reconstruct); device, placement
-        # and gravity state do not (they are acquisition CONFIG, the thing under test).
-        accel_sensor, gyro_sensor = "an accelerometer", "a gyroscope"
+        device_placement = "a device at an unspecified placement"
     else:
-        accel_context = (
-            "recorded alongside a gyroscope" if has_gyro else "recorded without a gyroscope"
-        )
-        gyro_context = (
-            "recorded alongside an accelerometer" if has_accel else "recorded without an accelerometer"
-        )
-        accel_sensor = f"a {device} accelerometer on {place}; {grav}; {accel_context}"
-        gyro_sensor = f"a {device} gyroscope on {place}; {gyro_context}"
+        device_placement = f"a {device} located at {place}"
+    if conditioning_schema == LEGACY_CONDITIONING_SCHEMA:
+        removed = (spec.gravity_state == "removed") if gravity_removed is None \
+            else bool(gravity_removed)
+        gravity = "gravity removed" if removed else "includes gravity"
+        if neutral:
+            accel_text, gyro_text = "an accelerometer", "a gyroscope"
+        else:
+            accel_partner = (
+                "recorded alongside a gyroscope" if has_gyro else "recorded without a gyroscope"
+            )
+            gyro_partner = (
+                "recorded alongside an accelerometer" if has_accel
+                else "recorded without an accelerometer"
+            )
+            accel_text = f"a {device} accelerometer on {place}; {gravity}; {accel_partner}"
+            gyro_text = f"a {device} gyroscope on {place}; {gyro_partner}"
+    else:
+        accel_text = gyro_text = device_placement
     # Emit only the modalities actually present. Absent-modality channels are channel_mask-masked, so
     # their sensor_id just needs to stay a valid index into sensor_texts.
     sensor_texts: list[str] = []
     accel_id = gyro_id = 0
     if has_accel:
         accel_id = len(sensor_texts)
-        sensor_texts.append(accel_sensor)
+        sensor_texts.append(accel_text)
     if has_gyro:
         gyro_id = len(sensor_texts)
-        sensor_texts.append(gyro_sensor)
+        sensor_texts.append(gyro_text)
     if not sensor_texts:                     # defensive: neither modality flagged present
-        sensor_texts.append(accel_sensor)
-        accel_id = gyro_id = 0
+        raise ValueError(f"{dataset}/{stream} has neither accelerometer nor gyroscope")
     sensor_id = [accel_id if c.startswith("acc") else gyro_id for c in CHANNELS]
     return role_texts, sensor_texts, sensor_id
+
+
+def structured_sensor_metadata(
+    *, has_accel: bool, has_gyro: bool, gravity_state: str | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return modality and gravity IDs in the same order as ``stream_sensor_texts``."""
+    modalities: list[int] = []
+    gravity: list[int] = []
+    if has_accel:
+        state = {
+            "present": GRAVITY_PRESENT,
+            "removed": GRAVITY_REMOVED,
+            "unknown": GRAVITY_UNKNOWN,
+            None: GRAVITY_UNKNOWN,
+        }.get(gravity_state)
+        if state is None:
+            raise ValueError(f"invalid accelerometer gravity state {gravity_state!r}")
+        modalities.append(MODALITY_ACCELEROMETER)
+        gravity.append(state)
+    if has_gyro:
+        modalities.append(MODALITY_GYROSCOPE)
+        gravity.append(GRAVITY_NOT_APPLICABLE)
+    if not modalities:
+        raise ValueError("a stream must contain accelerometer or gyroscope")
+    return torch.tensor(modalities, dtype=torch.long), torch.tensor(gravity, dtype=torch.long)
 
 
 _GRAVITY_STATE_CACHE: dict[tuple[str, str], str | None] = {}
@@ -707,6 +778,7 @@ class PretrainDataset(Dataset):
                  augmentation_config: AugmentationConfig | None = None,
                  rotation_pairing: str = "shared",
                  neutral_acquisition_text: bool = False,
+                 conditioning_schema: str = CONDITIONING_SCHEMA_V2,
                  multi_device_probability: float = 0.0,
                  max_devices: int = 4):
         self.index = index
@@ -714,6 +786,9 @@ class PretrainDataset(Dataset):
         self.two_view = two_view
         self.augment_enabled = bool(augment)
         self.neutral_acquisition_text = bool(neutral_acquisition_text)
+        if conditioning_schema not in {CONDITIONING_SCHEMA_V2, LEGACY_CONDITIONING_SCHEMA}:
+            raise ValueError(f"unsupported conditioning schema {conditioning_schema!r}")
+        self.conditioning_schema = conditioning_schema
         if not 0.0 <= multi_device_probability <= 1.0:
             raise ValueError("multi_device_probability must be in [0,1]")
         if max_devices < 2:
@@ -813,6 +888,7 @@ class PretrainDataset(Dataset):
             ref.dataset, ref.stream,
             has_accel=bool(any(ref.mask[:3])), has_gyro=bool(any(ref.mask[3:])),
             neutral=self.neutral_acquisition_text,
+            conditioning_schema=getattr(self, "conditioning_schema", CONDITIONING_SCHEMA_V2),
         )
         return IMUSample(
             data=window,
@@ -869,6 +945,7 @@ class PretrainDataset(Dataset):
         sensor_texts_out = list(sample.sensor_descriptions or ())
         if not sensor_texts_out:
             raise ValueError("an augmented Phase-A sample has no sensor description")
+        modality, gravity = self._structured_fields(sample, len(sensor_texts_out))
         return {
             "data": data6,                                # (T', 6) canonical slots
             "rate": float(sample.sampling_rate),
@@ -882,6 +959,12 @@ class PretrainDataset(Dataset):
             "role_texts": role_texts6,
             "sensor_texts": sensor_texts_out,
             "sensor_id": sensor_id6,
+            "sensor_modality": modality,
+            "sensor_gravity": gravity,
+            "sensor_rates_hz": torch.tensor(
+                [[float(sample.sampling_rate), source_rate]] * len(sensor_texts_out),
+                dtype=torch.float32,
+            ),
             "device_id": torch.zeros(len(sensor_texts_out), dtype=torch.long),
             # Placement group id per sensor. The sensor-mask JEPA objective uses this to refuse
             # cross-placement prediction; within one stream every sensor shares a placement, so
@@ -904,6 +987,7 @@ class PretrainDataset(Dataset):
             f"{ref.dataset}/{ref.stream}", float(ref.rate_hz),
         )
         source_rate = min(float(hardware_rate), float(sample.sampling_rate))
+        modality, gravity = self._structured_fields(sample, len(sensor_texts))
         return {
             "data": sample.data,
             "rate": float(sample.sampling_rate),
@@ -914,12 +998,50 @@ class PretrainDataset(Dataset):
             "role_texts": list(sample.role_descriptions or (_CHANNEL_ROLE_TEXT[c] for c in CHANNELS)),
             "sensor_texts": sensor_texts,
             "sensor_id": torch.as_tensor(sample.sensor_id, dtype=torch.long),
+            "sensor_modality": modality,
+            "sensor_gravity": gravity,
+            "sensor_rates_hz": torch.tensor(
+                [[float(sample.sampling_rate), source_rate]] * len(sensor_texts),
+                dtype=torch.float32,
+            ),
             "device_id": torch.zeros(len(sensor_texts), dtype=torch.long),
             "sensor_placement": torch.zeros(len(sensor_texts), dtype=torch.long),
             "channel_mask": torch.as_tensor(sample.channel_mask, dtype=torch.bool),
             "gravity_state": sample.gravity_state,
             "augmentations": (),
         }
+
+    @staticmethod
+    def _structured_fields(sample: IMUSample, n_sensors: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Derive exact modality IDs after any channel dropout/config augmentation."""
+        if sample.sensor_id is None:
+            raise ValueError("sensor_id is required for conditioning-v2 metadata")
+        live = (sample.channel_mask if sample.channel_mask is not None
+                else [True] * len(sample.channel_names))
+        if len(live) != len(sample.channel_names):
+            raise ValueError("channel_mask must align with channel_names")
+        modality = []
+        for sensor in range(n_sensors):
+            names = [name for name, owner, exists in zip(
+                sample.channel_names, sample.sensor_id, live,
+            ) if bool(exists) and int(owner) == sensor]
+            kinds = {"accel" if name.startswith("acc_") else "gyro" if name.startswith("gyro_")
+                     else "unsupported" for name in names}
+            if kinds == {"accel"}:
+                modality.append(MODALITY_ACCELEROMETER)
+            elif kinds == {"gyro"}:
+                modality.append(MODALITY_GYROSCOPE)
+            else:
+                raise ValueError(f"sensor {sensor} has unsupported or mixed modality channels {names}")
+        gravity = [
+            ({"present": GRAVITY_PRESENT, "removed": GRAVITY_REMOVED,
+              "unknown": GRAVITY_UNKNOWN, None: GRAVITY_UNKNOWN}.get(sample.gravity_state)
+             if kind == MODALITY_ACCELEROMETER else GRAVITY_NOT_APPLICABLE)
+            for kind in modality
+        ]
+        if any(value is None for value in gravity):
+            raise ValueError(f"invalid accelerometer gravity state {sample.gravity_state!r}")
+        return torch.tensor(modality, dtype=torch.long), torch.tensor(gravity, dtype=torch.long)
 
     def _can_use_plain_sample(self) -> bool:
         """Return whether the current, possibly test-overridden augmenters are no-ops."""
@@ -1267,7 +1389,7 @@ def merge_device_items(items: Sequence[dict]) -> dict:
     sensor_texts = [text for item in items for text in item.get("sensor_texts", ())]
     target_texts = [text for item in items
                     for text in item.get("sensor_target_texts", item.get("sensor_texts", ()))]
-    return {
+    out = {
         **first,
         "data": torch.cat([torch.as_tensor(item["data"]) for item in items], dim=1),
         "texts": [text for item in items for text in item["texts"]],
@@ -1298,6 +1420,8 @@ def merge_device_items(items: Sequence[dict]) -> dict:
         "stream": "+".join(str(item.get("stream", "?")) for item in items),
         "augmentations": tuple(value for item in items for value in item.get("augmentations", ())),
     }
+    _merge_conditioning_metadata(out, items)
+    return out
 
 
 def _physical_patch_bounds(num_samples: int, rate_hz: float,
@@ -1446,6 +1570,7 @@ class MultiScaleCollate:
                       "patch_durations", "patch_starts", "patch_ends", "resolution_ids",
                       "resolution_count", "texts",
                       "role_texts", "sensor_texts", "sensor_target_texts", "sensor_id",
+                      "sensor_modality", "sensor_gravity", "sensor_rates_hz",
                       "device_id",
                       "sensor_placement",
                       "channel_mask", "patch_padding_mask", "augmentations"):
@@ -1540,6 +1665,7 @@ class MultiScaleCollate:
         # datasets omit it, so no source-specific statistics enter or burden the training path.
         if "sensor_bias" in batch[0]:
             out["sensor_bias"] = _pad_sensor_rows(batch, "sensor_bias")
+        _attach_conditioning_metadata(out, batch)
         return out
 
 
@@ -1624,6 +1750,7 @@ class MultiResolutionCollate:
             for k in ("patches", "patch_len", "rates", "source_rates", "channel_source_rates", "positions", "patch_durations",
                       "resolution_ids", "texts", "role_texts", "sensor_texts",
                       "sensor_target_texts", "sensor_id",
+                      "sensor_modality", "sensor_gravity", "sensor_rates_hz",
                       "device_id",
                       "sensor_placement",
                       "channel_mask", "patch_padding_mask", "augmentations"):
@@ -1774,4 +1901,5 @@ class MultiResolutionCollate:
             out["compact_lengths"] = compact_lengths
         if "sensor_bias" in batch[0]:
             out["sensor_bias"] = _pad_sensor_rows(batch, "sensor_bias")
+        _attach_conditioning_metadata(out, batch)
         return out

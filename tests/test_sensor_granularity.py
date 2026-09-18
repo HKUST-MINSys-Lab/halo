@@ -18,6 +18,8 @@ from __future__ import annotations
 import torch
 
 from model.tokenizer.sensor_tokens import (
+    GRAVITY_NOT_APPLICABLE, GRAVITY_PRESENT,
+    MODALITY_ACCELEROMETER, MODALITY_GYROSCOPE,
     ConditioningProjection, DescriptorHead, SensorFold, descriptor_retrieval_loss,
 )
 from training.tokenizer.losses_repr import make_sensor_mask_plan
@@ -26,6 +28,19 @@ from training.tokenizer.pretrain_data import SENSOR_BIAS_DIM
 
 D = 32
 SEED = 20260811
+
+
+def _conditioning(batch: int, *, accel_only: bool = False, rate: float = 50.0) -> dict:
+    modalities = [MODALITY_ACCELEROMETER]
+    gravity = [GRAVITY_PRESENT]
+    if not accel_only:
+        modalities.append(MODALITY_GYROSCOPE)
+        gravity.append(GRAVITY_NOT_APPLICABLE)
+    return {
+        "sensor_modality": torch.tensor([modalities] * batch),
+        "sensor_gravity": torch.tensor([gravity] * batch),
+        "sensor_rates_hz": torch.tensor([[[rate, rate]] * len(modalities)] * batch),
+    }
 
 
 # ----------------------------------------------------------------------------- SensorFold
@@ -255,7 +270,7 @@ def test_sensor_encoder_forward_shapes_and_masking():
 
     with torch.no_grad():
         out = enc(patches, 50.0, N_TRUE, role, pos, channel_mask=cm, sensor_texts=sensor_texts,
-                  sensor_id=sid, sensor_bias=bias)
+                  sensor_id=sid, sensor_bias=bias, **_conditioning(B))
     assert out["tokens"].shape == (B, P, 2, 64)          # per SENSOR, not per channel
     assert out["descriptor"].shape == (B, 2, 384)
     assert out["descriptor_pred"].shape == (B, 2, 384)
@@ -267,7 +282,7 @@ def test_sensor_encoder_forward_shapes_and_masking():
         masked = enc(patches, 50.0, N_TRUE, role, pos, channel_mask=cm,
                      sensor_texts=sensor_texts, sensor_id=sid, sensor_bias=bias,
                      token_mask=token_mask,
-                     descriptor_mask=torch.tensor([[True, False]] * B))
+                     descriptor_mask=torch.tensor([[True, False]] * B), **_conditioning(B))
     assert not torch.allclose(out["pooled"], masked["pooled"])
 
 
@@ -338,7 +353,8 @@ def test_sensor_encoder_handles_accel_only_streams():
                   channel_mask=cm,
                   sensor_texts=[["a watch accelerometer on the wrist; includes gravity"]] * B,
                   sensor_id=torch.zeros(B, C, dtype=torch.long),
-                  sensor_bias=torch.randn(B, 1, SENSOR_BIAS_DIM))
+                  sensor_bias=torch.randn(B, 1, SENSOR_BIAS_DIM),
+                  **_conditioning(B, accel_only=True))
     assert out["tokens"].shape == (B, P, 1, 64)
     assert out["sensor_present"].all()
 
@@ -366,12 +382,14 @@ def test_retrieval_rows_are_sensor_isolated():
             patches, channel_mask=torch.ones(2, 6, dtype=torch.bool),
             sensor_texts=[["accelerometer at wrist", "gyroscope at wrist"]] * 2,
             sensor_id=sensor_id,
+            **_conditioning(2),
             **common,
         )
         accel = enc(
             patches, channel_mask=torch.tensor([[1, 1, 1, 0, 0, 0]] * 2).bool(),
             sensor_texts=[["accelerometer at wrist"]] * 2,
             sensor_id=torch.zeros(2, 6, dtype=torch.long),
+            **_conditioning(2, accel_only=True),
             **common,
         )
     assert torch.allclose(
@@ -398,6 +416,7 @@ def test_retrieval_only_shortcut_matches_full_forward_rows():
         patch_padding_mask=torch.ones(2, 3, dtype=torch.bool),
         sensor_texts=[["accelerometer at wrist", "gyroscope at wrist"]] * 2,
         sensor_id=torch.tensor([[0, 0, 0, 1, 1, 1]] * 2),
+        **_conditioning(2),
     )
     with torch.no_grad():
         full = enc(patches, **kwargs)
@@ -440,6 +459,7 @@ def test_multiresolution_sensor_pooling_is_duration_weighted():
             sensor_texts=[["accelerometer at wrist", "gyroscope at wrist"]],
             sensor_id=torch.tensor([[0, 0, 0, 1, 1, 1]]),
             sensor_bias=torch.randn(B, 2, SENSOR_BIAS_DIM),
+            **_conditioning(B),
         )
     per_patch = out["per_patch"]
     short = (per_patch[:, :2] * durations[:, :2, None]).sum(1) / durations[:, :2].sum(1, keepdim=True)

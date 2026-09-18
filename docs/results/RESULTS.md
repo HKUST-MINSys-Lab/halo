@@ -3,10 +3,11 @@
 This is the promoted result record for the current support-conditioned HAR design. Retired
 future-JEPA variants are archived separately and are not mixed into this table.
 
-> **Protocol boundary (2026-09-16):** historical tables retain their original artifacts but must
-> not be extended with new checkpoints. Current runs use `deployment-scenarios-v4-20260917` and
+> **Protocol boundary (2026-09-18):** historical tables retain their original artifacts but must
+> not be extended with new checkpoints. New runs use `deployment-scenarios-v5-20260918` and
 > `sealed-manifest-v2-20260916`, with the restored NumPy manifest draw, corrected k=0 filtering,
-> and current sampler. Matched comparisons must re-score every checkpoint under one protocol.
+> independent enrollment/acquisition sampler, and mandatory companion cosine 1-NN rows. Matched
+> comparisons must re-score every checkpoint under one protocol. The v4 table below is historical.
 
 ## Representative scenario protocol - 2026-09-17
 

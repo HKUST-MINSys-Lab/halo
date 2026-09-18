@@ -50,7 +50,7 @@ from model.tokenizer.encoder import SetTokenizerEncoder
 from model.tokenizer.continuous_kernel import ContinuousKernelTokenizer
 from model.tokenizer.filterbank import PhysicalFilterbankTokenizer
 from model.tokenizer.multispan_kernel import MS_FRAME_RATE_HZ, multispan_frame_count
-from model.tokenizer.sensor_tokens import descriptor_retrieval_loss
+from model.tokenizer.sensor_tokens import CONDITIONING_SCHEMA_V2, descriptor_retrieval_loss
 from training.tokenizer.losses_repr import (
     MASK_RATIO_TIME,
     make_mask_plan,
@@ -221,6 +221,7 @@ class PretrainConfig:
     # Retained in checkpoint metadata solely to reconstruct legacy encoders that used the artifact.
     sensor_bias_dim: int = 14
     use_sensor_bias_conditioning: bool = False
+    conditioning_schema: str = CONDITIONING_SCHEMA_V2
     use_sensor_isolated_retrieval: bool = True
     descriptor_weight: float = 0.0        # explicit ablation; default JEPA predicts signal latents only
     gate_bias_init: float = -2.0          # factored fusion identity-gate bias at init (sigma~=0.12)
@@ -430,6 +431,7 @@ class PipelineAModel(nn.Module):
             token_granularity=cfg.token_granularity,
             sensor_bias_dim=cfg.sensor_bias_dim,
             use_sensor_bias_conditioning=cfg.use_sensor_bias_conditioning,
+            conditioning_schema=cfg.conditioning_schema,
             use_sensor_isolated_retrieval=cfg.use_sensor_isolated_retrieval,
             gate_bias_init=cfg.gate_bias_init,
             # Center time alone cannot distinguish overlapping tokens with different physical
@@ -1172,6 +1174,12 @@ def embed_stratified(model: PipelineAModel, loader: DataLoader, device, per_labe
                     patch_padding_mask=batch["patch_padding_mask"].to(device, non_blocking=True),
                     sensor_texts=(batch["sensor_texts"] if factored else None),
                     sensor_id=(batch["sensor_id"].to(device, non_blocking=True) if factored else None),
+                    sensor_modality=(batch["sensor_modality"].to(device, non_blocking=True)
+                                     if sensor_granularity else None),
+                    sensor_gravity=(batch["sensor_gravity"].to(device, non_blocking=True)
+                                    if sensor_granularity else None),
+                    sensor_rates_hz=(batch["sensor_rates_hz"].to(device, non_blocking=True)
+                                     if sensor_granularity else None),
                     source_rate_hz=source_rates,
                     sensor_bias=(batch["sensor_bias"].to(device, non_blocking=True)
                                  if sensor_granularity and "sensor_bias" in batch else None),
@@ -1290,8 +1298,8 @@ def main() -> None:
                         help="future = past-only multi-horizon predictive objective (default); "
                              "masked = historical bidirectional masked-JEPA + VICReg control")
     parser.add_argument("--neutral-acquisition-text", action="store_true", default=None,
-                        help="IMWUT Arm A: strip device/placement/gravity from the conditioning "
-                             "text so the encoder is never told the acquisition configuration")
+                        help="strip device/placement language; exact modality, gravity and rate "
+                             "fields remain available under acquisition-conditioning-v2")
     parser.add_argument("--text-conditioning", choices=("per_channel", "factored"), default=None,
                         help="config-text conditioning (docs/design/TEXT_CONDITIONING.md §4b). "
                              "'per_channel' = one description per channel; 'factored' (the CLI "
@@ -1982,11 +1990,13 @@ def main() -> None:
         index, index.train, augment=True, two_view=two_view,
         augmentation_config=augmentation_cfg, rotation_pairing=cfg.rotation_pairing,
         neutral_acquisition_text=cfg.neutral_acquisition_text,
+        conditioning_schema=cfg.conditioning_schema,
     )
     calibration_ds = PretrainDataset(
         index, index.train, augment=True, two_view=False,
         augmentation_config=augmentation_cfg, rotation_pairing=cfg.rotation_pairing,
         neutral_acquisition_text=cfg.neutral_acquisition_text,
+        conditioning_schema=cfg.conditioning_schema,
     )
     # Preselecting keeps evaluation cheap. The helper covers every label/stream cell before filling
     # additional slots, preventing a large source from monopolizing a common label's cap.
@@ -1999,8 +2009,11 @@ def main() -> None:
         allowed_labels=semantic_label_ids,
     )
     has_internal_classification_probe = bool(val_keys)
-    val_ds = PretrainDataset(index, val_keys, augment=False,
-                             neutral_acquisition_text=cfg.neutral_acquisition_text)
+    val_ds = PretrainDataset(
+        index, val_keys, augment=False,
+        neutral_acquisition_text=cfg.neutral_acquisition_text,
+        conditioning_schema=cfg.conditioning_schema,
+    )
     fixed_train_durations = (cfg.future_patch_durations if cfg.jepa_mode == "future" else None)
     train_collate = (MultiResolutionCollate(
         short_choices=cfg.short_patch_choices, long_choices=cfg.long_patch_choices,
@@ -2129,7 +2142,9 @@ def main() -> None:
 
     train_eval_gen = torch.Generator().manual_seed(cfg.data_seed)
     train_eval_loader = DataLoader(
-        PretrainDataset(index, train_keys, augment=False), batch_size=256,
+        PretrainDataset(
+            index, train_keys, augment=False, conditioning_schema=cfg.conditioning_schema,
+        ), batch_size=256,
         shuffle=False, collate_fn=val_collate, generator=train_eval_gen,
         num_workers=val_workers, persistent_workers=val_workers > 0,
         pin_memory=device.type == "cuda", worker_init_fn=_seed_worker,
@@ -2452,6 +2467,12 @@ def main() -> None:
         sensor_granularity = cfg.token_granularity == "sensor"
         sid_b = (batch["sensor_id_b"].to(device, non_blocking=True)
                  if sensor_granularity else None)
+        modality_b = (batch["sensor_modality_b"].to(device, non_blocking=True)
+                      if sensor_granularity else None)
+        gravity_b = (batch["sensor_gravity_b"].to(device, non_blocking=True)
+                     if sensor_granularity else None)
+        sensor_rates_b = (batch["sensor_rates_hz_b"].to(device, non_blocking=True)
+                          if sensor_granularity else None)
         tokens_b = model.encoder.tokenize(
             p_b, r_b, pl_b,
             channel_mask=cmask_b,
@@ -2479,7 +2500,10 @@ def main() -> None:
                                     sensor_text_embs=ste_b, sensor_text_masks=stm_b,
                                     sensor_descriptors=sensor_descriptors_b,
                                     sensor_id=sid_b, role_text_ids=role_ids_b,
-                                    sensor_text_ids=sensor_text_ids_b)
+                                    sensor_text_ids=sensor_text_ids_b,
+                                    sensor_modality=modality_b,
+                                    sensor_gravity=gravity_b,
+                                    sensor_rates_hz=sensor_rates_b)
 
     # Keep conditioning/folding eager and compile the stable transformer core. Install runtime
     # callables rather than wrapping modules so state_dict keys remain identical.
@@ -2619,6 +2643,11 @@ def main() -> None:
                 augmentation_counts.update(names)
 
         sensor_granularity = cfg.token_granularity == "sensor"
+        conditioning_kwargs = ({
+            "sensor_modality": batch["sensor_modality"].to(device, non_blocking=True),
+            "sensor_gravity": batch["sensor_gravity"].to(device, non_blocking=True),
+            "sensor_rates_hz": batch["sensor_rates_hz"].to(device, non_blocking=True),
+        } if sensor_granularity else {})
         sensor_placement = batch.get("sensor_placement")
         if sensor_placement is not None:
             sensor_placement = sensor_placement.to(device, non_blocking=True)
@@ -2815,6 +2844,7 @@ def main() -> None:
                               sensor_descriptors=sensor_descriptors,
                               sensor_id=enc_sensor_id, role_text_ids=role_text_ids,
                               sensor_text_ids=sensor_text_ids,
+                              **conditioning_kwargs,
                               return_retrieval_tokens=cfg.jepa_mode == "masked")
             z = (model.vicreg_projector(clean["pooled"])
                  if cfg.jepa_mode == "masked" else clean["pooled"])
@@ -2834,6 +2864,7 @@ def main() -> None:
                                    sensor_descriptors=sensor_descriptors,
                                    sensor_id=enc_sensor_id, role_text_ids=role_text_ids,
                                    sensor_text_ids=sensor_text_ids,
+                                   **conditioning_kwargs,
                                    return_retrieval_tokens=False,
                                    **({"descriptor_mask": descriptor_mask}
                                       if sensor_granularity else {}))
@@ -2918,6 +2949,7 @@ def main() -> None:
                         sensor_id=enc_sensor_id,
                         role_text_ids=role_text_ids,
                         sensor_text_ids=sensor_text_ids,
+                        **conditioning_kwargs,
                         return_retrieval_tokens=False,
                         return_layer_states=cfg.jepa_mode == "future",
                         # The teacher consumes the SAME `patches` as view A, so it inherits view A's
@@ -2948,6 +2980,7 @@ def main() -> None:
                         sensor_id=enc_sensor_id,
                         role_text_ids=role_text_ids,
                         sensor_text_ids=sensor_text_ids,
+                        **conditioning_kwargs,
                         return_retrieval_tokens=False,
                         return_layer_states=True,
                     )

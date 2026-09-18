@@ -57,7 +57,7 @@ class ScaleCfg:
 class GravityCfg:
     """P1 — add/remove gravity. Subtracts a low-pass gravity estimate to
     manufacture the iOS `userAcceleration` (gravity-removed) representation the
-    training corpus otherwise lacks; annotates the acc channel text accordingly."""
+    training corpus otherwise lacks; updates the structured gravity state accordingly."""
     enabled: bool = False
     p: float = 0.5
     cutoff_hz: float = 0.4   # gravity is quasi-DC; human motion energy is > ~0.5 Hz
@@ -145,7 +145,7 @@ class ChannelTextDropoutCfg:
 
 @dataclass
 class SensorTextDropoutCfg:
-    """Neutralize per-SENSOR identity text (device/placement/gravity) so the factored model learns
+    """Neutralize per-SENSOR device/placement text so the factored model learns
     to fall back gracefully when config metadata is missing (F7). Distinct from channel-text dropout,
     which only touches the per-channel ROLE text and never the sensor identity. Bounded: with >=2
     sensors it keeps >=1 described; a single-sensor stream may be fully neutralized (the
@@ -153,7 +153,7 @@ class SensorTextDropoutCfg:
     enabled: bool = False
     p: float = 0.1           # fraction of samples that get any sensor-text neutralized
     max_frac: float = 0.5    # never neutralize more than this fraction of a sample's sensors (>=2 case)
-    neutral: str = "an inertial sensor"
+    neutral: str = "a device at an unspecified placement"
     # Share the decision (fire + which sensors) across a window's two VICReg views. MUST stay True
     # for the config-conditional thesis: with independent draws, ~2p(1-p) of positive pairs describe
     # the config in one view and neutralise it in the other, and the invariance term then trains
@@ -175,6 +175,7 @@ _CH_SYNONYMS = [
     (r"\by-axis\b", ["y-axis", "y axis"]),
     (r"\bz-axis\b", ["z-axis", "z axis"]),
     (r"\bmounted\b", ["mounted", "worn", "placed"]),
+    (r"\blocated at\b", ["located at", "positioned at", "placed at"]),
 ]
 _CH_TEMPLATES = ["{}", "channel: {}", "sensor channel — {}", "signal from {}", "this channel measures {}"]
 
@@ -440,30 +441,6 @@ def _mark_gravity_removed(desc: str) -> str:
     return d
 
 
-def _mark_partner_presence(desc: str, *, modality: str, partner_present: bool) -> str:
-    """Keep factored sensor text truthful after modality-level channel dropout."""
-    import re
-
-    if modality == "accel":
-        clause = (
-            "recorded alongside a gyroscope" if partner_present
-            else "recorded without a gyroscope"
-        )
-        partner = r"(?:a\s+)?gyroscope"
-    elif modality == "gyro":
-        clause = (
-            "recorded alongside an accelerometer" if partner_present
-            else "recorded without an accelerometer"
-        )
-        partner = r"(?:an?\s+)?accelerometer"
-    else:
-        return desc
-    pattern = rf"recorded\s+(?:alongside|without)\s+{partner}"
-    if re.search(pattern, desc, flags=re.I):
-        return re.sub(pattern, clause, desc, flags=re.I)
-    return f"{desc.rstrip().rstrip(';')}; {clause}"
-
-
 @contextmanager
 def _shared_draw(seed: int):
     """Seed BOTH module RNGs for the duration, then restore them exactly.
@@ -611,7 +588,6 @@ class IMUAugmenter:
         x = s.data.detach().cpu().numpy().astype(np.float64)
         desc = list(s.channel_descriptions)
         changed = False
-        affected_sensor_ids = set()
         for _loc, triads in self._triads(s.channel_names).items():
             for idxs, gname in triads:
                 if "acc" not in gname:       # only accelerometer carries gravity
@@ -624,20 +600,11 @@ class IMUAugmenter:
                     grav = _sps.filtfilt(b, a, x[:, j])
                     x[:, j] = x[:, j] - grav
                     desc[j] = _mark_gravity_removed(desc[j])
-                    if s.sensor_id is not None:
-                        affected_sensor_ids.add(s.sensor_id[j])
                 changed = True
         if changed:
             s.data = torch.from_numpy(x).float().to(s.data.device)
             s.channel_descriptions = desc
             s.gravity_state = "removed"
-            if s.sensor_descriptions is not None:
-                affected = (affected_sensor_ids if s.sensor_id is not None
-                            else set(range(len(s.sensor_descriptions))))
-                sensor_desc = list(s.sensor_descriptions)
-                for sid in affected:
-                    sensor_desc[sid] = _mark_gravity_removed(sensor_desc[sid])
-                s.sensor_descriptions = sensor_desc
             s.applied_augmentations.append("gravity")
         return s
 
@@ -729,21 +696,6 @@ class IMUAugmenter:
                 remap = {old: new for new, old in enumerate(used)}
                 s.sensor_descriptions = [s.sensor_descriptions[sid] for sid in used]
                 s.sensor_id = [remap[sid] for sid in kept_ids]
-                # The descriptor records whether the encoder saw the partner modality. Once dropout
-                # removes a modality, leaving "recorded alongside ..." would condition the signal on
-                # a sensor that is no longer present. Recompute the clause from surviving channels.
-                has_accel = any(name.startswith("acc") for name in kept_names)
-                has_gyro = any(name.startswith("gyro") for name in kept_names)
-                rewritten = []
-                for sid, description in enumerate(s.sensor_descriptions):
-                    owned = [name for name, owner in zip(kept_names, s.sensor_id) if owner == sid]
-                    modality = "accel" if any(name.startswith("acc") for name in owned) else "gyro"
-                    rewritten.append(_mark_partner_presence(
-                        description,
-                        modality=modality,
-                        partner_present=has_gyro if modality == "accel" else has_accel,
-                    ))
-                s.sensor_descriptions = rewritten
             else:
                 s.sensor_id = kept_ids
         s.applied_augmentations.append("channel_dropout")
@@ -791,9 +743,9 @@ class IMUAugmenter:
             s.applied_augmentations.append("channel_text_dropout")
         return s
 
-    # ---------- text: per-SENSOR identity dropout (device/placement/gravity) ----------
+    # ---------- text: per-SENSOR device/placement dropout ----------
     def _sensor_text_dropout(self, s, spec, rng=_random):
-        # F7: the factored model always saw the full sensor identity, so it never learned to operate
+        # F7: the factored model normally sees device/placement, so it must also learn to operate
         # when placement/device metadata is missing. Neutralize a bounded subset of the per-sensor
         # descriptions: with >=2 sensors keep >=1 described; a single-sensor stream may be fully
         # neutralized (the fully-unconditioned fallback), but that is rare (gated by the low spec.p).

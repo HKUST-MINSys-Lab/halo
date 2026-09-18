@@ -22,9 +22,11 @@ remain on disk for reproducibility but are deliberately omitted.
   modality with a mask, never as a claimed measurement. No per-session min-max normalization is
   allowed. Robust normalization statistics are fitted on the active train corpus only.
 - Native labels are retained in `labels.json`; canonical labels are a controlled vocabulary used
-  only for cross-source comparisons. Acquisition descriptions are generated from versioned
-  `StreamSpec` metadata (device role, placement, modality and gravity state), not hand-written per
-  evaluation row. Evaluation candidate labels remain frozen native labels.
+  only for cross-source comparisons. Acquisition conditioning follows the versioned
+  [schema-v2 contract](../design/ACQUISITION_CONDITIONING_CONTRACT.md): natural language contains
+  device role and placement only, while modality, gravity, and effective source rate are exact
+  structured model inputs. Stored rate is retained for provenance only. Evaluation candidate labels
+  remain frozen native labels.
 - Counts below are **processed session** counts. Duration is the sum of session samples divided by
   the recorded native rate; it is not a claim about raw archive duration. The median is per session.
   Rerun this inventory after rebuilding sessions before changing a protocol claim.
