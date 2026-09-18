@@ -91,3 +91,46 @@ diagnostics, not publication artifacts. Their conclusions and test counts are pe
   from the prepared sealed-six and MM-Fit scenario paths.
 - Existing promoted performance tables were not overwritten with smoke metrics. Fresh results
   need their own checkpoint/protocol provenance and complete manifests.
+
+## Current-code follow-up
+
+After the initial sweep, the active branch received two checkpoint-persistence repairs. A resumed
+run now preserves the closed-form text-projection calibration record (`p_text_init`), and the
+polarization enable flag and energy-gate coefficient are part of the trajectory compatibility
+contract. This prevents run metadata from silently disagreeing with the restored encoder. The
+repairs are commit `8a30afa`.
+
+The exact current residual recipe was then exercised on CUDA for three fresh optimizer steps and
+resumed for a fourth step. Calibration, worker-prefetched episode assembly, mixed-precision
+forward/backward, validation, atomic checkpoint writes, optimizer/RNG restoration, and strict
+encoder/classifier reload all passed. The restored model contains 840,097 encoder parameters and
+1,413,908 classifier parameters. Saved validation metrics were finite, the text calibration record
+survived resume, and the checkpoint retained polarization enabled with kappa 0.05.
+
+All monitored trainable paths had nonzero finite gradients: encoder, classifier, duration
+embedding, acquisition-text conditioner, structured conditioner, and recording pool. Effective
+rank stayed noncollapsed in the three-step probe (50.1--73.4). Early total gradient norms were
+19.7--107.0 and therefore strongly clipped by the declared norm-1.0 guard. Historical 3k and 40k
+runs show the same persistent clipping regime, so this is not a new implementation regression; it
+is a training-design characteristic that must remain visible in telemetry.
+
+The active curriculum audit sampled 256 support sets (969 queries): 46.1% complete, 22.3% partial,
+31.6% zero enrollment; among enrolled sets, 80.0% compatible, 9.7% cross-placement, and 10.3%
+cross-dataset acquisition. It found no cross-placement dataset contamination. The requested
+acquisition mix cannot be fully realized because the eight-source corpus has only four datasets
+with valid within-dataset cross-placement pairs and three with valid cross-dataset acquisition-key
+pairs; fallback was 19.1%. This is a measured corpus limitation, not a sampler leak.
+
+Two model-selection limitations remain explicit rather than silently changed:
+
+- `best_internal.pt` is selected on enrolled-support dataset-macro F1. Zero-support F1 is logged
+  separately but does not participate in selection, even though the shared model is reported in
+  both regimes.
+- internal validation uses deterministic independent multi-device composition, but not the
+  coordinated query/support device-set challenge used during training. The sealed scenario panel
+  measures that challenge only after checkpoint selection.
+
+Neither limitation blocks optimization or checkpoint restoration. Before the next publication
+run, the checkpoint-selection contract should be frozen explicitly: retain the enrolled-primary
+policy and name a zero-support companion checkpoint, or predeclare a joint criterion plus a fixed
+coordinated device-set development panel. Sealed results must never make that choice.

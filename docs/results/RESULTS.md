@@ -17,10 +17,25 @@ duration, and `k={0,1,4,8,32}`. It produced 11,211 rows across 1,132 scored task
 task failures and zero failed rows. Explicit unsupported rows are retained rather than repaired
 with project-specific adapter logic.
 
-This is a durable baseline reference, not a HALO comparison table. A fresh aggregate sealed curve
-and a matched fresh HALO scenario run are required before presenting a new head-to-head claim.
+This is a durable baseline reference, not a HALO comparison table. A matched fresh HALO scenario
+run is required before presenting a new scenario head-to-head claim.
 The generated table and its complete machine-readable provenance are in
 [`results/artifacts/scenarios_baselines_v5_20260918`](../../results/artifacts/scenarios_baselines_v5_20260918/).
+
+## Fresh baseline aggregate artifact - 2026-09-18
+
+The current baseline-only sealed evaluation completed all 39 protocol cells in 42.0 minutes. It
+covers the six sealed datasets, 4/8/16-second windows, and
+`k={0,1,2,4,8,16,32,64,128}` for all five retained released baselines. The artifact contains
+3,354 successful metric rows and 213 explicit unsupported rows, with no failed rows. For enrolled
+cells it retains both cosine 1-NN and equal-weight normalized fusion; zero-support cells retain the
+available native or training-bank/ConSE paths and the declared fusion path.
+
+These are fresh baseline numbers only. They replace the stale baseline side of the historical
+sealed table below, but must not be combined with its old HALO rows. A current HALO checkpoint must
+be scored on the same manifests before a new aggregate head-to-head table is promoted. The complete
+per-dataset table, confidence intervals, manifests, hashes, and machine-readable rows are in
+[`results/artifacts/baselines_sealed_v5_20260918`](../../results/artifacts/baselines_sealed_v5_20260918/).
 
 ## Representative scenario protocol - 2026-09-17
 

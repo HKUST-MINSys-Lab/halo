@@ -1,0 +1,32 @@
+{
+  "complete": true,
+  "feature_cache_schema": "sealed-feature-v6-20260918",
+  "k": [
+    0,
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64,
+    128
+  ],
+  "manifest_generator": "numpy-choice-json-fingerprint-v1",
+  "manifest_protocol": "sealed-manifest-v2-20260916",
+  "models": [
+    "harnet5",
+    "harnet10",
+    "limubert_x",
+    "unimts",
+    "normwear"
+  ],
+  "n_cells": 39,
+  "result_schema": "sealed-results-v3-20260916",
+  "scope": "sealed",
+  "window_seconds": [
+    4.0,
+    8.0,
+    16.0
+  ]
+}
