@@ -28,10 +28,15 @@ from baselines.data import (
 )
 from data.scripts.curate.deployment_policy import (
     MULTI_DEVICE_EVAL_CELLS,
+    PROSPECTIVE_EVAL_DATASETS,
     SEALED_TEST_EVAL_DATASETS,
     SUPERVISED_HEAD_TRAIN_DATASETS,
     assert_no_retired_sources,
     stream_specs,
+)
+from data.datasets.mobiact.protocol import (
+    candidate_labels as mobiact_candidate_labels,
+    partition_rows as mobiact_partition_rows,
 )
 from data.scripts.labels.canonical_labels import canonicalize
 from model.blocks import AttentionSpec
@@ -210,34 +215,45 @@ class QueryPlan:
     support_labels: tuple[str, ...]
 
 
-def sealed_cells() -> tuple[tuple[str, str], ...]:
-    """The executable sealed roster; no caller-supplied datasets are accepted."""
+def sealed_cells(scope: str = "sealed") -> tuple[tuple[str, str], ...]:
+    """Resolve one declared evaluation scope without admitting caller-supplied datasets."""
+    if scope == "sealed":
+        datasets = SEALED_TEST_EVAL_DATASETS
+    elif scope == "prospective":
+        datasets = PROSPECTIVE_EVAL_DATASETS
+    else:
+        raise ValueError(f"unknown evaluation scope {scope!r}")
     return tuple(
         (dataset, spec.stream_id)
-        for dataset in SEALED_TEST_EVAL_DATASETS
+        for dataset in datasets
         for spec in stream_specs(dataset, "primary")
     )
 
 
-def duration_cells(window_seconds: Sequence[float]) -> tuple[tuple[float, str, str], ...]:
-    """Expand the fixed sealed roster over declared evidence budgets deterministically."""
+def duration_cells(window_seconds: Sequence[float], *, scope: str = "sealed") -> tuple[tuple[float, str, str], ...]:
+    """Expand one declared roster over evidence budgets deterministically."""
     return tuple(
         (float(duration), dataset, stream)
         for duration in sorted(set(window_seconds))
-        for dataset, stream in sealed_cells()
+        for dataset, stream in sealed_cells(scope)
     )
 
 
-def evaluation_cells(window_seconds: Sequence[float]) -> tuple[tuple[float, str, str, tuple[str, ...]], ...]:
-    """Single placements plus one declared all-device composite per eligible dataset."""
+def evaluation_cells(
+    window_seconds: Sequence[float], *, scope: str = "sealed",
+) -> tuple[tuple[float, str, str, tuple[str, ...]], ...]:
+    """Single placements plus declared composites for the requested protocol scope."""
     singles = [
         (duration, dataset, stream, ())
-        for duration, dataset, stream in duration_cells(window_seconds)
+        for duration, dataset, stream in duration_cells(window_seconds, scope=scope)
     ]
+    if scope != "sealed":
+        return tuple(singles)
     composites = [
         (float(duration), cell.dataset, cell.cell_id, tuple(cell.stream_ids))
         for duration in sorted(set(window_seconds))
         for cell in MULTI_DEVICE_EVAL_CELLS
+        if cell.dataset in SEALED_TEST_EVAL_DATASETS
     ]
     return tuple(singles + composites)
 
@@ -259,7 +275,14 @@ def _stable_choice(values: np.ndarray, count: int, *, seed_parts: Sequence[objec
     return np.asarray(rng.choice(values, size=count, replace=False), dtype=np.int64)
 
 
-def build_manifest(stream: EvalStream, k: int, *, seed: int = SEED) -> list[QueryPlan]:
+def build_manifest(
+    stream: EvalStream,
+    k: int,
+    *,
+    seed: int = SEED,
+    query_rows: Sequence[int] | None = None,
+    support_rows: Sequence[int] | None = None,
+) -> list[QueryPlan]:
     """Create execution-disjoint target-dataset episodes without looking at representations.
 
     Each target candidate receives exactly k labelled support *windows* from a different physical
@@ -269,10 +292,20 @@ def build_manifest(stream: EvalStream, k: int, *, seed: int = SEED) -> list[Quer
     """
     if k < 0:
         raise ValueError("k must be non-negative")
+    n_rows = stream.n_windows
+    query_allowed = (np.arange(n_rows, dtype=np.int64) if query_rows is None
+                     else np.asarray(query_rows, dtype=np.int64))
+    support_allowed = (np.arange(n_rows, dtype=np.int64) if support_rows is None
+                       else np.asarray(support_rows, dtype=np.int64))
+    for name, rows in (("query", query_allowed), ("support", support_allowed)):
+        if rows.ndim != 1 or np.any(rows < 0) or np.any(rows >= n_rows):
+            raise ValueError(f"{name}_rows are outside the stream")
+        if len(np.unique(rows)) != len(rows):
+            raise ValueError(f"{name}_rows contain duplicates")
     if k == 0:
         labels = _aligned_labels(stream)
-        return [QueryPlan(query=i, support=(), support_labels=())
-                for i, label in enumerate(labels) if label in stream.eval_labels]
+        return [QueryPlan(query=int(i), support=(), support_labels=())
+                for i in query_allowed if labels[i] in stream.eval_labels]
     if not stream.execution_identity_known or stream.execution_ids is None:
         raise ValueError(
             f"{stream.dataset}/{stream.stream}: execution identity is unavailable; refusing "
@@ -280,13 +313,14 @@ def build_manifest(stream: EvalStream, k: int, *, seed: int = SEED) -> list[Quer
         )
     labels = _aligned_labels(stream)
     valid = np.flatnonzero(labels != None)  # noqa: E711 - object-array comparison is intentional
+    query_valid = query_allowed[labels[query_allowed] != None]  # noqa: E711
     plans: list[QueryPlan] = []
     candidates = tuple(stream.eval_labels)
     # Index once. The original direct expression scanned every valid row for every
     # (query, candidate) pair, which turns the optional high-k curve into needless quadratic CPU
     # work. A candidate-local index preserves exactly the same execution-disjoint rule.
     label_rows = {
-        label: valid[labels[valid] == label]
+        label: support_allowed[labels[support_allowed] == label]
         for label in candidates
     }
     label_execution = {
@@ -294,7 +328,7 @@ def build_manifest(stream: EvalStream, k: int, *, seed: int = SEED) -> list[Quer
         for label, rows in label_rows.items()
     }
     execution_pools: dict[tuple[str, object], np.ndarray] = {}
-    for query in valid.tolist():
+    for query in query_valid.tolist():
         q_execution = stream.execution_ids[query]
         support: list[int] = []
         support_labels: list[str] = []
@@ -1218,6 +1252,11 @@ def _write_markdown(rows: Sequence[dict], path: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--scope", choices=("sealed", "prospective"), default="sealed",
+        help=("sealed keeps the historical six-dataset protocol; prospective runs only the "
+              "separately frozen MobiAct expansion"),
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--models", nargs="+", default=list(PRIMARY_BASELINES))
     parser.add_argument("--halo-checkpoint", type=Path, default=None)
@@ -1301,7 +1340,7 @@ def main() -> None:
     zero_shot_banks: dict[tuple[str, float], tuple[np.ndarray, np.ndarray, list[str], str]] = {}
     all_rows: list[dict] = []
     manifests: dict[str, dict] = {}
-    requested_cells = list(evaluation_cells(args.window_seconds))
+    requested_cells = list(evaluation_cells(args.window_seconds, scope=args.scope))
     for window_seconds, dataset, stream_id, device_ids in requested_cells:
         cell_row_start = len(all_rows)
         stream = (
@@ -1313,6 +1352,10 @@ def main() -> None:
             load_eval_stream(
                 dataset, stream_id, alignment="native", window_seconds=window_seconds,
                 apply_quality_screen=True,
+                candidate_labels=(
+                    mobiact_candidate_labels(window_seconds)
+                    if args.scope == "prospective" and dataset == "mobiact" else None
+                ),
             )
         )
         if stream.quality_screen != "applied":
@@ -1321,7 +1364,14 @@ def main() -> None:
         # same query/support row ids; representation extraction cannot influence episode creation.
         plans_by_k: dict[int, list[QueryPlan]] = {}
         for k in sorted(set(args.k)):
-            plans = build_manifest(stream, k, seed=args.seed)
+            if args.scope == "prospective" and dataset == "mobiact":
+                plans = build_manifest(
+                    stream, k, seed=args.seed,
+                    query_rows=mobiact_partition_rows(stream, "query"),
+                    support_rows=mobiact_partition_rows(stream, "reference"),
+                )
+            else:
+                plans = build_manifest(stream, k, seed=args.seed)
             plans_by_k[k] = plans
             manifest_id = f"{dataset}/{stream_id}/w={window_seconds:g}/k={k}"
             manifests[manifest_id] = {
@@ -1331,7 +1381,10 @@ def main() -> None:
                 "window_seconds": float(window_seconds),
                 "source_slice_fingerprint": source_slice_fingerprint(stream),
                 "seed": args.seed,
-                "construction": "execution_disjoint_numpy_choice_json_v2",
+                "construction": (
+                    "prospective_subject_disjoint_numpy_choice_json_v1"
+                    if args.scope == "prospective" else "execution_disjoint_numpy_choice_json_v2"
+                ),
             }
         # A representation depends only on the provider and the stream, never on enrollment k.
         # Encode/cache it once, then run all protocol readouts on immutable manifests.
@@ -1722,11 +1775,14 @@ def main() -> None:
         k_values=sorted(set(args.k)),
     )
     (args.out / "run_metadata.json").write_text(json.dumps({
-        "result_schema": "sealed-results-v3-20260916",
-        "manifest_protocol": "sealed-manifest-v2-20260916",
+        "result_schema": "prospective-results-v1-20260918" if args.scope == "prospective"
+        else "sealed-results-v3-20260916",
+        "manifest_protocol": "prospective-mobiact-v1-20260918" if args.scope == "prospective"
+        else "sealed-manifest-v2-20260916",
         "manifest_generator": "numpy-choice-json-fingerprint-v1",
         "feature_cache_schema": FEATURE_CACHE_SCHEMA,
         "models": args.models,
+        "scope": args.scope,
         "k": sorted(set(args.k)),
         "window_seconds": sorted(set(map(float, args.window_seconds))),
         "n_cells": len(requested_cells),

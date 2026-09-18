@@ -112,7 +112,7 @@ def create_manifest(workouts: int, activities: list[str]) -> dict:
              "sampling_rate_hz": NATIVE_RATE}
             for prefix in DEVICES.values() for kind in ("acc", "gyro") for axis in "xyz"
         ],
-        "subjects": workouts,
+        "workouts": workouts,
         "activities": activities,
         "placements": list(DEVICES.values()),
         "device_profile": "watch",
@@ -129,7 +129,7 @@ def create_manifest(workouts: int, activities: list[str]) -> dict:
             f"WORKOUT IS NOT PERSON. The paper (section 3.1) states the 21 workouts come from "
             f"{N_PARTICIPANTS} participants: two did six sessions each, one did two, and seven did "
             "one. The full workout-to-person map is not released, so this converter still writes "
-            "one subject id per workout — but a workout-disjoint split is NOT person-disjoint, and "
+            "one workout id per row — but a workout-disjoint split is NOT person-disjoint, and "
             "cross-subject enrollment over arbitrary workout pairs can enrol and query the same "
             "person. The only person-disjoint boundary the release supports is the paper's own "
             "split (section 5.1.2), recorded in `paper_splits` below; the cross-subject test "
@@ -360,6 +360,8 @@ def main() -> None:
         json.dumps(create_manifest(len(workouts), ordered), indent=2))
     (HERE / "metadata.json").write_text(json.dumps({
         "dataset": "mmfit", "sampling_rate_hz": NATIVE_RATE, "pre_windowed": False,
+        "workouts": len(workouts), "participants": N_PARTICIPANTS,
+        "evaluation_role": "scenario_only",
     }, indent=2))
     (HERE / "eval_labels.json").write_text(json.dumps({"labels": ordered}, indent=2))
 

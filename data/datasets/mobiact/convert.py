@@ -1,505 +1,335 @@
-"""
-Convert MobiAct/MobiFall dataset to standardized format.
+"""Convert the official MobiAct v2 annotated CSV release into HALO sessions.
 
-Supports two formats:
-1. MobiAct (Annotated Data): CSV files with combined sensor data
-2. MobiFall (Kaggle): Separate TXT files for acc/gyro/ori per trial
+This converter intentionally supports one source format: ``Annotated Data/<CODE>/*_annotated.csv``
+from MobiAct v2. MobiFall's separate text files are a different release and must not silently
+masquerade as MobiAct. Use :mod:`data.datasets.mobiact.setup` for the full preparation workflow.
 
-Input: data/datasets/mobiact/downloads/
-Output: data/datasets/mobiact/
-  - manifest.json (channel metadata)
-  - labels.json (activity labels per session)
-  - sessions/session_XXX/data.parquet (sensor data)
-
-Activity codes:
-  ADL: STD, WAL, JOG, JUM, STU, STN, SCH, SIT, CSI, CSO, LYI
-  Falls: FOL, FKL, BSC, SDL
+Android acceleration remains in m/s^2 and angular velocity in rad/s. The shared grid assembler
+converts accelerometer channels to g exactly once.
 """
 
+from __future__ import annotations
+
+import argparse
+import hashlib
 import json
 import re
-import sys
+import shutil
+from collections import Counter, defaultdict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Iterable
 
 import numpy as np
 import pandas as pd
 
-# Add parent to path for shared utilities
-# NOTE: mobiact is Kaggle-terms-gated (kmknation/mobifall-dataset-v20 returns 403 until the terms are
-# accepted on kaggle.com), so this converter follows the standard recipe but is UNTESTED here — verify
-# the grids once the download is available.
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from data.scripts.assembly.assemble import resample_signal
 
+HERE = Path(__file__).resolve().parent
+DEFAULT_RAW_ROOT = HERE / "downloads"
+TARGET_RATE_HZ = 50.0
+RELEASE_ID = "mobiact-v2-annotated"
+PROTOCOL_VERSION = "mobiact-prospective-v1-20260918"
 
-# Activity mapping - standardized names
-ACTIVITIES = {
-    # Activities of Daily Living
-    "STD": "standing",
-    "WAL": "walking",
-    "JOG": "jogging",
-    "JUM": "jumping",
-    "STU": "stairs_up",
-    "STN": "stairs_down",
-    "SCH": "sitting_chair",
-    "SIT": "sitting",
-    "CSI": "car_step_in",
-    "CSO": "car_step_out",
-    "LYI": "lying",
-    # Falls
-    "FOL": "fall_forward",
-    "FKL": "fall_forward_knees",  # FKL = Front-Knees-Lying: FORWARD fall onto knees (per paper Table 2)
-    "BSC": "fall_backward_sitting",
-    "SDL": "fall_sideways",
+ACTIVITIES: dict[str, str] = {
+    "STD": "standing", "WAL": "walking", "JOG": "jogging", "JUM": "jumping",
+    "STU": "stairs_up", "STN": "stairs_down", "SCH": "sitting_chair",
+    "CHU": "chair_up", "SIT": "sitting", "CSI": "car_step_in",
+    "CSO": "car_step_out", "LYI": "lying", "FOL": "fall_forward",
+    "FKL": "fall_forward_knees", "BSC": "fall_backward_sitting", "SDL": "fall_sideways",
 }
-
-# Paths
-DS_DIR = Path(__file__).resolve().parent
-RAW_DIR = DS_DIR / "downloads"
-OUTPUT_DIR = DS_DIR
-
-# Target sampling rate
-TARGET_SAMPLE_RATE = 50.0
-
-
-def detect_format() -> str:
-    """Detect which dataset format is present."""
-    # Check for MobiAct format (Annotated Data folder)
-    mobiact_dir = RAW_DIR / "Annotated Data"
-    if mobiact_dir.exists():
-        csv_files = list(mobiact_dir.glob("**/*.csv"))
-        if csv_files:
-            return "mobiact"
-
-    # Check for MobiFall format
-    mobifall_dir = RAW_DIR / "MobiFall_Dataset_v2.0"
-    if mobifall_dir.exists():
-        txt_files = list(mobifall_dir.glob("**/*.txt"))
-        if txt_files:
-            return "mobifall"
-
-    # Check for MobiFall directly in RAW_DIR
-    txt_files = list(RAW_DIR.glob("**/sub*/**/*.txt"))
-    if txt_files:
-        return "mobifall"
-
-    return "unknown"
+FALL_CODES = frozenset({"FOL", "FKL", "BSC", "SDL"})
+TRANSITION_CODES = frozenset({"SCH", "CHU", "CSI", "CSO"})
+REQUIRED_COLUMNS = ("rel_time", "acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z")
+FILENAME = re.compile(
+    r"^(?P<activity>[A-Za-z]+)_(?P<subject>\d+)_(?P<trial>\d+)_annotated\.csv$",
+    re.IGNORECASE,
+)
 
 
-# ==================== MobiFall Format Functions ====================
+@dataclass(frozen=True)
+class Trial:
+    path: Path
+    activity_code: str
+    subject: int
+    trial: int
 
-def parse_mobifall_txt(filepath: Path) -> Optional[pd.DataFrame]:
-    """
-    Parse MobiFall TXT file.
-
-    Format:
-    - Header lines start with #
-    - Data: timestamp(ns), x, y, z
-    """
-    try:
-        # Read file, skip comment lines
-        lines = []
-        with open(filepath, "r") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    lines.append(line)
-
-        if len(lines) < 10:
-            return None
-
-        # Parse data
-        data = []
-        for line in lines:
-            parts = line.split(",")
-            if len(parts) >= 4:
-                try:
-                    ts = float(parts[0])
-                    x = float(parts[1])
-                    y = float(parts[2])
-                    z = float(parts[3])
-                    data.append([ts, x, y, z])
-                except ValueError:
-                    continue
-
-        if len(data) < 10:
-            return None
-
-        df = pd.DataFrame(data, columns=["timestamp_ns", "x", "y", "z"])
-
-        # Convert timestamp from nanoseconds to seconds
-        df["timestamp_sec"] = (df["timestamp_ns"] - df["timestamp_ns"].iloc[0]) / 1e9
-
-        return df
-
-    except Exception:
-        return None
+    @property
+    def recording_id(self) -> str:
+        return f"{self.activity_code}_s{self.subject:03d}_t{self.trial:02d}"
 
 
-def find_mobifall_trials(base_dir: Path) -> List[Dict]:
-    """
-    Find all trials in MobiFall format.
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-    Returns list of dicts with: activity, subject, trial, acc_file, gyro_file
-    """
-    trials = []
 
-    # Find all accelerometer files
-    acc_files = list(base_dir.glob("**/*_acc_*.txt"))
+def find_annotated_root(raw_root: Path) -> Path:
+    """Find exactly one populated ``Annotated Data`` directory below ``raw_root``."""
+    candidates = [
+        path for path in Path(raw_root).rglob("*")
+        if path.is_dir() and path.name.casefold() == "annotated data"
+        and any(path.rglob("*_annotated.csv"))
+    ]
+    if len(candidates) != 1:
+        raise FileNotFoundError(
+            f"expected exactly one populated 'Annotated Data' directory below {raw_root}, "
+            f"found {len(candidates)}. MobiFall text files are not MobiAct v2."
+        )
+    return candidates[0]
 
-    for acc_file in acc_files:
-        # Parse filename: {ACTIVITY}_acc_{subject}_{trial}.txt
-        match = re.match(r"([A-Z]+)_acc_(\d+)_(\d+)\.txt", acc_file.name)
-        if not match:
+
+def discover_trials(annotated_root: Path) -> list[Trial]:
+    trials: list[Trial] = []
+    unknown: list[str] = []
+    seen: set[tuple[str, int, int]] = set()
+    for path in sorted(Path(annotated_root).rglob("*.csv")):
+        match = FILENAME.match(path.name)
+        if match is None or match.group("activity").upper() not in ACTIVITIES:
+            unknown.append(str(path.relative_to(annotated_root)))
             continue
-
-        activity = match.group(1)
-        subject = int(match.group(2))
-        trial = int(match.group(3))
-
-        # Find corresponding gyro file
-        gyro_file = acc_file.parent / f"{activity}_gyro_{subject}_{trial}.txt"
-
-        trials.append({
-            "activity": activity,
-            "subject": subject,
-            "trial": trial,
-            "acc_file": acc_file,
-            "gyro_file": gyro_file if gyro_file.exists() else None,
-        })
-
+        trial = Trial(
+            path, match.group("activity").upper(),
+            int(match.group("subject")), int(match.group("trial")),
+        )
+        key = (trial.activity_code, trial.subject, trial.trial)
+        if key in seen:
+            raise ValueError(f"duplicate MobiAct trial identity {key}: {path}")
+        seen.add(key)
+        trials.append(trial)
+    if unknown:
+        raise ValueError(
+            f"unrecognized CSV files in MobiAct release ({len(unknown)}): {', '.join(unknown[:5])}"
+        )
+    if not trials:
+        raise ValueError(f"no MobiAct v2 annotated trials found in {annotated_root}")
     return trials
 
 
-def convert_mobifall_trial(trial_info: Dict) -> Optional[Tuple[pd.DataFrame, str]]:
-    """Convert a single MobiFall trial to standardized format."""
-    activity = trial_info["activity"]
-
-    # Skip unknown activities
-    if activity not in ACTIVITIES:
-        return None
-
-    activity_name = ACTIVITIES[activity]
-
-    # Load accelerometer data
-    acc_df = parse_mobifall_txt(trial_info["acc_file"])
-    if acc_df is None or len(acc_df) < 10:
-        return None
-
-    # Create result DataFrame
-    result = pd.DataFrame()
-    result["timestamp_sec"] = acc_df["timestamp_sec"].values
-    result["acc_x"] = acc_df["x"].values
-    result["acc_y"] = acc_df["y"].values
-    result["acc_z"] = acc_df["z"].values
-
-    # Load gyroscope data if available
-    if trial_info["gyro_file"] is not None:
-        gyro_df = parse_mobifall_txt(trial_info["gyro_file"])
-        if gyro_df is not None and len(gyro_df) > 10:
-            # Interpolate gyro to acc timestamps
-            result["gyro_x"] = np.interp(
-                result["timestamp_sec"].values,
-                gyro_df["timestamp_sec"].values,
-                gyro_df["x"].values,
-            )
-            result["gyro_y"] = np.interp(
-                result["timestamp_sec"].values,
-                gyro_df["timestamp_sec"].values,
-                gyro_df["y"].values,
-            )
-            result["gyro_z"] = np.interp(
-                result["timestamp_sec"].values,
-                gyro_df["timestamp_sec"].values,
-                gyro_df["z"].values,
-            )
-    else:
-        result["gyro_x"] = np.nan
-        result["gyro_y"] = np.nan
-        result["gyro_z"] = np.nan
-
-    return result, activity_name
+def _split_runs(time_s: np.ndarray) -> list[tuple[int, int]]:
+    delta = np.diff(time_s)
+    positive = delta[delta > 0]
+    if not len(positive):
+        return []
+    threshold = max(0.25, 10.0 * float(np.median(positive)))
+    boundaries = np.r_[0, np.flatnonzero(delta > threshold) + 1, len(time_s)]
+    return [(int(start), int(stop)) for start, stop in zip(boundaries[:-1], boundaries[1:])]
 
 
-# ==================== MobiAct Format Functions ====================
+def load_trial(path: Path) -> tuple[list[pd.DataFrame], dict]:
+    """Validate and anti-alias one annotated trial onto a uniform 50 Hz clock."""
+    source = pd.read_csv(path)
+    source.columns = [str(column).strip().lower() for column in source.columns]
+    missing = sorted(set(REQUIRED_COLUMNS) - set(source.columns))
+    if missing:
+        raise ValueError(f"{path}: missing required columns {missing}")
+    numeric = source.loc[:, REQUIRED_COLUMNS].apply(pd.to_numeric, errors="coerce")
+    if numeric.isna().any().any() or not np.isfinite(numeric.to_numpy()).all():
+        raise ValueError(f"{path}: required sensor columns contain non-finite values")
+    numeric = numeric.sort_values("rel_time", kind="stable").drop_duplicates("rel_time")
+    # Pandas may expose a read-only Arrow/Copy-on-Write view; the origin normalization below is
+    # deliberately local and must never mutate the source frame.
+    time_s = numeric["rel_time"].to_numpy(np.float64, copy=True)
+    time_s -= time_s[0]
+    if len(time_s) < 2 or np.any(np.diff(time_s) <= 0):
+        raise ValueError(f"{path}: relative time is not strictly increasing")
 
-def parse_mobiact_filename(filename: str) -> Tuple[Optional[str], Optional[int], Optional[int]]:
-    """Parse MobiAct filename: {ACTIVITY}_{SUBJECT}_{TRIAL}_annotated.csv"""
-    base = filename.replace("_annotated.csv", "").replace(".csv", "")
-    parts = base.split("_")
-
-    if len(parts) >= 3:
-        activity = parts[0]
-        try:
-            subject = int(parts[1])
-            trial = int(parts[2])
-            return activity, subject, trial
-        except ValueError:
-            pass
-
-    return None, None, None
-
-
-def load_mobiact_csv(filepath: Path) -> Optional[pd.DataFrame]:
-    """Load MobiAct CSV file."""
-    try:
-        df = pd.read_csv(filepath)
-        df.columns = [c.lower().strip() for c in df.columns]
-
-        # Find timestamp column
-        time_col = None
-        for candidate in ["rel_time", "timestamp", "time", "t"]:
-            if candidate in df.columns:
-                time_col = candidate
-                break
-        if time_col is None:
-            time_col = df.columns[0]
-
-        # Convert time to seconds
-        time_values = df[time_col].values
-        if time_values.max() > 1e9:
-            time_sec = (time_values - time_values[0]) / 1e9
-        elif time_values.max() > 1e6:
-            time_sec = (time_values - time_values[0]) / 1e3
-        else:
-            time_sec = time_values - time_values[0]
-
-        result = pd.DataFrame()
-        result["timestamp_sec"] = time_sec
-
-        # Map columns
-        column_mapping = {
-            "acc_x": ["acc_x", "accx"],
-            "acc_y": ["acc_y", "accy"],
-            "acc_z": ["acc_z", "accz"],
-            "gyro_x": ["gyro_x", "gyrox"],
-            "gyro_y": ["gyro_y", "gyroy"],
-            "gyro_z": ["gyro_z", "gyroz"],
-        }
-
-        for target, candidates in column_mapping.items():
-            for c in candidates:
-                if c in df.columns:
-                    result[target] = df[c].values
-                    break
-            if target not in result.columns:
-                result[target] = np.nan
-
-        return result
-
-    except Exception:
-        return None
-
-
-# ==================== Common Functions ====================
-
-def resample_to_target_rate(df: pd.DataFrame, target_rate: float = 50.0) -> Optional[pd.DataFrame]:
-    """Resample to target sampling rate."""
-    if df is None or len(df) == 0:
-        return None
-
-    duration = df["timestamp_sec"].iloc[-1] - df["timestamp_sec"].iloc[0]
-    if duration <= 0:
-        return None
-
-    num_samples = int(duration * target_rate) + 1
-    new_timestamps = np.linspace(0, duration, num_samples)
-
-    result = pd.DataFrame()
-    result["timestamp_sec"] = new_timestamps
-
-    for col in ["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"]:
-        if col in df.columns and not df[col].isna().all():
-            result[col] = np.interp(new_timestamps, df["timestamp_sec"].values, df[col].values)
-        else:
-            result[col] = np.nan
-
-    return result
-
-
-def convert_dataset():
-    """Convert MobiAct/MobiFall dataset to standardized format."""
-    print("=" * 80)
-    print("MobiAct/MobiFall → Standardized Format Converter")
-    print("=" * 80)
-
-    # Check input
-    if not RAW_DIR.exists():
-        print(f"ERROR: Raw data not found at {RAW_DIR}")
-        print("Run: python -m data.scripts.download_datasets mobiact")
-        return False
-
-    # Detect format
-    data_format = detect_format()
-    print(f"\nDetected format: {data_format}")
-
-    if data_format == "unknown":
-        print("ERROR: Could not detect data format")
-        print("Expected either:")
-        print(f"  - {RAW_DIR}/Annotated Data/ (MobiAct)")
-        print(f"  - {RAW_DIR}/MobiFall_Dataset_v2.0/ (MobiFall)")
-        return False
-
-    # Create output directory
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    sessions_dir = OUTPUT_DIR / "sessions"
-    sessions_dir.mkdir(exist_ok=True)
-
-    all_labels = {}
-    session_count = 0
-    skipped_count = 0
-
-    if data_format == "mobifall":
-        # Process MobiFall format
-        mobifall_dir = RAW_DIR / "MobiFall_Dataset_v2.0"
-        if not mobifall_dir.exists():
-            mobifall_dir = RAW_DIR
-
-        trials = find_mobifall_trials(mobifall_dir)
-        print(f"Found {len(trials)} trials")
-
-        for trial_info in trials:
-            result = convert_mobifall_trial(trial_info)
-            if result is None:
-                skipped_count += 1
-                continue
-
-            df, activity_name = result
-
-            # Resample
-            df = resample_to_target_rate(df, TARGET_SAMPLE_RATE)
-            if df is None or len(df) < 10:
-                skipped_count += 1
-                continue
-
-            # Create session ID prefix
-            activity = trial_info["activity"]
-            subject = trial_info["subject"]
-            trial = trial_info["trial"]
-            session_id = f"{activity}_{subject:02d}_{trial:02d}"
-
-            # Whole continuous single-activity trial = ONE session (build_grids does the 6 s
-            # windowing). Subject id for subject-disjoint splits (read by iter_sessions).
-            df["subject"] = f"s{subject:02d}"
-            session_dir = sessions_dir / session_id
-            session_dir.mkdir(exist_ok=True)
-            df.to_parquet(session_dir / "data.parquet", index=False)
-
-            all_labels[session_id] = [activity_name]
-            session_count += 1
-
-            if session_count % 100 == 0:
-                print(f"  Processed {session_count} sessions...")
-
-    else:
-        # Process MobiAct format
-        mobiact_dir = RAW_DIR / "Annotated Data"
-        activity_folders = [d for d in mobiact_dir.iterdir() if d.is_dir()]
-        print(f"Found {len(activity_folders)} activity folders")
-
-        for activity_folder in sorted(activity_folders):
-            activity_code = activity_folder.name.upper()
-            if activity_code not in ACTIVITIES:
-                continue
-
-            activity_name = ACTIVITIES[activity_code]
-            csv_files = list(activity_folder.glob("*.csv"))
-
-            for csv_file in csv_files:
-                activity, subject, trial = parse_mobiact_filename(csv_file.name)
-                if activity is None:
-                    skipped_count += 1
-                    continue
-
-                df = load_mobiact_csv(csv_file)
-                if df is None or len(df) < 10:
-                    skipped_count += 1
-                    continue
-
-                df = resample_to_target_rate(df, TARGET_SAMPLE_RATE)
-                if df is None or len(df) < 10:
-                    skipped_count += 1
-                    continue
-
-                session_id = f"{activity}_{subject:02d}_{trial:02d}"
-
-                # Whole continuous single-activity trial = ONE session (build_grids windows it).
-                df["subject"] = f"s{subject:02d}"
-                session_dir = sessions_dir / session_id
-                session_dir.mkdir(exist_ok=True)
-                df.to_parquet(session_dir / "data.parquet", index=False)
-
-                all_labels[session_id] = [activity_name]
-                session_count += 1
-
-    # Save labels.json
-    with open(OUTPUT_DIR / "labels.json", "w") as f:
-        json.dump(all_labels, f, indent=2)
-    print(f"\n✓ Created labels.json ({len(all_labels)} sessions)")
-
-    # Create manifest
-    create_manifest(data_format)
-
-    # Count unique activities
-    activities = set()
-    for labels in all_labels.values():
-        activities.update(labels)
-
-    print(f"\n{'=' * 80}")
-    print("Conversion complete!")
-    print(f"{'=' * 80}")
-    print(f"Output: {OUTPUT_DIR}")
-    print(f"  - {session_count} sessions converted")
-    print(f"  - {skipped_count} files skipped")
-    print(f"  - {len(activities)} unique activities")
-    print(f"  - {TARGET_SAMPLE_RATE} Hz sampling rate")
-
-    # Generate visualizations
-    try:
-        sys.path.insert(0, str(Path(__file__).parent.parent))
-        from data.scripts.debug.visualization_utils import generate_debug_visualizations
-        generate_debug_visualizations(OUTPUT_DIR)
-    except ImportError:
-        pass
-
-    return True
-
-
-def create_manifest(data_format: str):
-    """Create manifest.json."""
-    if data_format == "mobifall":
-        name = "MobiFall"
-        desc = "MobiAct (v2.0): ADL + fall dataset. Samsung Galaxy S3 in a trouser pocket, freely chosen in any random orientation. 9 ADL activities + 4 fall types."
-        num_subjects = 31
-    else:
-        name = "MobiAct"
-        desc = "MobiAct: Recognition of Activities of Daily Living using Smartphones. 66 subjects performing 11 ADL activities and 4 fall types."
-        num_subjects = 66
-
-    manifest = {
-        "dataset_name": name,
-        "description": f"{desc} Triaxial accelerometer and gyroscope resampled to {TARGET_SAMPLE_RATE}Hz.",
-        "source": "https://bmi.hmu.gr/the-mobifall-and-mobiact-datasets-2/",
-        "num_subjects": num_subjects,
-        "channels": [
-            {"name": "acc_x", "description": "Accelerometer X-axis", "sampling_rate_hz": TARGET_SAMPLE_RATE},
-            {"name": "acc_y", "description": "Accelerometer Y-axis", "sampling_rate_hz": TARGET_SAMPLE_RATE},
-            {"name": "acc_z", "description": "Accelerometer Z-axis", "sampling_rate_hz": TARGET_SAMPLE_RATE},
-            {"name": "gyro_x", "description": "Gyroscope X-axis", "sampling_rate_hz": TARGET_SAMPLE_RATE},
-            {"name": "gyro_y", "description": "Gyroscope Y-axis", "sampling_rate_hz": TARGET_SAMPLE_RATE},
-            {"name": "gyro_z", "description": "Gyroscope Z-axis", "sampling_rate_hz": TARGET_SAMPLE_RATE},
-        ],
+    signals = numeric.loc[:, REQUIRED_COLUMNS[1:]].to_numpy(np.float64)
+    segments: list[pd.DataFrame] = []
+    source_rates: list[float] = []
+    for start, stop in _split_runs(time_s):
+        local_t = time_s[start:stop] - time_s[start]
+        if len(local_t) < 10 or local_t[-1] <= 0:
+            continue
+        source_rate = 1.0 / float(np.median(np.diff(local_t)))
+        if not 5.0 <= source_rate <= 1000.0:
+            raise ValueError(f"{path}: implausible source sampling rate {source_rate:.3f} Hz")
+        source_grid = np.arange(int(np.floor(local_t[-1] * source_rate)) + 1) / source_rate
+        regular = np.column_stack([
+            np.interp(source_grid, local_t, signals[start:stop, column])
+            for column in range(signals.shape[1])
+        ])
+        sampled = resample_signal(regular, source_rate, TARGET_RATE_HZ)
+        if len(sampled) < 10 or not np.isfinite(sampled).all():
+            continue
+        frame = pd.DataFrame(sampled, columns=REQUIRED_COLUMNS[1:])
+        frame.insert(0, "timestamp_sec", np.arange(len(frame), dtype=np.float64) / TARGET_RATE_HZ)
+        segments.append(frame)
+        source_rates.append(source_rate)
+    if not segments:
+        raise ValueError(f"{path}: no valid contiguous sensor segment")
+    return segments, {
+        "source_rows": int(len(numeric)),
+        "source_rate_hz_median": float(np.median(source_rates)),
+        "segments": len(segments),
+        "duration_seconds": float(sum(len(frame) for frame in segments) / TARGET_RATE_HZ),
     }
 
-    with open(OUTPUT_DIR / "manifest.json", "w") as f:
-        json.dump(manifest, f, indent=2)
-    print("✓ Created manifest.json")
+
+def _stable_subject_split(
+    subjects: Iterable[int], *, seed: int, query_fraction: float,
+) -> tuple[list[int], list[int]]:
+    if not 0.0 < query_fraction < 0.5:
+        raise ValueError("query_fraction must be between zero and 0.5")
+    ranked = sorted(
+        set(map(int, subjects)),
+        key=lambda subject: hashlib.sha256(f"{seed}:{subject}".encode()).digest(),
+    )
+    n_query = max(1, int(round(len(ranked) * query_fraction)))
+    return sorted(ranked[n_query:]), sorted(ranked[:n_query])
 
 
-def main():
-    success = convert_dataset()
-    return 0 if success else 1
+def _write_json(path: Path, value: object) -> None:
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def convert(
+    raw_root: Path = DEFAULT_RAW_ROOT,
+    *, split_seed: int = 20260918,
+    query_fraction: float = 0.30,
+    archive_sha256: str | None = None,
+) -> dict:
+    annotated_root = find_annotated_root(Path(raw_root))
+    trials = discover_trials(annotated_root)
+    staging = HERE / "sessions.staging"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+
+    labels: dict[str, list[str]] = {}
+    recordings: dict[str, str] = {}
+    inventory: list[dict] = []
+    label_subjects: dict[str, set[int]] = defaultdict(set)
+    try:
+        for index, trial in enumerate(trials, 1):
+            segments, stats = load_trial(trial.path)
+            activity = ACTIVITIES[trial.activity_code]
+            label_subjects[activity].add(trial.subject)
+            for segment_index, frame in enumerate(segments):
+                session_id = trial.recording_id
+                if len(segments) > 1:
+                    session_id += f"_segment_{segment_index:02d}"
+                frame["subject"] = f"s{trial.subject:03d}"
+                destination = staging / session_id
+                destination.mkdir()
+                frame.to_parquet(destination / "data.parquet", index=False)
+                labels[session_id] = [activity]
+                recordings[session_id] = trial.recording_id
+            inventory.append({
+                "recording_id": trial.recording_id, "activity_code": trial.activity_code,
+                "activity": activity, "subject": f"s{trial.subject:03d}", "trial": trial.trial,
+                "source_file": str(trial.path.relative_to(annotated_root.parent)),
+                "source_sha256": _sha256(trial.path), **stats,
+            })
+            if index % 250 == 0:
+                print(f"[mobiact] converted {index}/{len(trials)} trials", flush=True)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    reference, query = _stable_subject_split(
+        (trial.subject for trial in trials), seed=split_seed, query_fraction=query_fraction,
+    )
+    reference_set, query_set = set(reference), set(query)
+    uncovered = sorted(
+        label for label, subjects in label_subjects.items()
+        if not (subjects & reference_set and subjects & query_set)
+    )
+    if uncovered:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise ValueError(
+            "frozen subject split lacks reference/query coverage for labels "
+            f"{uncovered}; choose another split seed before evaluation"
+        )
+
+    sessions = HERE / "sessions"
+    if sessions.exists():
+        shutil.rmtree(sessions)
+    staging.rename(sessions)
+    emitted_labels = sorted(set(value[0] for value in labels.values()))
+    subjects = sorted({trial.subject for trial in trials})
+    activity_counts = Counter(row["activity"] for row in inventory)
+
+    manifest = {
+        "dataset_name": "MobiAct v2", "release_id": RELEASE_ID,
+        "description": (
+            "MobiAct v2 annotated smartphone trials: ADLs and simulated falls, Samsung Galaxy S3 "
+            "in a freely selected trouser pocket orientation."
+        ),
+        "source": "https://bmi.hmu.gr/the-mobifall-and-mobiact-datasets-2/",
+        "citation": (
+            "Vavoulas G, Chatzaki C, Malliotakis T, Pediaditis M, Tsiknakis M. The MobiAct "
+            "Dataset: Recognition of Activities of Daily Living using Smartphones. ICT4AWE 2016."
+        ),
+        "license": "MobiAct database usage agreement; redistribution is not implied",
+        "sampling_rate_hz": TARGET_RATE_HZ,
+        "channels": [
+            {"name": name, "sampling_rate_hz": TARGET_RATE_HZ,
+             "unit": "m/s^2" if name.startswith("acc_") else "rad/s"}
+            for name in REQUIRED_COLUMNS[1:]
+        ],
+        "subjects": len(subjects), "trials": len(inventory), "activities": emitted_labels,
+        "placement": "freely oriented trouser pocket", "gravity_state": "present",
+    }
+    metadata = {
+        "dataset": "mobiact", "display_name": "MobiAct v2", "release_id": RELEASE_ID,
+        "sampling_rate_hz": TARGET_RATE_HZ, "pre_windowed": False, "full_windows_only": True,
+        "num_subjects": len(subjects), "num_trials": len(inventory), "num_sessions": len(labels),
+        "hours": sum(float(row["duration_seconds"]) for row in inventory) / 3600.0,
+        "activity_trial_counts": dict(sorted(activity_counts.items())),
+        "archive_sha256": archive_sha256,
+    }
+    protocol = {
+        "protocol_version": PROTOCOL_VERSION, "release_id": RELEASE_ID,
+        "status": "converted_needs_grid_finalization", "split_seed": split_seed,
+        "query_fraction": query_fraction,
+        "reference_subjects": [f"s{subject:03d}" for subject in reference],
+        "query_subjects": [f"s{subject:03d}" for subject in query],
+        "candidate_labels": emitted_labels, "candidate_labels_by_window_seconds": {},
+        "panels": {
+            "falls": sorted(ACTIVITIES[code] for code in FALL_CODES if ACTIVITIES[code] in emitted_labels),
+            "transitions": sorted(
+                ACTIVITIES[code] for code in TRANSITION_CODES if ACTIVITIES[code] in emitted_labels
+            ),
+            "ordinary_adl": sorted(
+                label for code, label in ACTIVITIES.items()
+                if code not in FALL_CODES | TRANSITION_CODES and label in emitted_labels
+            ),
+        },
+    }
+    artifacts = (
+        ("labels.json", labels), ("recordings.json", recordings), ("manifest.json", manifest),
+        ("metadata.json", metadata), ("eval_protocol.json", protocol),
+        ("eval_labels.json", {
+            "dataset": "mobiact", "protocol_version": PROTOCOL_VERSION,
+            "source": "Native MobiAct v2 activity names, frozen before model scoring.",
+            "labels": emitted_labels,
+        }),
+        ("source_inventory.json", {"release_id": RELEASE_ID, "trials": inventory}),
+    )
+    for filename, value in artifacts:
+        _write_json(HERE / filename, value)
+    print(
+        f"[mobiact] wrote {len(labels)} sessions from {len(inventory)} trials, "
+        f"{len(subjects)} subjects, {len(emitted_labels)} labels",
+        flush=True,
+    )
+    return metadata
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--raw-root", type=Path, default=DEFAULT_RAW_ROOT)
+    parser.add_argument("--split-seed", type=int, default=20260918)
+    parser.add_argument("--query-fraction", type=float, default=0.30)
+    parser.add_argument("--archive-sha256", default=None)
+    args = parser.parse_args()
+    convert(args.raw_root, split_seed=args.split_seed, query_fraction=args.query_fraction,
+            archive_sha256=args.archive_sha256)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

@@ -298,6 +298,12 @@ SEALED_TEST_EVAL_DATASETS = (
 
 PRIMARY_EVAL_DATASETS = SEALED_TEST_EVAL_DATASETS
 
+# Prospective sources are outside the historical sealed-six aggregate. They use an explicit scope
+# and are reported per dataset, so adding one cannot silently rewrite an established mean.
+PROSPECTIVE_EVAL_DATASETS = (
+    "mobiact",
+)
+
 # The held-out-configuration transfer probe is EMPTY under the three-role rule: every labelled
 # source is either a head-training source or sealed, and a probe run during training may read
 # neither (sealed data would be spent; head-training data is the same role the encoder is
@@ -310,8 +316,6 @@ EXCLUDED_PRIMARY_DATASETS = {
     "harth": "lower-back and thigh accelerometers are retained only as a placement stress test",
     "opportunity": "back and upper/lower-arm IMUs are appendix-only, not phone/watch inputs",
     "recgym": "per-axis min-max normalization destroyed physical scale and gravity",
-    "mobiact": "raw download + grids never materialized (empty downloads/, no grids/); "
-               "was a phantom in the policy and never actually scored — dropped 2026-07-19",
 }
 
 
@@ -685,6 +689,12 @@ MULTI_DEVICE_EVAL_CELLS: Tuple[MultiDeviceCell, ...] = (
     MultiDeviceCell(
         "shoaib", "phone_left_pocket+phone_right_pocket+watch_wrist_proxy+phone_belt",
         ("phone_left_pocket", "phone_right_pocket", "watch_wrist_proxy", "phone_belt"),
+    ),
+    # Scenario-only: the publication split, not local workout ids, establishes the held-out
+    # participant boundary before these simultaneous streams are sampled.
+    MultiDeviceCell(
+        "mmfit", "left_wrist+right_wrist+right_pocket+left_ear",
+        ("left_wrist", "right_wrist", "right_pocket", "left_ear"),
     ),
 )
 

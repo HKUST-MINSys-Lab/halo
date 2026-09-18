@@ -1,68 +1,10 @@
 {
-  "display_name": "MobiAct",
-  "num_sessions": 3646,
-  "sampling_rate_hz": 50,
-  "channels": [
-    "acc_x",
-    "acc_y",
-    "acc_z",
-    "gyro_x",
-    "gyro_y",
-    "gyro_z"
-  ],
-  "core_channels": {
-    "acc_x": "acc_x",
-    "acc_y": "acc_y",
-    "acc_z": "acc_z",
-    "gyro_x": "gyro_x",
-    "gyro_y": "gyro_y",
-    "gyro_z": "gyro_z"
-  },
-  "extra_channels": [],
-  "placement": "trouser_pocket",
-  "num_subjects": 24,
-  "activities": [
-    "car_step_in",
-    "car_step_out",
-    "fall_forward_knees",
-    "fall_backward_sitting",
-    "fall_forward",
-    "fall_sideways",
-    "jogging",
-    "jumping",
-    "sitting_chair",
-    "stairs_down",
-    "stairs_up",
-    "standing",
-    "walking"
-  ],
-  "train_subjects": [
-    1,
-    2,
-    3,
-    4,
-    5,
-    6,
-    7,
-    8,
-    9,
-    10,
-    11,
-    12,
-    13,
-    14,
-    15,
-    16,
-    17
-  ],
-  "test_subjects": [
-    18,
-    19,
-    20,
-    21,
-    29,
-    30,
-    31
-  ],
-  "role": "eval"
+  "dataset": "mobiact",
+  "display_name": "MobiAct v2",
+  "status": "unprepared",
+  "release_required": "official annotated MobiAct v2 release only",
+  "setup_command": "python -m data.datasets.mobiact.setup --archive /absolute/path/to/MobiAct_Dataset_v2.0.zip",
+  "sampling_rate_hz_after_conversion": 50.0,
+  "full_windows_only": true,
+  "note": "This placeholder intentionally contains no counts, split, labels, or grid provenance. setup.py rewrites it only after validating the supplied official archive."
 }

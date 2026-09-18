@@ -21,7 +21,9 @@ from training.support_classifier.sealed_eval import (
     _training_bank_conse_predictions,
     _write_markdown,
     build_manifest,
+    evaluation_cells,
     manifest_fingerprint,
+    sealed_cells,
     validate_result_rows,
 )
 
@@ -121,6 +123,22 @@ def test_common_readouts_share_the_same_manifest_and_recover_separable_features(
 def test_k_zero_manifest_contains_no_enrollment_rows():
     plans = build_manifest(_stream(), 0)
     assert plans and all(not plan.support and not plan.support_labels for plan in plans)
+
+
+def test_partitioned_manifest_never_uses_query_partition_as_support():
+    stream = _stream()
+    # rows 0/3/6 are subject s1, 1/4/7 s2 and 2/5/8 s3. Query/support partitions are
+    # deliberately disjoint so this exercises the prospective-evaluation contract.
+    plans = build_manifest(stream, 1, seed=17, query_rows=[0, 3, 6], support_rows=[1, 2, 4, 5, 7, 8])
+    assert plans
+    assert {plan.query for plan in plans} <= {0, 3, 6}
+    assert all(set(plan.support) <= {1, 2, 4, 5, 7, 8} for plan in plans)
+
+
+def test_evaluation_scope_keeps_prospective_cells_out_of_sealed_roster():
+    assert all(dataset != "mobiact" for dataset, _ in sealed_cells())
+    assert sealed_cells("prospective") == (("mobiact", "phone_trouser_pocket"),)
+    assert all(dataset == "mobiact" for _, dataset, _, _ in evaluation_cells([4.0], scope="prospective"))
 
 
 def test_k_zero_manifest_excludes_rows_outside_candidate_vocabulary():

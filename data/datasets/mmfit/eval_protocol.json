@@ -1,0 +1,10 @@
+{
+  "protocol_version": "mmfit-scenarios-v1-20260918",
+  "role": "scenario_only",
+  "source": "Stromback, Huang and Radu, MM-Fit, IMWUT 2020, section 5.1.2",
+  "reference_workouts": [1, 2, 3, 4, 6, 7, 8, 14, 15, 16, 17, 18, 19],
+  "query_workouts": [0, 5, 12, 13, 20],
+  "seen_person_test_workouts": [9, 10, 11],
+  "constraint": "Workout identifiers are not participant identifiers. Only query_workouts are documented participant-disjoint from reference_workouts.",
+  "scenarios": ["s2_cross_placement", "s6_new_domain", "s7_device_set"]
+}

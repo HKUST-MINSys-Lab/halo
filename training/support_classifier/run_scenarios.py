@@ -84,7 +84,11 @@ from .sealed_eval import (
     manifest_fingerprint,
     QueryPlan,
 )
-from data.datasets.mmfit.convert import PAPER_SPLITS
+from data.datasets.mmfit.protocol import partition_rows as mmfit_partition_rows
+from data.datasets.mobiact.protocol import (
+    candidate_labels as mobiact_candidate_labels,
+    partition_rows as mobiact_partition_rows,
+)
 from training.tokenizer.eval_transfer import build_encoder
 
 # ------------------------------------------------------------------ cell rosters
@@ -121,9 +125,8 @@ SEALED_SINGLE_CELLS = (
 
 NEW_DOMAIN_CELLS = (
     ("mmfit", "left_wrist"),
-    ("spar", "watch_left_wrist"),
-    ("upper_limb_use", "control_right_wrist"),
 )
+PROSPECTIVE_NEW_DOMAIN_CELLS = (("mobiact", "phone_trouser_pocket"),)
 
 RATE_TARGETS = (20.0, 25.0, 100.0)
 ACTIVE_SCENARIOS = (
@@ -218,7 +221,9 @@ class Task:
 @lru_cache(maxsize=64)
 def _load(dataset: str, stream_id: str, window_seconds: float):
     return load_eval_stream(dataset, stream_id, alignment="native",
-                            window_seconds=window_seconds, apply_quality_screen=True)
+                            window_seconds=window_seconds, apply_quality_screen=True,
+                            candidate_labels=(mobiact_candidate_labels(window_seconds)
+                                              if dataset == "mobiact" else None))
 
 
 @lru_cache(maxsize=32)
@@ -253,39 +258,42 @@ def _within_cross_subject(stream, k: int, seed: int) -> tuple:
     return plans
 
 
+def _partitioned_plans(stream, k: int, seed: int, *, query_rows, support_rows, relation: str) -> tuple[QueryPlan, ...]:
+    """Build a single-stream manifest with explicit reference/query partitions."""
+    if k == 0:
+        labels = _aligned_labels(stream)
+        return tuple(
+            QueryPlan(query=int(row), support=(), support_labels=())
+            for row in query_rows if labels[row] in stream.eval_labels
+        )
+    cross = build_cross_manifest(
+        stream, stream, k, seed=seed, relation=relation,
+        candidates=tuple(stream.eval_labels), query_rows=query_rows, support_rows=support_rows,
+    )
+    return tuple(QueryPlan(
+        query=plan.query,
+        support=tuple(row - cross.offset for row in plan.support),
+        support_labels=plan.support_labels,
+    ) for plan in cross.plans)
+
+
 def _mmfit_new_domain_plans(stream, k: int, seed: int) -> tuple[tuple[QueryPlan, ...], str]:
     """Use MM-Fit's published participant split without treating workout IDs as people."""
-    if k == 0:
-        query_rows = _mmfit_split_rows(stream, ("cross_subject_test",))
-        labels = _aligned_labels(stream)
-        plans = tuple(
-            QueryPlan(query=int(row), support=(), support_labels=())
-            for row in query_rows
-            if labels[row] in stream.eval_labels
-        )
-        return plans, "published_participant_test_zero_support"
-
-    query_rows = _mmfit_split_rows(stream, ("cross_subject_test",))
-    support_rows = _mmfit_split_rows(stream, ("train", "validation"))
-    cross = build_cross_manifest(
-        stream,
-        stream,
-        k,
-        seed=seed,
+    plans = _partitioned_plans(
+        stream, k, seed, query_rows=mmfit_partition_rows(stream, "query"),
+        support_rows=mmfit_partition_rows(stream, "reference"),
         relation="mmfit_published_participant_split",
-        candidates=tuple(stream.eval_labels),
-        query_rows=query_rows,
-        support_rows=support_rows,
-    )
-    plans = tuple(
-        QueryPlan(
-            query=plan.query,
-            support=tuple(row - cross.offset for row in plan.support),
-            support_labels=plan.support_labels,
-        )
-        for plan in cross.plans
     )
     return plans, "published_participant_split"
+
+
+def _mobiact_new_domain_plans(stream, k: int, seed: int) -> tuple[tuple[QueryPlan, ...], str]:
+    plans = _partitioned_plans(
+        stream, k, seed, query_rows=mobiact_partition_rows(stream, "query"),
+        support_rows=mobiact_partition_rows(stream, "reference"),
+        relation="mobiact_prospective_subject_split",
+    )
+    return plans, "prospective_subject_split"
 
 
 def _cross_view_of_within(plans, offset: int) -> tuple:
@@ -316,6 +324,17 @@ def _zero_support_cross_plans(query, support) -> tuple[tuple[QueryPlan, ...], tu
     return plans, candidates
 
 
+def _partitioned_zero_support_cross(query, support, query_rows) -> tuple[tuple[QueryPlan, ...], tuple[str, ...]]:
+    """Zero-support cross-view cell restricted to a frozen query partition."""
+    candidates, _ = shared_candidates(query, support)
+    labels = _aligned_labels(query)
+    plans = tuple(
+        QueryPlan(query=int(row), support=(), support_labels=())
+        for row in query_rows if labels[row] in candidates
+    )
+    return plans, candidates
+
+
 def _matched_within_reference(
     cross,
     query,
@@ -324,6 +343,8 @@ def _matched_within_reference(
     seed: int,
     same_subject: bool | None,
     relation: str,
+    query_rows=None,
+    support_rows=None,
 ) -> tuple[tuple[QueryPlan, ...], tuple[QueryPlan, ...]]:
     """Pair a cross-source condition with an in-query-source reference on identical queries.
 
@@ -331,10 +352,12 @@ def _matched_within_reference(
     Its support indexes address a concatenated matrix, so they are translated back to the one
     within-stream feature matrix before returning.
     """
-    query_rows = tuple(plan.query for plan in cross.plans)
+    selected_query_rows = (tuple(query_rows) if query_rows is not None
+                           else tuple(plan.query for plan in cross.plans))
     reference = build_cross_manifest(
         query, query, k, seed=seed, relation=relation, same_subject=same_subject,
-        candidates=cross.candidates, query_rows=query_rows,
+        candidates=cross.candidates, query_rows=selected_query_rows,
+        support_rows=support_rows,
     )
     cross_by_query = {plan.query: plan for plan in cross.plans}
     reference_by_query = {plan.query: plan for plan in reference.plans}
@@ -348,21 +371,13 @@ def _matched_within_reference(
     return cross_plans, reference_plans
 
 
-def _mmfit_split_rows(stream, split_names: tuple[str, ...]) -> np.ndarray:
-    workout_ids = {f"w{value:02d}" for name in split_names for value in PAPER_SPLITS[name]}
-    subjects = np.asarray(stream.subjects, dtype=str)
-    rows = np.flatnonzero(np.isin(subjects, sorted(workout_ids)))
-    if not len(rows):
-        raise ValueError(f"MM-Fit paper split {split_names} has no rows after quality screening")
-    return rows
-
-
 # ------------------------------------------------------------------ task builders
 
 
 def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                 coverage: float, limit: int | None = None,
-                failures: list[dict] | None = None) -> list[Task]:
+                failures: list[dict] | None = None,
+                include_prospective: bool = False) -> list[Task]:
     """Every cell of one scenario at one evidence budget and one enrolment size."""
     if limit is not None and limit < 1:
         return []
@@ -490,6 +505,66 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                                   "condition": "scenario"}))
                         if complete():
                             return tasks
+
+        # MM-Fit uses its published participant-disjoint split. The workout ids stored in the grid
+        # are not treated as subject ids, so this deliberately avoids the generic same/cross-workout
+        # branches above.
+        mmfit_streams = ("left_wrist", "right_wrist", "right_pocket", "left_ear")
+        for query_id in mmfit_streams:
+            for support_id in mmfit_streams:
+                if query_id == support_id:
+                    continue
+                query = safe_load("mmfit", query_id)
+                support = safe_load("mmfit", support_id)
+                if query is None or support is None:
+                    continue
+                query_rows = mmfit_partition_rows(query, "query")
+                support_rows = mmfit_partition_rows(support, "reference")
+                if k == 0:
+                    plans, candidates = _partitioned_zero_support_cross(query, support, query_rows)
+                    if plans:
+                        tasks.append(Task(
+                            scenario, f"mmfit/{query_id}<-{support_id}/published_split/zero_support",
+                            query, support, plans, candidates, stream_rows(query),
+                            {"L": 3, "S": 3, "P": 2, "C": 2},
+                            meta={"subject_relation": "published_participant_test_zero_support",
+                                  "condition": "scenario", "protocol": "mmfit-scenarios-v1"},
+                        ))
+                    if complete():
+                        return tasks
+                    continue
+                cross = build_cross_manifest(
+                    query, support, k, seed=seed, relation="mmfit_published_cross_device",
+                    query_rows=query_rows, support_rows=support_rows,
+                )
+                cross_plans, reference_plans = _matched_within_reference(
+                    cross, query, k, seed=seed, same_subject=None,
+                    relation="mmfit_published_same_device_reference",
+                    query_rows=query_rows,
+                    support_rows=mmfit_partition_rows(query, "reference"),
+                )
+                if not cross_plans:
+                    continue
+                matched_group = f"mmfit/{query_id}<-{support_id}/published_split/k{k}"
+                tasks.append(Task(
+                    scenario, f"mmfit/{query_id}<-{query_id}/published_split/matched_control",
+                    query, query, reference_plans, cross.candidates, stream_rows(query),
+                    {"L": 3, "S": 0, "P": 0, "C": 0},
+                    meta={"matched_group": matched_group, "condition": "control",
+                          "subject_relation": "published_participant_split"},
+                ))
+                if complete():
+                    return tasks
+                tasks.append(Task(
+                    scenario, f"mmfit/{query_id}<-{support_id}/published_split",
+                    query, support, cross_plans, cross.candidates, cross.offset,
+                    {"L": 3, "S": 0, "P": 2, "C": 2},
+                    meta={"matched_group": matched_group, "condition": "scenario",
+                          "subject_relation": "published_participant_split",
+                          "protocol": "mmfit-scenarios-v1"},
+                ))
+                if complete():
+                    return tasks
 
     elif scenario == "s3_cross_dataset":
         for (q_ds, q_id), (s_ds, s_id), region in CROSS_DATASET_PAIRS:
@@ -634,12 +709,17 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                     return tasks
 
     elif scenario == "s6_new_domain":
-        for dataset, stream_id in NEW_DOMAIN_CELLS:
+        cells = NEW_DOMAIN_CELLS + (
+            PROSPECTIVE_NEW_DOMAIN_CELLS if include_prospective else ()
+        )
+        for dataset, stream_id in cells:
             stream = safe_load(dataset, stream_id)
             if stream is None:
                 continue
             if dataset == "mmfit":
                 plans, subject_relation = _mmfit_new_domain_plans(stream, k, seed)
+            elif dataset == "mobiact":
+                plans, subject_relation = _mobiact_new_domain_plans(stream, k, seed)
             else:
                 plans = _within_cross_subject(stream, k, seed)
                 subject_relation = (
@@ -676,7 +756,12 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
             if partial is None:
                 continue
             if k == 0:
-                plans, candidates = _zero_support_cross_plans(composite, single)
+                if dataset == "mmfit":
+                    plans, candidates = _partitioned_zero_support_cross(
+                        composite, single, mmfit_partition_rows(composite, "query"),
+                    )
+                else:
+                    plans, candidates = _zero_support_cross_plans(composite, single)
                 if plans:
                     tasks.append(Task(
                         scenario, f"{dataset}/zero_support", composite, single, plans,
@@ -690,12 +775,26 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                     ("support_single_query_composite", composite, single),
                     ("support_composite_query_single", single, composite),
                     ("support_two_devices_query_all", composite, partial)):
-                cross = build_cross_manifest(
-                    query, support, k, seed=seed, relation=variant, same_subject=False,
-                )
+                if dataset == "mmfit":
+                    query_rows = mmfit_partition_rows(query, "query")
+                    support_rows = mmfit_partition_rows(support, "reference")
+                    cross = build_cross_manifest(
+                        query, support, k, seed=seed, relation=f"mmfit_{variant}",
+                        query_rows=query_rows, support_rows=support_rows,
+                    )
+                    reference_subject = None
+                    reference_rows = mmfit_partition_rows(query, "reference")
+                else:
+                    query_rows = None
+                    cross = build_cross_manifest(
+                        query, support, k, seed=seed, relation=variant, same_subject=False,
+                    )
+                    reference_subject = False
+                    reference_rows = None
                 cross_plans, reference_plans = _matched_within_reference(
-                    cross, query, k, seed=seed, same_subject=False,
+                    cross, query, k, seed=seed, same_subject=reference_subject,
                     relation=f"s7_reference_{variant}",
+                    query_rows=query_rows, support_rows=reference_rows,
                 )
                 if not cross_plans:
                     continue
@@ -705,7 +804,9 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                     reference_plans, cross.candidates, stream_rows(query),
                     {"L": 0, "S": 0, "P": 0, "C": 0},
                     meta={"device_variant": variant, "condition": "control",
-                          "matched_group": matched_group, "subject_relation": "cross_subject"},
+                          "matched_group": matched_group,
+                          "subject_relation": ("published_participant_split" if dataset == "mmfit"
+                                               else "cross_subject")},
                 ))
                 if complete():
                     return tasks
@@ -716,7 +817,8 @@ def build_tasks(scenario: str, k: int, window_seconds: float, *, seed: int,
                           "query_devices": len(getattr(query, "devices", [1])),
                           "support_devices": len(getattr(support, "devices", [1])),
                           "condition": "scenario", "matched_group": matched_group,
-                          "subject_relation": "cross_subject"}))
+                          "subject_relation": ("published_participant_split" if dataset == "mmfit"
+                                               else "cross_subject")}))
                 if complete():
                     return tasks
 
@@ -1304,6 +1406,11 @@ def main() -> None:
     )
     parser.add_argument("--max-tasks-per-scenario", type=int, default=None)
     parser.add_argument(
+        "--include-prospective-mobiact", action="store_true",
+        help=("include the separately versioned MobiAct prospective new-domain panel in s6; "
+              "it is excluded from the historical scenario suite by default"),
+    )
+    parser.add_argument(
         "--compact-audit", action="store_true",
         help="deprecated compatibility flag; compact audit is now the default",
     )
@@ -1433,7 +1540,8 @@ def main() -> None:
                 try:
                     tasks = build_tasks(scenario, k, window_seconds,
                                         seed=args.seed, coverage=args.coverage, limit=limit,
-                                        failures=failures)
+                                        failures=failures,
+                                        include_prospective=args.include_prospective_mobiact)
                 except Exception as exc:  # noqa: BLE001
                     failures.append({"scenario": scenario, "k": k,
                                      "window_seconds": window_seconds,
@@ -1547,7 +1655,7 @@ def main() -> None:
     failed_rows = [row for row in rows if row.get("status") == "failed"]
     complete = not failures and not failed_rows
     _atomic_json(args.out / "run_metadata.json", {
-        "schema": "deployment-scenarios-results-v3-20260916",
+        "schema": "deployment-scenarios-results-v4-20260918",
         "complete": complete,
         "n_rows": len(rows),
         "n_task_failures": len(failures),
@@ -1556,6 +1664,7 @@ def main() -> None:
         "scenarios": list(args.scenarios),
         "k": ks,
         "window_seconds": windows,
+        "include_prospective_mobiact": bool(args.include_prospective_mobiact),
     })
     checkpoint_progress(scenario=None, k=None, window_seconds=None)
     print(f"wrote {len(rows)} rows and {len(failures)} task failures to {args.out}")

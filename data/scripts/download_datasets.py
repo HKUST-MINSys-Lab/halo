@@ -1,6 +1,8 @@
 """Download raw HALO datasets into ``data/datasets/<ds>/downloads/``.
 
-Every source below was verified working on 2026-07-12. Two mechanisms:
+Most sources below were verified working on 2026-07-12. The entry itself records sources that need
+manual access or a dedicated setup workflow; notably MobiAct must use its official annotated release
+and is intentionally not fetched from a third-party mirror. Two mechanisms:
 
   * **direct**  — an HTTP(S) archive (UCI / uni-mannheim); downloaded with the stdlib and unzipped
                   in place (nested UCI zips are unpacked too).
@@ -62,9 +64,11 @@ SOURCES: dict[str, Source] = {
     # ---- Kaggle (needs ~/.kaggle/kaggle.json) ----
     "unimib_shar": Source("unimib_shar", "kaggle", kaggle="wangboluo/unimib-shar-dataset"),
     "kuhar": Source("kuhar", "kaggle", kaggle="niloy333/kuhar"),
-    "mobiact": Source("mobiact", "kaggle", kaggle="kmknation/mobifall-dataset-v20", manual=True,
-        note="Kaggle returns 403 until you accept the dataset terms on "
-             "https://www.kaggle.com/datasets/kmknation/mobifall-dataset-v20 (sign in, click Download once)."),
+    "mobiact": Source("mobiact", "manual", manual=True,
+        note="Use only the official annotated MobiAct release, not MobiFall. After obtaining the "
+             "archive from https://bmi.lab.uowm.gr/the-mobiact-dataset/, place it under "
+             "data/datasets/mobiact/downloads/ and run python -m data.datasets.mobiact.setup "
+             "--archive <archive>."),
 
     # ---- gated, no scriptable URL ----
     "shoaib": Source("shoaib", "manual", manual=True,
