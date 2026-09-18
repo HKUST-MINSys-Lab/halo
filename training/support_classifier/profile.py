@@ -58,10 +58,54 @@ def _mean(values: list[float]) -> float:
     return float(np.mean(values)) if values else 0.0
 
 
+def _grad_norm(module: torch.nn.Module) -> float:
+    pieces = [
+        parameter.grad.detach().float().square().sum()
+        for parameter in module.parameters()
+        if parameter.grad is not None
+    ]
+    return float(torch.stack(pieces).sum().sqrt()) if pieces else 0.0
+
+
+def _gradient_breakdown(encoder, classifier) -> dict[str, float]:
+    """Pre-clip block norms for diagnosing scale without changing the training graph."""
+    modules = {
+        "encoder": encoder,
+        **({"encoder/filterbank": encoder.filterbank}
+           if getattr(encoder, "filterbank", None) is not None else {}),
+        **({"encoder/sensor_fold": encoder.sensor_fold}
+           if getattr(encoder, "sensor_fold", None) is not None else {}),
+        **({"encoder/transformer": encoder.transformer}
+           if getattr(encoder, "transformer", None) is not None else {}),
+        **({"encoder/recording_pool": encoder.recording_pool}
+           if getattr(encoder, "recording_pool", None) is not None else {}),
+        **({"encoder/duration_proj": encoder.duration_proj}
+           if getattr(encoder, "duration_proj", None) is not None else {}),
+        **({"encoder/text_conditioner": encoder.descriptor_proj}
+           if getattr(encoder, "descriptor_proj", None) is not None else {}),
+        **({"encoder/structured_conditioner": encoder.structured_conditioner}
+           if getattr(encoder, "structured_conditioner", None) is not None else {}),
+    }
+    if classifier is not None:
+        modules.update({
+            "classifier": classifier,
+            "classifier/signal_proj": classifier.signal_proj,
+            "classifier/attention": classifier.metric_stack,
+            "classifier/support_residual": classifier.r_support_head,
+            "classifier/candidate_residual": classifier.r_candidate_head,
+            "classifier/text_bridge": classifier.p_text,
+        })
+    return {name: _grad_norm(module) for name, module in modules.items()}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workers", type=int, nargs="+", default=[8, 12, 16])
     parser.add_argument("--classifier", choices=("residual", "neighbors"), default="residual")
+    parser.add_argument("--support-temperature", type=float, default=TAU_SUPPORT,
+                        help="diagnostic support-vote temperature")
+    parser.add_argument("--text-temperature", type=float, default=0.07,
+                        help="diagnostic query-to-label temperature")
     parser.add_argument("--support-sets", type=int, default=4,
                         help="independent support sets per optimizer step")
     parser.add_argument("--queries-per-support-set", type=int, default=4)
@@ -87,6 +131,8 @@ def main() -> None:
         parser.error("positive worker counts and 0 <= warmup < steps <= 100 required")
     if not 0 <= args.validation_support_sets <= 64:
         parser.error("validation timing is bounded to 0..64 support sets")
+    if args.support_temperature <= 0 or args.text_temperature <= 0:
+        parser.error("diagnostic temperatures must be positive")
 
     torch.set_num_threads(2)
     device = torch.device("cuda")
@@ -167,7 +213,10 @@ def main() -> None:
             text = make_label_text(corpus.all_labels, device)
             classifier = (ResidualSupportClassifier(
                 AttentionSpec(d_model=encoder.d_model, n_heads=4, ffn_mult=2, dropout=0.1),
-                ResidualClassifierConfig(),
+                ResidualClassifierConfig(
+                    temperature=args.support_temperature,
+                    text_temperature=args.text_temperature,
+                ),
             ).to(device).train() if args.classifier == "residual" else None)
             if classifier is not None:
                 initialise_text_projection(
@@ -189,6 +238,7 @@ def main() -> None:
             shape_samples = []
             torch.cuda.reset_peak_memory_stats()
             trace = None
+            preclip_gradient_norms = {}
             for step in range(1, args.steps + 1):
                 if args.trace and step == args.steps:
                     trace = torch.profiler.profile(activities=[
@@ -219,7 +269,7 @@ def main() -> None:
                         logits, weights = differentiable_neighbor_logits(
                             query, rows["support_feature"], episode_vectors["support_bound"],
                             rows["support_mask"], episode_vectors["candidate_mask"],
-                            temperature=TAU_SUPPORT,
+                            temperature=args.support_temperature,
                         )
                     else:
                         output = classifier(query_feature=query,
@@ -230,6 +280,8 @@ def main() -> None:
                     marks[4].record()
                 loss.backward()
                 marks[5].record()
+                if step == args.steps:
+                    preclip_gradient_norms = _gradient_breakdown(encoder, classifier)
                 torch.nn.utils.clip_grad_norm_(parameters, 1., error_if_nonfinite=True)
                 marks[6].record()
                 optimizer.step()
@@ -278,6 +330,8 @@ def main() -> None:
 
             record = {
                 "classifier": args.classifier,
+                "support_temperature": args.support_temperature,
+                "text_temperature": args.text_temperature,
                 "corpus_setup_seconds": corpus_setup_seconds,
                 "draw_kwargs": draw_kwargs,
                 "encoder_params": sum(p.numel() for p in encoder.parameters()),
@@ -297,6 +351,7 @@ def main() -> None:
                     "compile_transformer": "Requested only; compilation errors are fatal rather than silently eager.",
                     "optimizer_only_minutes_35k": "Includes loader wait; excludes calibration, validation, checkpointing and telemetry.",
                     "gradient_norms": "Final step after clipping; encoder includes recording_pool.",
+                    "preclip_gradient_norms": "Final step before clipping; nested blocks overlap their parent totals.",
                 },
                 **{f"mean_{name}_ms": _mean(values) for name, values in timings.items()},
                 "median_step_ms": float(np.median(timings["step"])),
@@ -323,6 +378,20 @@ def main() -> None:
                     }.items()
                     if any(p.grad is not None for p in module.parameters())
                 },
+                "preclip_gradient_norms": preclip_gradient_norms,
+                "score_magnitudes": ({
+                    name: {
+                        "mean_abs": float(output[name][episode_vectors["candidate_mask"]]
+                                          .detach().float().abs().mean()),
+                        "std": float(output[name][episode_vectors["candidate_mask"]]
+                                     .detach().float().std()),
+                        "max_abs": float(output[name][episode_vectors["candidate_mask"]]
+                                         .detach().float().abs().max()),
+                    }
+                    for name in (
+                        "logits", "metric_part", "text_part", "r_candidate", "text_score",
+                    )
+                } if classifier is not None else {}),
                 "timing_samples_ms": timings,
                 "shape_samples": shape_samples,
             }
