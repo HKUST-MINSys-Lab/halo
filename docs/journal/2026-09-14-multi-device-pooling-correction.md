@@ -45,7 +45,7 @@ pool — random-init frozen and JEPA-frozen arms, since Phase-A JEPA trains patc
 never builds a recording pool.
 
 This was already documented correctly in
-[EVAL_EXPANSION_PLAN_20260913.md §D5b](../design/EVAL_EXPANSION_PLAN_20260913.md), which carries an
+[the evaluation expansion plan §D5b](2026-09-13-eval-expansion-plan.md), which carries an
 explicit "Correction to the first draft" making exactly this point. The two journal entries above
 were written later and regressed to the superseded wording. The design decision recorded as
 "option 3 — hierarchical parameter-free pooling" applies **only to the mean path**, not to the

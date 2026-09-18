@@ -210,7 +210,7 @@ kernels from both sides; `frontend/*` telemetry and `--frontend-lr-scale` /
 episodes per step, capped corpus, four loader workers): 43 ms per step against 17 ms for the fixed
 filterbank, i.e. 2.6x, so that earlier 35k-step classifier run was about 25 minutes. The JEPA
 measurement and planning budget are historical and live only in
-[PRETRAINING_CORPUS.md](../data/PRETRAINING_CORPUS.md). Per-token export for the evaluation adapter
+[the retired pretraining corpus record](retired-pretraining-corpus.md). Per-token export for the evaluation adapter
 follows the frontend's grid (`out["token_grid"]`).
 
 **Historical Future JEPA.** The past-only future objective supported this frontend directly. Student kernels saw
@@ -238,3 +238,5 @@ sealed evaluation was run.
   [--multispan-frame-rate-hz 16] [--multispan-stem conv] \
   [--frontend-lr-scale 1.0] [--frontend-reg-weight 0.0]
 ```
+> Archived on 2026-09-18. Superseded by the active fixed-filterbank contract in
+> [`../contracts/design_of_record.md`](../contracts/design_of_record.md).

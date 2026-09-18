@@ -1,5 +1,7 @@
 # Retained baseline encoders
 
+Last verified against code: 2026-09-18.
+
 The primary comparison is deliberately small and uses only author-released checkpoints.
 
 | encoder | representation family | required input | role in comparison |

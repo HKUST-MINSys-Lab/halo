@@ -1,9 +1,13 @@
 # Experiment Roadmap
 
+Last verified against code: 2026-09-18.
+
 This is the single forward-looking experiment record for the active support-conditioned HAR
 system. It separates completed exploratory work from experiments that can produce a current result.
-The architecture and protocol are defined in `DESIGN_OF_RECORD.md` and
-`EVALUATION_PROTOCOL.md`; this document defines the order in which claims are tested.
+The architecture and protocol are defined in
+[`design_of_record.md`](../contracts/design_of_record.md) and
+[`evaluation_protocol.md`](../contracts/evaluation_protocol.md); this document defines the order
+in which claims are tested.
 
 ## Question
 
@@ -39,8 +43,8 @@ Each row uses the current disjoint rosters and the immutable manifest produced b
 | 0 | released external baselines | none | none | Establish released-checkpoint 1-NN, prototype, ridge, and native `k=0` reference rows. |
 | 1 | HALO initialized / neighbors | none after initialization | none | Random-encoder and implementation floor. |
 | 2 | HALO supervised end-to-end / neighbors | yes | none | Measure what direct enrollment training can teach the encoder without semantic-head capacity. |
-| 3 | HALO frozen encoder / token mixer | no | yes | Test classifier reasoning independently of encoder adaptation. |
-| 4 | HALO end-to-end / token mixer | yes | yes | Test the complete system against the matched neighbors control. |
+| 3 | HALO frozen encoder / residual classifier | no | yes | Test classifier reasoning independently of encoder adaptation. |
+| 4 | HALO end-to-end / residual classifier | yes | yes | Test the complete system against the matched neighbors control. |
 | 5 | released encoder / HALO classifier | no | yes | Isolate classifier value from HALO encoder value under both aggregate and scenario manifests. |
 
 The one-second fixed filterbank is retained as the compact architectural control. The current
@@ -57,19 +61,17 @@ references.
 
 ## Classifier Experiment
 
-As of 2026-09-17 the implemented learned head is the v3 residual classifier, normally using one
-shared parameter set. The earlier two-head token mixer is a historical architecture, not the
-current default. The next approved classifier design and its implementation sequence are in
-[CONTEXTUAL_CLASSIFIER_PLAN_20260917.md](CONTEXTUAL_CLASSIFIER_PLAN_20260917.md).
+The implemented learned head is the v3 residual classifier, normally using one shared parameter
+set. The earlier two-head token mixer is a historical architecture, not the current default. A
+candidate-specific mixture remains a proposal in the
+[2026-09-17 contextual classifier plan](../journal/2026-09-17-contextual-classifier-plan.md).
 
-The planned replacement contextualizes query, support, support-label and candidate tokens, then
-combines semantic support voting and direct query/candidate scoring with a candidate-specific
-learned mixture. At zero support it uses only its contextual semantic path. This replacement has
-not been implemented or evaluated; the ladder's "token mixer" rows describe classifier experiments,
-not an instruction to load the retired token-mixer implementation.
+That proposal contextualizes query, support, support-label and candidate tokens, then combines
+semantic support voting and direct query/candidate scoring with a candidate-specific learned
+mixture. It has not been implemented or evaluated and is not part of the active contract.
 
 The necessary comparison is always the same encoder and the same manifest under `neighbors` versus
-`retrieve-mix-vote`. A token mixer that does not exceed the neighbor control is not promoted as a
+`residual-classifier`. A learned classifier that does not exceed the neighbor control is not promoted as a
 useful component, even if its absolute score is high.
 
 ## Reporting Rules
@@ -93,13 +95,13 @@ useful component, even if its absolute score is high.
 
 ## Active curriculum experiment
 
-The 2026-09-17 [heterogeneity and metadata audit](HETEROGENEITY_METADATA_AUDIT_20260917.md)
+The 2026-09-17 [heterogeneity and metadata audit](../journal/2026-09-17-heterogeneity-metadata-audit.md)
 separates deployment heterogeneity from nuisance augmentation and from metadata/text-backend
 ablations. Complete the source-label/device/exposure checks before making stronger unseen-domain
 claims. Baseline-encoder plus HALO-classifier training remains planned but explicitly deferred.
 
 The staged deployment-challenge experiment is specified in
-[`CLASSIFIER_CURRICULUM_EXPERIMENT_20260916.md`](CLASSIFIER_CURRICULUM_EXPERIMENT_20260916.md).
+[`curriculum.md`](../contracts/curriculum.md).
 It first changes acquisition/enrollment episode construction, then adds truthful rate/modality
 perturbations and an evidence-dependent semantic gate. Explicit acquisition tokens are deferred.
 

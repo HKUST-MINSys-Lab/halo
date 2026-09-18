@@ -6,7 +6,7 @@ authoritative evaluation caches remain pending regeneration.
 
 This is the consolidated implementation plan for the two verified readiness sweeps.
 It takes precedence over conflicting implementation details in
-[EVAL_EXPANSION_PLAN_20260913.md](EVAL_EXPANSION_PLAN_20260913.md), not over the scientific
+[the 2026-09-13 evaluation expansion plan](2026-09-13-eval-expansion-plan.md), not over the scientific
 goals of that protocol. It is a temporary repair checklist, not another model specification.
 Update task status and evidence here as work lands; keep architecture in DESIGN_OF_RECORD
 and evaluation rules in EVALUATION_PROTOCOL. Journal entries and historical results stay intact.

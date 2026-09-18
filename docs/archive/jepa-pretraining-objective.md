@@ -4,7 +4,7 @@
 > `training/tokenizer/pretrain.py` implements this multi-horizon future-JEPA objective only behind
 > an explicit archival acknowledgement. It is not part of the active recipe. Literature evidence and
 > the audit that motivated the change remain in
-> [`JEPA_LITERATURE_NOTES_20260909.md`](JEPA_LITERATURE_NOTES_20260909.md).
+> [the 2026-09-09 literature notes](../journal/2026-09-09-jepa-literature-notes.md).
 
 ## 1. Purpose
 
@@ -373,7 +373,7 @@ student/teacher encoders, corpus sampler, and downstream selection probes.
 ## 10. Implementation map
 
 The operational corpus, exposure budget, and current measured runtime live in
-[PRETRAINING_CORPUS.md](../data/PRETRAINING_CORPUS.md); this design document does not duplicate
+[the retired pretraining corpus record](retired-pretraining-corpus.md); this design document does not duplicate
 hardware-dependent estimates.
 
 - `training/tokenizer/future_jepa.py`: physical-time target planner, metadata-only future predictor,
@@ -402,3 +402,5 @@ a sampling rate or interpreting token indices as time.
 - [Context Autoencoder](https://arxiv.org/abs/2202.03026): joint latent prediction and reconstruction from the predicted representation.
 - [VICReg](https://arxiv.org/abs/2105.04906): explicit variance and covariance control against collapse and redundancy.
 - [V-JEPA](https://arxiv.org/abs/2404.08471): evidence that bidirectional multi-block prediction remains a necessary control rather than assuming causal prediction must win.
+> Archived on 2026-09-18. JEPA is not part of the active training recipe; see
+> [`../overview/roadmap.md`](../overview/roadmap.md).

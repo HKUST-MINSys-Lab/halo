@@ -54,7 +54,7 @@ the encoder robust — a trade we took deliberately.
 
 Learnable Gabor kernels were meant to give frequency *and* time-frequency resolution. Three
 measurements closed it
-([halo-continuous-kernel-sweep](../design/CONTINUOUS_KERNEL_FRONTEND.md),
+([halo-continuous-kernel-sweep](../archive/continuous-kernel-frontend.md),
 [2026-09-12-jepa-and-encoder-findings.md](2026-09-12-jepa-and-encoder-findings.md)):
 
 1. **Gradients reach every parameter** (zero-fraction 0.000) but are **sign-inconsistent** once the

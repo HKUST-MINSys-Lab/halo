@@ -1,5 +1,7 @@
 # Baseline comparison policy
 
+Last verified against code: 2026-09-18.
+
 The goal is a useful deployment comparison, not an attribution claim across unmatched upstream
 corpora. Each retained encoder keeps its author-released weights and published input preprocessing.
 
@@ -18,7 +20,7 @@ For an eligible query/support episode:
 6. In partial-enrollment and deployment-heterogeneity scenario tables, use equal-weight normalized
    fusion as the default external-baseline readout. Preserve truth-enrolled, truth-unenrolled,
    combined, and harmonic-mean diagnostics.
-7. Report HALO's learned retrieve-mix-vote result separately from its matched `neighbors` and 1-NN
+7. Report HALO's learned residual-classifier result separately from its matched `neighbors` and 1-NN
    controls.
 8. Mark unsupported source/model combinations instead of inventing a replacement input path.
 
@@ -30,4 +32,4 @@ with frozen <encoder>` and disclose trainable parameters, steps, runtime, and se
 All model-selection decisions are fixed a priori or use the internal subject-held-out fold of the
 supervised training sources; there is no separate development-source roster. Test results are per
 dataset with subject-level uncertainty, checkpoint provenance, upstream data-overlap disclosure,
-runtime, and memory. See the full [evaluation protocol](../design/EVALUATION_PROTOCOL.md).
+runtime, and memory. See the full [evaluation protocol](../contracts/evaluation_protocol.md).

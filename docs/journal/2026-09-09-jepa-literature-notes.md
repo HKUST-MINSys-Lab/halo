@@ -2,7 +2,7 @@
 
 > **Historical literature audit.** The "design under review" below is the retired masked-JEPA and
 > pooled-VICReg recipe. Its findings informed the implemented future objective in
-> [`JEPA_PRETRAINING_OBJECTIVE.md`](JEPA_PRETRAINING_OBJECTIVE.md); do not read the restatement below
+> [the archived JEPA objective](../archive/jepa-pretraining-objective.md); do not read the restatement below
 > as the current trainer behavior.
 
 Compiled 2026-09-09. Numbers marked **[V]** were read by me directly out of the primary PDF

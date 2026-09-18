@@ -1,6 +1,6 @@
 # Evaluation protocol: support-conditioned HAR
 
-> Protocol of record, revised 2026-09-13. A score is reportable only when the run records the data split,
+> Last verified against code: 2026-09-18. A score is reportable only when the run records the data split,
 > encoder checkpoint, baseline adapter revision, episode manifest, and support/candidate settings.
 
 > **Operational status:** `training.support_classifier.sealed_eval` is the only sealed-test entry
@@ -25,7 +25,7 @@
    or read from training data. Touch the sealed test sources once, after those choices are frozen.
 
 The exact active 8/6 source lists are recorded once in
-[DESIGN_OF_RECORD.md](DESIGN_OF_RECORD.md) and enforced in code by roster tests.
+[design_of_record.md](design_of_record.md) and enforced in code by roster tests.
 
 ## Episode contract
 
@@ -78,10 +78,11 @@ For each eligible representation, report these readouts on exactly the same epis
    predictions are identical at `k=0`.
 4. **Differentiable neighbours:** HALO encoder-development objective only; it is not reported as an
    adaptation mechanism for released baseline models.
-5. **HALO retrieve-mix-vote:** its learned semantic token mixer. For `k > 0`, it jointly attends
-   to query, support, support-label, and candidate-label tokens before a soft support vote. For
-   `k = 0`, it jointly attends to the query and candidate-label tokens before direct cosine
-   scoring. The two paths use separately trained head weights and one shared encoder.
+5. **HALO residual classifier:** the learned support-conditioned classifier. It jointly
+   contextualizes query, support, paired support-label, and candidate-label tokens, then combines
+   centered support evidence with a direct semantic candidate term. The default checkpoint uses
+   one shared classifier across `k = 0` and `k > 0`; a regime-split checkpoint is a named ablation,
+   never an implicit evaluation choice.
 
 At `k=0`, there is no target-dataset enrollment, but labelled training-corpus evidence remains
 available. For HALO and released encoders without a native open-label head, retrieve the nearest

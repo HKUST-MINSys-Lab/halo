@@ -1,9 +1,9 @@
 # Retired label-free pretraining corpus
 
-> Historical record. `data/pretraining/corpus_plan.py` and the associated data remain preserved for
+> Archived on 2026-09-18. `data/pretraining/corpus_plan.py` and the associated data remain preserved for
 > reproducibility, but future-JEPA is not an active HALO recipe.
 
-## Purpose and isolation
+## Historical purpose and isolation
 
 Future-JEPA uses no activity labels. Label-free sources live under `data/pretraining/`, carry the
 reserved `__unlabeled__` marker, and are excluded from label vocabularies, support-classifier

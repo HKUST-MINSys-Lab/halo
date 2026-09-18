@@ -1,10 +1,10 @@
 # Active Dataset Ledger
 
-**Status:** active protocol ledger, measured 2026-09-18 from the local processed session files.
-This is the single source for data-role, conversion, and fairness disclosures. It covers only the
-three label-free encoder-pretraining sources, eight supervised-head sources, six sealed evaluation
-sources, and the two separately scoped scenario/prospective sources. Retired and historical data
-remain on disk for reproducibility but are deliberately omitted.
+**Status:** active protocol ledger. Last verified against code and local processed sessions: 2026-09-18.
+This is the single source for active data-role, conversion, and fairness disclosures. It covers the
+eight supervised-head sources, six sealed evaluation sources, and separately scoped prospective
+sources. The three label-free sources are retained below as a historical inventory only; JEPA
+pretraining is disconnected from the active recipe.
 
 ## Common processing contract
 
@@ -23,7 +23,7 @@ remain on disk for reproducibility but are deliberately omitted.
   allowed. Robust normalization statistics are fitted on the active train corpus only.
 - Native labels are retained in `labels.json`; canonical labels are a controlled vocabulary used
   only for cross-source comparisons. Acquisition conditioning follows the versioned
-  [schema-v2 contract](../design/ACQUISITION_CONDITIONING_CONTRACT.md): natural language contains
+  [schema-v2 contract](acquisition_conditioning.md): natural language contains
   device role and placement only, while modality, gravity, and effective source rate are exact
   structured model inputs. Stored rate is retained for provenance only. Evaluation candidate labels
   remain frozen native labels.
@@ -31,11 +31,11 @@ remain on disk for reproducibility but are deliberately omitted.
   the recorded native rate; it is not a claim about raw archive duration. The median is per session.
   Rerun this inventory after rebuilding sessions before changing a protocol claim.
 
-## Label-free Encoder Pretraining
+## Retired Label-free Encoder Pretraining
 
-All three sources are structurally label-free (`__unlabeled__` only) and cannot enter the
+These sources remain structurally label-free (`__unlabeled__` only) and cannot enter the
 supervised vocabulary, support bank, validation selection, or sealed evaluation. They total
-**5,271.4 stream-hours** across **730 processed streams**.
+**5,271.4 stream-hours** across **730 processed streams**. They are not loaded by current training.
 
 | Dataset | Original schema and available subset | Local quantity | Conversion / preprocessing | Why retained |
 |---|---|---:|---|---|

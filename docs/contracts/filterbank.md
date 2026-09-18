@@ -1,5 +1,7 @@
 # Fixed-filterbank polarization features
 
+Last verified against code: 2026-09-18.
+
 The fixed physical filterbank can append bounded, rotation-aware features for a complete
 accelerometer or gyroscope xyz triad. This is an optional fixed analysis block, not a new learned
 frontend or a cross-sensor fusion mechanism.

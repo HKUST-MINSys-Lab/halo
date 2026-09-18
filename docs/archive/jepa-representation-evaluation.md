@@ -8,7 +8,7 @@ not a model-design document.
 
 The commands below reproduce revision-2 checkpoints whose physical durations were
 `0.5/1.0/1.5` seconds. They are historical controls, not templates for the revision-3 frontend in
-[CONTINUOUS_KERNEL_FRONTEND.md](CONTINUOUS_KERNEL_FRONTEND.md), which uses `0.5/1.0/2.0` seconds.
+[the archived continuous-kernel design](continuous-kernel-frontend.md), which uses `0.5/1.0/2.0` seconds.
 
 ## Arms
 
@@ -57,4 +57,5 @@ python -m training.support_classifier.sealed_eval \
 ```
 
 Use the multispan checkpoint with `--frontend multispan --spans 0.5 1.0 1.5` for the parallel arm.
-All reportable runs must follow [EVALUATION_PROTOCOL.md](EVALUATION_PROTOCOL.md).
+All reportable runs must follow the current [evaluation protocol](../contracts/evaluation_protocol.md).
+> Archived on 2026-09-18. These results use a retired protocol and remain historical evidence only.

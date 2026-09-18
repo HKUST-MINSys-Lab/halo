@@ -1,20 +1,31 @@
-# HALO documentation
+# Documentation
 
-Start with [START_HERE.md](START_HERE.md). It names the active system, source of truth for the
-pretraining corpus, and the exact separation between live and archived work.
+HALO documentation has three kinds of source, and each fact should have exactly one owner.
 
-Live documents:
+## Overview
 
-- [Readiness repair plan](design/READINESS_REPAIR_PLAN_20260913.md): consolidated verified
-  training/evaluation fixes and acceptance gates; pending implementation, not a new model design;
-- `design/DESIGN_OF_RECORD.md`: current encoder and support-classifier architecture;
-- `design/ACQUISITION_CONDITIONING_CONTRACT.md`: mandatory device/placement text and exact
-  modality, gravity, and rate metadata contract for every dataset;
-- `design/EXPERIMENT_ROADMAP.md`: active experiment sequence and result-promotion rules;
-- `design/EVALUATION_PROTOCOL.md`: support-classification splits, metrics, and reporting rules;
-- `baselines/`: retained released-checkpoint roster and comparison policy; and
-- `results/RESULTS.md`: promoted result record.
+- [Thesis and scope](overview/thesis.md)
+- [Current architecture](overview/architecture.md)
+- [Experiment roadmap](overview/roadmap.md)
+- [Project eras and historical Git references](overview/history.md)
 
-Use [HISTORY.md](HISTORY.md) and the dated [journal](journal/README.md) for retired work,
-including the JEPA design, corpus, and results. Do not restore archived documents into this tree
-as live design material.
+## Living contracts
+
+- [Design of record](contracts/design_of_record.md)
+- [Acquisition conditioning](contracts/acquisition_conditioning.md)
+- [Training curriculum](contracts/curriculum.md)
+- [Evaluation protocol](contracts/evaluation_protocol.md)
+- [Baseline policy](contracts/baselines.md)
+- [Baseline comparison fairness](contracts/baseline_fairness.md)
+- [Dataset policy and roster](contracts/data_policy.md)
+- [Fixed filterbank](contracts/filterbank.md)
+
+## Evidence
+
+- [Promoted results](results/RESULTS.md)
+- [Dated journal and audits](journal/README.md)
+- [Frozen superseded designs](archive/)
+
+Contracts are edited in place and carry a last-verified date. Journal entries are dated records and
+are not silently rewritten. Archive files are retained only for reproducibility and begin with a
+supersession notice.

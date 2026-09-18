@@ -1,62 +1,41 @@
 # HALO
 
-HALO is a research codebase for support-conditioned human-activity recognition from heterogeneous
-inertial measurement unit (IMU) recordings. The current question is practical: can a
-physical-time encoder and a simple comparison head recognize a bounded set of activities when it
-is given zero or a small number of labelled support recordings?
+**HALO: Heterogeneity-Adaptive, Lightweight, Open-vocabulary activity recognition** is a
+support-conditioned system for zero- and few-shot recognition from heterogeneous wearable IMUs in
+under one million trainable parameters.
+
+HALO receives a query recording, a declared candidate-label set, and optionally labelled support
+recordings. It does not claim that language alone describes arbitrary motion, nor does it perform
+open-set rejection. Instead, it learns a compact physical-time representation and judges the query
+against the evidence available at deployment.
 
 ```text
-native-rate IMU + honest channel metadata
-    -> rate-aware HALO encoder
-    -> one representation per recording
-    -> compare a query with labelled supports
-    -> score the supplied candidate activities
+native-rate IMU + acquisition metadata
+    -> fixed multiresolution physical filterbank (0.5, 1, 2, 4 s)
+    -> contextual temporal encoder and learned recording pool
+    -> support-conditioned classifier
+    -> scores over the declared candidate labels
 ```
 
-The project does not claim unconstrained activity recognition from arbitrary label text. The
-support set defines the available evidence: zero-support and enrolled-support conditions are
-separate, explicitly reported evaluation regimes.
+The active experiment uses 8-second training windows. The parameter-free differentiable-neighbor
+path is the encoder control; the learned residual classifier combines support evidence with a
+semantic candidate path. Future-JEPA, continuous kernels, explicit admissibility, and hidden-bank
+retrieval are preserved as historical work, not active defaults.
 
-## Current scope
+Start with [the documentation index](docs/README.md). The living architecture, conditioning,
+curriculum, data, baseline, and evaluation contracts are under `docs/contracts/`; promoted results
+are in [RESULTS.md](docs/results/RESULTS.md); the dated research record is under `docs/journal/`.
 
-- **Encoder arms:** a one-second fixed physical filterbank control, a fixed multiresolution
-  filterbank (0.5, 1.0, and 1.5 seconds), and a continuous multispan frontend at the same spans.
-- **No active label-free pretraining:** future-JEPA was evaluated and retired because supervised
-  end-to-end encoder adaptation recovered its observed gain. The reproducibility code and results
-  remain archived behind an explicit command-line acknowledgment.
-- **Classifier:** a semantic token mixer with separate zero-support and enrolled-support weights.
-  With enrollment it jointly contextualises query, support, paired support-label, and candidate-label
-  tokens before a soft support vote. The parameter-free `neighbors` path is the encoder control.
-  Neither path contains the retired admissibility gate or hidden memory-bank retrieval machinery.
-- **External comparisons:** author-released HARNet, UniMTS, and NormWear checkpoints, adapted
-  faithfully and evaluated under the same support protocol where their input contracts permit it.
-
-Read [the documentation entry point](docs/START_HERE.md) before configuring a run.
-
-## Layout
-
-```text
-baselines/                    # retained released-checkpoint adapters and publications
-data/                         # labelled data, curation, and label-free pretraining sources
-model/tokenizer/              # HALO frontends and contextual encoder
-model/support/                # current support-conditioned comparison head
-training/tokenizer/           # encoder utilities and archived JEPA reproducibility code
-training/support_classifier/  # support-classifier training and validation
-docs/                         # current design, data, protocol, and results record
-tests/                        # regression tests for the retained surface
-```
-
-The previous language-alignment, explicit-admissibility, Phase-B memory-bank evidence engine, and
-movement-monitoring application pivots are archived in Git. They are not live implementation
-guidance. See [docs/HISTORY.md](docs/HISTORY.md).
-
-## Development
-
-Use the project interpreter for Torch and scientific dependencies:
+## Commands
 
 ```bash
-/home/alex/code/HALO/legacy_code/.venv/bin/python -m pytest tests -q
+uv sync --extra model --extra dev
+uv run halo-train --help
+uv run halo-sealed-eval --help
+uv run halo-scenarios --help
+uv run pytest -q
 ```
 
-Raw downloads, caches, checkpoints, and generated run outputs are ignored by Git. Promoted
-protocols and result summaries are tracked with their code.
+Generated datasets remain under `data/datasets/`. Checkpoints, feature caches, and local result
+artifacts are ignored and can be redirected with `HALO_RUNS_DIR`, `HALO_CACHE_DIR`, and
+`HALO_RESULTS_DIR`; all path variables are defined in `halo/paths.py`.

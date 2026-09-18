@@ -7,7 +7,7 @@ is changed by this document. The implementation on this date remains the v3 resi
 ## 1. Scope and decisions
 
 Prerequisite audit and separate experiment tracks:
-[HETEROGENEITY_METADATA_AUDIT_20260917.md](HETEROGENEITY_METADATA_AUDIT_20260917.md).
+[the heterogeneity and metadata audit](2026-09-17-heterogeneity-metadata-audit.md).
 In particular, cross-stream manifests currently rewrite support labels into the query vocabulary;
 preserving source wording for semantic-transfer experiments needs an explicit protocol revision,
 not just changing the classifier's text gather. The new head must accept independent label text,

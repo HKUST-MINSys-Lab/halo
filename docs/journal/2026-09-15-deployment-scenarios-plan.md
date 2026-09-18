@@ -2,7 +2,7 @@
 
 **Status:** implemented, repaired after review, and bounded integration-tested on HALO and every
 primary baseline. The full comparison has not been run. See
-[the review acceptance record](DEPLOYMENT_SCENARIOS_REVIEW_20260915.md#execution-and-acceptance-checklist).
+[the review acceptance record](2026-09-15-deployment-scenarios-review.md#execution-and-acceptance-checklist).
 Written after the 2026-09-15 supervisor meeting. Companion to
 `ABLATION_PLAN_20260915.md`: that plan explains *why* we lead once we know *where*; this plan finds
 where. Nothing here trains a model. Every scenario is evaluation-only on existing checkpoints,

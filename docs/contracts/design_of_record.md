@@ -1,6 +1,6 @@
 # Design of record: support-conditioned heterogeneous HAR
 
-> Current design, 2026-09-12. This document supersedes the earlier language-alignment,
+> Last verified against code: 2026-09-18. This document supersedes the earlier language-alignment,
 > admissibility, evidence-engine, and movement-monitoring designs on `main`.
 
 ## Objective
@@ -42,37 +42,31 @@ validity masks.
 | arm | frontend | intended role |
 |---|---|---|
 | fixed control | one-second physical filterbank | small, interpretable baseline |
-| fixed multiresolution | filterbank at 0.5, 1.0, and 1.5 seconds, jointly contextualized | frequency features at multiple physical spans |
+| fixed multiresolution | filterbank at 0.5, 1.0, 2.0, and 4.0 seconds, jointly contextualized | frequency features at multiple physical spans |
 | continuous multispan | retired experimental frontend; retained only for checkpoint loading/reproduction | not part of the active recipe or reported comparison |
 
 New fixed-filterbank runs append bounded per-triad polarization features when complete xyz metadata
 is available. This preserves the physical band-energy path while adding rotation-aware motion
 geometry. The complete contract, including checkpoint compatibility, is in
-[FILTERBANK_POLARIZATION.md](FILTERBANK_POLARIZATION.md).
+[filterbank.md](filterbank.md).
 
 Acquisition-description conditioning is auxiliary context. It may explain which channels are
 present and how they were acquired; it must not become a shortcut for dataset or label identity.
 
 ## Support classifier
 
-Classifier status updated 2026-09-17. For each episode, the encoder produces one learnable pooled
-vector for the query recording and each support recording. The implemented default is the v3
-residual classifier: a shared set transformer produces scalar corrections to centered sensor
-comparisons and exact-label support voting, combined with a direct semantic term. Its historical
-specification is [SUPPORT_CLASSIFIER_DESIGN_20260914.md](SUPPORT_CLASSIFIER_DESIGN_20260914.md).
-The earlier independent zero/few-shot token mixers are not the current default.
+For each episode, the encoder produces one learned pooled vector for the query recording and each
+support recording. The active v3 residual classifier contextualizes query, support,
+paired support-label, and candidate-label tokens with a shared set transformer. Scalar residuals
+adjust centered sensor comparisons and exact-label support voting, which are combined with a
+direct semantic candidate term. The default uses one parameter set across zero- and few-support
+episodes. The earlier independent zero/few-shot token mixers are retired.
 
-The approved replacement, **not yet implemented**, is specified in
-[CONTEXTUAL_CLASSIFIER_PLAN_20260917.md](CONTEXTUAL_CLASSIFIER_PLAN_20260917.md). It contextualizes
-query, support, paired support-label, and candidate tokens before all comparisons. Projected
-query/support similarities weight semantic support-label votes to candidates. A second path
-compares the contextual query directly with candidate labels. Both paths are normalized and a
-small shared MLP supplies a candidate-specific mixture weight, followed by final normalization.
-With no support, only the contextual semantic path applies. The plan retains unified classifier
-parameters and does not reintroduce the historical regime split.
+The next candidate-specific mixture design remains a proposal, not active code. Its rationale is
+preserved in the [2026-09-17 contextual classifier plan](../journal/2026-09-17-contextual-classifier-plan.md).
 
 There is no top-k retrieval or hidden background bank. Every supplied support row participates in
-attention and receives a differentiable score. The `neighbors` control removes the token mixer and
+attention and receives a differentiable score. The `neighbors` control removes the learned classifier and
 uses the same encoder with a temperature-scaled soft support vote; it is the fast diagnostic of
 encoder quality without classifier reasoning.
 
@@ -97,7 +91,7 @@ fold. That fold selects support-classifier checkpoints, but it is not a separate
 roster. Candidate count and support count are episode properties recorded with every score. The
 sealed sources never select a checkpoint or hyperparameter and are touched only after the protocol
 is frozen. See
-[EVALUATION_PROTOCOL.md](EVALUATION_PROTOCOL.md).
+[evaluation_protocol.md](evaluation_protocol.md).
 
 Training mixes single-device examples with exact event-aligned 2-4-device examples from `realdisp`,
 `xrf_v2`, `dsads`, and `forth_trace`. Device subsets are drawn independently whenever a query or
@@ -109,5 +103,5 @@ the sealed protocol measures both single placements and fixed all-device composi
 
 The retired explicit admissibility table, separate Phase-B memory bank, memory-wide retrieval and
 candidate-scoring path, arbitrary-label curriculum, and Task 0-3 movement-monitoring packages are
-not part of this design. The active bounded-set token mixer described above is distinct from that
+not part of this design. The active bounded-set residual classifier described above is distinct from that
 retired path. Archived components must not be revived through a default flag or undocumented import.

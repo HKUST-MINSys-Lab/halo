@@ -112,7 +112,7 @@ the held-out people. Do not use arbitrary local subject splits for a cross-subje
 **Superseded on 2026-09-18.** The acquisition pipeline described in sections 5.1, 6, 7, and the
 T0/T1 proposals below motivated `acquisition-conditioning-v2`; it is not the current runtime
 contract. The implemented design is specified in
-[ACQUISITION_CONDITIONING_CONTRACT.md](ACQUISITION_CONDITIONING_CONTRACT.md): text carries only
+[the acquisition conditioning contract](../contracts/acquisition_conditioning.md): text carries only
 device role and placement, while modality, gravity, and effective source rate use an independent
 exact structured branch. Stored rate is retained for provenance but deliberately excluded from
 the learned input. Activity-label text remains a separate classifier input.

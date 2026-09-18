@@ -1,6 +1,6 @@
 # Acquisition Conditioning Contract
 
-**Status:** design of record, schema `acquisition-conditioning-v2`, 2026-09-18.
+**Status:** design of record, schema `acquisition-conditioning-v2`. Last verified against code: 2026-09-18.
 
 This document is the authoritative contract for turning runtime acquisition metadata into HALO
 encoder inputs. Dataset converters and evaluation derivations must populate this contract. They

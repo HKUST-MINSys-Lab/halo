@@ -193,3 +193,4 @@ vs our adapted arms** (does the gap survive supervised adaptation, the way JEPA'
   **`Mantis-8M`** — it is the one ZARA evaluated. Note the others in the docstring as future work.
 * If `mantis-tsfm` pulls a heavy or conflicting dependency set, vendor only the architecture module
   rather than taking the dependency; record which you did.
+> Archived on 2026-09-18. Mantis is not in the retained released-checkpoint baseline roster.

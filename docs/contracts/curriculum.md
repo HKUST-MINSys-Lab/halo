@@ -1,7 +1,10 @@
 # Classifier Curriculum Experiment - 2026-09-16
 
+Last verified against code: 2026-09-18.
+
 **Status:** approved staged experiment. This document records the hypotheses, implementation
-order, controls, and reporting contract. It supplements `SUPPORT_CLASSIFIER_DESIGN_20260914.md`;
+order, controls, and reporting contract. It supplements the active
+[`design_of_record.md`](design_of_record.md);
 it does not redefine the sealed evaluation protocol.
 
 > **Protocol update (2026-09-17):** active comparisons use the seven-scenario v4 roster. Cold-start
