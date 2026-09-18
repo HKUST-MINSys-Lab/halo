@@ -22,8 +22,12 @@ class BucketedSupportBatch:
 class SupportCollate:
     """Carry per-window gravity and optional sensor-bias metadata through the base collate."""
 
-    def __init__(self, base):
+    def __init__(self, base, max_rows_per_batch: int = 0):
         self.base = base
+        if max_rows_per_batch < 0:
+            raise ValueError("max_rows_per_batch cannot be negative")
+        # 0 keeps the historical behaviour: one dense sub-batch per channel-width group.
+        self.max_rows_per_batch = int(max_rows_per_batch)
 
     def __call__(self, batch: list[dict]) -> dict:
         return self._add_support_metadata(self.base(batch), batch)
@@ -60,13 +64,20 @@ class SupportCollate:
         flattened = []
         for channels in sorted(groups):
             members = groups[channels]
-            row_index = torch.tensor([row for row, _ in members], dtype=torch.long)
-            items = [item for _, item in members]
-            deferred = getattr(self.base, "deferred", None)
-            dense = deferred(items) if deferred is not None else self.base(items)
-            batches.append(self._add_support_metadata(dense, items))
-            indices.append(row_index)
-            flattened.extend(row_index.tolist())
+            # Recordings are encoded independently, so emitting several smaller dense sub-batches
+            # is mathematically identical to one large one: ``restore_order`` below reassembles
+            # dataset row order whatever the split. This bounds the transient spectral tensors of
+            # the filterbank, which are the peak memory of a high-enrolment multi-device step.
+            step = self.max_rows_per_batch or len(members)
+            for start in range(0, len(members), step):
+                chunk = members[start:start + step]
+                row_index = torch.tensor([row for row, _ in chunk], dtype=torch.long)
+                items = [item for _, item in chunk]
+                deferred = getattr(self.base, "deferred", None)
+                dense = deferred(items) if deferred is not None else self.base(items)
+                batches.append(self._add_support_metadata(dense, items))
+                indices.append(row_index)
+                flattened.extend(row_index.tolist())
         restore = torch.tensor(flattened, dtype=torch.long).argsort()
         return BucketedSupportBatch(
             batches=tuple(batches), row_indices=tuple(indices),

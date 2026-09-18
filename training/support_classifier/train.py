@@ -1443,6 +1443,12 @@ def main() -> None:
                              "updated at --checkpoint-every")
     parser.add_argument("--calib-batches", type=int, default=20)
     parser.add_argument("--calib-batch-size", type=int, default=256)
+    parser.add_argument("--encode-chunk-rows", type=int, default=0,
+                        help="maximum recording rows per dense encoder sub-batch. 0 keeps one "
+                             "sub-batch per channel-width group. Recordings encode independently, "
+                             "so a smaller value is mathematically identical and only bounds the "
+                             "transient filterbank spectra that dominate peak GPU memory on "
+                             "high-enrolment multi-device steps")
     parser.add_argument("--loader-workers", type=int, default=16,
                         help="forked worker PROCESSES that draw, load and collate upcoming steps "
                              "while the GPU trains (PrefetchLoader). 0 = synchronous on the main "
@@ -1772,7 +1778,7 @@ def main() -> None:
         if args.resolutions is not None
         else MultiScaleCollate(fixed_patch_seconds=args.patch_seconds)
     )
-    collate = SupportCollate(base_collate)
+    collate = SupportCollate(base_collate, max_rows_per_batch=args.encode_chunk_rows)
     # Calibration and validation load on this thread; training steps come from the prefetcher.
     executor = None
 

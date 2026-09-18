@@ -203,3 +203,43 @@ def test_synchronous_and_worker_batch_preparation_match(monkeypatch, challenge_p
         "planned" if challenge_probability else "independent"
     }
     assert (expected[3][0].relation != "not_applicable") == bool(challenge_probability)
+
+
+def test_support_collate_row_chunking_preserves_rows_and_order():
+    """A row-chunked bucketing must reassemble exactly the unchunked row order."""
+    items = [_item(300, 12, 0.01), _item(300, 6, 0.02), _item(300, 12, 0.03),
+             _item(300, 6, 0.04), _item(300, 12, 0.05)]
+    plain = SupportCollate(MultiResolutionCollate(fixed_patch_seconds=(0.5, 1.0, 1.5)))
+    chunked = SupportCollate(MultiResolutionCollate(fixed_patch_seconds=(0.5, 1.0, 1.5)),
+                             max_rows_per_batch=2)
+    a, b = plain.bucketed(items), chunked.bucketed(items)
+
+    assert a.row_count == b.row_count == len(items)
+    # Chunking splits the wide bucket; it must not merge or drop any row.
+    assert len(b.batches) > len(a.batches)
+    assert max(int(batch["compact_data"].shape[0]) for batch in b.batches) <= 2
+
+    def restored(bucket):
+        return torch.cat([
+            index.float().unsqueeze(1) for index in bucket.row_indices
+        ]).index_select(0, bucket.restore_order).squeeze(1).tolist()
+
+    assert restored(a) == restored(b) == [float(row) for row in range(len(items))]
+
+    # Every row's own payload must survive the split unchanged.
+    def payload_by_row(bucket):
+        out = {}
+        for batch, index in zip(bucket.batches, bucket.row_indices):
+            for position, row in enumerate(index.tolist()):
+                out[row] = batch["compact_data"][position]
+        return out
+
+    left, right = payload_by_row(a), payload_by_row(b)
+    assert set(left) == set(right)
+    for row in left:
+        assert torch.equal(left[row], right[row])
+
+
+def test_support_collate_rejects_negative_chunk_size():
+    with pytest.raises(ValueError):
+        SupportCollate(MultiResolutionCollate(fixed_patch_seconds=(0.5,)), max_rows_per_batch=-1)
