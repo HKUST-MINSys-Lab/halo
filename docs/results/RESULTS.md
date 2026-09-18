@@ -9,6 +9,19 @@ future-JEPA variants are archived separately and are not mixed into this table.
 > independent enrollment/acquisition sampler, and mandatory companion cosine 1-NN rows. Matched
 > comparisons must re-score every checkpoint under one protocol. The v4 table below is historical.
 
+## Fresh baseline scenario artifact - 2026-09-18
+
+The current `deployment-scenarios-v5-20260918` baseline-only run completed successfully before
+any new HALO run: five released baseline providers, seven active scenarios, one 8-second evidence
+duration, and `k={0,1,4,8,32}`. It produced 11,211 rows across 1,132 scored task units with zero
+task failures and zero failed rows. Explicit unsupported rows are retained rather than repaired
+with project-specific adapter logic.
+
+This is a durable baseline reference, not a HALO comparison table. A fresh aggregate sealed curve
+and a matched fresh HALO scenario run are required before presenting a new head-to-head claim.
+The generated table and its complete machine-readable provenance are in
+[`results/artifacts/scenarios_baselines_v5_20260918`](../../results/artifacts/scenarios_baselines_v5_20260918/).
+
 ## Representative scenario protocol - 2026-09-17
 
 Deployment scenarios are a fixed set of seven stress tests, not a full Cartesian sweep. The

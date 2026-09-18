@@ -1,0 +1,178 @@
+{
+  "harnet10": {
+    "artifacts": {
+      "released_checkpoint": {
+        "path": "/home/alex/.cache/torch/hub/OxWearables_ssl-wearables_v1.0.0/model_check_point/mtl_best.mdl",
+        "sha256": "c64f9135d99e2dcdfc9ae7cc0672f2bcc438df9ceb8215665882f92cddd162a6"
+      }
+    },
+    "evaluation_config": {
+      "feature_layer": "feature_extractor",
+      "feature_readout": "exact tensor consumed by released EvaClassifier (squeeze T=1)",
+      "input_rate_hz": 30,
+      "input_samples": 300,
+      "metadata_inputs": "none",
+      "released_model": "harnet10",
+      "released_source": "OxWearables/ssl-wearables:v1.0.0",
+      "resampler": "linear interpolation matching released preprocessing",
+      "window_policy": "published_center_crop_or_wrap_pad"
+    },
+    "feature_config": {
+      "feature_layer": "feature_extractor",
+      "feature_readout": "exact tensor consumed by released EvaClassifier (squeeze T=1)",
+      "input_rate_hz": 30,
+      "input_samples": 300,
+      "metadata_inputs": "none",
+      "released_model": "harnet10",
+      "released_source": "OxWearables/ssl-wearables:v1.0.0",
+      "resampler": "linear interpolation matching released preprocessing",
+      "window_policy": "published_center_crop_or_wrap_pad"
+    }
+  },
+  "harnet5": {
+    "artifacts": {
+      "released_checkpoint": {
+        "path": "/home/alex/.cache/torch/hub/OxWearables_ssl-wearables_v1.0.0/model_check_point/mtl_5_best.mdl",
+        "sha256": "74ffaefbafb467b7253d121ef71fe734ee03bc802ba33c33a6aa1aef7f91de5e"
+      }
+    },
+    "evaluation_config": {
+      "feature_layer": "feature_extractor",
+      "feature_readout": "exact tensor consumed by released EvaClassifier (squeeze T=1)",
+      "input_rate_hz": 30,
+      "input_samples": 150,
+      "metadata_inputs": "none",
+      "released_model": "harnet5",
+      "released_source": "OxWearables/ssl-wearables:v1.0.0",
+      "resampler": "linear interpolation matching released preprocessing",
+      "window_policy": "published_center_crop_or_wrap_pad"
+    },
+    "feature_config": {
+      "feature_layer": "feature_extractor",
+      "feature_readout": "exact tensor consumed by released EvaClassifier (squeeze T=1)",
+      "input_rate_hz": 30,
+      "input_samples": 150,
+      "metadata_inputs": "none",
+      "released_model": "harnet5",
+      "released_source": "OxWearables/ssl-wearables:v1.0.0",
+      "resampler": "linear interpolation matching released preprocessing",
+      "window_policy": "published_center_crop_or_wrap_pad"
+    }
+  },
+  "limubert_x": {
+    "artifacts": {
+      "released_checkpoint": {
+        "path": "/home/alex/code/HALO/halo/baselines/limubert_x/limu_bert_x.pt",
+        "sha256": "65697e7017020f36429a221382253f1fc370fdfd493cfb71667f95846c18516c"
+      }
+    },
+    "evaluation_config": {},
+    "feature_config": {
+      "acceleration_units": "g (authors' post-normalization convention)",
+      "across_clip_pool": "duration-weighted mean",
+      "feature_layer": "transformer hidden states",
+      "gyroscope_units": "rad/s",
+      "input_channels": [
+        "acc_x",
+        "acc_y",
+        "acc_z",
+        "gyro_x",
+        "gyro_y",
+        "gyro_z"
+      ],
+      "input_rate_hz": 10.0,
+      "input_samples_per_clip": 20,
+      "metadata_inputs": "none",
+      "pooling_provenance": "HALO evaluation choice; released downstream classifier is GRU-based",
+      "released_config": "base_v4",
+      "within_clip_pool": "mean"
+    }
+  },
+  "normwear": {
+    "artifacts": {
+      "backbone": {
+        "path": "/home/alex/code/HALO/legacy_code/auxiliary_repos/NormWear/checkpoints/normwear_pretrain_ckpt.pth",
+        "sha256": "36d0bca18356ccfc8e8916058bf838f26f1212a646f5780b487ad78581a92561"
+      },
+      "text_model": {
+        "path": "/home/alex/.cache/huggingface/hub/models--muzammil-eds--tinyllama-2.5T-Clinical-v2/snapshots/60edacbb121c27e4e10b33db00ee8f54b307b175/model.safetensors",
+        "sha256": "ea221e61b1730ad4a4fffe8805332284e5aa15963e1abb913f77e9fc3b92e97e"
+      },
+      "text_tokenizer": {
+        "path": "/home/alex/.cache/huggingface/hub/models--muzammil-eds--tinyllama-2.5T-Clinical-v2/snapshots/60edacbb121c27e4e10b33db00ee8f54b307b175/tokenizer.json",
+        "sha256": "ed10d2bec548adc9cfeda7fecea1fce5f921970afbcfcf5acfade32893c64f70"
+      },
+      "zero_shot_fusion": {
+        "path": "/home/alex/code/HALO/legacy_code/auxiliary_repos/NormWear/checkpoints/normwear_msitf_zeroshot_last_checkpoint-5.pth",
+        "sha256": "6605c137d3cea7cab479d8ab0f9bc06cc76f1ecd7429f33eb81a6f35e0887dbe"
+      }
+    },
+    "evaluation_config": {
+      "cwt_implementation": "released-variable-length-ricker-torch-v1",
+      "enrollment_feature": "backbone_mean_patch_then_channel_768",
+      "inference_precision": "fp16",
+      "input_rate_hz": 65,
+      "input_samples": "variable, full evaluation interval",
+      "native_metric": "manhattan_l1",
+      "native_zero_shot_feature": "MSiTF_query_conditioned_2048",
+      "real_channels_only": true,
+      "short_tail_policy": "repeat-last-to-11-samples-at-65Hz",
+      "text_model": "muzammil-eds/tinyllama-2.5T-Clinical-v2",
+      "text_model_revision": "60edacbb121c27e4e10b33db00ee8f54b307b175",
+      "window_policy": "released variable-length single pass"
+    },
+    "feature_config": {
+      "cwt_implementation": "released-variable-length-ricker-torch-v1",
+      "enrollment_feature": "backbone_mean_patch_then_channel_768",
+      "feature_dim": "768 x real sensor channels",
+      "feature_layer": "released backbone patch tokens",
+      "feature_readout": "mean patches then flatten real channels",
+      "feature_readout_provenance": "released downstream recipe",
+      "feature_role": "common_enrollment",
+      "inference_precision": "fp16",
+      "input_rate_hz": 65,
+      "input_samples": "variable, full evaluation interval",
+      "metadata_inputs": "none",
+      "native_metric": "manhattan_l1",
+      "native_zero_shot_feature": "MSiTF_query_conditioned_2048",
+      "real_channels_only": true,
+      "short_tail_policy": "repeat-last-to-11-samples-at-65Hz",
+      "text_model": "muzammil-eds/tinyllama-2.5T-Clinical-v2",
+      "text_model_revision": "60edacbb121c27e4e10b33db00ee8f54b307b175",
+      "window_policy": "released variable-length single pass"
+    }
+  },
+  "unimts": {
+    "artifacts": {
+      "released_checkpoint": {
+        "path": "/home/alex/code/HALO/legacy_code/auxiliary_repos/UniMTS/checkpoint/UniMTS.pth",
+        "sha256": "a9858c0084d936655240407e30ff9db9adeded6a67dc5650e3f667578e93b220"
+      }
+    },
+    "evaluation_config": {
+      "input_channels": [
+        "acc_x",
+        "acc_y",
+        "acc_z"
+      ],
+      "input_rate_hz": 20.0,
+      "input_samples": 200,
+      "label_dictionary_sha256": "e924d6561ff58558f3296eb134b3e9c543086c2e3c091acf2c57caf7d4edbd35",
+      "label_text_source": "sealed source-backed dataset dictionaries",
+      "metadata_inputs": "sensor placement mapped to released SMPL joint; candidate label text",
+      "window_policy": "published_wrap_pad_or_truncate"
+    },
+    "feature_config": {
+      "feature_layer": "acc_st_gcn",
+      "input_channels": [
+        "acc_x",
+        "acc_y",
+        "acc_z"
+      ],
+      "input_rate_hz": 20.0,
+      "input_samples": 200,
+      "metadata_inputs": "sensor placement mapped to released SMPL joint",
+      "window_policy": "published_wrap_pad_or_truncate"
+    }
+  }
+}
