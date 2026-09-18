@@ -1,6 +1,11 @@
 # Support classifier design — 2026-09-14
 
-**Status:** design of record for the learned support-conditioned classifier. Core v2 implementation,
+**Status (2026-09-17):** historical specification of the implemented v2/v3 residual classifier,
+not the newly approved contextual semantic-voting design. The replacement is planned in
+[CONTEXTUAL_CLASSIFIER_PLAN_20260917.md](CONTEXTUAL_CLASSIFIER_PLAN_20260917.md); it is not yet
+implemented. Dates, measurements, and readiness notes below describe the 2026-09-14 state.
+
+**Original status:** Core v2 implementation,
 strict checkpoint round-trip, unit contracts, and a three-step real-data smoke completed
 2026-09-14; no training or sealed evaluation has been launched. The full suite passes (788 passed,
 1 skipped). The development-only centring and cross-placement diagnostics remain pending and are

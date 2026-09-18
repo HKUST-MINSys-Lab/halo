@@ -55,19 +55,21 @@ present and how they were acquired; it must not become a shortcut for dataset or
 
 ## Support classifier
 
-For each episode, the encoder produces one learnable pooled vector for the query recording and for
-each enrolled support recording. The active classifier is a small set transformer with **separate
-parameters** for the two information conditions:
+Classifier status updated 2026-09-17. For each episode, the encoder produces one learnable pooled
+vector for the query recording and each support recording. The implemented default is the v3
+residual classifier: a shared set transformer produces scalar corrections to centered sensor
+comparisons and exact-label support voting, combined with a direct semantic term. Its historical
+specification is [SUPPORT_CLASSIFIER_DESIGN_20260914.md](SUPPORT_CLASSIFIER_DESIGN_20260914.md).
+The earlier independent zero/few-shot token mixers are not the current default.
 
-* With enrollment (`k > 0`), the token set is the query vector, every support vector, each
-  support's paired label token, and every candidate-label token. Role embeddings distinguish the
-  four token types. Pair tags bind a support vector to its own label token; candidate tags bind
-  that label token to its candidate. The head refines the set jointly, scores the refined query
-  against every refined support vector by cosine similarity, and softly votes the scores to the
-  bound candidate labels.
-* With no enrollment (`k = 0`), the token set is only the query vector and candidate-label tokens.
-  The zero-shot head refines them jointly, then scores the refined query against each refined
-  candidate label by cosine similarity.
+The approved replacement, **not yet implemented**, is specified in
+[CONTEXTUAL_CLASSIFIER_PLAN_20260917.md](CONTEXTUAL_CLASSIFIER_PLAN_20260917.md). It contextualizes
+query, support, paired support-label, and candidate tokens before all comparisons. Projected
+query/support similarities weight semantic support-label votes to candidates. A second path
+compares the contextual query directly with candidate labels. Both paths are normalized and a
+small shared MLP supplies a candidate-specific mixture weight, followed by final normalization.
+With no support, only the contextual semantic path applies. The plan retains unified classifier
+parameters and does not reintroduce the historical regime split.
 
 There is no top-k retrieval or hidden background bank. Every supplied support row participates in
 attention and receives a differentiable score. The `neighbors` control removes the token mixer and

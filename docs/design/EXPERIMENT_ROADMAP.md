@@ -57,13 +57,16 @@ references.
 
 ## Classifier Experiment
 
-The active token mixer has two parameter sets and one shared encoder:
+As of 2026-09-17 the implemented learned head is the v3 residual classifier, normally using one
+shared parameter set. The earlier two-head token mixer is a historical architecture, not the
+current default. The next approved classifier design and its implementation sequence are in
+[CONTEXTUAL_CLASSIFIER_PLAN_20260917.md](CONTEXTUAL_CLASSIFIER_PLAN_20260917.md).
 
-* **Zero-shot (`k=0`):** query plus candidate-label tokens, followed by query/candidate cosine
-  scoring.
-* **Enrollment (`k>0`):** query, all support recordings, paired support-label tokens, and all
-  candidate-label tokens. Role embeddings and pair/candidate tags identify the relationships;
-  attention contextualises the full set, then refined query/support cosine scores vote to labels.
+The planned replacement contextualizes query, support, support-label and candidate tokens, then
+combines semantic support voting and direct query/candidate scoring with a candidate-specific
+learned mixture. At zero support it uses only its contextual semantic path. This replacement has
+not been implemented or evaluated; the ladder's "token mixer" rows describe classifier experiments,
+not an instruction to load the retired token-mixer implementation.
 
 The necessary comparison is always the same encoder and the same manifest under `neighbors` versus
 `retrieve-mix-vote`. A token mixer that does not exceed the neighbor control is not promoted as a
@@ -89,6 +92,11 @@ useful component, even if its absolute score is high.
   it is an ablation reference, not a numeric baseline.
 
 ## Active curriculum experiment
+
+The 2026-09-17 [heterogeneity and metadata audit](HETEROGENEITY_METADATA_AUDIT_20260917.md)
+separates deployment heterogeneity from nuisance augmentation and from metadata/text-backend
+ablations. Complete the source-label/device/exposure checks before making stronger unseen-domain
+claims. Baseline-encoder plus HALO-classifier training remains planned but explicitly deferred.
 
 The staged deployment-challenge experiment is specified in
 [`CLASSIFIER_CURRICULUM_EXPERIMENT_20260916.md`](CLASSIFIER_CURRICULUM_EXPERIMENT_20260916.md).
