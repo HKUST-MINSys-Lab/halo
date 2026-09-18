@@ -197,7 +197,11 @@ def main() -> None:
                     trace.__enter__()
                 torch.cuda.synchronize()
                 started = time.perf_counter()
-                episodes, _, batch = loader.get(step)
+                loaded = loader.get(step)
+                # Current loaders attach per-episode device-set plans. The profile does not
+                # aggregate scenario telemetry, but it must consume the same prepared batches
+                # as training so its timing remains representative.
+                episodes, _, batch = loaded[:3]
                 loader_done = time.perf_counter()
                 optimizer.zero_grad(set_to_none=True)
 

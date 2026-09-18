@@ -133,6 +133,13 @@ def test_consumed_step_cannot_block_on_second_request():
         loader.get(1)
 
 
+def test_loader_returns_device_plans_when_worker_provides_them():
+    loader = _loader()
+    plans = [SimpleNamespace(relation="aligned")]
+    loader._results.put((1, ["episode"], {"draw": 1}, {"batch": 1}, plans, None))
+    assert loader.get(1) == (["episode"], {"draw": 1}, {"batch": 1}, plans)
+
+
 def test_worker_exception_is_propagated():
     loader = _loader()
     loader._results.put((1, None, None, None, "bad data"))
