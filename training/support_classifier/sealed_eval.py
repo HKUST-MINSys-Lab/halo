@@ -10,6 +10,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import time
 import weakref
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, replace
@@ -1260,6 +1262,13 @@ def _write_markdown(rows: Sequence[dict], path: Path) -> None:
     path.write_text("\n".join(lines) + "\n")
 
 
+def _atomic_json(path: Path, value: object) -> None:
+    """Write evaluator state without exposing a partial JSON document to monitors."""
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True, default=str) + "\n")
+    os.replace(temporary, path)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
@@ -1354,7 +1363,31 @@ def main() -> None:
     all_rows: list[dict] = []
     manifests: dict[str, dict] = {}
     requested_cells = list(evaluation_cells(args.window_seconds, scope=args.scope))
-    for window_seconds, dataset, stream_id, device_ids in requested_cells:
+    started = time.perf_counter()
+    total_cells = len(requested_cells)
+
+    def checkpoint_progress(*, completed_cells: int, current: tuple[float, str, str] | None) -> None:
+        elapsed = time.perf_counter() - started
+        fraction = completed_cells / total_cells if total_cells else 1.0
+        eta = None if completed_cells == 0 else elapsed * (1.0 - fraction) / fraction
+        _atomic_json(args.out / "progress.json", {
+            "complete": completed_cells == total_cells,
+            "completed_cells": completed_cells,
+            "total_cells": total_cells,
+            "elapsed_seconds": elapsed,
+            "eta_seconds": eta,
+            "current": (None if current is None else {
+                "window_seconds": float(current[0]), "dataset": current[1], "stream": current[2],
+            }),
+        })
+        eta_text = "unknown" if eta is None else f"{eta / 60.0:.1f}m"
+        print(f"[sealed-eval] cells={completed_cells}/{total_cells} "
+              f"elapsed={elapsed / 60.0:.1f}m eta={eta_text}", flush=True)
+
+    checkpoint_progress(completed_cells=0, current=None)
+    for cell_index, (window_seconds, dataset, stream_id, device_ids) in enumerate(requested_cells, start=1):
+        checkpoint_progress(completed_cells=cell_index - 1,
+                            current=(window_seconds, dataset, stream_id))
         cell_row_start = len(all_rows)
         stream = (
             load_multi_device_stream(
@@ -1780,6 +1813,7 @@ def main() -> None:
             row["multi_device_mode"] = mode
             row.update(accounting)
             row["source_slice_fingerprint"] = source_slice_fingerprint(stream)
+        checkpoint_progress(completed_cells=cell_index, current=None)
     validate_result_rows(
         all_rows,
         expected_cells=[(duration, dataset, stream_id)
@@ -1787,7 +1821,7 @@ def main() -> None:
         models=args.models,
         k_values=sorted(set(args.k)),
     )
-    (args.out / "run_metadata.json").write_text(json.dumps({
+    _atomic_json(args.out / "run_metadata.json", {
         "result_schema": "prospective-results-v1-20260918" if args.scope == "prospective"
         else "sealed-results-v3-20260916",
         "manifest_protocol": "prospective-mobiact-v1-20260918" if args.scope == "prospective"
@@ -1800,10 +1834,11 @@ def main() -> None:
         "window_seconds": sorted(set(map(float, args.window_seconds))),
         "n_cells": len(requested_cells),
         "complete": True,
-    }, indent=2) + "\n")
+    })
     (args.out / "episode_manifests.json").write_text(json.dumps(manifests, indent=2) + "\n")
     (args.out / "results.json").write_text(json.dumps(all_rows, indent=2, allow_nan=True) + "\n")
     _write_markdown(all_rows, args.out / "RESULTS.md")
+    checkpoint_progress(completed_cells=total_cells, current=None)
     print(f"[sealed-eval] wrote {args.out / 'RESULTS.md'}", flush=True)
 
 

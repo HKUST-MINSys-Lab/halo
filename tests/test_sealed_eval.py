@@ -111,6 +111,8 @@ def test_neighbor_checkpoint_zero_support_is_visible_in_results(tmp_path, monkey
     assert len(rows) == 1
     assert rows[0]["status"] == "ok" and not rows[0]["diagnostic_only"]
     assert "training-bank-1nn-conse" in (out / "RESULTS.md").read_text()
+    progress = json.loads((out / "progress.json").read_text())
+    assert progress["complete"] and progress["completed_cells"] == progress["total_cells"] == 1
 
 
 def test_manifest_is_execution_disjoint_and_deterministic():
