@@ -61,3 +61,4 @@ entries preserve what was believed at the time; current behavior is defined only
 | 2026-09-18 | [2026-09-18-repo-docs-consolidation-plan.md](2026-09-18-repo-docs-consolidation-plan.md) | Repository, documentation and naming consolidation plan (2026-09-18, second pass) |
 | 2026-09-18 | [2026-09-18-repository-consolidation-executed.md](2026-09-18-repository-consolidation-executed.md) | Repository and documentation consolidation executed |
 | 2026-09-18 | [2026-09-18-training-evaluation-readiness.md](2026-09-18-training-evaluation-readiness.md) | Training and evaluation readiness sweep |
+| 2026-09-19 | [2026-09-19-contextual-residual-classifier-implementation.md](2026-09-19-contextual-residual-classifier-implementation.md) | Contextual residual classifier implementation and smoke verification |

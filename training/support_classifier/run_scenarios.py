@@ -76,6 +76,7 @@ from .sealed_eval import (
     _build_training_reference_bank,
     _file_hash,
     _halo_residual_predictions,
+    halo_acquisition_rows,
     _load_or_encode,
     _aligned_labels,
     _native_capabilities,
@@ -89,7 +90,7 @@ from data.datasets.mobiact.protocol import (
     candidate_labels as mobiact_candidate_labels,
     partition_rows as mobiact_partition_rows,
 )
-from model.support.factory import LEARNED_CLASSIFIER_ARCHITECTURES
+from model.support.factory import CONTEXTUAL_ARCHITECTURE, LEARNED_CLASSIFIER_ARCHITECTURES
 from training.tokenizer.eval_transfer import build_encoder
 from halo.paths import CACHE_DIR
 
@@ -878,6 +879,7 @@ def _requires_cross_support_features(task: Task, k: int) -> bool:
 def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootstrap,
                banks, k: int, window_seconds: float, halo_state=None,
                halo_has_classifier: bool = False,
+               halo_requires_acquisition: bool = False,
                selected_readouts: frozenset[str] | None = None,
                provider_states=None, prediction_sink=None, cache_read_dirs=(),
                feature_memory_cache=None, manifest: str | None = None,
@@ -988,6 +990,18 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
             else:
                 features = query_features
                 support_fingerprint = query_fingerprint if not task.cross else None
+            acquisitions = None
+            if name == "halo" and halo_state is not None and halo_requires_acquisition:
+                query_acquisition = halo_acquisition_rows(task.query_stream, halo_state[0], device)
+                if _requires_cross_support_features(task, k):
+                    support_acquisition = halo_acquisition_rows(
+                        task.support_stream, halo_state[0], device,
+                    )
+                    acquisitions = np.concatenate(
+                        [query_acquisition, support_acquisition], axis=0,
+                    )
+                else:
+                    acquisitions = query_acquisition
             extra_base = {**severity_meta, "n_candidates": len(task.candidates),
                           # Keep the legacy field for readers that predate cross-stream scoring,
                           # but record both sides explicitly so a result is fully auditable.
@@ -1059,7 +1073,8 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
                 if (name == "halo" and halo_checkpoint is not None and halo_has_classifier
                         and (selected_readouts is None or "halo-classifier" in selected_readouts)):
                     predicted = _halo_residual_predictions(features, roster, task.plans,
-                                                          halo_checkpoint, device)
+                                                          halo_checkpoint, device,
+                                                          acquisitions=acquisitions)
                     append_emitted(predicted, readout="halo-classifier")
                 elif (name != "halo" and text is not None and baseline_fusion_requested):
                     # With no enrolled supports the fixed combiner has only its semantic
@@ -1094,7 +1109,10 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
 
             if (name == "halo" and halo_checkpoint is not None and halo_has_classifier and k > 0
                     and (selected_readouts is None or "halo-classifier" in selected_readouts)):
-                predicted = _halo_residual_predictions(features, roster, task.plans, halo_checkpoint, device)
+                predicted = _halo_residual_predictions(
+                    features, roster, task.plans, halo_checkpoint, device,
+                    acquisitions=acquisitions,
+                )
                 append_emitted(predicted, readout="halo-classifier")
         except baselines.UnsupportedEvaluationCell as exc:
             rows.append({"model": name, "status": "unsupported", "reason": str(exc),
@@ -1498,10 +1516,12 @@ def main() -> None:
     device = torch.device(args.device)
     halo_state = None
     halo_has_classifier = False
+    halo_requires_acquisition = False
     if "halo" in args.models:
         blob = torch.load(args.halo_checkpoint, map_location="cpu", weights_only=False)
         halo_state = (build_encoder(blob, device).eval(), _file_hash(args.halo_checkpoint))
         halo_has_classifier = blob.get("architecture_version") in LEARNED_CLASSIFIER_ARCHITECTURES
+        halo_requires_acquisition = blob.get("architecture_version") == CONTEXTUAL_ARCHITECTURE
     args.out.mkdir(parents=True, exist_ok=True)
     cache_dir = args.feature_cache or DEFAULT_SHARED_FEATURE_CACHE
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1653,6 +1673,7 @@ def main() -> None:
                             halo_checkpoint=args.halo_checkpoint, bootstrap=bootstrap,
                             banks=banks, k=k, window_seconds=window_seconds,
                             halo_state=halo_state, halo_has_classifier=halo_has_classifier,
+                            halo_requires_acquisition=halo_requires_acquisition,
                             selected_readouts=(None if args.readouts is None
                                                else frozenset(args.readouts)),
                             provider_states=provider_states,

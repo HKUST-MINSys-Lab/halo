@@ -1,10 +1,16 @@
 # Acquisition Conditioning Contract
 
-**Status:** design of record, schema `acquisition-conditioning-v2`. Last verified against code: 2026-09-18.
+**Status:** design of record, schema `acquisition-conditioning-v2`. Last verified against code: 2026-09-19.
 
 This document is the authoritative contract for turning runtime acquisition metadata into HALO
 encoder inputs. Dataset converters and evaluation derivations must populate this contract. They
 must not construct ad hoc description strings or infer metadata from dataset names.
+
+The encoder exposes a per-sensor learned acquisition vector formed from its projected natural-
+language device/placement description plus its structured modality, gravity, and effective-rate
+embedding. The support classifier pools sensors within device and devices within recording. This
+is the only classifier metadata vector; evaluation reconstructs it with the checkpoint's own
+conditioner separately for query and support streams.
 
 ## Design
 

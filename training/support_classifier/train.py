@@ -28,9 +28,9 @@ from data.scripts.augmentations import AugmentationConfig
 from model.blocks import AttentionSpec
 from model.tokenizer.multispan_kernel import MS_SPANS_S, MS_FRAME_RATE_HZ
 from model.support.token_mixer import SupportTokenMixer, TokenMixerConfig
-from model.support.contextual_classifier import (
-    ARCHITECTURE_VERSION as CONTEXTUAL_ARCHITECTURE, ContextualClassifierConfig,
-    ContextualSupportClassifier,
+from model.support.contextual_residual_classifier import (
+    ARCHITECTURE_VERSION as CONTEXTUAL_ARCHITECTURE,
+    ContextualResidualClassifierConfig, ContextualResidualSupportClassifier,
 )
 from model.support.residual_classifier import (
     RegimeSplitSupportClassifier, ResidualClassifierConfig, ResidualSupportClassifier,
@@ -63,6 +63,10 @@ from training.support_classifier.encoding import (
     install_compiled_transformer,
 )
 from training.support_classifier.neighbors import DEFAULT_TEMPERATURE, differentiable_neighbor_logits
+from training.support_classifier.objectives import (
+    COMPARISONS as CONTEXTUAL_AUX_COMPARISONS,
+    ImprovementObjectiveConfig, contextual_path_improvement_objective,
+)
 from training.tokenizer.eval_transfer import build_encoder
 from model.tokenizer.sensor_tokens import CONDITIONING_SCHEMA_V2, LEGACY_CONDITIONING_SCHEMA
 from training.tokenizer.pretrain_data import (
@@ -317,31 +321,33 @@ def make_label_text(labels, device) -> LabelTextTable:
 
 # ------------------------------------------------------------------ batching
 def recording_rows(encoded: dict) -> tuple[torch.Tensor, torch.Tensor]:
-    """One pooled feature and one device/placement text descriptor per encoded recording.
+    """One pooled motion feature and one pooled acquisition vector per recording.
 
-    The descriptor is the normalized mean over sensors that are actually present. Exact modality,
-    gravity and rate facts condition the encoder through a separate structured branch; this vector
-    carries only the natural-language context exposed to the support classifier.
+    Current HALO encoders expose the same learned text-plus-structured representation used by
+    their internal conditioner.  Historical or matched encoders have no such path and receive a
+    zero vector rather than a fabricated metadata representation.
     """
     pooled = encoded.get("pooled")
-    descriptor = encoded.get("descriptor")
+    acquisition = encoded.get("acquisition")
     present = encoded.get("sensor_present")
-    if pooled is None or descriptor is None or present is None:
-        raise KeyError("the support classifier needs pooled, descriptor and sensor_present outputs")
+    if pooled is None or present is None:
+        raise KeyError("the support classifier needs pooled and sensor_present outputs")
+    if acquisition is None:
+        acquisition = pooled.new_zeros((*present.shape, pooled.shape[-1]))
     if bool((~present.any(dim=1)).any()):
         raise ValueError("an encoded recording carries no real sensor")
     device_id = encoded.get("device_id")
-    weight = present.unsqueeze(-1).to(descriptor.dtype)
+    weight = present.unsqueeze(-1).to(acquisition.dtype)
     if device_id is None or not bool((device_id > 0).any()):
-        merged = (descriptor * weight).sum(dim=1) / weight.sum(dim=1).clamp_min(1.0)
+        merged = (acquisition * weight).sum(dim=1) / weight.sum(dim=1).clamp_min(1.0)
     else:
         per_device = []
         valid_device = []
         for slot in range(int(device_id.max().item()) + 1):
             member = (device_id == slot) & present
-            member_weight = member.unsqueeze(-1).to(descriptor.dtype)
+            member_weight = member.unsqueeze(-1).to(acquisition.dtype)
             per_device.append(
-                (descriptor * member_weight).sum(dim=1)
+                (acquisition * member_weight).sum(dim=1)
                 / member_weight.sum(dim=1).clamp_min(1.0)
             )
             valid_device.append(member.any(dim=1))
@@ -364,31 +370,31 @@ def encode_recording_rows(
     """
     if not isinstance(batch, BucketedSupportBatch):
         encoded = encode_batch(encoder, batch, device)
-        pooled, descriptor = recording_rows(encoded)
+        pooled, acquisition = recording_rows(encoded)
         device_present = encoded.get("device_present")
         device_count = (device_present.any(dim=1).sum(dim=1).float()
                         if device_present is not None else pooled.new_ones(len(pooled)))
-        return pooled, descriptor, device_count
+        return pooled, acquisition, device_count
 
     pooled_parts = []
-    descriptor_parts = []
+    acquisition_parts = []
     device_count_parts = []
     for dense in batch.batches:
         encoded = encode_batch(encoder, dense, device)
-        pooled, descriptor = recording_rows(encoded)
+        pooled, acquisition = recording_rows(encoded)
         device_present = encoded.get("device_present")
         device_count = (device_present.any(dim=1).sum(dim=1).float()
                         if device_present is not None else pooled.new_ones(len(pooled)))
         pooled_parts.append(pooled)
-        descriptor_parts.append(descriptor)
+        acquisition_parts.append(acquisition)
         device_count_parts.append(device_count)
     restore = batch.restore_order.to(device, non_blocking=True)
     pooled = torch.cat(pooled_parts, dim=0).index_select(0, restore)
-    descriptor = torch.cat(descriptor_parts, dim=0).index_select(0, restore)
+    acquisition = torch.cat(acquisition_parts, dim=0).index_select(0, restore)
     device_count = torch.cat(device_count_parts, dim=0).index_select(0, restore)
     if pooled.shape[0] != batch.row_count:
         raise RuntimeError("bucketed encoder did not restore every recording row")
-    return pooled, descriptor, device_count
+    return pooled, acquisition, device_count
 
 
 def episode_recording_indices(episodes: list[Episode]) -> list[int]:
@@ -412,7 +418,7 @@ def episode_positions(episodes: list[Episode], corpus: SupportCorpus) -> list[in
 
 def split_encoded(
     pooled: torch.Tensor,
-    descriptor: torch.Tensor,
+    acquisition: torch.Tensor,
     episodes: list[Episode],
     corpus: SupportCorpus,
 ) -> dict[str, torch.Tensor]:
@@ -452,13 +458,13 @@ def split_encoded(
         valid = torch.from_numpy(group_valid).to(device).unsqueeze(-1)
         denom = valid.sum(1).clamp_min(1).to(pooled.dtype)
         group_feature = (pooled[gather] * valid.to(pooled.dtype)).sum(1) / denom
-        group_descriptor = F.normalize(
-            (descriptor[gather] * valid.to(descriptor.dtype)).sum(1)
-            / valid.sum(1).clamp_min(1).to(descriptor.dtype), dim=-1,
+        group_acquisition = F.normalize(
+            (acquisition[gather] * valid.to(acquisition.dtype)).sum(1)
+            / valid.sum(1).clamp_min(1).to(acquisition.dtype), dim=-1,
         )
     else:
         group_feature = pooled.new_zeros((1, pooled.shape[-1]))
-        group_descriptor = descriptor.new_zeros((1, descriptor.shape[-1]))
+        group_acquisition = acquisition.new_zeros((1, acquisition.shape[-1]))
 
     query_position = np.asarray([encoded_row[e.query] for e in episodes], dtype=np.int64)
     support_position = np.zeros((B, K), dtype=np.int64)
@@ -474,10 +480,10 @@ def split_encoded(
     keep = support_mask.unsqueeze(-1)
     return {
         "query_feature": pooled[query_index].unsqueeze(1),
-        "query_descriptor": descriptor[query_index].unsqueeze(1),
+        "query_acquisition": acquisition[query_index].unsqueeze(1),
         "query_mask": torch.ones((B, 1), dtype=torch.bool, device=device),
         "support_feature": group_feature[support_index] * keep.to(pooled.dtype),
-        "support_descriptor": group_descriptor[support_index] * keep.to(descriptor.dtype),
+        "support_acquisition": group_acquisition[support_index] * keep.to(acquisition.dtype),
         "support_mask": support_mask,
     }
 
@@ -713,8 +719,10 @@ def run_step(
     dataset: PretrainDataset,
     collate,
     encoder,
-    classifier: SupportTokenMixer | ResidualSupportClassifier | RegimeSplitSupportClassifier | None,
+    classifier: SupportTokenMixer | ResidualSupportClassifier | RegimeSplitSupportClassifier |
+                ContextualResidualSupportClassifier | None,
     classifier_mode: str,
+    improvement_objective: ImprovementObjectiveConfig | None = None,
     text_of,
     device: torch.device,
     executor: ThreadPoolExecutor | None = None,
@@ -756,9 +764,9 @@ def run_step(
             ])) if support_rows else 0.0)
             for name in ("rate", "channel_dropout")
         })
-    pooled, descriptor, device_count = encode_recording_rows(encoder, batch, device)
+    pooled, acquisition, device_count = encode_recording_rows(encoder, batch, device)
 
-    rows = split_encoded(pooled, descriptor, episodes, corpus)
+    rows = split_encoded(pooled, acquisition, episodes, corpus)
     text = episode_text(episodes, corpus, text_of, device)
     query = rows["query_feature"].squeeze(1)
     if classifier_mode == "neighbors":
@@ -794,17 +802,31 @@ def run_step(
             candidate_slot=text["candidate_slot"],
         )
     elif classifier_mode == "contextual":
-        if not isinstance(classifier, ContextualSupportClassifier):
-            raise ValueError("contextual mode requires ContextualSupportClassifier")
+        if not isinstance(classifier, ContextualResidualSupportClassifier):
+            raise ValueError("contextual mode requires ContextualResidualSupportClassifier")
         output = classifier(
             query_feature=query, support_feature=rows["support_feature"],
-            support_label_text=text["support_label_text"], support_mask=rows["support_mask"],
+            query_acquisition=rows["query_acquisition"].squeeze(1),
+            support_acquisition=rows["support_acquisition"],
+            support_label_text=text["support_label_text"],
+            support_bound=text["support_bound"], support_mask=rows["support_mask"],
             support_pair_slot=text["support_pair_slot"],
             candidate_text=text["candidate_text"], candidate_mask=text["candidate_mask"],
+            candidate_slot=text["candidate_slot"],
         )
     else:
         raise ValueError(f"unknown classifier mode {classifier_mode!r}")
     loss = episode_loss(output["logits"], episodes, text)
+    if classifier_mode == "contextual" and improvement_objective is not None:
+        target = torch.tensor(
+            [episode.gt_slot for episode in episodes], dtype=torch.long, device=device,
+        )
+        auxiliary, auxiliary_metrics = contextual_path_improvement_objective(
+            output, target, text["candidate_mask"], improvement_objective,
+        )
+        loss["main_ce"] = loss["loss"].detach()
+        loss["loss"] = loss["loss"] + improvement_objective.weight * auxiliary
+        loss.update(auxiliary_metrics)
     return {**loss, **output, "pooled": pooled, "text": text, "rows": rows,
             "device_count": device_count, "readout": classifier_mode,
             "augmentation_rows": augmentation_rows,
@@ -1048,6 +1070,30 @@ def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, flo
         metrics["classifier/text_score_gt_minus_max_other"] = float(
             (target_text - other_text.max(dim=1).values).mean().detach()
         )
+    if "support_correction" in result:
+        correction = result["support_correction"].detach()
+        correction_mask = support_mask.unsqueeze(-1) & mask.unsqueeze(1)
+        metrics.update({
+            "classifier/mean_abs_support_correction": (
+                float(correction.masked_select(correction_mask).abs().mean())
+                if bool(correction_mask.any()) else 0.0
+            ),
+            "classifier/semantic_weight_mean": float(
+                result["semantic_weight"].detach().masked_select(mask).mean()
+            ),
+        })
+        for name in ("complete", "partial", "zero"):
+            selected = torch.tensor(
+                [episode.enrollment_regime == name for episode in episodes],
+                dtype=torch.bool, device=target.device,
+            ).unsqueeze(1) & mask
+            if bool(selected.any()):
+                metrics[f"scenario/enrollment/{name}/semantic_weight_fraction"] = float(
+                    selected.float().mean()
+                )
+                metrics[f"scenario/enrollment/{name}/semantic_weight"] = float(
+                    result["semantic_weight"].detach().masked_select(selected).mean()
+                )
     return metrics
 
 
@@ -1399,9 +1445,20 @@ def main() -> None:
     parser.add_argument("--freeze-encoder", action=argparse.BooleanOptionalAction, default=None,
                         help="default: train encoder and classifier together")
     parser.add_argument("--classifier", choices=("token_mixer", "neighbors", "residual", "contextual"),
-                        default="residual",
-                        help="residual is the identity-initialised unified support classifier; "
-                             "neighbors is the parameter-free control")
+                        default="contextual",
+                        help="contextual is the active contextual residual classifier; residual "
+                             "is the historical scalar-residual control; neighbors is the "
+                             "parameter-free control")
+    parser.add_argument("--contextual-aux", action=argparse.BooleanOptionalAction, default=True,
+                        help="enable modular path-improvement objectives for contextual training")
+    parser.add_argument("--contextual-aux-weight", type=float, default=0.1,
+                        help="global weight on the mean of active path-improvement losses")
+    parser.add_argument("--contextual-aux-margin", type=float, default=0.0)
+    parser.add_argument("--contextual-aux-temperature", type=float, default=0.1)
+    parser.add_argument("--contextual-aux-comparisons", nargs="*",
+                        choices=CONTEXTUAL_AUX_COMPARISONS,
+                        default=list(CONTEXTUAL_AUX_COMPARISONS),
+                        help="named better-over-reference comparisons; an empty list disables all")
     parser.add_argument("--centring", choices=("none", "support_mean", "corpus_mean"),
                         default="support_mean")
     parser.add_argument("--p-mask-candidate", type=float, default=0.25,
@@ -1543,6 +1600,11 @@ def main() -> None:
         parser.error("support-mask probabilities must be in [0, 1]")
     if args.text_temperature <= 0:
         parser.error("text-temperature must be positive")
+    if (not math.isfinite(args.contextual_aux_weight) or args.contextual_aux_weight < 0
+            or not math.isfinite(args.contextual_aux_margin) or args.contextual_aux_margin < 0
+            or not math.isfinite(args.contextual_aux_temperature)
+            or args.contextual_aux_temperature <= 0):
+        parser.error("contextual auxiliary scales must be finite; weight/margin nonnegative and temperature positive")
 
     if args.smoke:
         args.steps = min(args.steps, 3)
@@ -1671,6 +1733,11 @@ def main() -> None:
         saved.setdefault("rate_augmentation_probability", 0.0)
         saved.setdefault("modality_dropout_probability", 0.0)
         saved.setdefault("device_set_challenge_probability", 0.0)
+        saved.setdefault("contextual_aux", True)
+        saved.setdefault("contextual_aux_weight", 0.1)
+        saved.setdefault("contextual_aux_margin", 0.0)
+        saved.setdefault("contextual_aux_temperature", 0.1)
+        saved.setdefault("contextual_aux_comparisons", list(CONTEXTUAL_AUX_COMPARISONS))
         saved.setdefault(
             "polarization",
             bool((resume_blob.get("config") or {}).get("use_polarization", True)),
@@ -1696,6 +1763,11 @@ def main() -> None:
             "device_set_challenge_probability": "--device-set-challenge-probability",
             "label_subset": "--label-subset", "mode": "--mode",
             "classifier": "--classifier",
+            "contextual_aux": ("--contextual-aux", "--no-contextual-aux"),
+            "contextual_aux_weight": "--contextual-aux-weight",
+            "contextual_aux_margin": "--contextual-aux-margin",
+            "contextual_aux_temperature": "--contextual-aux-temperature",
+            "contextual_aux_comparisons": "--contextual-aux-comparisons",
             "freeze_encoder": ("--freeze-encoder", "--no-freeze-encoder"), "lr": "--lr",
             "encoder_lr_scale": "--encoder-lr-scale",
             "frontend_lr_scale": "--frontend-lr-scale",
@@ -1833,8 +1905,8 @@ def main() -> None:
                 spec, ResidualClassifierConfig(**classifier_config),
             ).to(device) if args.classifier == "residual" else None
         elif version == CONTEXTUAL_ARCHITECTURE:
-            classifier = ContextualSupportClassifier(
-                spec, ContextualClassifierConfig(**resume_blob["classifier_config"]),
+            classifier = ContextualResidualSupportClassifier(
+                spec, ContextualResidualClassifierConfig(**resume_blob["classifier_config"]),
             ).to(device) if args.classifier == "contextual" else None
         elif version == "support_token_mixer_v1":
             classifier = SupportTokenMixer(spec, TokenMixerConfig(**resume_blob["classifier_config"])).to(device) \
@@ -1983,10 +2055,18 @@ def main() -> None:
                 text_temperature=args.text_temperature,
                 adaptive_text_gate=args.adaptive_text_gate,
             )).to(device) if args.classifier == "residual" else
-            ContextualSupportClassifier(spec, ContextualClassifierConfig()).to(device)
+            ContextualResidualSupportClassifier(
+                spec, ContextualResidualClassifierConfig(acquisition_dim=encoder.d_model),
+            ).to(device)
             if args.classifier == "contextual" else
             SupportTokenMixer(spec, TokenMixerConfig()).to(device) if args.classifier == "token_mixer" else None)
     print(f"[compare] classifier={args.classifier}", flush=True)
+    improvement_objective = ImprovementObjectiveConfig(
+        enabled=bool(args.contextual_aux), weight=float(args.contextual_aux_weight),
+        margin=float(args.contextual_aux_margin),
+        temperature=float(args.contextual_aux_temperature),
+        comparisons=tuple(args.contextual_aux_comparisons),
+    )
     if hasattr(encoder, "mask_token"):
         encoder.mask_token.requires_grad_(False)
     if args.freeze_encoder:
@@ -2090,7 +2170,15 @@ def main() -> None:
             "neutral_acquisition_text": args.neutral_acquisition_text,
             "classifier": args.classifier,
             "classifier_config": (dataclasses.asdict(classifier.cfg)
-                                  if isinstance(classifier, (ResidualSupportClassifier, RegimeSplitSupportClassifier)) else None),
+                                  if isinstance(classifier, (
+                                      ResidualSupportClassifier, RegimeSplitSupportClassifier,
+                                      ContextualResidualSupportClassifier,
+                                  )) else None),
+            "contextual_aux": bool(args.contextual_aux),
+            "contextual_aux_weight": float(args.contextual_aux_weight),
+            "contextual_aux_margin": float(args.contextual_aux_margin),
+            "contextual_aux_temperature": float(args.contextual_aux_temperature),
+            "contextual_aux_comparisons": list(args.contextual_aux_comparisons),
             "freeze_encoder": args.freeze_encoder,
             "lr": args.lr,
             "encoder_lr_scale": args.encoder_lr_scale,
@@ -2130,6 +2218,13 @@ def main() -> None:
         saved_trajectory.setdefault("patch_seconds", PATCH_SECONDS)
         saved_trajectory.setdefault("window_seconds", 6.0)
         saved_trajectory.setdefault("device_set_challenge_probability", 0.0)
+        saved_trajectory.setdefault("contextual_aux", True)
+        saved_trajectory.setdefault("contextual_aux_weight", 0.1)
+        saved_trajectory.setdefault("contextual_aux_margin", 0.0)
+        saved_trajectory.setdefault("contextual_aux_temperature", 0.1)
+        saved_trajectory.setdefault(
+            "contextual_aux_comparisons", list(CONTEXTUAL_AUX_COMPARISONS),
+        )
         saved_trajectory.setdefault(
             "max_per_stream", (resume_blob.get("args") or {}).get("max_per_stream"),
         )
@@ -2172,12 +2267,19 @@ def main() -> None:
             saved_trajectory.setdefault(field, saved_args.get(field, default))
         saved_trajectory.setdefault(
             "classifier_config",
-            dataclasses.asdict(classifier.cfg) if isinstance(classifier, (ResidualSupportClassifier, RegimeSplitSupportClassifier)) else None,
+            (dataclasses.asdict(classifier.cfg)
+             if isinstance(classifier, (
+                 ResidualSupportClassifier, RegimeSplitSupportClassifier,
+                 ContextualResidualSupportClassifier,
+             )) else None),
         )
         # `regime_split` was added to ResidualClassifierConfig after some snapshots were written;
         # migrate their classifier_config sub-dict the same way the fields above are migrated,
         # rather than rejecting an otherwise-identical resume.
-        if saved_trajectory.get("classifier_config") is not None:
+        if (saved_trajectory.get("classifier_config") is not None
+                and resume_blob.get("architecture_version") in {
+                    "support_classifier_v2", "support_classifier_v3",
+                }):
             defaults = dataclasses.asdict(classifier.cfg)
             for field in ("regime_split", "adaptive_text_gate", "text_gate_hidden"):
                 saved_trajectory["classifier_config"].setdefault(field, defaults[field])
@@ -2322,6 +2424,7 @@ def main() -> None:
             result = run_step(
                 episodes=episodes, corpus=corpus, dataset=dataset, collate=collate,
                 encoder=encoder, classifier=classifier, classifier_mode=args.classifier,
+                improvement_objective=improvement_objective,
                 text_of=text_of, device=device, executor=executor, batch=batch,
                 device_set_plans=device_set_plans,
             )
@@ -2370,6 +2473,10 @@ def main() -> None:
                 "loss/ce": float(result["ce"]),
                 "loss/few_shot_ce": float(result["few_shot_ce"]),
                 "loss/zero_shot_ce": float(result["zero_shot_ce"]),
+                **{
+                    key: float(value) for key, value in result.items()
+                    if key.startswith("aux/") and torch.is_tensor(value) and value.numel() == 1
+                },
                 "encoder/effective_rank": effective_rank(result["pooled"]),
                 "gradient/encoder_norm": encoder_grad,
                 "gradient/classifier_norm": classifier_grad,

@@ -1,6 +1,6 @@
 # Classifier Curriculum Experiment - 2026-09-16
 
-Last verified against code: 2026-09-18.
+Last verified against code: 2026-09-19.
 
 **Status:** approved staged experiment. This document records the hypotheses, implementation
 order, controls, and reporting contract. It supplements the active
@@ -14,6 +14,20 @@ it does not redefine the sealed evaluation protocol.
 
 Can deployment-shaped training make HALO's learned classifier improve on its own neighbour floor
 when enrollment is incomplete or query and support acquisition conditions differ?
+
+## Current classifier objective
+
+The current `--classifier contextual` path is `support_contextual_residual_v1`, replacing the
+failed unrestricted contextualize-first mixture. Main cross-entropy remains authoritative. Two
+toggleable auxiliary comparisons use one generic true-class log-odds improvement loss:
+
+1. `contextual_support_over_support_floor`, only where the truth has enrollment;
+2. `final_over_best_branch`, against the detached better of contextual support and semantics.
+
+The mean of active comparisons receives one global weight (`0.1` by default). Reference quality is
+detached, but no model component is frozen or routed to a bespoke loss. Telemetry records both
+terms, the number active, correction magnitude, semantic weight by enrollment regime, and gradient
+norms through the text and structured acquisition conditioners.
 
 The 2026-09-16 scenario evaluation found the largest classifier gains under partial enrollment,
 cross-placement support, and cross-dataset support. It also found regressions when strong enrolled

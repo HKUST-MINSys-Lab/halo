@@ -10,17 +10,27 @@ import torch
 
 from model.blocks import AttentionSpec
 from model.support.contextual_classifier import (
-    ARCHITECTURE_VERSION as CONTEXTUAL_ARCHITECTURE,
+    ARCHITECTURE_VERSION as LEGACY_CONTEXTUAL_ARCHITECTURE,
     ContextualClassifierConfig, ContextualSupportClassifier,
+)
+from model.support.contextual_residual_classifier import (
+    ARCHITECTURE_VERSION as CONTEXTUAL_ARCHITECTURE,
+    ContextualResidualClassifierConfig, ContextualResidualSupportClassifier,
 )
 from model.support.residual_classifier import ResidualClassifierConfig, build_support_classifier
 
 RESIDUAL_ARCHITECTURES = frozenset({"support_classifier_v2", "support_classifier_v3"})
-LEARNED_CLASSIFIER_ARCHITECTURES = RESIDUAL_ARCHITECTURES | {CONTEXTUAL_ARCHITECTURE}
+LEARNED_CLASSIFIER_ARCHITECTURES = RESIDUAL_ARCHITECTURES | {
+    LEGACY_CONTEXTUAL_ARCHITECTURE, CONTEXTUAL_ARCHITECTURE,
+}
 MODE_TO_ARCHITECTURE = {"residual": "support_classifier_v3", "contextual": CONTEXTUAL_ARCHITECTURE,
                         "token_mixer": "support_token_mixer_v1"}
-CONTEXTUAL_READOUTS = ("halo-classifier-semantic-only", "halo-classifier-support-only",
-                       "halo-classifier-fixed-half-mixture")
+CONTEXTUAL_READOUTS = ("halo-classifier-semantic-only", "halo-classifier-support-floor",
+                       "halo-classifier-contextual-support")
+LEGACY_CONTEXTUAL_READOUTS = (
+    "halo-classifier-semantic-only", "halo-classifier-support-only",
+    "halo-classifier-fixed-half-mixture",
+)
 
 
 def classifier_architecture(mode: str) -> str | None:
@@ -44,10 +54,16 @@ def build_classifier_from_blob(blob: dict, *, device=None, overrides: dict | Non
             config.setdefault("normalized_token_composition", False)
         config.update(overrides or {})
         head = build_support_classifier(spec, ResidualClassifierConfig(**config))
-    elif version == CONTEXTUAL_ARCHITECTURE:
+    elif version == LEGACY_CONTEXTUAL_ARCHITECTURE:
         if overrides:
             raise ValueError("residual ablation flags are not defined for the contextual head")
         head = ContextualSupportClassifier(spec, ContextualClassifierConfig(**config))
+    elif version == CONTEXTUAL_ARCHITECTURE:
+        if overrides:
+            raise ValueError("residual ablation flags are not defined for the contextual head")
+        head = ContextualResidualSupportClassifier(
+            spec, ContextualResidualClassifierConfig(**config),
+        )
     else:
         raise ValueError(f"unsupported support-classifier architecture {version!r}")
     head.load_state_dict(blob["classifier"], strict=True)

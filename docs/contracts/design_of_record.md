@@ -1,6 +1,6 @@
 # Design of record: support-conditioned heterogeneous HAR
 
-> Last verified against code: 2026-09-18. This document supersedes the earlier language-alignment,
+> Last verified against code: 2026-09-19. This document supersedes the earlier language-alignment,
 > admissibility, evidence-engine, and movement-monitoring designs on `main`.
 
 ## Objective
@@ -55,15 +55,19 @@ present and how they were acquired; it must not become a shortcut for dataset or
 
 ## Support classifier
 
-For each episode, the encoder produces one learned pooled vector for the query recording and each
-support recording. The active v3 residual classifier contextualizes query, support,
-paired support-label, and candidate-label tokens with a shared set transformer. Scalar residuals
-adjust centered sensor comparisons and exact-label support voting, which are combined with a
-direct semantic candidate term. The default uses one parameter set across zero- and few-support
-episodes. The earlier independent zero/few-shot token mixers are retired.
+For each episode, the encoder produces one learned pooled motion vector and one pooled runtime
+acquisition vector for the query recording and each support recording. The active
+`support_contextual_residual_v1` classifier contextualizes query, support, paired support-label,
+candidate-label, and acquisition tokens with a shared set transformer. Contextual states may
+adjust individual query-support scores and a candidate-local semantic weight, but there is no
+unrestricted candidate-logit MLP. Final logits are assembled from a centered differentiable-
+neighbor support floor and direct query-to-candidate semantic evidence.
 
-The next candidate-specific mixture design remains a proposal, not active code. Its rationale is
-preserved in the [2026-09-17 contextual classifier plan](../journal/2026-09-17-contextual-classifier-plan.md).
+Zero-support and enrolled semantic projections are independently parameterized but mechanically
+identical. At initialization the support correction is exactly zero, enrolled semantic influence
+is `1e-3`, and zero-support semantic influence is one. The failed
+`support_contextual_mixture_v1` contextualize-first arm remains loadable for historical results,
+but `--classifier contextual` creates only the current architecture.
 
 There is no top-k retrieval or hidden background bank. Every supplied support row participates in
 attention and receives a differentiable score. The `neighbors` control removes the learned classifier and
@@ -77,6 +81,13 @@ selected encoder or train a dedicated HALO copy end to end. Query and support en
 receive gradients in the end-to-end arm, including the learned recording pool. The
 zero-shot and enrolled losses are averaged by regime when both appear in a batch, so the shared
 encoder is not dominated by whichever condition happened to supply more queries.
+
+The contextual arm optionally adds modular path-improvement losses. Every term has the same form:
+the true-class log-odds of a named path should improve over a detached reference path. The default
+comparisons are contextual support over the neighbor floor (truth-enrolled rows) and final output
+over the stronger of the contextual-support and semantic branches. Active terms are averaged and
+weighted once, so toggling a term does not silently multiply the auxiliary scale; no module is
+manually frozen or assigned to a particular objective.
 
 The current paper roster has two pairwise-disjoint active source roles. This table is explanatory; the
 executable authority is `data/scripts/curate/deployment_policy.py`.
@@ -106,5 +117,5 @@ all-device composites at 4, 8, and 16 seconds.
 
 The retired explicit admissibility table, separate Phase-B memory bank, memory-wide retrieval and
 candidate-scoring path, arbitrary-label curriculum, and Task 0-3 movement-monitoring packages are
-not part of this design. The active bounded-set residual classifier described above is distinct from that
+not part of this design. The active bounded-set contextual residual classifier described above is distinct from that
 retired path. Archived components must not be revived through a default flag or undocumented import.

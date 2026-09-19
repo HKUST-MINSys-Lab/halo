@@ -21,6 +21,7 @@ from typing import Iterable, Sequence
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 import baselines
 from baselines import scoring
@@ -46,8 +47,10 @@ from model.blocks import AttentionSpec
 from model.support.token_mixer import SupportTokenMixer, TokenMixerConfig
 from model.support.residual_classifier import ResidualClassifierConfig, build_support_classifier
 from model.support.contextual_classifier import ContextualSupportClassifier
+from model.support.contextual_residual_classifier import ContextualResidualSupportClassifier
 from model.support.factory import (
-    CONTEXTUAL_ARCHITECTURE, CONTEXTUAL_READOUTS, LEARNED_CLASSIFIER_ARCHITECTURES,
+    CONTEXTUAL_ARCHITECTURE, LEGACY_CONTEXTUAL_ARCHITECTURE,
+    CONTEXTUAL_READOUTS, LEGACY_CONTEXTUAL_READOUTS, LEARNED_CLASSIFIER_ARCHITECTURES,
     RESIDUAL_ARCHITECTURES, build_classifier_from_blob,
 )
 from training.support_classifier.train import make_label_text
@@ -60,7 +63,10 @@ from training.support_classifier.partial_coverage import (
     equal_weight_normalized_fusion_predictions,
 )
 from training.tokenizer.eval_transfer import build_encoder, encode_dataset, encode_multi_device_dataset
-from training.tokenizer.pretrain_data import _stream_gravity_state, stream_channel_descriptions
+from training.tokenizer.pretrain_data import (
+    STREAM_SOURCE_RATE_HZ, _stream_gravity_state, modalities_present,
+    stream_channel_descriptions, stream_sensor_texts, structured_sensor_metadata,
+)
 
 SEED = 20260912
 # Full enrollment curve. All six sealed sources have at least 128 execution-disjoint
@@ -87,6 +93,7 @@ _PARAMETER_BREAKDOWN_M = {
 }
 _HALO_CLASSIFIER_PARAMETER_CACHE: dict[str, int] = {}
 _HALO_RESIDUAL_HEAD_CACHE: dict[tuple[str, str, bool, bool], torch.nn.Module] = {}
+_HALO_ACQUISITION_VECTOR_CACHE: dict[tuple, np.ndarray] = {}
 TRAINING_BANK_ZERO_SHOT = frozenset({"halo", "harnet5", "harnet10", "limubert_x"})
 # Bump whenever feature extraction semantics, cache inputs, or pooling changes.  This avoids
 # treating an old embedding array as valid after a code-only correction.
@@ -755,10 +762,94 @@ def _halo_features(
 
 
 @torch.no_grad()
+def halo_acquisition_vector(
+    stream: EvalStream | MultiDeviceEvalStream,
+    encoder: torch.nn.Module,
+    device: torch.device,
+) -> np.ndarray:
+    """One runtime acquisition vector for a stream, using the checkpoint's own conditioner.
+
+    The vector contains only information available at inference: device/placement prose plus exact
+    modality, gravity and effective-rate facts. Composite devices are balanced exactly like the
+    recording path: sensors within device, then devices within recording.
+    """
+    if not hasattr(encoder, "descriptor_proj"):
+        return np.zeros((int(getattr(encoder, "d_model")),), dtype=np.float32)
+    members = stream.devices if isinstance(stream, MultiDeviceEvalStream) else [stream]
+    cache_key = (
+        id(encoder),
+        tuple((
+            member.dataset, member.stream, float(member.rate_hz),
+            (None if member.effective_source_rate_hz is None
+             else float(member.effective_source_rate_hz)),
+            tuple(np.asarray(member.mask, dtype=np.bool_).tolist()),
+            member.gravity_state, member.perturbation,
+        ) for member in members),
+    )
+    cached = _HALO_ACQUISITION_VECTOR_CACHE.get(cache_key)
+    if cached is not None:
+        return cached.copy()
+    per_device = []
+    for member in members:
+        mask = torch.as_tensor(member.mask, dtype=torch.bool)
+        modalities = modalities_present(mask.tolist())
+        gravity = member.gravity_state or _stream_gravity_state(member.dataset, member.stream)
+        _, sensor_texts, _ = stream_sensor_texts(
+            member.dataset, member.stream,
+            gravity_removed=gravity == "removed",
+            has_accel="accel" in modalities, has_gyro="gyro" in modalities,
+            neutral=bool(getattr(encoder, "neutral_acquisition_text", False)),
+            conditioning_schema=getattr(encoder, "conditioning_schema", "legacy-combined-text-v1"),
+        )
+        descriptors, inverse = encoder.encode_sensor_descriptors_unique([sensor_texts], device)
+        descriptor = descriptors.index_select(0, inverse.clamp_min(0).reshape(-1)).reshape(
+            1, len(sensor_texts), -1,
+        )
+        text_embedding = encoder.descriptor_proj.embed(descriptor)
+        if hasattr(encoder, "structured_conditioner"):
+            modality, gravity_ids = structured_sensor_metadata(
+                has_accel="accel" in modalities, has_gyro="gyro" in modalities,
+                gravity_state=gravity,
+            )
+            source_rate = min(
+                float(member.rate_hz),
+                float(member.effective_source_rate_hz
+                      if member.effective_source_rate_hz is not None
+                      else STREAM_SOURCE_RATE_HZ.get(
+                          f"{member.dataset}/{member.stream}", member.rate_hz,
+                      )),
+            )
+            rates = torch.tensor(
+                [[[float(member.rate_hz), source_rate]] * len(sensor_texts)],
+                dtype=torch.float32, device=device,
+            )
+            valid = torch.ones((1, len(sensor_texts)), dtype=torch.bool, device=device)
+            structured = encoder.structured_conditioner.embed(
+                modality.unsqueeze(0).to(device), gravity_ids.unsqueeze(0).to(device), rates, valid,
+            )
+            acquisition = F.normalize(text_embedding.float() + structured.float(), dim=-1)
+        else:
+            acquisition = F.normalize(text_embedding.float(), dim=-1)
+        per_device.append(acquisition.mean(dim=1).squeeze(0))
+    value = F.normalize(torch.stack(per_device).mean(dim=0), dim=-1).cpu().numpy().astype(np.float32)
+    _HALO_ACQUISITION_VECTOR_CACHE[cache_key] = value
+    return value.copy()
+
+
+def halo_acquisition_rows(
+    stream: EvalStream | MultiDeviceEvalStream,
+    encoder: torch.nn.Module,
+    device: torch.device,
+) -> np.ndarray:
+    vector = halo_acquisition_vector(stream, encoder, device)
+    return np.broadcast_to(vector, (stream.n_windows, len(vector))).copy()
+
+
+@torch.no_grad()
 def _halo_residual_predictions(
     features: np.ndarray, stream: EvalStream, plans: Sequence[QueryPlan], checkpoint: Path,
     device: torch.device, *, residual_enabled: bool = True, text_term_enabled: bool = True,
-    batch_size: int = 64,
+    batch_size: int = 64, acquisitions: np.ndarray | None = None,
 ) -> list[str]:
     """Evaluate v2's unified scorer; shared parameter-free controls remain elsewhere unchanged."""
     fingerprint = _file_hash(checkpoint)
@@ -769,8 +860,16 @@ def _halo_residual_predictions(
         if blob.get("architecture_version") == CONTEXTUAL_ARCHITECTURE:
             if not (residual_enabled and text_term_enabled):
                 raise ValueError("residual ablation flags are not defined for the contextual head")
-            return _halo_contextual_predictions(features, stream, plans, checkpoint, device,
-                                                batch_size=batch_size)
+            return _halo_contextual_residual_predictions(
+                features, stream, plans, checkpoint, device,
+                batch_size=batch_size, acquisitions=acquisitions,
+            )
+        if blob.get("architecture_version") == LEGACY_CONTEXTUAL_ARCHITECTURE:
+            if not (residual_enabled and text_term_enabled):
+                raise ValueError("residual ablation flags are not defined for the contextual head")
+            return _halo_contextual_predictions(
+                features, stream, plans, checkpoint, device, batch_size=batch_size,
+            )
         if blob.get("architecture_version") not in RESIDUAL_ARCHITECTURES:
             raise ValueError("residual readout requires a residual support-classifier checkpoint")
         classifier_config = dict(blob["classifier_config"])
@@ -820,6 +919,7 @@ def _halo_residual_predictions(
 
 
 _HALO_CONTEXTUAL_HEAD_CACHE: dict[tuple, ContextualSupportClassifier] = {}
+_HALO_CONTEXTUAL_RESIDUAL_HEAD_CACHE: dict[tuple, ContextualResidualSupportClassifier] = {}
 
 
 @torch.no_grad()
@@ -838,7 +938,7 @@ def _halo_contextual_predictions(
     head = _HALO_CONTEXTUAL_HEAD_CACHE.get(cache_key)
     if head is None:
         blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
-        if blob.get("architecture_version") != CONTEXTUAL_ARCHITECTURE:
+        if blob.get("architecture_version") != LEGACY_CONTEXTUAL_ARCHITECTURE:
             raise ValueError("contextual readout requires a contextual support-classifier checkpoint")
         head, _ = build_classifier_from_blob(blob, device=device)
         _HALO_CONTEXTUAL_HEAD_CACHE[cache_key] = head
@@ -881,6 +981,86 @@ def _halo_contextual_predictions(
         )
         scores = ContextualSupportClassifier.branch_logits(result, branch)
         output.extend(candidates[index] for index in scores.argmax(dim=1).cpu().tolist())
+    return output
+
+
+@torch.no_grad()
+def _halo_contextual_residual_predictions(
+    features: np.ndarray, stream: EvalStream, plans: Sequence[QueryPlan], checkpoint: Path,
+    device: torch.device, *, branch: str = "final", batch_size: int = 64,
+    acquisitions: np.ndarray | None,
+) -> list[str]:
+    """Score immutable plans with the current contextual residual classifier."""
+    if acquisitions is None:
+        raise ValueError(
+            "contextual residual evaluation requires acquisition rows aligned with features"
+        )
+    features = np.asarray(features)
+    acquisitions = np.asarray(acquisitions)
+    if acquisitions.ndim != 2 or len(acquisitions) != len(features):
+        raise ValueError("acquisition rows must align 1:1 with feature rows")
+    fingerprint = _file_hash(checkpoint)
+    cache_key = (fingerprint, str(device))
+    head = _HALO_CONTEXTUAL_RESIDUAL_HEAD_CACHE.get(cache_key)
+    if head is None:
+        blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        if blob.get("architecture_version") != CONTEXTUAL_ARCHITECTURE:
+            raise ValueError("contextual residual readout requires its matching checkpoint")
+        loaded, _ = build_classifier_from_blob(blob, device=device)
+        if not isinstance(loaded, ContextualResidualSupportClassifier):
+            raise TypeError("classifier factory returned the wrong contextual architecture")
+        head = loaded
+        _HALO_CONTEXTUAL_RESIDUAL_HEAD_CACHE[cache_key] = head
+
+    candidates = tuple(stream.eval_labels)
+    extra = sorted({label for plan in plans for label in plan.support_labels} - set(candidates))
+    table = make_label_text(tuple(candidates) + tuple(extra), device)
+    candidate_ids = torch.as_tensor(table.ids(candidates), device=device)
+    candidate_text = table.matrix[candidate_ids].unsqueeze(0)
+    candidate_to_slot = {label: slot for slot, label in enumerate(candidates)}
+    output: list[str] = []
+    for start in range(0, len(plans), batch_size):
+        chunk = plans[start:start + batch_size]
+        b, c = len(chunk), len(candidates)
+        width = max((len(plan.support) for plan in chunk), default=0)
+        rows = np.zeros((b, width), dtype=np.int64)
+        label_ids = np.zeros((b, width), dtype=np.int64)
+        bound = torch.full((b, width), -1, dtype=torch.long, device=device)
+        support_mask = torch.zeros((b, width), dtype=torch.bool, device=device)
+        for row, plan in enumerate(chunk):
+            if not plan.support:
+                continue
+            rows[row, :len(plan.support)] = plan.support
+            label_ids[row, :len(plan.support)] = table.ids(list(plan.support_labels))
+            bound[row, :len(plan.support)] = torch.tensor(
+                [candidate_to_slot.get(label, -1) for label in plan.support_labels],
+                dtype=torch.long, device=device,
+            )
+            support_mask[row, :len(plan.support)] = True
+        support_feature = torch.as_tensor(features[rows], dtype=torch.float32, device=device)
+        support_feature = support_feature * support_mask.unsqueeze(-1)
+        support_acquisition = torch.as_tensor(
+            acquisitions[rows], dtype=torch.float32, device=device,
+        ) * support_mask.unsqueeze(-1)
+        support_text = table.matrix[torch.as_tensor(label_ids, device=device)] \
+            * support_mask.unsqueeze(-1)
+        query_rows = np.asarray([plan.query for plan in chunk], dtype=np.int64)
+        result = head(
+            query_feature=torch.as_tensor(features[query_rows], dtype=torch.float32, device=device),
+            support_feature=support_feature,
+            query_acquisition=torch.as_tensor(
+                acquisitions[query_rows], dtype=torch.float32, device=device,
+            ),
+            support_acquisition=support_acquisition,
+            support_label_text=support_text, support_bound=bound,
+            support_mask=support_mask,
+            support_pair_slot=torch.arange(1, width + 1, device=device).unsqueeze(0).expand(b, -1),
+            candidate_text=candidate_text.expand(b, -1, -1),
+            candidate_mask=torch.ones((b, c), dtype=torch.bool, device=device),
+            candidate_slot=torch.arange(1, c + 1, device=device).unsqueeze(0).expand(b, -1),
+        )
+        logits = head.branch_logits(result, branch)
+        output.extend(candidates[index] for index in logits.argmax(dim=1).cpu().tolist())
     return output
 
 
@@ -977,6 +1157,7 @@ def _halo_token_mixer_predictions(
     checkpoint: Path,
     device: torch.device,
     batch_size: int = 64,
+    acquisitions: np.ndarray | None = None,
 ) -> list[str]:
     """Run HALO's semantic token mixer on an immutable manifest.
 
@@ -988,6 +1169,10 @@ def _halo_token_mixer_predictions(
     if blob.get("architecture_version") in RESIDUAL_ARCHITECTURES:
         return _halo_residual_predictions(features, stream, plans, checkpoint, device)
     if blob.get("architecture_version") == CONTEXTUAL_ARCHITECTURE:
+        return _halo_contextual_residual_predictions(
+            features, stream, plans, checkpoint, device, acquisitions=acquisitions,
+        )
+    if blob.get("architecture_version") == LEGACY_CONTEXTUAL_ARCHITECTURE:
         return _halo_contextual_predictions(features, stream, plans, checkpoint, device)
     if blob.get("architecture_version") != "support_token_mixer_v1" \
             or "classifier" not in blob or "classifier_config" not in blob \
@@ -1402,11 +1587,13 @@ def main() -> None:
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
     halo_state: tuple[torch.nn.Module, str] | None = None
     halo_has_classifier = False
+    halo_architecture = None
     if "halo" in args.models:
         if args.halo_checkpoint is None:
             parser.error("--halo-checkpoint is required when model list includes halo")
         halo_blob = torch.load(args.halo_checkpoint, map_location="cpu", weights_only=False)
         halo_has_classifier = halo_blob.get("classifier") is not None
+        halo_architecture = halo_blob.get("architecture_version")
         if "jepa_mode" in halo_blob.get("config", {}) \
                 and not args.allow_retired_jepa_checkpoint:
             parser.error(
@@ -1477,6 +1664,10 @@ def main() -> None:
         )
         if stream.quality_screen != "applied":
             raise RuntimeError(f"{dataset}/{stream_id}: quality screen unavailable ({stream.quality_screen})")
+        halo_acquisitions = (
+            halo_acquisition_rows(stream, halo_state[0], device)
+            if halo_state is not None and halo_architecture == CONTEXTUAL_ARCHITECTURE else None
+        )
         # Freeze every episode before any provider is loaded or invoked. All models consume these
         # same query/support row ids; representation extraction cannot influence episode creation.
         plans_by_k: dict[int, list[QueryPlan]] = {}
@@ -1552,6 +1743,7 @@ def main() -> None:
                         try:
                             predicted = _halo_token_mixer_predictions(
                                 features, stream, plans, args.halo_checkpoint, device,
+                                acquisitions=halo_acquisitions,
                             )
                         except ValueError:
                             # The differentiable-neighbours control intentionally has no mixer.
@@ -1816,6 +2008,7 @@ def main() -> None:
                         is_residual = halo_architecture in RESIDUAL_ARCHITECTURES
                         predicted = _halo_token_mixer_predictions(
                             features, stream, plans, args.halo_checkpoint, device,
+                            acquisitions=halo_acquisitions,
                         )
                     except ValueError as exc:
                         all_rows.append({"model": name, "readout": "retrieve-mix-vote", "k": k,
@@ -1831,11 +2024,27 @@ def main() -> None:
                         all_rows.append(metric)
                         if is_v2 and not is_residual:
                             # Contextual head: branch decompositions of the same forward.
-                            for readout, branch in zip(CONTEXTUAL_READOUTS,
-                                                       ("semantic", "support", "fixed_half")):
-                                branch_predicted = _halo_contextual_predictions(
-                                    features, stream, plans, args.halo_checkpoint, device, branch=branch,
-                                )
+                            branches = (
+                                ("semantic", "support_floor", "contextual_support")
+                                if halo_architecture == CONTEXTUAL_ARCHITECTURE
+                                else ("semantic", "support", "fixed_half")
+                            )
+                            readout_names = (
+                                CONTEXTUAL_READOUTS
+                                if halo_architecture == CONTEXTUAL_ARCHITECTURE
+                                else LEGACY_CONTEXTUAL_READOUTS
+                            )
+                            for readout, branch in zip(readout_names, branches):
+                                if halo_architecture == CONTEXTUAL_ARCHITECTURE:
+                                    branch_predicted = _halo_contextual_residual_predictions(
+                                        features, stream, plans, args.halo_checkpoint, device,
+                                        branch=branch, acquisitions=halo_acquisitions,
+                                    )
+                                else:
+                                    branch_predicted = _halo_contextual_predictions(
+                                        features, stream, plans, args.halo_checkpoint, device,
+                                        branch=branch,
+                                    )
                                 branch_metric = _metric_row(stream, plans, branch_predicted,
                                                             bootstrap=args.bootstrap)
                                 branch_metric.update({"model": name, "readout": readout, "k": k,

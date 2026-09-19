@@ -25,6 +25,7 @@ import numpy as np
 import torch
 
 import baselines
+from model.support.factory import CONTEXTUAL_ARCHITECTURE
 from baselines import scoring
 from halo.paths import CACHE_DIR
 from baselines.data import load_eval_stream, load_global_labels, load_multi_device_stream
@@ -45,6 +46,7 @@ from .sealed_eval import (
     TRAINING_BANK_ZERO_SHOT,
     _aligned_labels,
     _halo_residual_predictions,
+    halo_acquisition_rows,
     _build_training_reference_bank,
     _file_hash,
     _load_or_encode,
@@ -280,9 +282,11 @@ def main() -> None:
         parser.error("CUDA was requested but is unavailable")
     device = torch.device(args.device)
     halo_state = None
+    halo_requires_acquisition = False
     if "halo" in args.models:
         blob = torch.load(args.halo_checkpoint, map_location="cpu", weights_only=False)
         halo_state = (build_encoder(blob, device).eval(), _file_hash(args.halo_checkpoint))
+        halo_requires_acquisition = blob.get("architecture_version") == CONTEXTUAL_ARCHITECTURE
     provider_states = {
         name: baselines.REGISTRY[name].setup_features(device)
         for name in args.models if name != "halo"
@@ -403,8 +407,13 @@ def main() -> None:
                         reason="no text path: unenrolled candidates are unreachable"))
 
                 if name == "halo" and args.halo_checkpoint is not None:
+                    acquisitions = (
+                        halo_acquisition_rows(stream, halo_state[0], device)
+                        if halo_requires_acquisition else None
+                    )
                     predicted = _halo_residual_predictions(
-                        matrix, stream, covered, args.halo_checkpoint, device)
+                        matrix, stream, covered, args.halo_checkpoint, device,
+                        acquisitions=acquisitions)
                     rows.extend(emit_rows(stream, covered, predicted, cell,
                                           model=name, readout="halo-classifier", **shared))
 

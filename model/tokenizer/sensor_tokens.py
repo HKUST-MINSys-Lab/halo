@@ -162,9 +162,11 @@ class ConditioningProjection(nn.Module):
         sensor_tokens: torch.Tensor,
         artifact: torch.Tensor,
         valid: torch.Tensor | None = None,
+        *,
+        embedded: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return only the gated residual, permitting parallel conditioners."""
-        emb = self.embed(artifact)                                   # (B,S,d)
+        emb = self.embed(artifact) if embedded is None else embedded  # (B,S,d)
         if valid is not None:
             emb = emb * valid.unsqueeze(-1).to(emb.dtype)
         B, P, S, d = sensor_tokens.shape
@@ -251,8 +253,11 @@ class StructuredSensorConditioner(nn.Module):
         gravity: torch.Tensor,
         rates_hz: torch.Tensor,
         valid: torch.Tensor,
+        *,
+        embedded: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        emb = self.embed(modality, gravity, rates_hz, valid).to(sensor_tokens.dtype)
+        emb = (self.embed(modality, gravity, rates_hz, valid)
+               if embedded is None else embedded).to(sensor_tokens.dtype)
         emb = emb * valid.unsqueeze(-1).to(emb.dtype)
         expanded = emb.unsqueeze(1).expand_as(sensor_tokens)
         gate = torch.sigmoid(self.gate(torch.cat([sensor_tokens, expanded], dim=-1)))

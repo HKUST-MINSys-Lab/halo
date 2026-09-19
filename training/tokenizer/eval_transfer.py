@@ -302,6 +302,7 @@ def build_encoder(
     enc.min_resolution_ratio = float(c.get("min_resolution_ratio", 1.75))
     enc.multiresolution = bool(c.get("multiresolution", False))
     enc.retrieval_granularity = c.get("retrieval_granularity", "patch")
+    enc.neutral_acquisition_text = bool(c.get("neutral_acquisition_text", False))
     enc = enc.to(device)
     return enc.train() if training else enc.eval()
 

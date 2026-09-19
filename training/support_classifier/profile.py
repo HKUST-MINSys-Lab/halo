@@ -1,6 +1,7 @@
 """Bounded profile of the current support-classifier training recipe.
 
-This profiles the deployment-shaped residual classifier or differentiable-neighbour control.
+This profiles the deployment-shaped contextual residual classifier, historical residual head, or
+differentiable-neighbour control.
 Optional validation only uses the training roster's held-out subjects; no checkpoints or sealed
 results are written. Worker-count variants run sequentially.
 """
@@ -25,8 +26,14 @@ from training.support_classifier.encoding import (
     install_compiled_transformer,
 )
 from training.support_classifier.neighbors import differentiable_neighbor_logits
+from training.support_classifier.objectives import (
+    ImprovementObjectiveConfig, contextual_path_improvement_objective,
+)
 from model.blocks import AttentionSpec
 from model.support.residual_classifier import ResidualClassifierConfig, ResidualSupportClassifier
+from model.support.contextual_residual_classifier import (
+    ContextualResidualClassifierConfig, ContextualResidualSupportClassifier,
+)
 from training.support_classifier.train import (
     TAU_SUPPORT,
     PrefetchLoader,
@@ -87,21 +94,29 @@ def _gradient_breakdown(encoder, classifier) -> dict[str, float]:
            if getattr(encoder, "structured_conditioner", None) is not None else {}),
     }
     if classifier is not None:
-        modules.update({
-            "classifier": classifier,
-            "classifier/signal_proj": classifier.signal_proj,
-            "classifier/attention": classifier.metric_stack,
-            "classifier/support_residual": classifier.r_support_head,
-            "classifier/candidate_residual": classifier.r_candidate_head,
-            "classifier/text_bridge": classifier.p_text,
-        })
+        modules["classifier"] = classifier
+        if isinstance(classifier, ContextualResidualSupportClassifier):
+            modules.update({
+                "classifier/attention": classifier.stack,
+                "classifier/support_correction": classifier.correction_candidate,
+                "classifier/semantic_gate": classifier.semantic_gate,
+            })
+        else:
+            modules.update({
+                "classifier/signal_proj": classifier.signal_proj,
+                "classifier/attention": classifier.metric_stack,
+                "classifier/support_residual": classifier.r_support_head,
+                "classifier/candidate_residual": classifier.r_candidate_head,
+                "classifier/text_bridge": classifier.p_text,
+            })
     return {name: _grad_norm(module) for name, module in modules.items()}
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workers", type=int, nargs="+", default=[8, 12, 16])
-    parser.add_argument("--classifier", choices=("residual", "neighbors"), default="residual")
+    parser.add_argument("--classifier", choices=("contextual", "residual", "neighbors"),
+                        default="contextual")
     parser.add_argument("--support-temperature", type=float, default=TAU_SUPPORT,
                         help="diagnostic support-vote temperature")
     parser.add_argument("--text-temperature", type=float, default=0.07,
@@ -157,7 +172,7 @@ def main() -> None:
     ))
     recipe_args = argparse.Namespace(
         classifier=args.classifier,
-        p_gt_present=(DEFAULT_P_GT_PRESENT if args.classifier == "residual" else 1.0),
+        p_gt_present=(DEFAULT_P_GT_PRESENT if args.classifier != "neighbors" else 1.0),
         p_mask_candidate=0.25,
         p_mask_gt=0.10,
         same_subject_probability=DEFAULT_SAME_SUBJECT_PROBABILITY,
@@ -165,7 +180,7 @@ def main() -> None:
         mode="compatible",
         enrollment_k=DEFAULT_ENROLLMENT_K,
         acquisition_mix=DEFAULT_ACQUISITION_MIX,
-        enrollment_mix=(DEFAULT_ENROLLMENT_MIX if args.classifier == "residual"
+        enrollment_mix=(DEFAULT_ENROLLMENT_MIX if args.classifier != "neighbors"
                         else (2.0 / 3.0, 1.0 / 3.0, 0.0)),
         partial_coverage=DEFAULT_PARTIAL_COVERAGE,
         variable_support_probability=DEFAULT_VARIABLE_SUPPORT_PROBABILITY,
@@ -211,14 +226,25 @@ def main() -> None:
                     batches=1, batch_size=64, executor=None,
                 )
             text = make_label_text(corpus.all_labels, device)
-            classifier = (ResidualSupportClassifier(
-                AttentionSpec(d_model=encoder.d_model, n_heads=4, ffn_mult=2, dropout=0.1),
-                ResidualClassifierConfig(
-                    temperature=args.support_temperature,
-                    text_temperature=args.text_temperature,
-                ),
-            ).to(device).train() if args.classifier == "residual" else None)
-            if classifier is not None:
+            spec = AttentionSpec(d_model=encoder.d_model, n_heads=4, ffn_mult=2, dropout=0.1)
+            classifier = (
+                ResidualSupportClassifier(
+                    spec, ResidualClassifierConfig(
+                        temperature=args.support_temperature,
+                        text_temperature=args.text_temperature,
+                    ),
+                ).to(device).train()
+                if args.classifier == "residual" else
+                ContextualResidualSupportClassifier(
+                    spec, ContextualResidualClassifierConfig(
+                        support_temperature=args.support_temperature,
+                        semantic_temperature=args.text_temperature,
+                        acquisition_dim=encoder.d_model,
+                    ),
+                ).to(device).train()
+                if args.classifier == "contextual" else None
+            )
+            if isinstance(classifier, ResidualSupportClassifier):
                 initialise_text_projection(
                     classifier, encoder, dataset, corpus, collate, text,
                     np.random.default_rng(7), device, batches=1, batch_size=64, executor=None,
@@ -258,10 +284,10 @@ def main() -> None:
                 marks = [_event() for _ in range(8)]
                 marks[0].record()
                 with autocast(device):
-                    pooled, descriptor, _ = encode_recording_rows(encoder, batch, device)
+                    pooled, acquisition, _ = encode_recording_rows(encoder, batch, device)
                     marks[1].record()
                     marks[2].record()
-                    rows = split_encoded(pooled, descriptor, episodes, corpus)
+                    rows = split_encoded(pooled, acquisition, episodes, corpus)
                     episode_vectors = episode_text(episodes, corpus, text, device)
                     marks[3].record()
                     query = rows["query_feature"].squeeze(1)
@@ -271,12 +297,37 @@ def main() -> None:
                             rows["support_mask"], episode_vectors["candidate_mask"],
                             temperature=args.support_temperature,
                         )
+                    elif isinstance(classifier, ContextualResidualSupportClassifier):
+                        output = classifier(
+                            query_feature=query,
+                            support_feature=rows["support_feature"],
+                            query_acquisition=rows["query_acquisition"].squeeze(1),
+                            support_acquisition=rows["support_acquisition"],
+                            support_label_text=episode_vectors["support_label_text"],
+                            support_bound=episode_vectors["support_bound"],
+                            support_mask=rows["support_mask"],
+                            support_pair_slot=episode_vectors["support_pair_slot"],
+                            candidate_text=episode_vectors["candidate_text"],
+                            candidate_mask=episode_vectors["candidate_mask"],
+                            candidate_slot=episode_vectors["candidate_slot"],
+                        )
+                        logits, weights = output["logits"], output["support_weight"]
                     else:
                         output = classifier(query_feature=query,
                             support_feature=rows["support_feature"], support_mask=rows["support_mask"],
                             **episode_vectors)
                         logits, weights = output["logits"], output["support_weight"]
                     loss = episode_loss(logits, episodes, episode_vectors)["loss"]
+                    if isinstance(classifier, ContextualResidualSupportClassifier):
+                        target = torch.tensor(
+                            [episode.gt_slot for episode in episodes],
+                            dtype=torch.long, device=device,
+                        )
+                        auxiliary, _ = contextual_path_improvement_objective(
+                            output, target, episode_vectors["candidate_mask"],
+                            ImprovementObjectiveConfig(),
+                        )
+                        loss = loss + 0.1 * auxiliary
                     marks[4].record()
                 loss.backward()
                 marks[5].record()
@@ -371,10 +422,7 @@ def main() -> None:
                         "encoder": encoder,
                         **({"recording_pool": encoder.recording_pool}
                            if getattr(encoder, "recording_pool", None) is not None else {}),
-                        **({"classifier": classifier, "trunk": classifier.metric_stack,
-                            "support_residual": classifier.r_support_head,
-                            "candidate_residual": classifier.r_candidate_head,
-                            "text_bridge": classifier.p_text} if classifier else {}),
+                        **({"classifier": classifier} if classifier else {}),
                     }.items()
                     if any(p.grad is not None for p in module.parameters())
                 },

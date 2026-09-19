@@ -1,6 +1,6 @@
 # Evaluation protocol: support-conditioned HAR
 
-> Last verified against code: 2026-09-18. A score is reportable only when the run records the data split,
+> Last verified against code: 2026-09-19. A score is reportable only when the run records the data split,
 > encoder checkpoint, baseline adapter revision, episode manifest, and support/candidate settings.
 
 > **Operational status:** `training.support_classifier.sealed_eval` is the only sealed-test entry
@@ -78,11 +78,12 @@ For each eligible representation, report these readouts on exactly the same epis
    predictions are identical at `k=0`.
 4. **Differentiable neighbours:** HALO encoder-development objective only; it is not reported as an
    adaptation mechanism for released baseline models.
-5. **HALO residual classifier:** the learned support-conditioned classifier. It jointly
-   contextualizes query, support, paired support-label, and candidate-label tokens, then combines
-   centered support evidence with a direct semantic candidate term. The default checkpoint uses
-   one shared classifier across `k = 0` and `k > 0`; a regime-split checkpoint is a named ablation,
-   never an implicit evaluation choice.
+5. **HALO contextual residual classifier:** the learned support-conditioned classifier. It jointly
+   contextualizes query, support, paired support-label, candidate-label, and runtime acquisition
+   vectors, then applies candidate-specific corrections around the centered-neighbor support floor
+   and combines them with candidate-local semantic evidence. Evaluation must reconstruct
+   acquisition vectors from each query and support stream separately; cross-stream scenarios may
+   not replace them with zeros or reuse the query configuration for supports.
 
 At `k=0`, there is no target-dataset enrollment, but labelled training-corpus evidence remains
 available. For HALO and released encoders without a native open-label head, retrieve the nearest

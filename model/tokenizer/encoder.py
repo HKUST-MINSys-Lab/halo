@@ -786,6 +786,7 @@ class SetTokenizerEncoder(nn.Module):
         descriptor_visible = sensor_present
         if descriptor_mask is not None:
             descriptor_visible = descriptor_visible & ~descriptor_mask.to(sensor_present.device)
+        text_embedding = self.descriptor_proj.embed(descriptor)
         if self.conditioning_schema == CONDITIONING_SCHEMA_V2:
             if sensor_modality is None or sensor_gravity is None or sensor_rates_hz is None:
                 raise ValueError(
@@ -795,17 +796,29 @@ class SetTokenizerEncoder(nn.Module):
             if sensor_modality.shape != expected or sensor_gravity.shape != expected \
                     or sensor_rates_hz.shape != (B, N, 2):
                 raise ValueError("conditioning-v2 metadata does not match the sensor layout")
-            text_delta = self.descriptor_proj.delta(tokens, descriptor, descriptor_visible)
+            modality = sensor_modality.to(device=tokens.device, dtype=torch.long)
+            gravity = sensor_gravity.to(device=tokens.device, dtype=torch.long)
+            rates = sensor_rates_hz.to(device=tokens.device, dtype=tokens.dtype)
+            structured_embedding = self.structured_conditioner.embed(
+                modality, gravity, rates, sensor_present,
+            )
+            text_delta = self.descriptor_proj.delta(
+                tokens, descriptor, descriptor_visible, embedded=text_embedding,
+            )
             structured_delta = self.structured_conditioner.delta(
-                tokens,
-                sensor_modality.to(device=tokens.device, dtype=torch.long),
-                sensor_gravity.to(device=tokens.device, dtype=torch.long),
-                sensor_rates_hz.to(device=tokens.device, dtype=tokens.dtype),
-                sensor_present,
+                tokens, modality, gravity, rates, sensor_present,
+                embedded=structured_embedding,
             )
             tokens = tokens + text_delta + structured_delta
+            acquisition = F.normalize(
+                text_embedding.float() + structured_embedding.float(), dim=-1,
+            )
         else:
-            tokens = self.descriptor_proj(tokens, descriptor, descriptor_visible)
+            tokens = tokens + self.descriptor_proj.delta(
+                tokens, descriptor, descriptor_visible, embedded=text_embedding,
+            )
+            acquisition = F.normalize(text_embedding.float(), dim=-1)
+        acquisition = acquisition * sensor_present.unsqueeze(-1).to(acquisition.dtype)
         if self.use_sensor_bias_conditioning:
             if sensor_bias is None:
                 raise ValueError("this legacy checkpoint requires sensor_bias conditioning")
@@ -890,6 +903,7 @@ class SetTokenizerEncoder(nn.Module):
                   "sensor_context": sensor_context, "sensor_present": sensor_present,
                   "device_id": device_id,
                   "descriptor": descriptor,
+                  "acquisition": acquisition,
                   "descriptor_pred": descriptor_pred}
         if return_layer_states:
             output["layer_states"] = layer_states

@@ -19,7 +19,8 @@ native-rate IMU + acquisition metadata
 
 The active experiment uses 8-second training windows. The parameter-free differentiable-neighbor
 path is the encoder control; the learned residual classifier combines support evidence with a
-semantic candidate path. Future-JEPA, continuous kernels, explicit admissibility, and hidden-bank
+semantic candidate path after jointly contextualizing runtime evidence and acquisition metadata.
+Future-JEPA, continuous kernels, explicit admissibility, and hidden-bank
 retrieval are preserved as historical work, not active defaults.
 
 Start with [the documentation index](docs/README.md). The living architecture, conditioning,
