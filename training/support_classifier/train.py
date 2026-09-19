@@ -198,6 +198,12 @@ class PrefetchLoader:
             raise ValueError("PrefetchLoader needs at least one worker; use draw_batch directly")
         import torch.multiprocessing as mp
 
+        # A heterogeneous bucketed batch owns many independent tensor storages. With 16 workers,
+        # the default ``file_descriptor`` transport can exceed the process' 1024-FD limit before
+        # the parent reconstructs the first device-challenge batch (``received 0 ancdata``).
+        # This host has ample /dev/shm; the filename-backed strategy carries the same tensors
+        # without one live descriptor per storage and is the documented PyTorch fallback.
+        mp.set_sharing_strategy("file_system")
         context = mp.get_context("fork")
         self._requests = context.Queue()
         self._results = context.Queue()
