@@ -9,9 +9,12 @@ The complete v5 sealed protocol finished all 39 cells over six datasets, 4/8/16-
 windows, and `k = 0, 1, 2, 4, 8, 16, 32, 64, 128`. It produced 2,190 rows without a failed cell.
 The episode manifest is byte-identical to the current released-baseline artifact.
 
-This is a valid negative result, not the promoted classifier. At 8 seconds, dataset-balanced macro
-F1 for the full classifier is 50.0/59.7/64.0/67.6/70.3 at `k=0/1/8/32/128`; its parameter-free
-support floor reaches 59.8/72.0/75.4/76.3 at `k=1/8/32/128`. The learned head therefore retains
+This is a valid negative result, not the promoted classifier. Human-facing summaries call the full
+head the **proposed hybrid classifier**, its contextual support branch the **learned support
+matcher**, its unmodified floor the **soft support vote**, its external 1-NN the **nearest support**,
+and its semantic branch the **label-meaning matcher**. At 8 seconds, dataset-balanced macro F1 for
+the proposed hybrid is 50.0/59.7/64.0/67.6/70.3 at `k=0/1/8/32/128`; its soft support vote reaches
+59.8/72.0/75.4/76.3 at `k=1/8/32/128`. The learned head therefore retains
 useful zero-support behavior but degrades the stronger support evidence as enrollment grows.
 
 `results.json.gz` is the exhaustive result payload, `episode_manifests.json.gz` is the exact

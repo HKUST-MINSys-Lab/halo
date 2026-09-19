@@ -52,21 +52,39 @@ Dataset-balanced, single-device macro F1:
 `*` At 16 seconds, `k=128` is MotionSense only and is not an aggregate comparable to the other
 columns. At `k=64`, the 16-second full classifier/support floor scores are 70.9/77.7.
 
-At 8 seconds the branch decomposition is:
+For human-facing tables, use these names. The identifiers in parentheses remain only in
+machine-readable artifacts and checkpoint loading:
 
-| readout | k=1 | k=8 | k=32 | k=128 |
-|---|---:|---:|---:|---:|
-| full classifier | 59.7 | 64.0 | 67.6 | 70.3 |
-| contextual support | **61.2** | 69.7 | 72.5 | 74.2 |
-| closed-form support floor | 59.8 | **72.0** | **75.4** | 76.3 |
-| cosine 1-NN | 60.4 | 71.5 | 74.6 | **76.5** |
-| semantic path | 47.7 | 43.5 | 37.8 | 32.0 |
+| presentation name | implementation identifier | meaning |
+|---|---|---|
+| proposed hybrid classifier | `halo-classifier` | learned support matching plus label-meaning evidence |
+| learned support matcher | `halo-classifier-contextual-support` | learned episode-aware support comparison, without direct query-to-label evidence |
+| soft support vote | `halo-classifier-support-floor` | centred similarity-weighted voting, with no learned classifier correction |
+| nearest support | `1nn` | external cosine 1-NN on the trained encoder |
+| label-meaning matcher | `halo-classifier-semantic-only` | direct query-to-candidate-label evidence, without support voting |
+
+At 8 seconds the comparison with the current best HALO classifier is:
+
+| system or diagnostic | k=0 | k=1 | k=8 | k=32 | k=128 |
+|---|---:|---:|---:|---:|---:|
+| **current best HALO classifier** | **51.7** | **62.4** | **71.5** | **73.4** | **74.4** |
+| proposed hybrid classifier | 50.0 | 59.7 | 64.0 | 67.6 | 70.3 |
+| learned support matcher | - | 61.2 | 69.7 | 72.5 | 74.2 |
+| soft support vote | - | 59.8 | 72.0 | 75.4 | 76.3 |
+| nearest support | - | 60.4 | 71.5 | 74.6 | 76.5 |
+| label-meaning matcher | - | 47.7 | 43.5 | 37.8 | 32.0 |
 
 The design repaired the prior all-semantic gate collapse: enrollment now changes predictions and
 the contextual support path improves the floor at `k=1`. It still fails the central monotonic
 safety goal. As support grows, the semantic path degrades sharply and the final learned combination
 overrides stronger support evidence. The auxiliary objective improves the contextual support path
 locally but does not guarantee that the final path preserves the support floor on unseen labels.
+
+The current best row is the previously promoted support-vote-anchored residual classifier, trained
+under the same v5 protocol. The proposed hybrid is lower by 1.7/2.7/7.5/5.8/4.1 macro-F1 points at
+`k=0/1/8/32/128`. Its encoder remains useful: soft support voting and nearest-support classification
+equal or exceed the current best at high `k`; the regression is primarily in the learned evidence
+combination.
 
 ## Scenario result
 

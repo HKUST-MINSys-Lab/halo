@@ -8,8 +8,11 @@ The representative `deployment-scenarios-v5-20260918` suite completed all seven 
 8-second evidence and `k = 0, 1, 4, 8, 32`: 2,395 result rows, 1,132 task units, and zero task
 failures. The manifest is byte-identical to the current released-baseline scenario artifact.
 
-The learned classifier remains useful under partial enrollment, where it can name candidates with
-no enrolled support, but it does not improve complete-enrollment evidence consistently. This
+Human-facing summaries call the full head the **proposed hybrid classifier**, its contextual
+support branch the **learned support matcher**, its unmodified floor the **soft support vote**, its
+external 1-NN the **nearest support**, and its semantic branch the **label-meaning matcher**. The
+proposed hybrid remains useful under partial enrollment, where it can name candidates with no
+enrolled support, but it does not improve complete-enrollment evidence consistently. This
 artifact is retained as a valid design result and is not promoted over the current residual
 classifier.
 
