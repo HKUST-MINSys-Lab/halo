@@ -29,8 +29,12 @@ from model.blocks import AttentionSpec
 from model.tokenizer.multispan_kernel import MS_SPANS_S, MS_FRAME_RATE_HZ
 from model.support.token_mixer import SupportTokenMixer, TokenMixerConfig
 from model.support.contextual_residual_classifier import (
-    ARCHITECTURE_VERSION as CONTEXTUAL_ARCHITECTURE,
+    ARCHITECTURE_VERSION as CONTEXTUAL_RESIDUAL_ARCHITECTURE,
     ContextualResidualClassifierConfig, ContextualResidualSupportClassifier,
+)
+from model.support.evidence_aware_classifier import (
+    ARCHITECTURE_VERSION as EVIDENCE_AWARE_ARCHITECTURE,
+    EvidenceAwareClassifierConfig, EvidenceAwareSupportClassifier,
 )
 from model.support.residual_classifier import (
     RegimeSplitSupportClassifier, ResidualClassifierConfig, ResidualSupportClassifier,
@@ -65,7 +69,8 @@ from training.support_classifier.encoding import (
 from training.support_classifier.neighbors import DEFAULT_TEMPERATURE, differentiable_neighbor_logits
 from training.support_classifier.objectives import (
     COMPARISONS as CONTEXTUAL_AUX_COMPARISONS,
-    ImprovementObjectiveConfig, contextual_path_improvement_objective,
+    EvidenceAwareObjectiveConfig, ImprovementObjectiveConfig, contextual_path_improvement_objective,
+    evidence_aware_objective,
 )
 from training.tokenizer.eval_transfer import build_encoder
 from model.tokenizer.sensor_tokens import CONDITIONING_SCHEMA_V2, LEGACY_CONDITIONING_SCHEMA
@@ -715,6 +720,7 @@ def draw_kwargs_from_args(args) -> dict:
                            if args.enrollment_mix is not None else None),
         "partial_coverage": tuple(args.partial_coverage),
         "variable_support_probability": args.variable_support_probability,
+        "counterfactual_enrollment_probability": args.counterfactual_enrollment_probability,
         "require_query_support": args.classifier == "neighbors",
         "queries_per_support_set": args.queries_per_support_set,
         "windows_per_execution": args.windows_per_execution,
@@ -729,7 +735,7 @@ def run_step(
     collate,
     encoder,
     classifier: SupportTokenMixer | ResidualSupportClassifier | RegimeSplitSupportClassifier |
-                ContextualResidualSupportClassifier | None,
+                ContextualResidualSupportClassifier | EvidenceAwareSupportClassifier | None,
     classifier_mode: str,
     improvement_objective: ImprovementObjectiveConfig | None = None,
     text_of,
@@ -811,8 +817,8 @@ def run_step(
             candidate_slot=text["candidate_slot"],
         )
     elif classifier_mode == "contextual":
-        if not isinstance(classifier, ContextualResidualSupportClassifier):
-            raise ValueError("contextual mode requires ContextualResidualSupportClassifier")
+        if not isinstance(classifier, (ContextualResidualSupportClassifier, EvidenceAwareSupportClassifier)):
+            raise ValueError("contextual mode requires an evidence-aware support classifier")
         output = classifier(
             query_feature=query, support_feature=rows["support_feature"],
             query_acquisition=rows["query_acquisition"].squeeze(1),
@@ -830,9 +836,24 @@ def run_step(
         target = torch.tensor(
             [episode.gt_slot for episode in episodes], dtype=torch.long, device=device,
         )
-        auxiliary, auxiliary_metrics = contextual_path_improvement_objective(
-            output, target, text["candidate_mask"], improvement_objective,
-        )
+        if isinstance(classifier, EvidenceAwareSupportClassifier):
+            # Counterfactual groups are optional during the initial migration.  Independent
+            # episodes deliberately use their own row as a group, preserving the exact contract.
+            groups = torch.tensor(
+                [getattr(episode, "counterfactual_group", -1) for episode in episodes],
+                dtype=torch.long, device=device,
+            )
+            auxiliary, auxiliary_metrics = evidence_aware_objective(
+                output, target, text["candidate_mask"],
+                EvidenceAwareObjectiveConfig(
+                    enabled=improvement_objective.enabled, weight=improvement_objective.weight,
+                    margin=improvement_objective.margin, temperature=improvement_objective.temperature,
+                ), group_ids=groups,
+            )
+        else:
+            auxiliary, auxiliary_metrics = contextual_path_improvement_objective(
+                output, target, text["candidate_mask"], improvement_objective,
+            )
         loss["main_ce"] = loss["loss"].detach()
         loss["loss"] = loss["loss"] + improvement_objective.weight * auxiliary
         loss.update(auxiliary_metrics)
@@ -1432,6 +1453,8 @@ def main() -> None:
     parser.add_argument("--variable-support-probability", type=float,
                         default=DEFAULT_VARIABLE_SUPPORT_PROBABILITY,
                         help="share of enrolled support sets with unequal per-candidate counts")
+    parser.add_argument("--counterfactual-enrollment-probability", type=float, default=0.25,
+                        help="share of batches replacing one complete episode with matched enrollment views")
     parser.add_argument("--rate-augmentation-probability", type=float, default=0.0,
                         help="independent anti-aliased rate perturbation probability per recording")
     parser.add_argument("--modality-dropout-probability", type=float, default=0.0,
@@ -1595,6 +1618,8 @@ def main() -> None:
         parser.error("frozen head training requires --phase-a ENCODER_CHECKPOINT")
     if args.p_gt_present is None:
         args.p_gt_present = DEFAULT_P_GT_PRESENT
+    if not 0.0 <= args.counterfactual_enrollment_probability <= 1.0:
+        parser.error("--counterfactual-enrollment-probability must be in [0, 1]")
     if args.classifier == "neighbors":
         # A neighbor vote has no candidate-only k=0 path.  Make the control honest rather than
         # quietly giving it the semantic token mixer's zero-shot machinery.
@@ -1739,6 +1764,7 @@ def main() -> None:
         saved.setdefault("enrollment_mix", None)
         saved.setdefault("partial_coverage", list(DEFAULT_PARTIAL_COVERAGE))
         saved.setdefault("variable_support_probability", 0.0)
+        saved.setdefault("counterfactual_enrollment_probability", 0.0)
         saved.setdefault("rate_augmentation_probability", 0.0)
         saved.setdefault("modality_dropout_probability", 0.0)
         saved.setdefault("device_set_challenge_probability", 0.0)
@@ -1762,6 +1788,7 @@ def main() -> None:
             "acquisition_mix": "--acquisition-mix", "enrollment_mix": "--enrollment-mix",
             "partial_coverage": "--partial-coverage",
             "variable_support_probability": "--variable-support-probability",
+            "counterfactual_enrollment_probability": "--counterfactual-enrollment-probability",
             "rate_augmentation_probability": "--rate-augmentation-probability",
             "modality_dropout_probability": "--modality-dropout-probability",
             "queries_per_support_set": "--queries-per-support-set",
@@ -1913,9 +1940,13 @@ def main() -> None:
             classifier = build_support_classifier(
                 spec, ResidualClassifierConfig(**classifier_config),
             ).to(device) if args.classifier == "residual" else None
-        elif version == CONTEXTUAL_ARCHITECTURE:
+        elif version == CONTEXTUAL_RESIDUAL_ARCHITECTURE:
             classifier = ContextualResidualSupportClassifier(
                 spec, ContextualResidualClassifierConfig(**resume_blob["classifier_config"]),
+            ).to(device) if args.classifier == "contextual" else None
+        elif version == EVIDENCE_AWARE_ARCHITECTURE:
+            classifier = EvidenceAwareSupportClassifier(
+                spec, EvidenceAwareClassifierConfig(**resume_blob["classifier_config"]),
             ).to(device) if args.classifier == "contextual" else None
         elif version == "support_token_mixer_v1":
             classifier = SupportTokenMixer(spec, TokenMixerConfig(**resume_blob["classifier_config"])).to(device) \
@@ -2064,8 +2095,8 @@ def main() -> None:
                 text_temperature=args.text_temperature,
                 adaptive_text_gate=args.adaptive_text_gate,
             )).to(device) if args.classifier == "residual" else
-            ContextualResidualSupportClassifier(
-                spec, ContextualResidualClassifierConfig(acquisition_dim=encoder.d_model),
+            EvidenceAwareSupportClassifier(
+                spec, EvidenceAwareClassifierConfig(acquisition_dim=encoder.d_model),
             ).to(device)
             if args.classifier == "contextual" else
             SupportTokenMixer(spec, TokenMixerConfig()).to(device) if args.classifier == "token_mixer" else None)
@@ -2162,6 +2193,7 @@ def main() -> None:
             "curriculum_sampler_schema": DEPLOYMENT_SAMPLER_SCHEMA,
             "partial_coverage": list(args.partial_coverage),
             "variable_support_probability": args.variable_support_probability,
+            "counterfactual_enrollment_probability": args.counterfactual_enrollment_probability,
             "rate_augmentation_probability": args.rate_augmentation_probability,
             "modality_dropout_probability": args.modality_dropout_probability,
             "queries_per_support_set": args.queries_per_support_set,
@@ -2181,7 +2213,7 @@ def main() -> None:
             "classifier_config": (dataclasses.asdict(classifier.cfg)
                                   if isinstance(classifier, (
                                       ResidualSupportClassifier, RegimeSplitSupportClassifier,
-                                      ContextualResidualSupportClassifier,
+                                      ContextualResidualSupportClassifier, EvidenceAwareSupportClassifier,
                                   )) else None),
             "contextual_aux": bool(args.contextual_aux),
             "contextual_aux_weight": float(args.contextual_aux_weight),
@@ -2270,6 +2302,7 @@ def main() -> None:
             ("enrollment_mix", None),
             ("partial_coverage", list(DEFAULT_PARTIAL_COVERAGE)),
             ("variable_support_probability", 0.0),
+            ("counterfactual_enrollment_probability", 0.0),
             ("rate_augmentation_probability", 0.0),
             ("modality_dropout_probability", 0.0),
         ):
@@ -2279,7 +2312,7 @@ def main() -> None:
             (dataclasses.asdict(classifier.cfg)
              if isinstance(classifier, (
                  ResidualSupportClassifier, RegimeSplitSupportClassifier,
-                 ContextualResidualSupportClassifier,
+                 ContextualResidualSupportClassifier, EvidenceAwareSupportClassifier,
              )) else None),
         )
         # `regime_split` was added to ResidualClassifierConfig after some snapshots were written;
@@ -2351,7 +2384,7 @@ def main() -> None:
             "config": config,
             "encoder": encoder.state_dict(),
             "architecture_version": ("support_classifier_v3" if args.classifier == "residual"
-                                     else CONTEXTUAL_ARCHITECTURE if args.classifier == "contextual"
+                                     else EVIDENCE_AWARE_ARCHITECTURE if args.classifier == "contextual"
                                      else "support_token_mixer_v1"),
             "classifier": None if classifier is None else classifier.state_dict(),
             "classifier_config": None if classifier is None else dataclasses.asdict(classifier.cfg),

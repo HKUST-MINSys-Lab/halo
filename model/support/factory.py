@@ -14,19 +14,32 @@ from model.support.contextual_classifier import (
     ContextualClassifierConfig, ContextualSupportClassifier,
 )
 from model.support.contextual_residual_classifier import (
-    ARCHITECTURE_VERSION as CONTEXTUAL_ARCHITECTURE,
+    ARCHITECTURE_VERSION as CONTEXTUAL_RESIDUAL_ARCHITECTURE,
     ContextualResidualClassifierConfig, ContextualResidualSupportClassifier,
+)
+from model.support.evidence_aware_classifier import (
+    ARCHITECTURE_VERSION as EVIDENCE_AWARE_ARCHITECTURE,
+    EvidenceAwareClassifierConfig, EvidenceAwareSupportClassifier,
 )
 from model.support.residual_classifier import ResidualClassifierConfig, build_support_classifier
 
 RESIDUAL_ARCHITECTURES = frozenset({"support_classifier_v2", "support_classifier_v3"})
 LEARNED_CLASSIFIER_ARCHITECTURES = RESIDUAL_ARCHITECTURES | {
-    LEGACY_CONTEXTUAL_ARCHITECTURE, CONTEXTUAL_ARCHITECTURE,
+    LEGACY_CONTEXTUAL_ARCHITECTURE, CONTEXTUAL_RESIDUAL_ARCHITECTURE,
+    EVIDENCE_AWARE_ARCHITECTURE,
 }
-MODE_TO_ARCHITECTURE = {"residual": "support_classifier_v3", "contextual": CONTEXTUAL_ARCHITECTURE,
+# ``contextual`` is the CLI mode, not a checkpoint family.  New runs use v2 while v1 remains
+# explicitly addressable for checkpoint loading and historical evaluation.
+CONTEXTUAL_ARCHITECTURE = EVIDENCE_AWARE_ARCHITECTURE
+CONTEXTUAL_CHECKPOINT_ARCHITECTURES = frozenset({CONTEXTUAL_RESIDUAL_ARCHITECTURE, EVIDENCE_AWARE_ARCHITECTURE})
+MODE_TO_ARCHITECTURE = {"residual": "support_classifier_v3", "contextual": EVIDENCE_AWARE_ARCHITECTURE,
                         "token_mixer": "support_token_mixer_v1"}
 CONTEXTUAL_READOUTS = ("halo-classifier-semantic-only", "halo-classifier-support-floor",
                        "halo-classifier-contextual-support")
+EVIDENCE_AWARE_READOUTS = (
+    "halo-classifier-label-meaning-only", "halo-classifier-unmodified-support-vote",
+    "halo-classifier-contextual-support-vote",
+)
 LEGACY_CONTEXTUAL_READOUTS = (
     "halo-classifier-semantic-only", "halo-classifier-support-only",
     "halo-classifier-fixed-half-mixture",
@@ -58,12 +71,16 @@ def build_classifier_from_blob(blob: dict, *, device=None, overrides: dict | Non
         if overrides:
             raise ValueError("residual ablation flags are not defined for the contextual head")
         head = ContextualSupportClassifier(spec, ContextualClassifierConfig(**config))
-    elif version == CONTEXTUAL_ARCHITECTURE:
+    elif version == CONTEXTUAL_RESIDUAL_ARCHITECTURE:
         if overrides:
             raise ValueError("residual ablation flags are not defined for the contextual head")
         head = ContextualResidualSupportClassifier(
             spec, ContextualResidualClassifierConfig(**config),
         )
+    elif version == EVIDENCE_AWARE_ARCHITECTURE:
+        if overrides:
+            raise ValueError("residual ablation flags are not defined for the evidence-aware head")
+        head = EvidenceAwareSupportClassifier(spec, EvidenceAwareClassifierConfig(**config))
     else:
         raise ValueError(f"unsupported support-classifier architecture {version!r}")
     head.load_state_dict(blob["classifier"], strict=True)

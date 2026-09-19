@@ -57,17 +57,20 @@ present and how they were acquired; it must not become a shortcut for dataset or
 
 For each episode, the encoder produces one learned pooled motion vector and one pooled runtime
 acquisition vector for the query recording and each support recording. The active
-`support_contextual_residual_v1` classifier contextualizes query, support, paired support-label,
-candidate-label, and acquisition tokens with a shared set transformer. Contextual states may
-adjust individual query-support scores and a candidate-local semantic weight, but there is no
-unrestricted candidate-logit MLP. Final logits are assembled from a centered differentiable-
-neighbor support floor and direct query-to-candidate semantic evidence.
+`support_evidence_aware_v2` classifier first calculates two pre-context status-quo distributions:
+an execution-distinct support vote and a query-to-candidate label-meaning score. It then
+contextualizes query, support, paired support-label, candidate-label, runtime acquisition, and
+the status-quo evidence with a shared set transformer. The contextualizer can refine
+query/support-to-candidate comparisons and choose a candidate-specific semantic reliance, but it
+cannot emit unrestricted candidate logits. Final probabilities are a normalized mixture of the
+refined support vote and semantic distribution. With no supports, the availability mask makes the
+result exactly the semantic distribution.
 
-Zero-support and enrolled semantic projections are independently parameterized but mechanically
-identical. At initialization the support correction is exactly zero, enrolled semantic influence
-is `1e-3`, and zero-support semantic influence is one. The failed
-`support_contextual_mixture_v1` contextualize-first arm remains loadable for historical results,
-but `--classifier contextual` creates only the current architecture.
+The semantic status path is query-only before contextualization, so changing a support set cannot
+alter it. Support corrections and status-evidence token projections initialize at zero; semantic
+reliance initializes at `1e-3` when supports exist. The v1 residual and failed v1
+contextualize-first heads remain loadable solely for historical reproduction; `--classifier
+contextual` creates v2.
 
 There is no top-k retrieval or hidden background bank. Every supplied support row participates in
 attention and receives a differentiable score. The `neighbors` control removes the learned classifier and
@@ -82,12 +85,11 @@ receive gradients in the end-to-end arm, including the learned recording pool. T
 zero-shot and enrolled losses are averaged by regime when both appear in a batch, so the shared
 encoder is not dominated by whichever condition happened to supply more queries.
 
-The contextual arm optionally adds modular path-improvement losses. Every term has the same form:
-the true-class log-odds of a named path should improve over a detached reference path. The default
-comparisons are contextual support over the neighbor floor (truth-enrolled rows) and final output
-over the stronger of the contextual-support and semantic branches. Active terms are averaged and
-weighted once, so toggling a term does not silently multiply the auxiliary scale; no module is
-manually frozen or assigned to a particular objective.
+The evidence-aware arm optionally adds modular path-improvement losses: semantic branch
+preservation, refined-support improvement over the unmodified vote where truth has direct support,
+and final-output non-regression against the detached better branch. The last is aggregated over a
+matched counterfactual group before its smooth hinge is applied. Active terms are averaged and
+weighted once; no module is manually frozen or assigned to a bespoke objective.
 
 The current paper roster has two pairwise-disjoint active source roles. This table is explanatory; the
 executable authority is `data/scripts/curate/deployment_policy.py`.

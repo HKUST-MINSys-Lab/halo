@@ -70,7 +70,7 @@ DEFAULT_ENROLLMENT_K = (1, 2, 4, 8, 16, 32)
 DEFAULT_QUERIES_PER_SUPPORT_SET = 4
 DEFAULT_WINDOWS_PER_EXECUTION = 2
 DEFAULT_ACQUISITION_MIX = (0.50, 0.25, 0.25)  # compatible, cross-placement, cross-dataset
-DEPLOYMENT_SAMPLER_SCHEMA = "independent-enrollment-acquisition-v2-20260918"
+DEPLOYMENT_SAMPLER_SCHEMA = "counterfactual-ready-v3-20260919"
 DEFAULT_ENROLLMENT_MIX = (0.50, 0.25, 0.25)   # complete, partial, zero
 DEFAULT_PARTIAL_COVERAGE = (0.25, 0.75)
 DEFAULT_VARIABLE_SUPPORT_PROBABILITY = 0.50
@@ -318,10 +318,67 @@ class Episode:
     acquisition_regime: str = "compatible"
     enrollment_regime: str = "complete"
     curriculum_fallback: bool = False
+    # These fields are explicit rather than inferred from row order.  Existing independent draws
+    # retain ``-1``/``independent`` and therefore preserve historical sampler behavior.
+    counterfactual_group: int = -1
+    counterfactual_view: str = "independent"
+    counterfactual_axis: str = "independent"
+    counterfactual_intervention: tuple[tuple[str, str], ...] = ()
 
     @property
     def is_zero_shot(self) -> bool:
         return self.zero_shot
+
+
+@dataclass(frozen=True)
+class CounterfactualGroup:
+    """Fixed recognition problem with bounded, one-axis deployment variants."""
+    group_id: int
+    query: int
+    candidates: tuple[str, ...]
+    gt_slot: int
+    axis: str
+    views: tuple[Episode, ...]
+
+
+def enrollment_counterfactual_group(
+    episode: Episode, *, group_id: int, rng: np.random.Generator,
+) -> CounterfactualGroup:
+    """Construct complete/partial/zero views without changing query or candidates.
+
+    This reusable primitive is intentionally limited to the enrollment axis: it never fabricates
+    placement, rate, device, or modality observations.  Those axes must be drawn from compatible
+    physical rows by their dedicated sampler paths.
+    """
+    if episode.zero_shot or not episode.support:
+        raise ValueError("enrollment counterfactuals require a complete enrolled base episode")
+    slots = np.asarray(episode.support_candidate, dtype=np.int64)
+    present = tuple(sorted(set(int(slot) for slot in slots.tolist())))
+    if len(present) < 2:
+        raise ValueError("counterfactual enrollment needs at least two supported candidates")
+    truth = episode.gt_slot
+    non_truth = [slot for slot in present if slot != truth]
+    hide = int(rng.choice(non_truth)) if non_truth else truth
+    partial_keep = np.asarray([slot != hide for slot in slots], dtype=bool)
+    partial_truth_keep = np.asarray([slot != truth for slot in slots], dtype=bool)
+
+    def view(name: str, keep: np.ndarray) -> Episode:
+        selected = np.flatnonzero(keep).tolist()
+        support = tuple(episode.support[index] for index in selected)
+        candidates = tuple(episode.support_candidate[index] for index in selected)
+        groups = tuple(episode.support_window_groups[index] for index in selected) if episode.support_window_groups else ()
+        return replace(episode, support=support, support_candidate=candidates,
+                       support_window_groups=groups, support_counts=tuple(candidates.count(slot) for slot in range(len(episode.candidates))),
+                       support_per_candidate=max((candidates.count(slot) for slot in range(len(episode.candidates))), default=0),
+                       zero_shot=not support, enrollment_regime=("zero" if not support else "partial"),
+                       shrunk=len(support) < len(episode.support), counterfactual_group=group_id,
+                       counterfactual_view=name, counterfactual_axis="enrollment",
+                       counterfactual_intervention=(("enrollment", name),))
+    complete = replace(episode, counterfactual_group=group_id, counterfactual_view="complete",
+                       counterfactual_axis="enrollment", counterfactual_intervention=(("enrollment", "complete"),))
+    views = (complete, view("partial_truth_enrolled", partial_keep),
+             view("partial_truth_unenrolled", partial_truth_keep), view("zero", np.zeros_like(slots, dtype=bool)))
+    return CounterfactualGroup(group_id, episode.query, episode.candidates, episode.gt_slot, "enrollment", views)
 
 
 def _keys_for(corpus: SupportCorpus, key: AcquisitionKey, mode: SamplingMode) -> list[AcquisitionKey]:
@@ -1164,10 +1221,18 @@ def draw_batch(
     enrollment_mix: Sequence[float] | None = None,
     partial_coverage: tuple[float, float] = DEFAULT_PARTIAL_COVERAGE,
     variable_support_probability: float = DEFAULT_VARIABLE_SUPPORT_PROBABILITY,
+    counterfactual_enrollment_probability: float = 0.0,
     require_query_support: bool = False,
     **kwargs,
 ) -> tuple[list[Episode], dict[str, float]]:
-    """Draw ``batch_size`` episodes plus the telemetry that makes the draw auditable."""
+    """Draw ``batch_size`` episodes plus auditable curriculum telemetry.
+
+    A selected complete episode may be replaced by a four-view enrollment
+    counterfactual group.  This changes effective row count, never physical
+    support rows, and remains opt-in for historical protocol reproduction.
+    """
+    if not 0.0 <= counterfactual_enrollment_probability <= 1.0:
+        raise ValueError("counterfactual_enrollment_probability must be in [0, 1]")
 
     if deployment_matched:
         # Keep the deployment episode contract self-contained.  The trainer passes these values
@@ -1390,6 +1455,18 @@ def draw_batch(
             )
         regime_episodes = episodes
         support_set_episodes = episodes
+    counterfactual_groups = 0
+    if counterfactual_enrollment_probability and rng.random() < counterfactual_enrollment_probability:
+        eligible_complete = [index for index, episode in enumerate(episodes)
+                             if not episode.zero_shot and episode.enrollment_regime == "complete"
+                             and len(set(episode.support_candidate)) >= 2]
+        if eligible_complete:
+            index = int(rng.choice(eligible_complete))
+            group = enrollment_counterfactual_group(
+                episodes[index], group_id=int(rng.integers(0, np.iinfo(np.int32).max)), rng=rng,
+            )
+            episodes = [*episodes[:index], *group.views, *episodes[index + 1:]]
+            counterfactual_groups = 1
     zero_shot = sum(1 for episode in episodes if episode.is_zero_shot)
     gt_supported = [any(slot == episode.gt_slot for slot in episode.support_candidate)
                     for episode in episodes]
@@ -1446,6 +1523,10 @@ def draw_batch(
             min(support_set_dataset_counts.values()) / len(support_set_episodes)
         ),
         "sampler/duplicate_support_execution_mean": float(np.mean(duplicate_executions)),
+        "sampler/counterfactual_group_count": float(counterfactual_groups),
+        "sampler/counterfactual_episode_fraction": float(np.mean([
+            episode.counterfactual_group >= 0 for episode in episodes
+        ])),
         "sampler/support_set_count": float(len(query_counts)),
         "sampler/eligible_dataset_count": (
             float(len(eligible)) if deployment_matched

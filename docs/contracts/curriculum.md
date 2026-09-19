@@ -17,17 +17,18 @@ when enrollment is incomplete or query and support acquisition conditions differ
 
 ## Current classifier objective
 
-The current `--classifier contextual` path is `support_contextual_residual_v1`, replacing the
-failed unrestricted contextualize-first mixture. Main cross-entropy remains authoritative. Two
-toggleable auxiliary comparisons use one generic true-class log-odds improvement loss:
+The current `--classifier contextual` path is `support_evidence_aware_v2`. It preserves explicit
+support-vote and query-to-candidate semantic paths, then contextualizes their status quo before
+candidate-specific evidence arbitration. Main cross-entropy remains authoritative. Its three
+toggleable auxiliaries are semantic branch preservation, refined support-vote improvement over the
+unmodified vote where truth has direct support, and group-level final non-regression against the
+better detached branch. The mean receives one global weight (`0.1` by default); no component is
+frozen or directly router-supervised.
 
-1. `contextual_support_over_support_floor`, only where the truth has enrollment;
-2. `final_over_best_branch`, against the detached better of contextual support and semantics.
-
-The mean of active comparisons receives one global weight (`0.1` by default). Reference quality is
-detached, but no model component is frozen or routed to a bespoke loss. Telemetry records both
-terms, the number active, correction magnitude, semantic weight by enrollment regime, and gradient
-norms through the text and structured acquisition conditioners.
+The sampler can replace a complete episode with a matched four-view enrollment counterfactual
+group: complete, partial with truth enrolled, partial with truth withheld, and zero support. Each
+view records its group id, axis, view name, and intervention. Physical acquisition changes remain
+drawn only from real compatible rows or their declared signal transforms.
 
 The 2026-09-16 scenario evaluation found the largest classifier gains under partial enrollment,
 cross-placement support, and cross-dataset support. It also found regressions when strong enrolled

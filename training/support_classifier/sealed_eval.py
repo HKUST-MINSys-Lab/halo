@@ -48,9 +48,11 @@ from model.support.token_mixer import SupportTokenMixer, TokenMixerConfig
 from model.support.residual_classifier import ResidualClassifierConfig, build_support_classifier
 from model.support.contextual_classifier import ContextualSupportClassifier
 from model.support.contextual_residual_classifier import ContextualResidualSupportClassifier
+from model.support.evidence_aware_classifier import EvidenceAwareSupportClassifier
 from model.support.factory import (
-    CONTEXTUAL_ARCHITECTURE, LEGACY_CONTEXTUAL_ARCHITECTURE,
-    CONTEXTUAL_READOUTS, LEGACY_CONTEXTUAL_READOUTS, LEARNED_CLASSIFIER_ARCHITECTURES,
+    CONTEXTUAL_ARCHITECTURE, CONTEXTUAL_RESIDUAL_ARCHITECTURE, EVIDENCE_AWARE_ARCHITECTURE,
+    LEGACY_CONTEXTUAL_ARCHITECTURE,
+    CONTEXTUAL_READOUTS, EVIDENCE_AWARE_READOUTS, LEGACY_CONTEXTUAL_READOUTS, LEARNED_CLASSIFIER_ARCHITECTURES,
     RESIDUAL_ARCHITECTURES, build_classifier_from_blob,
 )
 from training.support_classifier.train import make_label_text
@@ -857,7 +859,7 @@ def _halo_residual_predictions(
     head = _HALO_RESIDUAL_HEAD_CACHE.get(cache_key)
     if head is None:
         blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
-        if blob.get("architecture_version") == CONTEXTUAL_ARCHITECTURE:
+        if blob.get("architecture_version") in {CONTEXTUAL_RESIDUAL_ARCHITECTURE, EVIDENCE_AWARE_ARCHITECTURE}:
             if not (residual_enabled and text_term_enabled):
                 raise ValueError("residual ablation flags are not defined for the contextual head")
             return _halo_contextual_residual_predictions(
@@ -920,6 +922,7 @@ def _halo_residual_predictions(
 
 _HALO_CONTEXTUAL_HEAD_CACHE: dict[tuple, ContextualSupportClassifier] = {}
 _HALO_CONTEXTUAL_RESIDUAL_HEAD_CACHE: dict[tuple, ContextualResidualSupportClassifier] = {}
+_ACQUISITION_CONDITIONED_ARCHITECTURES = frozenset({CONTEXTUAL_RESIDUAL_ARCHITECTURE, EVIDENCE_AWARE_ARCHITECTURE})
 
 
 @torch.no_grad()
@@ -1004,10 +1007,10 @@ def _halo_contextual_residual_predictions(
     head = _HALO_CONTEXTUAL_RESIDUAL_HEAD_CACHE.get(cache_key)
     if head is None:
         blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
-        if blob.get("architecture_version") != CONTEXTUAL_ARCHITECTURE:
+        if blob.get("architecture_version") not in {CONTEXTUAL_RESIDUAL_ARCHITECTURE, EVIDENCE_AWARE_ARCHITECTURE}:
             raise ValueError("contextual residual readout requires its matching checkpoint")
         loaded, _ = build_classifier_from_blob(blob, device=device)
-        if not isinstance(loaded, ContextualResidualSupportClassifier):
+        if not isinstance(loaded, (ContextualResidualSupportClassifier, EvidenceAwareSupportClassifier)):
             raise TypeError("classifier factory returned the wrong contextual architecture")
         head = loaded
         _HALO_CONTEXTUAL_RESIDUAL_HEAD_CACHE[cache_key] = head
@@ -1168,7 +1171,7 @@ def _halo_token_mixer_predictions(
     blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
     if blob.get("architecture_version") in RESIDUAL_ARCHITECTURES:
         return _halo_residual_predictions(features, stream, plans, checkpoint, device)
-    if blob.get("architecture_version") == CONTEXTUAL_ARCHITECTURE:
+    if blob.get("architecture_version") in {CONTEXTUAL_RESIDUAL_ARCHITECTURE, EVIDENCE_AWARE_ARCHITECTURE}:
         return _halo_contextual_residual_predictions(
             features, stream, plans, checkpoint, device, acquisitions=acquisitions,
         )
@@ -1666,7 +1669,7 @@ def main() -> None:
             raise RuntimeError(f"{dataset}/{stream_id}: quality screen unavailable ({stream.quality_screen})")
         halo_acquisitions = (
             halo_acquisition_rows(stream, halo_state[0], device)
-            if halo_state is not None and halo_architecture == CONTEXTUAL_ARCHITECTURE else None
+            if halo_state is not None and halo_architecture in _ACQUISITION_CONDITIONED_ARCHITECTURES else None
         )
         # Freeze every episode before any provider is loaded or invoked. All models consume these
         # same query/support row ids; representation extraction cannot influence episode creation.
@@ -2026,16 +2029,16 @@ def main() -> None:
                             # Contextual head: branch decompositions of the same forward.
                             branches = (
                                 ("semantic", "support_floor", "contextual_support")
-                                if halo_architecture == CONTEXTUAL_ARCHITECTURE
+                                if halo_architecture in _ACQUISITION_CONDITIONED_ARCHITECTURES
                                 else ("semantic", "support", "fixed_half")
                             )
                             readout_names = (
-                                CONTEXTUAL_READOUTS
-                                if halo_architecture == CONTEXTUAL_ARCHITECTURE
+                                EVIDENCE_AWARE_READOUTS if halo_architecture == EVIDENCE_AWARE_ARCHITECTURE
+                                else CONTEXTUAL_READOUTS if halo_architecture in _ACQUISITION_CONDITIONED_ARCHITECTURES
                                 else LEGACY_CONTEXTUAL_READOUTS
                             )
                             for readout, branch in zip(readout_names, branches):
-                                if halo_architecture == CONTEXTUAL_ARCHITECTURE:
+                                if halo_architecture in _ACQUISITION_CONDITIONED_ARCHITECTURES:
                                     branch_predicted = _halo_contextual_residual_predictions(
                                         features, stream, plans, args.halo_checkpoint, device,
                                         branch=branch, acquisitions=halo_acquisitions,

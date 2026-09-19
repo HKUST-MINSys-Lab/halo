@@ -25,7 +25,7 @@ import numpy as np
 import torch
 
 import baselines
-from model.support.factory import CONTEXTUAL_ARCHITECTURE
+from model.support.factory import CONTEXTUAL_CHECKPOINT_ARCHITECTURES
 from baselines import scoring
 from halo.paths import CACHE_DIR
 from baselines.data import load_eval_stream, load_global_labels, load_multi_device_stream
@@ -286,7 +286,7 @@ def main() -> None:
     if "halo" in args.models:
         blob = torch.load(args.halo_checkpoint, map_location="cpu", weights_only=False)
         halo_state = (build_encoder(blob, device).eval(), _file_hash(args.halo_checkpoint))
-        halo_requires_acquisition = blob.get("architecture_version") == CONTEXTUAL_ARCHITECTURE
+        halo_requires_acquisition = blob.get("architecture_version") in CONTEXTUAL_CHECKPOINT_ARCHITECTURES
     provider_states = {
         name: baselines.REGISTRY[name].setup_features(device)
         for name in args.models if name != "halo"

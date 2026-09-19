@@ -78,10 +78,11 @@ For each eligible representation, report these readouts on exactly the same epis
    predictions are identical at `k=0`.
 4. **Differentiable neighbours:** HALO encoder-development objective only; it is not reported as an
    adaptation mechanism for released baseline models.
-5. **HALO contextual residual classifier:** the learned support-conditioned classifier. It jointly
-   contextualizes query, support, paired support-label, candidate-label, and runtime acquisition
-   vectors, then applies candidate-specific corrections around the centered-neighbor support floor
-   and combines them with candidate-local semantic evidence. Evaluation must reconstruct
+5. **HALO evidence-aware classifier:** the learned support-conditioned classifier. It computes
+   auditable support-vote and label-meaning distributions before contextualizing query, support,
+   paired support-label, candidate-label, runtime acquisition, and status-quo evidence. It refines
+   support comparisons and learns candidate-specific semantic reliance, then normalizes their
+   probability mixture. Evaluation must reconstruct
    acquisition vectors from each query and support stream separately; cross-stream scenarios may
    not replace them with zeros or reuse the query configuration for supports.
 
