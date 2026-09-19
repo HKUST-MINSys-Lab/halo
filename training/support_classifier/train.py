@@ -217,7 +217,10 @@ class PrefetchLoader:
         ]
         for process in self._processes:
             process.start()
-        self._fill(self._next_request + self._ahead)
+        # Fork before CUDA/text-library threads exist, but leave workers idle while the parent
+        # calibrates the frontend and initializes MiniLM. Eagerly materializing ``workers`` full
+        # tensor batches here can exhaust the process' file-descriptor handoff queue before step 1
+        # on the uncapped corpus. ``get`` fills the same steady-state horizon on first use.
 
     def _fill(self, upto: int) -> None:
         while self._next_request < upto:
