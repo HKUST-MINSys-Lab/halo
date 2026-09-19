@@ -62,6 +62,16 @@ def test_zero_support_reduces_exactly_to_semantic_path():
     assert torch.allclose(output["logits"], output["semantic_logits"], atol=1e-6)
 
 
+def test_partial_enrollment_keeps_unenrolled_candidates_live():
+    head = _head().eval()
+    case = _case()
+    case["support_bound"] = torch.zeros_like(case["support_bound"])
+    output = head(**case)
+    assert torch.isfinite(output["contextual_support_logits"][:, 1:]).all()
+    assert torch.isfinite(output["logits"]).all()
+    assert torch.equal(output["k_c"][:, 1:], torch.zeros_like(output["k_c"][:, 1:]))
+
+
 def test_support_permutation_is_equivariant_and_predictions_are_invariant():
     head = _head().eval()
     case = _case()
@@ -93,6 +103,23 @@ def test_main_and_generic_auxiliary_objective_reach_all_learnable_paths():
     assert head.semantic_gate[-1].weight.grad is not None
     assert float(head.correction_candidate.weight.grad.abs().sum()) > 0
     assert float(head.semantic_gate[-1].weight.grad.abs().sum()) > 0
+
+
+def test_acquisition_inputs_change_predictions_and_receive_gradients():
+    head = _head().eval()
+    case = _case()
+    reference = head(**case)["logits"]
+    shifted = dict(case)
+    shifted["query_acquisition"] = (
+        case["query_acquisition"].detach()
+        + torch.linspace(-2.0, 2.0, case["query_acquisition"].shape[-1])
+    ).requires_grad_()
+    actual = head(**shifted)["logits"]
+    assert not torch.allclose(actual, reference)
+
+    actual[:, 0].sum().backward()
+    assert shifted["query_acquisition"].grad is not None
+    assert float(shifted["query_acquisition"].grad.abs().sum()) > 0
 
 
 def test_candidate_count_is_dynamic_for_shared_gate():

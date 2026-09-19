@@ -1564,8 +1564,8 @@ def main() -> None:
                              "changes predictions, manifests, or checkpoint selection")
     parser.add_argument(
         "--baseline-diagnostic-readouts", action="store_true",
-        help=("also compute 1-NN, prototype, and ridge controls for external encoders; "
-              "the primary baseline readout remains equal-weight normalized fusion"),
+        help=("also compute prototype and ridge controls for external encoders; cosine 1-NN is "
+              "always emitted and the primary baseline readout remains equal-weight normalized fusion"),
     )
     parser.add_argument(
         "--classifier-isolation", action="store_true",

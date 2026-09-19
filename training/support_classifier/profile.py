@@ -438,7 +438,10 @@ def main() -> None:
                     }
                     for name in (
                         "logits", "metric_part", "text_part", "r_candidate", "text_score",
+                        "support_floor_logits", "contextual_support_logits", "semantic_logits",
+                        "semantic_weight",
                     )
+                    if name in output and output[name].shape == episode_vectors["candidate_mask"].shape
                 } if classifier is not None else {}),
                 "timing_samples_ms": timings,
                 "shape_samples": shape_samples,
@@ -466,7 +469,7 @@ def main() -> None:
                 record["validation_seconds"] = time.perf_counter() - validation_start
             print(json.dumps({k:v for k,v in record.items() if k not in ("timing_samples_ms", "shape_samples")}), flush=True)
             results.append(record)
-            del encoder, optimizer, parameters, pooled, descriptor, rows, loss
+            del encoder, optimizer, parameters, pooled, rows, loss
             torch.cuda.empty_cache()
         finally:
             loader.close()
