@@ -15,6 +15,7 @@ directory name. "Arm" means a training run; "readout" means how a trained checkp
 | run | protocol | encoder conditioning | status | numbers |
 |---|---|---|---|---|
 | HALO evidence-aware v2, step 40k, 2026-09-19 | v5 | acquisition-conditioning-v2 | **completed negative result** | [below](#the-evidence-aware-v2-follow-up) |
+| HALO evidence-aware v2, step 32,500 companion, 2026-09-19 | v5 | acquisition-conditioning-v2 | **completed negative result** | [below](#the-evidence-aware-v2-follow-up) |
 | HALO bounded contextual residual v1, step 35k, 2026-09-19 | v5 | acquisition-conditioning-v2 | **completed negative result** | [record](../journal/2026-09-19-bounded-contextual-residual-v1-results.md) |
 | HALO residual arm, step 40k, 2026-09-18 | v5 | acquisition-conditioning-v2 | **current** | below |
 | HALO neighbours arm, step 40k, 2026-09-18 | v5 | acquisition-conditioning-v2 | **current** | below |
@@ -355,7 +356,10 @@ open-vocabulary label holdout used only for checkpoint selection.
 neighbours arms; 42 minutes. Evaluated at `11c9221`, which differs from the training commit only in
 docstrings and a lifecycle registry. **Primary checkpoint: `last.pt`, step 40,000**, declared before
 any sealed number existed (SHA-256 `d0961938…cba52`). Companion `best_internal.pt` (step 32,500,
-v2's seen-plus-held-out selection rule) is evaluated separately; its row is added when it completes.
+v2's seen-plus-held-out selection rule, SHA-256 `be0dd82e…876ea`) was evaluated as well and
+lands within about one point of the primary everywhere: 8 s classifier 34.2/34.5/35.4/35.7/36.0 at
+`k=0/1/8/32/128`, unmodified support vote 55.1/66.8/70.5/72.2 at `k=1/8/32/128`, and 25-45 macro F1
+in every scenario. Checkpoint choice does not change the conclusion.
 
 **Result: negative, not promoted.** Sealed, 8 s, dataset-balanced macro F1 (333/333 manifests identical):
 
@@ -421,7 +425,9 @@ Figures: [sealed k-curves](../../results/artifacts/promoted-figures/k_curve_evid
 (regenerate with `results/tools/plot_telemetry.py`). Artifacts:
 [`halo_evidence_aware_v2_step40k_sealed_v5_20260919`](../../results/artifacts/halo_evidence_aware_v2_step40k_sealed_v5_20260919/),
 [`halo_evidence_aware_v2_step40k_scenarios_v5_20260919`](../../results/artifacts/halo_evidence_aware_v2_step40k_scenarios_v5_20260919/),
-[`halo_evidence_aware_v2_step40k_scenario_branches_v5_20260919`](../../results/artifacts/halo_evidence_aware_v2_step40k_scenario_branches_v5_20260919/).
+[`halo_evidence_aware_v2_step40k_scenario_branches_v5_20260919`](../../results/artifacts/halo_evidence_aware_v2_step40k_scenario_branches_v5_20260919/),
+[`halo_evidence_aware_v2_step32500_sealed_v5_20260919`](../../results/artifacts/halo_evidence_aware_v2_step32500_sealed_v5_20260919/),
+[`halo_evidence_aware_v2_step32500_scenarios_v5_20260919`](../../results/artifacts/halo_evidence_aware_v2_step32500_scenarios_v5_20260919/).
 
 ### Limitations of the current record
 
