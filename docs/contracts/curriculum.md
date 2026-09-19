@@ -30,10 +30,17 @@ group: complete, partial with truth enrolled, partial with truth withheld, and z
 view records its group id, axis, view name, and intervention. Physical acquisition changes remain
 drawn only from real compatible rows or their declared signal transforms.
 
-Checkpoint selection uses deterministic subject-held-out panels. It averages available deployment
-panels equally and datasets equally within a panel, then breaks ties by lower cross-entropy. The
-training log records semantic reliance split by enrollment/acquisition condition, support-correction
-magnitude, counterfactual group prevalence, and the two auxiliary losses.
+Checkpoint selection uses deterministic subject-held-out panels. It averages each deployment
+family first and datasets equally within a panel, then breaks exact ties by lower cross-entropy and
+lower positive regret. Separate zero-support and enrolled diagnostic checkpoints are retained. The
+training log records semantic reliance distributions split by enrollment/acquisition condition,
+support-correction RMS and tail magnitude, branch accuracy, positive regret, counterfactual group
+prevalence, realized post-expansion view shares, and the two auxiliary losses.
+
+The active same-query counterfactual implementation varies enrollment only. Acquisition, rate,
+modality, and device-set conditions remain independently sampled curriculum challenges; they are
+not described as counterfactual groups because transformed observations require a distinct loader
+identity. The internal panel is subject-held-out, not source- or label-held-out.
 
 The 2026-09-16 scenario evaluation found the largest classifier gains under partial enrollment,
 cross-placement support, and cross-dataset support. It also found regressions when strong enrolled

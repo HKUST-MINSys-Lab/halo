@@ -27,12 +27,16 @@ from training.support_classifier.encoding import (
 )
 from training.support_classifier.neighbors import differentiable_neighbor_logits
 from training.support_classifier.objectives import (
-    ImprovementObjectiveConfig, contextual_path_improvement_objective,
+    EvidenceAwareObjectiveConfig, ImprovementObjectiveConfig,
+    contextual_path_improvement_objective, evidence_aware_objective,
 )
 from model.blocks import AttentionSpec
 from model.support.residual_classifier import ResidualClassifierConfig, ResidualSupportClassifier
 from model.support.contextual_residual_classifier import (
     ContextualResidualClassifierConfig, ContextualResidualSupportClassifier,
+)
+from model.support.evidence_aware_classifier import (
+    EvidenceAwareClassifierConfig, EvidenceAwareSupportClassifier,
 )
 from training.support_classifier.train import (
     TAU_SUPPORT,
@@ -95,11 +99,14 @@ def _gradient_breakdown(encoder, classifier) -> dict[str, float]:
     }
     if classifier is not None:
         modules["classifier"] = classifier
-        if isinstance(classifier, ContextualResidualSupportClassifier):
+        if isinstance(classifier, (ContextualResidualSupportClassifier, EvidenceAwareSupportClassifier)):
             modules.update({
                 "classifier/attention": classifier.stack,
                 "classifier/support_correction": classifier.correction_candidate,
-                "classifier/semantic_gate": classifier.semantic_gate,
+                "classifier/semantic_gate": (
+                    classifier.router if isinstance(classifier, EvidenceAwareSupportClassifier)
+                    else classifier.semantic_gate
+                ),
             })
         else:
             modules.update({
@@ -184,6 +191,7 @@ def main() -> None:
                         else (2.0 / 3.0, 1.0 / 3.0, 0.0)),
         partial_coverage=DEFAULT_PARTIAL_COVERAGE,
         variable_support_probability=DEFAULT_VARIABLE_SUPPORT_PROBABILITY,
+        counterfactual_enrollment_probability=(0.25 if args.classifier == "contextual" else 0.0),
         queries_per_support_set=args.queries_per_support_set,
         windows_per_execution=2,
     )
@@ -235,8 +243,8 @@ def main() -> None:
                     ),
                 ).to(device).train()
                 if args.classifier == "residual" else
-                ContextualResidualSupportClassifier(
-                    spec, ContextualResidualClassifierConfig(
+                EvidenceAwareSupportClassifier(
+                    spec, EvidenceAwareClassifierConfig(
                         support_temperature=args.support_temperature,
                         semantic_temperature=args.text_temperature,
                         acquisition_dim=encoder.d_model,
@@ -297,7 +305,8 @@ def main() -> None:
                             rows["support_mask"], episode_vectors["candidate_mask"],
                             temperature=args.support_temperature,
                         )
-                    elif isinstance(classifier, ContextualResidualSupportClassifier):
+                    elif isinstance(classifier, (ContextualResidualSupportClassifier,
+                                                 EvidenceAwareSupportClassifier)):
                         output = classifier(
                             query_feature=query,
                             support_feature=rows["support_feature"],
@@ -317,16 +326,32 @@ def main() -> None:
                             support_feature=rows["support_feature"], support_mask=rows["support_mask"],
                             **episode_vectors)
                         logits, weights = output["logits"], output["support_weight"]
-                    loss = episode_loss(logits, episodes, episode_vectors)["loss"]
-                    if isinstance(classifier, ContextualResidualSupportClassifier):
+                    loss = episode_loss(
+                        logits, episodes, episode_vectors,
+                        counterfactual_grouping=isinstance(
+                            classifier, EvidenceAwareSupportClassifier,
+                        ),
+                    )["loss"]
+                    if isinstance(classifier, (ContextualResidualSupportClassifier,
+                                               EvidenceAwareSupportClassifier)):
                         target = torch.tensor(
                             [episode.gt_slot for episode in episodes],
                             dtype=torch.long, device=device,
                         )
-                        auxiliary, _ = contextual_path_improvement_objective(
-                            output, target, episode_vectors["candidate_mask"],
-                            ImprovementObjectiveConfig(),
-                        )
+                        if isinstance(classifier, EvidenceAwareSupportClassifier):
+                            group_ids = torch.tensor(
+                                [episode.counterfactual_group for episode in episodes],
+                                dtype=torch.long, device=device,
+                            )
+                            auxiliary, _ = evidence_aware_objective(
+                                output, target, episode_vectors["candidate_mask"],
+                                EvidenceAwareObjectiveConfig(), group_ids=group_ids,
+                            )
+                        else:
+                            auxiliary, _ = contextual_path_improvement_objective(
+                                output, target, episode_vectors["candidate_mask"],
+                                ImprovementObjectiveConfig(),
+                            )
                         loss = loss + 0.1 * auxiliary
                     marks[4].record()
                 loss.backward()

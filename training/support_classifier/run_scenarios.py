@@ -44,6 +44,7 @@ import baselines
 from baselines import scoring
 from baselines.data import load_eval_stream, load_multi_device_stream, source_slice_fingerprint
 from data.scripts.curate.compatibility import PLACEMENT_SITE
+from model.support.factory import EVIDENCE_AWARE_ARCHITECTURE, EVIDENCE_AWARE_READOUTS
 from data.scripts.curate.deployment_policy import MULTI_DEVICE_EVAL_CELLS, get_stream_spec
 
 from .partial_coverage import (
@@ -75,6 +76,7 @@ from .sealed_eval import (
     TRAINING_BANK_ZERO_SHOT,
     _build_training_reference_bank,
     _file_hash,
+    _halo_contextual_residual_predictions,
     _halo_residual_predictions,
     halo_acquisition_rows,
     _load_or_encode,
@@ -882,6 +884,7 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
                banks, k: int, window_seconds: float, halo_state=None,
                halo_has_classifier: bool = False,
                halo_requires_acquisition: bool = False,
+               halo_architecture: str | None = None,
                selected_readouts: frozenset[str] | None = None,
                provider_states=None, prediction_sink=None, cache_read_dirs=(),
                feature_memory_cache=None, manifest: str | None = None,
@@ -919,7 +922,7 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
             for row in emitted:
                 split = row.get("coverage_split")
                 row["severity_S"] = 1 if split == "truth_enrolled" else 2 if split == "truth_unenrolled" else 2
-        if name == "halo" and readout == "halo-classifier":
+        if name == "halo" and readout.startswith("halo-classifier"):
             for row in emitted:
                 row["parameters_m"] = round(_parameter_count_m(
                     name, halo_state, halo_checkpoint=halo_checkpoint, include_classifier=True,
@@ -957,6 +960,8 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
             )
             halo_classifier_requested = name == "halo" and halo_has_classifier and (
                 selected_readouts is None or "halo-classifier" in selected_readouts
+                or bool(set(EVIDENCE_AWARE_READOUTS) & set(selected_readouts or ()))
+                or "halo-classifier-oracle-better-branch" in (selected_readouts or ())
             )
             companion_1nn_required = k > 0 and (
                 baseline_fusion_requested or halo_classifier_requested
@@ -1116,6 +1121,36 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
                     acquisitions=acquisitions,
                 )
                 append_emitted(predicted, readout="halo-classifier")
+            if (name == "halo" and halo_checkpoint is not None
+                    and halo_architecture == EVIDENCE_AWARE_ARCHITECTURE
+                    and halo_classifier_requested):
+                diagnostic_predictions = {}
+                for readout, branch in zip(
+                    EVIDENCE_AWARE_READOUTS,
+                    ("semantic_status", "support_status", "refined_support"),
+                ):
+                    branch_predictions = _halo_contextual_residual_predictions(
+                        features, roster, task.plans, halo_checkpoint, device,
+                        branch=branch, acquisitions=acquisitions,
+                    )
+                    diagnostic_predictions[branch] = branch_predictions
+                    if selected_readouts is None or readout in selected_readouts:
+                        append_emitted(branch_predictions, readout=readout)
+                truth = _aligned_labels(task.query_stream)
+                oracle = []
+                for plan, support_prediction, semantic_prediction in zip(
+                    task.plans, diagnostic_predictions["refined_support"],
+                    diagnostic_predictions["semantic_status"],
+                ):
+                    expected = str(truth[int(plan.query)])
+                    oracle.append(
+                        support_prediction if support_prediction == expected
+                        else semantic_prediction if semantic_prediction == expected
+                        else support_prediction
+                    )
+                if (selected_readouts is None
+                        or "halo-classifier-oracle-better-branch" in selected_readouts):
+                    append_emitted(oracle, readout="halo-classifier-oracle-better-branch")
         except baselines.UnsupportedEvaluationCell as exc:
             rows.append({"model": name, "status": "unsupported", "reason": str(exc),
                          "k": k, "window_seconds": float(window_seconds), **severity_meta})
@@ -1454,6 +1489,8 @@ def main() -> None:
         "--readouts", nargs="+", choices=(
             "1nn", "prototype", "ridge", "equal-weight-normalized-fusion",
             "zero-shot-native-or-bridge", "halo-classifier",
+            *EVIDENCE_AWARE_READOUTS,
+            "halo-classifier-oracle-better-branch",
         ), default=None,
         help=("optional readout subset for a controlled diagnostic; omitted reports only "
               "equal-weight normalized fusion plus companion cosine 1-NN for baselines, and the "
@@ -1519,10 +1556,12 @@ def main() -> None:
     halo_state = None
     halo_has_classifier = False
     halo_requires_acquisition = False
+    halo_architecture = None
     if "halo" in args.models:
         blob = torch.load(args.halo_checkpoint, map_location="cpu", weights_only=False)
         halo_state = (build_encoder(blob, device).eval(), _file_hash(args.halo_checkpoint))
         halo_has_classifier = blob.get("architecture_version") in LEARNED_CLASSIFIER_ARCHITECTURES
+        halo_architecture = blob.get("architecture_version")
         halo_requires_acquisition = blob.get("architecture_version") in CONTEXTUAL_CHECKPOINT_ARCHITECTURES
     args.out.mkdir(parents=True, exist_ok=True)
     cache_dir = args.feature_cache or DEFAULT_SHARED_FEATURE_CACHE
@@ -1676,6 +1715,7 @@ def main() -> None:
                             banks=banks, k=k, window_seconds=window_seconds,
                             halo_state=halo_state, halo_has_classifier=halo_has_classifier,
                             halo_requires_acquisition=halo_requires_acquisition,
+                            halo_architecture=halo_architecture,
                             selected_readouts=(None if args.readouts is None
                                                else frozenset(args.readouts)),
                             provider_states=provider_states,

@@ -70,7 +70,7 @@ from training.support_classifier.neighbors import DEFAULT_TEMPERATURE, different
 from training.support_classifier.objectives import (
     COMPARISONS as CONTEXTUAL_AUX_COMPARISONS,
     EvidenceAwareObjectiveConfig, ImprovementObjectiveConfig, contextual_path_improvement_objective,
-    evidence_aware_objective,
+    evidence_aware_objective, true_class_log_odds,
 )
 from training.tokenizer.eval_transfer import build_encoder
 from model.tokenizer.sensor_tokens import CONDITIONING_SCHEMA_V2, LEGACY_CONDITIONING_SCHEMA
@@ -567,6 +567,8 @@ def episode_loss(
     logits: torch.Tensor,           # (B, C)
     episodes: list[Episode],
     text: dict[str, torch.Tensor],
+    *,
+    counterfactual_grouping: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Cross-entropy on the true candidate, averaged separately for each episode regime."""
     device = logits.device
@@ -585,13 +587,39 @@ def episode_loss(
     target = torch.tensor([episode.gt_slot for episode in episodes], dtype=torch.long, device=device)
     per_episode = F.nll_loss(log_probability, target, reduction="none")
 
+    # Explicit counterfactual views are one recognition problem. Average their views first so a
+    # feasible axis with more views cannot silently receive more optimizer weight.
+    explicit_groups: dict[int, list[int]] = {}
+    if counterfactual_grouping:
+        for index, episode in enumerate(episodes):
+            group = getattr(episode, "counterfactual_group", -1)
+            if group >= 0:
+                explicit_groups.setdefault(group, []).append(index)
+
     # Several queries may share an original roster, but per-query candidate masking can put them
     # in different information regimes. Equalize each roster within each regime; assigning a
     # roster the first query's regime makes the objective depend on row order.
     support_set_ids = torch.tensor(
         [episode.support_set_id for episode in episodes], dtype=torch.long, device=device,
     )
-    if bool(support_set_ids.ge(0).all()):
+    if explicit_groups:
+        grouped_rows = {index for rows in explicit_groups.values() for index in rows}
+        counterfactual_losses = torch.stack([
+            per_episode[torch.as_tensor(rows, device=device)].mean()
+            for rows in explicit_groups.values()
+        ])
+        independent = [index for index in range(len(episodes)) if index not in grouped_rows]
+        family_terms = [counterfactual_losses.mean()]
+        independent_few = [index for index in independent if not episodes[index].is_zero_shot]
+        independent_zero = [index for index in independent if episodes[index].is_zero_shot]
+        if independent_few:
+            family_terms.append(per_episode[torch.as_tensor(independent_few, device=device)].mean())
+        if independent_zero:
+            family_terms.append(per_episode[torch.as_tensor(independent_zero, device=device)].mean())
+        loss = torch.stack(family_terms).mean()
+        few_ce = per_episode[few_shot].mean() if len(few_shot) else logits.new_zeros(())
+        zero_ce = per_episode[zero_shot].mean() if len(zero_shot) else logits.new_zeros(())
+    elif bool(support_set_ids.ge(0).all()):
         unique_ids = list(dict.fromkeys(
             (episode.support_set_id, episode.is_zero_shot) for episode in episodes
         ))
@@ -663,7 +691,7 @@ def weighted_present_metrics(
         # as a common condition. Its sibling fraction recovers the honest selected-row count.
         suffix = key.rsplit("/", 1)[-1]
         conditional = key.startswith("scenario/") and suffix in {
-            "loss", "accuracy", "semantic_weight", "soft_vote_accuracy",
+            "loss", "accuracy", "semantic_weight", "semantic_reliance", "soft_vote_accuracy",
             "classifier_accuracy", "rescue_rate", "overturn_rate", "preserve_rate",
             "both_wrong_rate", "net_gain",
         }
@@ -706,6 +734,9 @@ def build_dataset(index: CorpusIndex, args) -> PretrainDataset:
 
 def draw_kwargs_from_args(args) -> dict:
     """Single source of truth for the deployment-shaped episode curriculum."""
+    counterfactual_probability = float(args.counterfactual_enrollment_probability)
+    if args.classifier != "contextual" and counterfactual_probability:
+        raise ValueError("counterfactual enrollment groups require the contextual classifier")
     return {
         "p_gt_present": args.p_gt_present,
         "same_subject_probability": args.same_subject_probability,
@@ -720,7 +751,7 @@ def draw_kwargs_from_args(args) -> dict:
                            if args.enrollment_mix is not None else None),
         "partial_coverage": tuple(args.partial_coverage),
         "variable_support_probability": args.variable_support_probability,
-        "counterfactual_enrollment_probability": args.counterfactual_enrollment_probability,
+        "counterfactual_enrollment_probability": counterfactual_probability,
         "require_query_support": args.classifier == "neighbors",
         "queries_per_support_set": args.queries_per_support_set,
         "windows_per_execution": args.windows_per_execution,
@@ -738,6 +769,7 @@ def run_step(
                 ContextualResidualSupportClassifier | EvidenceAwareSupportClassifier | None,
     classifier_mode: str,
     improvement_objective: ImprovementObjectiveConfig | None = None,
+    evidence_objective: EvidenceAwareObjectiveConfig | None = None,
     text_of,
     device: torch.device,
     executor: ThreadPoolExecutor | None = None,
@@ -831,7 +863,10 @@ def run_step(
         )
     else:
         raise ValueError(f"unknown classifier mode {classifier_mode!r}")
-    loss = episode_loss(output["logits"], episodes, text)
+    loss = episode_loss(
+        output["logits"], episodes, text,
+        counterfactual_grouping=isinstance(classifier, EvidenceAwareSupportClassifier),
+    )
     if classifier_mode == "contextual" and improvement_objective is not None:
         target = torch.tensor(
             [episode.gt_slot for episode in episodes], dtype=torch.long, device=device,
@@ -845,9 +880,10 @@ def run_step(
             )
             auxiliary, auxiliary_metrics = evidence_aware_objective(
                 output, target, text["candidate_mask"],
-                EvidenceAwareObjectiveConfig(
+                evidence_objective or EvidenceAwareObjectiveConfig(
                     enabled=improvement_objective.enabled, weight=improvement_objective.weight,
-                    margin=improvement_objective.margin, temperature=improvement_objective.temperature,
+                    margin=improvement_objective.margin,
+                    temperature=improvement_objective.temperature,
                 ), group_ids=groups,
             )
         else:
@@ -855,7 +891,13 @@ def run_step(
                 output, target, text["candidate_mask"], improvement_objective,
             )
         loss["main_ce"] = loss["loss"].detach()
-        loss["loss"] = loss["loss"] + improvement_objective.weight * auxiliary
+        auxiliary_weight = (
+            evidence_objective.weight
+            if isinstance(classifier, EvidenceAwareSupportClassifier)
+            and evidence_objective is not None
+            else improvement_objective.weight
+        )
+        loss["loss"] = loss["loss"] + auxiliary_weight * auxiliary
         loss.update(auxiliary_metrics)
     return {**loss, **output, "pooled": pooled, "text": text, "rows": rows,
             "device_count": device_count, "readout": classifier_mode,
@@ -946,15 +988,59 @@ def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, flo
     if "semantic_reliance" in result:
         reliance = result["semantic_reliance"].detach()
         direct = result["candidate_has_direct_support"].detach()
+        valid_reliance = reliance.masked_select(mask)
+        quantiles = torch.quantile(valid_reliance.float(), torch.tensor(
+            [0.1, 0.5, 0.9], device=valid_reliance.device,
+        ))
+        correction_values = result["support_correction"].detach().abs()
+        correction_mask = support_mask.unsqueeze(-1) & mask.unsqueeze(1)
+        valid_correction = correction_values.masked_select(correction_mask)
         metrics.update({
             "classifier/semantic_reliance": float(reliance.masked_select(mask).mean()),
+            "classifier/semantic_reliance_p10": float(quantiles[0]),
+            "classifier/semantic_reliance_p50": float(quantiles[1]),
+            "classifier/semantic_reliance_p90": float(quantiles[2]),
+            "classifier/semantic_reliance_saturation_low": float(valid_reliance.lt(0.01).float().mean()),
+            "classifier/semantic_reliance_saturation_high": float(valid_reliance.gt(0.99).float().mean()),
             "classifier/semantic_reliance_direct_support": float(
                 reliance.masked_select(mask & direct).mean()) if bool((mask & direct).any()) else 0.0,
             "classifier/semantic_reliance_no_direct_support": float(
                 reliance.masked_select(mask & ~direct).mean()) if bool((mask & ~direct).any()) else 0.0,
-            "classifier/support_correction_abs": float(result["support_correction"].detach().abs().mean())
-            if result["support_correction"].numel() else 0.0,
+            "classifier/support_correction_abs": float(valid_correction.mean())
+            if valid_correction.numel() else 0.0,
+            "classifier/support_correction_rms": float(valid_correction.square().mean().sqrt())
+            if valid_correction.numel() else 0.0,
+            "classifier/support_correction_p95": float(torch.quantile(valid_correction.float(), 0.95))
+            if valid_correction.numel() else 0.0,
             "classifier/correction_scale": float(result["correction_scale"].detach()),
+        })
+        branch_predictions = {}
+        for name, key in (
+            ("support_status", "support_status_logits"),
+            ("refined_support", "refined_support_logits"),
+            ("semantic_status", "semantic_status_logits"),
+        ):
+            prediction = result[key].detach().masked_fill(~mask, float("-inf")).argmax(1)
+            branch_predictions[name] = prediction
+            metrics[f"classifier/branch_accuracy/{name}"] = float(prediction.eq(target).float().mean())
+        support_quality = true_class_log_odds(
+            result["refined_support_logits"].detach(), target, mask,
+        )
+        semantic_quality = true_class_log_odds(
+            result["semantic_status_logits"].detach(), target, mask,
+        )
+        final_quality = true_class_log_odds(result["logits"].detach(), target, mask)
+        available_reference = torch.where(
+            has_support, torch.maximum(support_quality, semantic_quality), semantic_quality,
+        )
+        positive_regret = (available_reference - final_quality).clamp_min(0)
+        best_correct = branch_predictions["refined_support"].eq(target) | branch_predictions["semantic_status"].eq(target)
+        final_correct = learned.eq(target)
+        metrics.update({
+            "classifier/positive_regret_mean": float(positive_regret.mean()),
+            "classifier/positive_regret_fraction": float(positive_regret.gt(0).float().mean()),
+            "classifier/best_branch_rescue_rate": float((~best_correct & final_correct).float().mean()),
+            "classifier/best_branch_harm_rate": float((best_correct & ~final_correct).float().mean()),
         })
         for axis, names, values in (
             ("enrollment", ("complete", "partial", "zero"), [e.enrollment_regime for e in episodes]),
@@ -1380,10 +1466,22 @@ def validate(
     # Treat available deployment panels equally, then datasets equally inside each panel.  This
     # prevents common compatible/enrolled rows from selecting a checkpoint that regresses on a
     # rarer but predeclared information condition.
-    selection_panels = [
-        float(np.mean(list(values.values()))) for values in panel_f1.values() if values
+    panel_means = {
+        name: float(np.mean(list(values.values())))
+        for name, values in panel_f1.items() if values
+    }
+    family_scores = []
+    for prefix in ("acquisition/", "enrollment/", "truth/"):
+        values = [value for name, value in panel_means.items() if name.startswith(prefix)]
+        if values:
+            family_scores.append(float(np.mean(values)))
+    regime_values = [
+        float(np.mean(list(values.values())))
+        for values in (enrolled_f1, zero_f1) if values
     ]
-    scenario_balanced_f1 = float(np.mean(selection_panels)) if selection_panels else float("-inf")
+    if regime_values:
+        family_scores.append(float(np.mean(regime_values)))
+    scenario_balanced_f1 = float(np.mean(family_scores)) if family_scores else float("-inf")
     return {
         "validation/loss": float(np.average(losses, weights=loss_group_sizes)),
         "validation/encoder_effective_rank": float(np.mean(ranks)),
@@ -1409,7 +1507,7 @@ def validate(
             for dataset, value in zero_f1.items()
         },
         **{
-            f"validation/panel/{panel_name}/dataset_macro_f1": float(np.mean(list(values.values())))
+            f"validation/panel/{panel_name}/dataset_macro_f1": panel_means[panel_name]
             for panel_name, values in panel_f1.items() if values
         },
         **{
@@ -1482,8 +1580,8 @@ def main() -> None:
     parser.add_argument("--variable-support-probability", type=float,
                         default=DEFAULT_VARIABLE_SUPPORT_PROBABILITY,
                         help="share of enrolled support sets with unequal per-candidate counts")
-    parser.add_argument("--counterfactual-enrollment-probability", type=float, default=0.25,
-                        help="share of batches replacing one complete episode with matched enrollment views")
+    parser.add_argument("--counterfactual-enrollment-probability", type=float, default=0.0,
+                        help="v2-only share of batches replacing one complete episode with matched enrollment views; default 0.25 for contextual, otherwise 0")
     parser.add_argument("--rate-augmentation-probability", type=float, default=0.0,
                         help="independent anti-aliased rate perturbation probability per recording")
     parser.add_argument("--modality-dropout-probability", type=float, default=0.0,
@@ -1520,6 +1618,14 @@ def main() -> None:
                         choices=CONTEXTUAL_AUX_COMPARISONS,
                         default=list(CONTEXTUAL_AUX_COMPARISONS),
                         help="named better-over-reference comparisons; an empty list disables all")
+    parser.add_argument("--evidence-branch-preservation", action=argparse.BooleanOptionalAction,
+                        default=True, help="v2: preserve independently useful support and semantic branches")
+    parser.add_argument("--evidence-best-path", action=argparse.BooleanOptionalAction,
+                        default=True, help="v2: grouped final-over-best-branch non-regression")
+    parser.add_argument("--evidence-injection", action=argparse.BooleanOptionalAction,
+                        default=True, help="v2: inject pre-context path status into entity tokens")
+    parser.add_argument("--evidence-group-temperature", type=float, default=0.1,
+                        help="v2: log-mean-exp temperature across counterfactual views")
     parser.add_argument("--centring", choices=("none", "support_mean", "corpus_mean"),
                         default="support_mean")
     parser.add_argument("--p-mask-candidate", type=float, default=0.25,
@@ -1647,6 +1753,8 @@ def main() -> None:
         parser.error("frozen head training requires --phase-a ENCODER_CHECKPOINT")
     if args.p_gt_present is None:
         args.p_gt_present = DEFAULT_P_GT_PRESENT
+    if "--counterfactual-enrollment-probability" not in sys.argv:
+        args.counterfactual_enrollment_probability = 0.25 if args.classifier == "contextual" else 0.0
     if not 0.0 <= args.counterfactual_enrollment_probability <= 1.0:
         parser.error("--counterfactual-enrollment-probability must be in [0, 1]")
     if args.classifier == "neighbors":
@@ -1659,6 +1767,8 @@ def main() -> None:
             args.enrollment_mix = [2.0 / 3.0, 1.0 / 3.0, 0.0]
         elif args.enrollment_mix[2] > 0:
             parser.error("differentiable neighbors requires zero weight for ZERO enrollment")
+    if args.classifier != "contextual" and args.counterfactual_enrollment_probability > 0:
+        parser.error("counterfactual enrollment groups require --classifier contextual")
     if not 0.0 <= args.p_mask_candidate <= 1.0 or not 0.0 <= args.p_mask_gt <= 1.0:
         parser.error("support-mask probabilities must be in [0, 1]")
     if args.text_temperature <= 0:
@@ -1666,7 +1776,9 @@ def main() -> None:
     if (not math.isfinite(args.contextual_aux_weight) or args.contextual_aux_weight < 0
             or not math.isfinite(args.contextual_aux_margin) or args.contextual_aux_margin < 0
             or not math.isfinite(args.contextual_aux_temperature)
-            or args.contextual_aux_temperature <= 0):
+            or args.contextual_aux_temperature <= 0
+            or not math.isfinite(args.evidence_group_temperature)
+            or args.evidence_group_temperature <= 0):
         parser.error("contextual auxiliary scales must be finite; weight/margin nonnegative and temperature positive")
 
     if args.smoke:
@@ -1802,6 +1914,10 @@ def main() -> None:
         saved.setdefault("contextual_aux_margin", 0.0)
         saved.setdefault("contextual_aux_temperature", 0.1)
         saved.setdefault("contextual_aux_comparisons", list(CONTEXTUAL_AUX_COMPARISONS))
+        saved.setdefault("evidence_branch_preservation", True)
+        saved.setdefault("evidence_best_path", True)
+        saved.setdefault("evidence_group_temperature", 0.1)
+        saved.setdefault("evidence_injection", True)
         saved.setdefault(
             "polarization",
             bool((resume_blob.get("config") or {}).get("use_polarization", True)),
@@ -1813,6 +1929,7 @@ def main() -> None:
         resume_fields = {
             "frontend": "--frontend", "patch_seconds": "--patch-seconds",
             "window_seconds": "--window-seconds", "resolutions": "--resolutions",
+            "episodes_per_step": "--episodes-per-step",
             "support_size": "--support-size", "enrollment_k": "--enrollment-k",
             "acquisition_mix": "--acquisition-mix", "enrollment_mix": "--enrollment-mix",
             "partial_coverage": "--partial-coverage",
@@ -1833,6 +1950,12 @@ def main() -> None:
             "contextual_aux_margin": "--contextual-aux-margin",
             "contextual_aux_temperature": "--contextual-aux-temperature",
             "contextual_aux_comparisons": "--contextual-aux-comparisons",
+            "evidence_branch_preservation": (
+                "--evidence-branch-preservation", "--no-evidence-branch-preservation",
+            ),
+            "evidence_best_path": ("--evidence-best-path", "--no-evidence-best-path"),
+            "evidence_group_temperature": "--evidence-group-temperature",
+            "evidence_injection": ("--evidence-injection", "--no-evidence-injection"),
             "freeze_encoder": ("--freeze-encoder", "--no-freeze-encoder"), "lr": "--lr",
             "encoder_lr_scale": "--encoder-lr-scale",
             "frontend_lr_scale": "--frontend-lr-scale",
@@ -2125,7 +2248,10 @@ def main() -> None:
                 adaptive_text_gate=args.adaptive_text_gate,
             )).to(device) if args.classifier == "residual" else
             EvidenceAwareSupportClassifier(
-                spec, EvidenceAwareClassifierConfig(acquisition_dim=encoder.d_model),
+                spec, EvidenceAwareClassifierConfig(
+                    acquisition_dim=encoder.d_model,
+                    evidence_injection=bool(args.evidence_injection),
+                ),
             ).to(device)
             if args.classifier == "contextual" else
             SupportTokenMixer(spec, TokenMixerConfig()).to(device) if args.classifier == "token_mixer" else None)
@@ -2135,6 +2261,15 @@ def main() -> None:
         margin=float(args.contextual_aux_margin),
         temperature=float(args.contextual_aux_temperature),
         comparisons=tuple(args.contextual_aux_comparisons),
+    )
+    evidence_objective = EvidenceAwareObjectiveConfig(
+        enabled=bool(args.contextual_aux),
+        branch_preservation=bool(args.evidence_branch_preservation),
+        best_path_non_regression=bool(args.evidence_best_path),
+        weight=float(args.contextual_aux_weight),
+        margin=float(args.contextual_aux_margin),
+        temperature=float(args.contextual_aux_temperature),
+        group_temperature=float(args.evidence_group_temperature),
     )
     if hasattr(encoder, "mask_token"):
         encoder.mask_token.requires_grad_(False)
@@ -2249,6 +2384,10 @@ def main() -> None:
             "contextual_aux_margin": float(args.contextual_aux_margin),
             "contextual_aux_temperature": float(args.contextual_aux_temperature),
             "contextual_aux_comparisons": list(args.contextual_aux_comparisons),
+            "evidence_branch_preservation": bool(args.evidence_branch_preservation),
+            "evidence_best_path": bool(args.evidence_best_path),
+            "evidence_group_temperature": float(args.evidence_group_temperature),
+            "evidence_injection": bool(args.evidence_injection),
             "freeze_encoder": args.freeze_encoder,
             "lr": args.lr,
             "encoder_lr_scale": args.encoder_lr_scale,
@@ -2292,6 +2431,10 @@ def main() -> None:
         saved_trajectory.setdefault("contextual_aux_weight", 0.1)
         saved_trajectory.setdefault("contextual_aux_margin", 0.0)
         saved_trajectory.setdefault("contextual_aux_temperature", 0.1)
+        saved_trajectory.setdefault("evidence_branch_preservation", True)
+        saved_trajectory.setdefault("evidence_best_path", True)
+        saved_trajectory.setdefault("evidence_group_temperature", 0.1)
+        saved_trajectory.setdefault("evidence_injection", True)
         saved_trajectory.setdefault(
             "contextual_aux_comparisons", list(CONTEXTUAL_AUX_COMPARISONS),
         )
@@ -2407,14 +2550,26 @@ def main() -> None:
         if resume_blob else float("inf")
     best_dataset_f1 = float(resume_blob.get("best_validation_dataset_macro_f1", -1.0)) \
         if resume_blob else -1.0
+    best_zero_f1 = float(resume_blob.get("best_validation_zero_support_f1", -1.0)) \
+        if resume_blob else -1.0
+    best_enrolled_f1 = float(resume_blob.get("best_validation_enrolled_f1", -1.0)) \
+        if resume_blob else -1.0
+    best_positive_regret = float(resume_blob.get("best_validation_positive_regret", float("inf"))) \
+        if resume_blob else float("inf")
 
     def payload(step: int) -> dict:
+        if isinstance(classifier, EvidenceAwareSupportClassifier):
+            architecture_version = EVIDENCE_AWARE_ARCHITECTURE
+        elif isinstance(classifier, ContextualResidualSupportClassifier):
+            architecture_version = CONTEXTUAL_RESIDUAL_ARCHITECTURE
+        elif args.classifier == "residual":
+            architecture_version = "support_classifier_v3"
+        else:
+            architecture_version = "support_token_mixer_v1"
         return {
             "config": config,
             "encoder": encoder.state_dict(),
-            "architecture_version": ("support_classifier_v3" if args.classifier == "residual"
-                                     else EVIDENCE_AWARE_ARCHITECTURE if args.classifier == "contextual"
-                                     else "support_token_mixer_v1"),
+            "architecture_version": architecture_version,
             "classifier": None if classifier is None else classifier.state_dict(),
             "classifier_config": None if classifier is None else dataclasses.asdict(classifier.cfg),
             "attention_spec": dataclasses.asdict(spec),
@@ -2428,6 +2583,9 @@ def main() -> None:
             "best_validation_accuracy": best_accuracy,
             "best_validation_loss": best_loss,
             "best_validation_dataset_macro_f1": best_dataset_f1,
+            "best_validation_zero_support_f1": best_zero_f1,
+            "best_validation_enrolled_f1": best_enrolled_f1,
+            "best_validation_positive_regret": best_positive_regret,
             "optimizer": optimizer.state_dict(),
             "rng": {
                 "torch": torch.get_rng_state(),
@@ -2447,6 +2605,7 @@ def main() -> None:
 
     def run_validation(step: int) -> dict[str, float]:
         nonlocal latest_validation, best_accuracy, best_loss, best_dataset_f1
+        nonlocal best_zero_f1, best_enrolled_f1, best_positive_regret
         latest_validation = validate(
             encoder=encoder, classifier=classifier, classifier_mode=args.classifier,
             corpus=val_corpus, dataset=val_dataset,
@@ -2462,13 +2621,29 @@ def main() -> None:
         best_accuracy = max(best_accuracy, latest_validation["validation/accuracy/learned"])
         score = latest_validation["validation/selection_dataset_macro_f1"]
         loss = latest_validation["validation/loss"]
+        positive_regret = latest_validation.get(
+            "validation/classifier/positive_regret_mean", float("inf"),
+        )
         improved = score > best_dataset_f1 or (
-            math.isclose(score, best_dataset_f1) and loss < best_loss
+            math.isclose(score, best_dataset_f1, rel_tol=0.0, abs_tol=1e-12)
+            and (loss < best_loss or (
+                math.isclose(loss, best_loss, rel_tol=0.0, abs_tol=1e-12)
+                and positive_regret < best_positive_regret
+            ))
         )
         if improved:
             best_dataset_f1 = score
             best_loss = loss
+            best_positive_regret = positive_regret
             _atomic_torch_save(payload(step), args.out / "best_internal.pt")
+        zero_f1 = latest_validation["validation/zero_shot_dataset_macro_f1"]
+        if math.isfinite(zero_f1) and zero_f1 > best_zero_f1:
+            best_zero_f1 = zero_f1
+            _atomic_torch_save(payload(step), args.out / "best_zero_support.pt")
+        enrolled_f1 = latest_validation["validation/enrolled_dataset_macro_f1"]
+        if math.isfinite(enrolled_f1) and enrolled_f1 > best_enrolled_f1:
+            best_enrolled_f1 = enrolled_f1
+            _atomic_torch_save(payload(step), args.out / "best_enrolled.pt")
         return latest_validation
 
     if resume_blob is None:
@@ -2496,6 +2671,7 @@ def main() -> None:
                 episodes=episodes, corpus=corpus, dataset=dataset, collate=collate,
                 encoder=encoder, classifier=classifier, classifier_mode=args.classifier,
                 improvement_objective=improvement_objective,
+                evidence_objective=evidence_objective,
                 text_of=text_of, device=device, executor=executor, batch=batch,
                 device_set_plans=device_set_plans,
             )

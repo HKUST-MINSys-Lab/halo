@@ -1467,6 +1467,10 @@ def draw_batch(
             )
             episodes = [*episodes[:index], *group.views, *episodes[index + 1:]]
             counterfactual_groups = 1
+    # All per-view metrics below must describe the rows actually handed to the model, including
+    # counterfactual expansion. ``support_set_episodes`` intentionally remains the requested-draw
+    # view for the separately named support-set telemetry.
+    regime_episodes = episodes
     zero_shot = sum(1 for episode in episodes if episode.is_zero_shot)
     gt_supported = [any(slot == episode.gt_slot for slot in episode.support_candidate)
                     for episode in episodes]
@@ -1570,6 +1574,18 @@ def draw_batch(
             telemetry[f"sampler/enrollment_{name}_fraction"] = sum(
                 episode.enrollment_regime == name for episode in support_set_episodes
             ) / len(support_set_episodes)
+            telemetry[f"sampler/view_enrollment_{name}_fraction"] = sum(
+                episode.enrollment_regime == name for episode in episodes
+            ) / len(episodes)
+        enrolled_views = [episode for episode in episodes if not episode.is_zero_shot]
+        for name in ("compatible", "cross_placement", "cross_dataset"):
+            telemetry[f"sampler/view_acquisition_{name}_fraction"] = sum(
+                episode.acquisition_regime == name for episode in enrolled_views
+            ) / max(1, len(enrolled_views))
+        telemetry["sampler/counterfactual_enrollment_view_count"] = float(sum(
+            episode.counterfactual_group >= 0 and episode.counterfactual_axis == "enrollment"
+            for episode in episodes
+        ))
         telemetry["sampler/unequal_support_count_fraction"] = float(np.mean([
             len(set(count for count in episode.support_counts if count > 0)) > 1
             for episode in enrolled_support_sets

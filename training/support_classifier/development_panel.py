@@ -72,6 +72,7 @@ def _draw_kwargs(blob: dict) -> dict:
         variable_support_probability=_value(
             blob, "variable_support_probability", DEFAULT_VARIABLE_SUPPORT_PROBABILITY,
         ),
+        counterfactual_enrollment_probability=0.0,
         queries_per_support_set=_value(
             blob, "queries_per_support_set", DEFAULT_QUERIES_PER_SUPPORT_SET,
         ),

@@ -18,7 +18,6 @@ import torch.nn.functional as F
 
 from model.blocks import AttentionSpec, ScaledSum, SetAttentionStack
 from model.support.roles import N_ROLES, ROLE_CANDIDATE, ROLE_QUERY, ROLE_SUPPORT, ROLE_SUPPORT_LABEL
-from training.support_classifier.neighbors import differentiable_neighbor_logits
 
 ARCHITECTURE_VERSION = "support_evidence_aware_v2"
 NEG = -1e30
@@ -38,6 +37,7 @@ class EvidenceAwareClassifierConfig:
     temperature_floor: float = 1e-3
     router_hidden: int | None = None
     semantic_reliance_init: float = 1e-3
+    evidence_injection: bool = True
 
     def __post_init__(self) -> None:
         if self.text_dim < 1 or self.n_layers < 0 or self.max_candidates < 2 or self.max_supports < 0:
@@ -89,23 +89,24 @@ class EvidenceAwareSupportClassifier(nn.Module):
         self.semantic_query = _identity_linear(d)
         self.semantic_candidate = _identity_linear(d)
         self.query_token_sum = ScaledSum(3, init=[1.0, 0.25, 0.15])
-        self.support_token_sum = ScaledSum(5, init=[1.0, 0.25, 0.15, 0.10, 0.10])
+        self.support_token_sum = ScaledSum(4, init=[1.0, 0.25, 0.15, 0.10])
         self.label_token_sum = ScaledSum(3, init=[1.0, 0.15, 0.10])
-        self.candidate_token_sum = ScaledSum(3, init=[1.0, 0.15, 0.10])
+        self.candidate_token_sum = ScaledSum(2, init=[1.0, 0.15])
         self.support_evidence = nn.Linear(1, d)
         self.candidate_evidence = nn.Linear(3, d)
-        nn.init.zeros_(self.support_evidence.weight); nn.init.zeros_(self.support_evidence.bias)
-        nn.init.zeros_(self.candidate_evidence.weight); nn.init.zeros_(self.candidate_evidence.bias)
+        self.support_evidence_scale = nn.Parameter(torch.tensor(0.0))
+        self.candidate_evidence_scale = nn.Parameter(torch.tensor(0.0))
         self.stack = SetAttentionStack(spec, self.cfg.n_layers)
 
         self.correction_query = nn.Linear(d, d, bias=False)
         self.correction_support = nn.Linear(d, d, bias=False)
         self.correction_label = nn.Linear(d, d, bias=False)
-        self.correction_candidate = nn.Linear(d, d, bias=False)
-        nn.init.zeros_(self.correction_candidate.weight)
-        self.raw_correction_scale = nn.Parameter(torch.tensor(0.0))
+        self.correction_candidate = _identity_linear(d)
+        # A zero scalar keeps the initial correction exactly zero without normalizing a zero
+        # vector (whose 1/eps derivative creates catastrophic first-step gradients).
+        self.correction_scale = nn.Parameter(torch.tensor(0.0))
 
-        self.router = nn.Sequential(nn.LayerNorm(2 * d + 3), nn.Linear(2 * d + 3, hidden), nn.GELU(), nn.Linear(hidden, 1))
+        self.router = nn.Sequential(nn.LayerNorm(2 * d), nn.Linear(2 * d, hidden), nn.GELU(), nn.Linear(hidden, 1))
         nn.init.zeros_(self.router[-1].weight); nn.init.zeros_(self.router[-1].bias)
         self.semantic_reliance_bias = nn.Parameter(torch.tensor(_inverse_sigmoid(self.cfg.semantic_reliance_init)))
         self.raw_temperatures = nn.Parameter(torch.tensor([
@@ -120,7 +121,7 @@ class EvidenceAwareSupportClassifier(nn.Module):
         tau = self.temperatures().detach()
         return {"classifier/tau_support": float(tau[0]), "classifier/tau_semantic": float(tau[1]),
                 "classifier/semantic_reliance_prior": float(torch.sigmoid(self.semantic_reliance_bias).detach()),
-                "classifier/correction_scale": float(F.softplus(self.raw_correction_scale).detach())}
+                "classifier/correction_scale": float(self.correction_scale.detach())}
 
     def _role(self, content: torch.Tensor, role: int) -> torch.Tensor:
         return self.role_emb(torch.full(content.shape[:-1], role, dtype=torch.long, device=content.device))
@@ -138,6 +139,27 @@ class EvidenceAwareSupportClassifier(nn.Module):
         exact = mask & bound.ge(0)
         if bound.shape[1]: counts.scatter_add_(1, bound.clamp_min(0), exact.float())
         return counts
+
+    @staticmethod
+    def _support_path(
+        sensor_score: torch.Tensor,
+        label_logp: torch.Tensor,
+        support_mask: torch.Tensor,
+        candidate_mask: torch.Tensor,
+        uniform_logp: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Normalize support/candidate pair evidence and aggregate it by candidate."""
+        b, s, c = label_logp.shape
+        if s == 0:
+            return uniform_logp.expand(-1, c).clone(), sensor_score.new_zeros((b, 0))
+        pair_valid = support_mask[..., None] & candidate_mask[:, None, :]
+        flat = (sensor_score[..., None] + label_logp).flatten(1)
+        pair_logp = _masked_log_softmax(flat, pair_valid.flatten(1), 1).reshape(b, s, c)
+        mass = torch.exp(pair_logp.masked_fill(~pair_valid, float("-inf"))).sum(1)
+        neutral = uniform_logp.exp()
+        mass = torch.where(mass.gt(0), mass, neutral)
+        support_logp = _masked_log_softmax(mass.clamp_min(1e-30).log(), candidate_mask, 1)
+        return support_logp, pair_logp.flatten(1)
 
     def _check(self, query, support, q_acq, s_acq, support_text, bound, mask, pair, candidate_text, candidate_mask) -> None:
         b, c = candidate_mask.shape; s = support.shape[1]
@@ -180,42 +202,82 @@ class EvidenceAwareSupportClassifier(nn.Module):
         semantic_status = _masked_log_softmax(torch.einsum("bd,bcd->bc", F.normalize(self.semantic_query(semantic_query.float()), dim=-1), F.normalize(self.semantic_candidate(candidates.float()), dim=-1)) / tau_semantic, cmask, 1)
         support_status = uniform.expand(-1, c).clone(); support_weight = q0.new_zeros((b, s))
         exact = mask & support_bound.ge(0)
-        if s and bool(exact.any(1).any()):
-            rows = exact.any(1)
-            floor, weight = differentiable_neighbor_logits(q0[rows], s0[rows], support_bound[rows], exact[rows], cmask[rows], temperature=self.cfg.support_temperature)
-            support_status[rows] = torch.where(counts[rows].gt(0), floor, uniform[rows])
-            support_weight[rows] = weight
-        support_status = _masked_log_softmax(support_status, cmask, 1)
         qsn = F.normalize(q0.float(), dim=-1); ssn = F.normalize(s0.float(), dim=-1)
-        query_support_cosine = (torch.einsum("bd,bsd->bs", qsn, ssn) / tau_support).masked_fill(~mask, 0.0)
+        query_support_cosine = torch.einsum("bd,bsd->bs", qsn, ssn).float().masked_fill(~mask, 0.0)
+        sensor_score = query_support_cosine / tau_support
+        if s:
+            pre_binding = torch.einsum(
+                "bsd,bcd->bsc", F.normalize(labels.float(), dim=-1),
+                F.normalize(candidates.float(), dim=-1),
+            ) / tau_semantic
+            pre_binding = _masked_log_softmax(
+                pre_binding, cmask[:, None, :].expand(-1, s, -1), 2,
+            )
+            exact_binding = pre_binding.new_full((b, s, c), LOG_FILL)
+            exact_binding.scatter_(2, support_bound.clamp_min(0)[..., None], 0.0)
+            pre_label_logp = torch.where(exact[..., None], exact_binding, pre_binding)
+            rows = has_any
+            status, _ = self._support_path(
+                sensor_score[rows], pre_label_logp[rows], mask[rows], cmask[rows], uniform[rows],
+            )
+            support_status[rows] = status
+            support_weight[rows] = torch.softmax(
+                sensor_score[rows].masked_fill(~mask[rows], float("-inf")), 1,
+            ).masked_fill(~mask[rows], 0.0)
+        support_status = _masked_log_softmax(support_status, cmask, 1)
         status_features = torch.stack((support_status - uniform, semantic_status - uniform, has_direct.float()), dim=-1)
         pair = self.support_pair_tag(support_pair_slot.clamp(0, self.cfg.max_supports))
+        evidence_enabled = float(self.cfg.evidence_injection)
+        support_evidence = evidence_enabled * self.support_evidence_scale * F.normalize(
+            self.support_evidence(query_support_cosine[..., None]), dim=-1, eps=1e-4,
+        )
+        candidate_evidence = evidence_enabled * self.candidate_evidence_scale * F.normalize(
+            self.candidate_evidence(status_features), dim=-1, eps=1e-4,
+        )
+        query_token = self.query_token_sum(q_motion, q_acq, self._role(q_motion, ROLE_QUERY))
+        support_token = self.support_token_sum(
+            s_motion, s_acq, self._role(s_motion, ROLE_SUPPORT), pair,
+        ) + support_evidence
+        label_token = self.label_token_sum(labels, self._role(labels, ROLE_SUPPORT_LABEL), pair)
+        candidate_token = self.candidate_token_sum(
+            candidates, self._role(candidates, ROLE_CANDIDATE),
+        ) + candidate_evidence
         tokens = torch.cat((
-            self.query_token_sum(q_motion, q_acq, self._role(q_motion, ROLE_QUERY)),
-            self.support_token_sum(s_motion, s_acq, self._role(s_motion, ROLE_SUPPORT), pair, self.support_evidence(query_support_cosine[..., None])),
-            self.label_token_sum(labels, self._role(labels, ROLE_SUPPORT_LABEL), pair),
-            self.candidate_token_sum(candidates, self._role(candidates, ROLE_CANDIDATE), self.candidate_evidence(status_features)),
+            query_token, support_token, label_token, candidate_token,
         ), 1)
         valid = torch.cat((torch.ones((b, 1), dtype=torch.bool, device=tokens.device), mask, mask, cmask), 1)
         hidden = self.stack(tokens, key_padding_mask=valid)
         q_h, s_h, l_h, c_h = hidden[:, 0], hidden[:, 1:1+s], hidden[:, 1+s:1+2*s], hidden[:, 1+2*s:]
         if s:
-            u = torch.tanh(self.correction_query(q_h.float())[:, None] + self.correction_support(s_h.float()) + self.correction_label(l_h.float()))
-            correction = F.softplus(self.raw_correction_scale) * torch.einsum("bsd,bcd->bsc", u, self.correction_candidate(c_h.float())) / math.sqrt(self.spec.d_model)
+            pair_state = F.normalize(
+                self.correction_query(q_h.float())[:, None]
+                + self.correction_support(s_h.float())
+                + self.correction_label(l_h.float()), dim=-1, eps=1e-4,
+            )
+            candidate_state = F.normalize(
+                self.correction_candidate(c_h.float()), dim=-1, eps=1e-4,
+            )
+            correction = self.correction_scale * torch.einsum(
+                "bsd,bcd->bsc", pair_state, candidate_state,
+            )
             binding = torch.einsum("bsd,bcd->bsc", F.normalize(l_h.float(), dim=-1), F.normalize(c_h.float(), dim=-1)) / tau_semantic
             binding = _masked_log_softmax(binding, cmask[:, None, :].expand(-1, s, -1), 2)
             exact_binding = binding.new_full((b, s, c), LOG_FILL)
             exact_binding.scatter_(2, support_bound.clamp_min(0)[..., None], 0.0)
             label_logp = torch.where(exact[..., None], exact_binding, binding)
-            pair_valid = mask[..., None] & cmask[:, None, :]
-            pair_logp = _masked_log_softmax((query_support_cosine[..., None] + correction + label_logp).flatten(1), pair_valid.flatten(1), 1)
-            refined_support = torch.logsumexp(pair_logp.reshape(b, s, c), 1)
-            evidence_present = has_direct | (mask & support_bound.lt(0)).any(1, keepdim=True)
-            refined_support = torch.where(evidence_present, refined_support, uniform)
+            refined_support = uniform.expand(-1, c).clone()
+            pair_logp = q0.new_full((b, s * c), LOG_FILL)
+            rows = has_any
+            refined, refined_pair = self._support_path(
+                sensor_score[rows], label_logp[rows] + correction[rows], mask[rows],
+                cmask[rows], uniform[rows],
+            )
+            refined_support[rows] = refined
+            pair_logp[rows] = refined_pair
         else:
             correction = q0.new_zeros((b, 0, c)); pair_logp = q0.new_zeros((b, 0)); refined_support = uniform.expand(-1, c).clone()
         refined_support = _masked_log_softmax(refined_support, cmask, 1)
-        router_features = torch.cat((q_h.float()[:, None].expand(-1, c, -1), c_h.float(), status_features), -1)
+        router_features = torch.cat((q_h.float()[:, None].expand(-1, c, -1), c_h.float()), -1)
         semantic_reliance = torch.sigmoid(self.semantic_reliance_bias + self.router(router_features).squeeze(-1))
         semantic_reliance = torch.where(has_any[:, None], semantic_reliance, torch.ones_like(semantic_reliance)).masked_fill(~cmask, 0.0)
         log_g = semantic_reliance.clamp_min(torch.finfo(semantic_reliance.dtype).tiny).log()
@@ -228,7 +290,7 @@ class EvidenceAwareSupportClassifier(nn.Module):
                "semantic_reliance": semantic_reliance, "semantic_weight": semantic_reliance, "query_support_cosine": query_support_cosine,
                "support_weight": support_weight, "support_correction": correction, "candidate_has_direct_support": has_direct,
                "has_any_support": has_any, "has_support": has_any, "k_c": counts, "temperatures": torch.stack((tau_support, tau_semantic)),
-               "correction_scale": F.softplus(self.raw_correction_scale)}
+               "correction_scale": self.correction_scale}
         if return_diagnostics: out["pair_log_probability"] = pair_logp
         return out
 
@@ -236,6 +298,6 @@ class EvidenceAwareSupportClassifier(nn.Module):
     def branch_logits(output: dict[str, torch.Tensor], branch: str) -> torch.Tensor:
         keys = {"final": "logits", "support_status": "support_status_logits", "support_floor": "support_status_logits",
                 "refined_support": "refined_support_logits", "contextual_support": "refined_support_logits",
-                "semantic": "semantic_status_logits"}
+                "semantic": "semantic_status_logits", "semantic_status": "semantic_status_logits"}
         if branch not in keys: raise ValueError(f"unknown evidence-aware branch {branch!r}")
         return output[keys[branch]]

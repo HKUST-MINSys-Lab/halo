@@ -8,6 +8,7 @@ freezing, so gradients remain free to update the complete encoder, conditioner a
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
 import torch.nn.functional as F
@@ -130,28 +131,59 @@ class EvidenceAwareObjectiveConfig:
     at least as useful as an auditable detached reference.
     """
     enabled: bool = True
+    branch_preservation: bool = True
+    best_path_non_regression: bool = True
     weight: float = 0.1
     margin: float = 0.0
     temperature: float = 0.1
+    group_temperature: float = 0.1
 
     def __post_init__(self) -> None:
-        if self.weight < 0 or self.margin < 0 or self.temperature <= 0:
+        if (self.weight < 0 or self.margin < 0 or self.temperature <= 0
+                or self.group_temperature <= 0):
             raise ValueError("invalid evidence-aware auxiliary scale")
 
 
-def _group_mean(values: torch.Tensor, group_ids: torch.Tensor) -> torch.Tensor:
-    """Mean each non-negative group; ``-1`` makes a row its own group."""
+def _canonical_group_ids(values: torch.Tensor, group_ids: torch.Tensor) -> torch.Tensor:
+    """Map explicit groups densely and give every negative identifier a private group."""
     if values.ndim != 1 or group_ids.shape != values.shape:
         raise ValueError("group values and identifiers must be one-dimensional and aligned")
-    ids = group_ids.long().clone()
-    private = ids.lt(0)
-    ids[private] = torch.arange(ids.numel(), device=ids.device)[private] + ids.numel()
-    _, inverse = torch.unique(ids, sorted=True, return_inverse=True)
+    source = group_ids.long()
+    explicit = source.ge(0)
+    inverse = torch.empty_like(source)
+    n_explicit = 0
+    if bool(explicit.any()):
+        _, mapped = torch.unique(source[explicit], sorted=True, return_inverse=True)
+        inverse[explicit] = mapped
+        n_explicit = int(mapped.max()) + 1
+    private = ~explicit
+    if bool(private.any()):
+        inverse[private] = torch.arange(
+            n_explicit, n_explicit + int(private.sum()), device=source.device,
+        )
+    return inverse
+
+
+def _group_mean(values: torch.Tensor, group_ids: torch.Tensor) -> torch.Tensor:
+    """Mean each explicit group; every negative identifier makes a private group."""
+    inverse = _canonical_group_ids(values, group_ids)
     total = torch.zeros(int(inverse.max()) + 1, device=values.device, dtype=values.dtype)
     count = torch.zeros_like(total)
     total.scatter_add_(0, inverse, values)
     count.scatter_add_(0, inverse, torch.ones_like(values))
     return total / count.clamp_min(1)
+
+
+def _group_logmeanexp(
+    values: torch.Tensor, group_ids: torch.Tensor, *, temperature: float,
+) -> torch.Tensor:
+    """Stable temperature-scaled log-mean-exp for groups of unequal size."""
+    inverse = _canonical_group_ids(values, group_ids)
+    grouped = []
+    for group in range(int(inverse.max()) + 1):
+        selected = values[inverse.eq(group)] / temperature
+        grouped.append(temperature * (torch.logsumexp(selected, 0) - math.log(selected.numel())))
+    return torch.stack(grouped)
 
 
 def evidence_aware_objective(
@@ -165,7 +197,8 @@ def evidence_aware_objective(
     treated as their own group.
     """
     zero = output["logits"].new_zeros(())
-    if not cfg.enabled or cfg.weight == 0:
+    if (not cfg.enabled or cfg.weight == 0
+            or not (cfg.branch_preservation or cfg.best_path_non_regression)):
         return zero, {"aux/evidence_aware": zero.detach(), "aux/active_terms": zero.detach()}
     b = target.numel()
     groups = torch.arange(b, device=target.device) if group_ids is None else group_ids.to(target.device)
@@ -174,26 +207,41 @@ def evidence_aware_objective(
     semantic = true_class_log_odds(output["semantic_status_logits"], target, candidate_mask)
     final = true_class_log_odds(output["logits"], target, candidate_mask)
     direct = output["candidate_has_direct_support"].gather(1, target[:, None]).squeeze(1)
-    # Support-only counterfactual views share a query/candidate semantic problem.  Count that
-    # semantic CE once per explicit group rather than letting four enrollment views multiply it.
-    semantic_ce = F.nll_loss(output["semantic_status_logits"], target, reduction="none")
-    branch_terms = [_group_mean(semantic_ce, groups).mean()]
-    if bool(direct.any()):
-        branch_terms.append(F.nll_loss(output["refined_support_logits"][direct], target[direct]))
-    improve = improvement_loss(refined, support_status, direct, margin=cfg.margin, temperature=cfg.temperature)
-    if improve is not None:
-        branch_terms.append(improve)
-    branch = torch.stack(branch_terms).mean()
-    reference = torch.maximum(refined.detach(), semantic.detach())
-    regret = F.softplus((reference + cfg.margin - final) / cfg.temperature) * cfg.temperature
-    # Aggregate counterfactual variants before applying the soft hinge.  A single
-    # easy view cannot hide a regression in another deployment condition.
-    grouped_regret = _group_mean(regret, groups)
-    best = F.softplus(grouped_regret / cfg.temperature).mean() * cfg.temperature
-    active = torch.stack((branch, best)).mean()
+    terms: list[torch.Tensor] = []
+    branch = zero
+    if cfg.branch_preservation:
+        # Support-only counterfactual views share a query/candidate semantic problem. Count that
+        # semantic CE once per explicit group rather than multiplying it by the number of views.
+        semantic_ce = F.nll_loss(output["semantic_status_logits"], target, reduction="none")
+        branch_terms = [_group_mean(semantic_ce, groups).mean()]
+        if bool(direct.any()):
+            branch_terms.append(F.nll_loss(output["refined_support_logits"][direct], target[direct]))
+        improve = improvement_loss(
+            refined, support_status, direct, margin=cfg.margin, temperature=cfg.temperature,
+        )
+        if improve is not None:
+            branch_terms.append(improve)
+        branch = torch.stack(branch_terms).mean()
+        terms.append(branch)
+
+    best = zero
+    if cfg.best_path_non_regression:
+        has_support = output["has_any_support"].bool()
+        reference = torch.where(
+            has_support, torch.maximum(refined.detach(), semantic.detach()), semantic.detach(),
+        )
+        regret = reference + cfg.margin - final
+        grouped_regret = _group_logmeanexp(
+            regret, groups, temperature=cfg.group_temperature,
+        )
+        best = (F.softplus(grouped_regret / cfg.temperature) * cfg.temperature).mean()
+        terms.append(best)
+
+    active = torch.stack(terms).mean()
     metrics = {
         "aux/evidence_aware": active.detach(), "aux/branch_preservation": branch.detach(),
-        "aux/best_path_non_regression": best.detach(), "aux/active_terms": active.new_tensor(2.0),
-        "aux/group_count": active.new_tensor(float(grouped_regret.numel())),
+        "aux/best_path_non_regression": best.detach(),
+        "aux/active_terms": active.new_tensor(float(len(terms))),
+        "aux/group_count": active.new_tensor(float(_canonical_group_ids(final, groups).max() + 1)),
     }
     return active, metrics

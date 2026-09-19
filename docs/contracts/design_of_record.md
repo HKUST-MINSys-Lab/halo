@@ -67,7 +67,8 @@ refined support vote and semantic distribution. With no supports, the availabili
 result exactly the semantic distribution.
 
 The semantic status path is query-only before contextualization, so changing a support set cannot
-alter it. Support corrections and status-evidence token projections initialize at zero; semantic
+alter it. Support corrections and status-evidence additions initialize at exactly zero through
+learned scalar gates applied after well-conditioned normalized projections; semantic
 reliance initializes at `1e-3` when supports exist. The v1 residual and failed v1
 contextualize-first heads remain loadable solely for historical reproduction; `--classifier
 contextual` creates v2.
@@ -87,8 +88,8 @@ encoder is not dominated by whichever condition happened to supply more queries.
 
 The evidence-aware arm optionally adds modular path-improvement losses: semantic branch
 preservation, refined-support improvement over the unmodified vote where truth has direct support,
-and final-output non-regression against the detached better branch. The last is aggregated over a
-matched counterfactual group before its smooth hinge is applied. Active terms are averaged and
+and final-output non-regression against the detached better available branch. The last uses raw
+per-view regret, normalized group log-mean-exp, then one smooth hinge. Active terms are averaged and
 weighted once; no module is manually frozen or assigned to a bespoke objective.
 
 The current paper roster has two pairwise-disjoint active source roles. This table is explanatory; the
