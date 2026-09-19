@@ -1,0 +1,6 @@
+{
+  "halo": {
+    "checkpoint": "/home/alex/code/HALO/halo/runs/support-classifier/halo_evidence_aware_v2_40k_20260919/last.pt",
+    "checkpoint_sha256": "d0961938c05479d550dfa00b4c67948353ffbf1560171d12f34eb135151cba52"
+  }
+}
