@@ -69,9 +69,9 @@ result exactly the semantic distribution.
 The semantic status path is query-only before contextualization, so changing a support set cannot
 alter it. Support corrections and status-evidence additions initialize at exactly zero through
 learned scalar gates applied after well-conditioned normalized projections; semantic
-reliance initializes at `1e-3` when supports exist. The v1 residual and failed v1
-contextualize-first heads remain loadable solely for historical reproduction; `--classifier
-contextual` creates v2. The CLI default remains the promoted residual control so an omitted model
+reliance initializes at `1e-3` when supports exist. The two failed v1 contextual heads remain
+loadable solely for historical reproduction; `--classifier contextual` creates evidence-aware
+v2. The scalar residual v3 remains the promoted control and the CLI default, so an omitted model
 flag cannot silently launch an experimental head.
 
 The support status uses a learned query/support temperature, while the separately named support
@@ -133,5 +133,6 @@ all-device composites at 4, 8, and 16 seconds.
 
 The retired explicit admissibility table, separate Phase-B memory bank, memory-wide retrieval and
 candidate-scoring path, arbitrary-label curriculum, and Task 0-3 movement-monitoring packages are
-not part of this design. The active bounded-set contextual residual classifier described above is distinct from that
-retired path. Archived components must not be revived through a default flag or undocumented import.
+not part of this design. The abandoned `support_contextual_mixture_v1` and
+`support_contextual_residual_v1` heads are also outside the active design. Archived or abandoned
+components must not be revived through a default flag or undocumented import.

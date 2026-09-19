@@ -1,10 +1,13 @@
-"""Evidence-aware support classifier.
+"""ACTIVE EXPERIMENT: evidence-aware support classifier.
 
 This is the active successor to the contextual residual head.  It keeps the
 two auditable sources of evidence separate: a support vote over recordings and
 a query-to-candidate-label semantic score.  Set attention sees the *status quo*
 from both paths and only refines the support comparison and candidate-local
 mixture weight; it never emits unconstrained class logits.
+
+Architecture ``support_evidence_aware_v2`` is mechanically validated but is not promoted until a
+full training and matched evaluation beat the ``support_classifier_v3`` control.
 """
 
 from __future__ import annotations

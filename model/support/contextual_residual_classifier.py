@@ -1,4 +1,8 @@
-"""Contextual residual support classifier with an explicit neighbour floor.
+"""ABANDONED NEGATIVE RESULT: contextual residual classifier with a neighbour floor.
+
+Architecture ``support_contextual_residual_v1`` preserved useful zero-support behavior but
+degraded its stronger support floor as enrollment grew. It remains strictly loadable only to
+reproduce the recorded 2026-09-19 result; new ``--classifier contextual`` runs do not build it.
 
 The head preserves the deployment-time evidence decomposition instead of asking a transformer to
 invent logits directly.  Query, support, support-label, candidate-label and acquisition tokens are

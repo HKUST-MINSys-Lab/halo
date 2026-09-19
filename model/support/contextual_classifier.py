@@ -1,4 +1,7 @@
-"""Contextual semantic-voting support classifier (``support_contextual_mixture_v1``).
+"""ABANDONED NEGATIVE RESULT: contextualize-first semantic-voting classifier.
+
+Architecture ``support_contextual_mixture_v1`` collapsed onto its semantic branch and is not a
+candidate design. It remains strictly loadable only to reproduce the recorded 2026-09-18 result.
 
 Implements the approved 2026-09-17 plan: every supplied token (query, support recordings,
 support labels, candidate labels) is contextualised by one set-attention stack *before* either

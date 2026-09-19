@@ -43,8 +43,8 @@ Each row uses the current disjoint rosters and the immutable manifest produced b
 | 0 | released external baselines | none | none | Establish released-checkpoint 1-NN, prototype, ridge, and native `k=0` reference rows. |
 | 1 | HALO initialized / neighbors | none after initialization | none | Random-encoder and implementation floor. |
 | 2 | HALO supervised end-to-end / neighbors | yes | none | Measure what direct enrollment training can teach the encoder without semantic-head capacity. |
-| 3 | HALO frozen encoder / contextual residual classifier | no | yes | Test classifier reasoning independently of encoder adaptation. |
-| 4 | HALO end-to-end / contextual residual classifier | yes | yes | Test the complete system against the matched neighbors control. |
+| 3 | HALO frozen encoder / evidence-aware v2 classifier | no | yes | Test classifier reasoning independently of encoder adaptation. |
+| 4 | HALO end-to-end / evidence-aware v2 classifier | yes | yes | Test the complete system against the matched neighbors control. |
 | 5 | released encoder / HALO classifier | no | yes | Isolate classifier value from HALO encoder value under both aggregate and scenario manifests. |
 
 The one-second fixed filterbank is retained as the compact architectural control. The current
@@ -61,15 +61,17 @@ references.
 
 ## Classifier Experiment
 
-The implemented learned head is `support_contextual_residual_v1`. It keeps the neighbor vote as an
-explicit floor, contextualizes motion, acquisition, support-label and candidate-label evidence,
-and learns candidate-specific support corrections and semantic weights. The unrestricted
-`support_contextual_mixture_v1`, v3 scalar residual classifier, and two-head token mixer are
-historical controls rather than the current default. Implementation and smoke evidence are in the
-[2026-09-19 record](../journal/2026-09-19-contextual-residual-classifier-implementation.md).
+The active experiment is `support_evidence_aware_v2`. It computes auditable support and semantic
+status-quo paths before contextualization, then learns candidate-specific support corrections and
+semantic reliance. It is mechanically validated but has no full-duration result yet. The promoted
+control remains `support_classifier_v3`. Both `support_contextual_mixture_v1` and
+`support_contextual_residual_v1` are abandoned negative results; the two-head token mixer is
+retired. They remain loadable only for historical reproduction. The current implementation record
+is [the 2026-09-19 handoff](../journal/2026-09-19-new-classifier-design-handoff.md), followed by the
+[second-review fixes](../journal/2026-09-19-evidence-aware-v2-second-review-fixes.md).
 
 The necessary comparison is always the same encoder and the same manifest under `neighbors` versus
-`contextual-residual-classifier`. A learned classifier that does not exceed the neighbor control is not promoted as a
+`evidence-aware-v2`. A learned classifier that does not exceed the neighbor control is not promoted as a
 useful component, even if its absolute score is high.
 
 ## Reporting Rules

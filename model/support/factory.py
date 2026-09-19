@@ -34,6 +34,24 @@ CONTEXTUAL_ARCHITECTURE = EVIDENCE_AWARE_ARCHITECTURE
 CONTEXTUAL_CHECKPOINT_ARCHITECTURES = frozenset({CONTEXTUAL_RESIDUAL_ARCHITECTURE, EVIDENCE_AWARE_ARCHITECTURE})
 MODE_TO_ARCHITECTURE = {"residual": "support_classifier_v3", "contextual": EVIDENCE_AWARE_ARCHITECTURE,
                         "token_mixer": "support_token_mixer_v1"}
+
+# One authoritative lifecycle registry for humans and tooling. Historical architectures remain
+# strictly loadable so old results are reproducible, but they must not be mistaken for active
+# experiment choices. The CLI mode ``contextual`` always constructs the active experimental v2.
+CLASSIFIER_ARCHITECTURE_STATUS = {
+    "support_token_mixer_v1": "retired-reproduction-only",
+    "support_classifier_v2": "historical-checkpoint-only",
+    "support_classifier_v3": "promoted-control",
+    LEGACY_CONTEXTUAL_ARCHITECTURE: "abandoned-negative-result",
+    CONTEXTUAL_RESIDUAL_ARCHITECTURE: "abandoned-negative-result",
+    EVIDENCE_AWARE_ARCHITECTURE: "active-experimental",
+}
+PROMOTED_CLASSIFIER_ARCHITECTURE = "support_classifier_v3"
+ACTIVE_EXPERIMENTAL_CLASSIFIER_ARCHITECTURE = EVIDENCE_AWARE_ARCHITECTURE
+ABANDONED_CLASSIFIER_ARCHITECTURES = frozenset({
+    LEGACY_CONTEXTUAL_ARCHITECTURE,
+    CONTEXTUAL_RESIDUAL_ARCHITECTURE,
+})
 CONTEXTUAL_READOUTS = ("halo-classifier-semantic-only", "halo-classifier-support-floor",
                        "halo-classifier-contextual-support")
 EVIDENCE_AWARE_READOUTS = (
@@ -48,6 +66,14 @@ LEGACY_CONTEXTUAL_READOUTS = (
 
 def classifier_architecture(mode: str) -> str | None:
     return MODE_TO_ARCHITECTURE.get(mode)
+
+
+def classifier_architecture_status(architecture: str) -> str:
+    """Return the declared lifecycle state of a persisted classifier architecture."""
+    try:
+        return CLASSIFIER_ARCHITECTURE_STATUS[architecture]
+    except KeyError as exc:
+        raise ValueError(f"unknown support-classifier architecture {architecture!r}") from exc
 
 
 def build_classifier_from_blob(blob: dict, *, device=None, overrides: dict | None = None):

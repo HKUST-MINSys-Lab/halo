@@ -1,4 +1,7 @@
-"""Identity-initialised support-conditioned residual classifier.
+"""PROMOTED CONTROL: identity-initialised support-conditioned residual classifier.
+
+New checkpoints use ``support_classifier_v3``. The v2 checkpoint schema remains loadable for
+historical reproduction but must not be used as a new experiment architecture.
 
 The shared nearest-neighbour controls remain in ``training.support_classifier.neighbors``.
 This module is HALO-only: it centres an episode locally, takes its differentiable-neighbour vote

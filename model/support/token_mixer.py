@@ -1,4 +1,7 @@
-"""Full support-conditioned token mixer.
+"""RETIRED: full support-conditioned token mixer (historical reproduction only).
+
+This design is not an active experiment and cannot be selected without
+``--allow-retired-classifier``. It remains importable solely to load old checkpoints.
 
 The classifier is deliberately a small, explicit layer above the shared motion encoder.  It sees
 query motion, enrolled support motion, the labels attached to those supports, and the declared

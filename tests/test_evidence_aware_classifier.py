@@ -5,7 +5,13 @@ from model.blocks import AttentionSpec
 from model.support.evidence_aware_classifier import (
     ARCHITECTURE_VERSION, EvidenceAwareClassifierConfig, EvidenceAwareSupportClassifier,
 )
-from model.support.factory import build_classifier_from_blob
+from model.support.factory import (
+    ACTIVE_EXPERIMENTAL_CLASSIFIER_ARCHITECTURE,
+    CLASSIFIER_ARCHITECTURE_STATUS,
+    LEARNED_CLASSIFIER_ARCHITECTURES,
+    PROMOTED_CLASSIFIER_ARCHITECTURE,
+    build_classifier_from_blob,
+)
 from training.support_classifier.objectives import EvidenceAwareObjectiveConfig, evidence_aware_objective
 from training.support_classifier.sampling import Episode, enrollment_counterfactual_group
 
@@ -15,6 +21,13 @@ def _model() -> EvidenceAwareSupportClassifier:
         AttentionSpec(d_model=16, n_heads=4, dropout=0.0),
         EvidenceAwareClassifierConfig(text_dim=8, acquisition_dim=16, max_candidates=4, max_supports=5),
     )
+
+
+def test_every_learned_checkpoint_architecture_has_an_explicit_lifecycle():
+    assert LEARNED_CLASSIFIER_ARCHITECTURES <= CLASSIFIER_ARCHITECTURE_STATUS.keys()
+    assert CLASSIFIER_ARCHITECTURE_STATUS[PROMOTED_CLASSIFIER_ARCHITECTURE] == "promoted-control"
+    assert ACTIVE_EXPERIMENTAL_CLASSIFIER_ARCHITECTURE == ARCHITECTURE_VERSION
+    assert CLASSIFIER_ARCHITECTURE_STATUS[ARCHITECTURE_VERSION] == "active-experimental"
 
 
 def _inputs(*, support_bound=None):

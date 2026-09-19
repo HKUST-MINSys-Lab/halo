@@ -1637,8 +1637,8 @@ def main() -> None:
     parser.add_argument("--classifier", choices=("token_mixer", "neighbors", "residual", "contextual"),
                         default="residual",
                         help="contextual explicitly selects the experimental evidence-aware head; residual "
-                             "is the historical scalar-residual control; neighbors is the "
-                             "parameter-free control")
+                             "is the promoted scalar-residual control; neighbors is the "
+                             "parameter-free control; token_mixer is reproduction-only")
     parser.add_argument("--contextual-aux", action=argparse.BooleanOptionalAction, default=True,
                         help="enable modular path-improvement objectives for contextual training")
     parser.add_argument("--contextual-aux-weight", type=float, default=0.1,

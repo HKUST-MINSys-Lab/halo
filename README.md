@@ -18,10 +18,11 @@ native-rate IMU + acquisition metadata
 ```
 
 The active experiment uses 8-second training windows. The parameter-free differentiable-neighbor
-path is the encoder control; the learned residual classifier combines support evidence with a
-semantic candidate path after jointly contextualizing runtime evidence and acquisition metadata.
-Future-JEPA, continuous kernels, explicit admissibility, and hidden-bank
-retrieval are preserved as historical work, not active defaults.
+path is the encoder control. The promoted learned control is scalar residual v3; the explicitly
+selected evidence-aware v2 experiment combines support and semantic status-quo paths after
+contextualizing runtime evidence and acquisition metadata. The token mixer and both v1 contextual
+heads are abandoned or retired and preserved only for historical reproduction. Future-JEPA,
+continuous kernels, explicit admissibility, and hidden-bank retrieval are likewise not active.
 
 Start with [the documentation index](docs/README.md). The living architecture, conditioning,
 curriculum, data, baseline, and evaluation contracts are under `docs/contracts/`; promoted results
