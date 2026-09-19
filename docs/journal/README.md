@@ -66,3 +66,4 @@ entries preserve what was believed at the time; current behavior is defined only
 | 2026-09-19 | [2026-09-19-bounded-contextual-residual-v1-results.md](2026-09-19-bounded-contextual-residual-v1-results.md) | Bounded contextual residual v1: training and evaluation |
 | 2026-09-19 | [2026-09-19-contextual-residual-classifier-implementation.md](2026-09-19-contextual-residual-classifier-implementation.md) | Contextual residual classifier implementation |
 | 2026-09-19 | [2026-09-19-evidence-aware-classifier-repair-plan.md](2026-09-19-evidence-aware-classifier-repair-plan.md) | Evidence-aware classifier repair plan |
+| 2026-09-19 | [2026-09-19-new-classifier-design-handoff.md](2026-09-19-new-classifier-design-handoff.md) | New classifier design: implementation handoff |
