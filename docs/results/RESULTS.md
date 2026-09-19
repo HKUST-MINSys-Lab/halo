@@ -14,6 +14,7 @@ directory name. "Arm" means a training run; "readout" means how a trained checkp
 
 | run | protocol | encoder conditioning | status | numbers |
 |---|---|---|---|---|
+| HALO bounded contextual residual v1, step 35k, 2026-09-19 | v5 | acquisition-conditioning-v2 | **completed negative result** | [record](../journal/2026-09-19-bounded-contextual-residual-v1-results.md) |
 | HALO residual arm, step 40k, 2026-09-18 | v5 | acquisition-conditioning-v2 | **current** | below |
 | HALO neighbours arm, step 40k, 2026-09-18 | v5 | acquisition-conditioning-v2 | **current** | below |
 | HALO contextual arm, step 40k, 2026-09-18 | v5 | acquisition-conditioning-v2 | **failed, recorded** | below |
@@ -316,6 +317,17 @@ place.
 
 Artifacts: [`halo_contextual_sealed_v5_20260918`](../../results/artifacts/halo_contextual_sealed_v5_20260918/),
 [`halo_contextual_scenarios_v5_20260918`](../../results/artifacts/halo_contextual_scenarios_v5_20260918/).
+
+### The bounded contextual residual v1 follow-up
+
+The 2026-09-19 replacement restored a closed-form support floor, bounded contextual corrections,
+per-candidate semantic weighting, and modular path-improvement losses. It trained cleanly and no
+longer collapses entirely onto semantics, but it is not promoted: at 8 seconds its full classifier
+scores 50.0/59.7/64.0/67.6/70.3 macro F1 at `k=0/1/8/32/128`, while its own support floor reaches
+59.8/72.0/75.4/76.3 at `k=1/8/32/128`. The contextual support path improves the floor at one shot
+(61.2 versus 59.8) but falls behind as evidence grows. Full training telemetry, branch
+decomposition, sealed rows, and scenario rows are in the
+[2026-09-19 result record](../journal/2026-09-19-bounded-contextual-residual-v1-results.md).
 
 ### Limitations of the current record
 

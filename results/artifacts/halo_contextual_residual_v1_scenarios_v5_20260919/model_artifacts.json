@@ -1,0 +1,6 @@
+{
+  "halo": {
+    "checkpoint": "/home/alex/code/HALO/halo/runs/support-classifier/halo_mr_filterbank_contextual_residual_v1_e2e_40k_20260919/best_internal.pt",
+    "checkpoint_sha256": "471ec05f45b83e563de30e489a875b57ed4e77b1002eba59b6319e8b7ff7ebdd"
+  }
+}
