@@ -40,7 +40,10 @@ from model.support.residual_classifier import (
     RegimeSplitSupportClassifier, ResidualClassifierConfig, ResidualSupportClassifier,
     build_support_classifier,
 )
-from training.support_classifier.corpus import support_corpus_from_index
+from training.support_classifier.corpus import (
+    open_vocabulary_holdout_labels,
+    support_corpus_from_index,
+)
 from training.support_classifier.sampling import (
     DEFAULT_ENROLLMENT_K,
     DEFAULT_ACQUISITION_MIX,
@@ -494,7 +497,7 @@ def split_encoded(
     keep = support_mask.unsqueeze(-1)
     return {
         "query_feature": pooled[query_index].unsqueeze(1),
-        "query_acquisition": acquisition[query_index].unsqueeze(1),
+        "query_acquisition": F.normalize(acquisition[query_index], dim=-1).unsqueeze(1),
         "query_mask": torch.ones((B, 1), dtype=torch.bool, device=device),
         "support_feature": group_feature[support_index] * keep.to(pooled.dtype),
         "support_acquisition": group_acquisition[support_index] * keep.to(acquisition.dtype),
@@ -603,22 +606,35 @@ def episode_loss(
         [episode.support_set_id for episode in episodes], dtype=torch.long, device=device,
     )
     if explicit_groups:
+        # A counterfactual group replaces one query row; it must retain that row's optimizer
+        # weight. Collapse its views first, then apply the same support-set and regime balancing as
+        # an ordinary batch. Treat the mixed complete/partial/zero group as enrolled because its
+        # base view was a complete enrolled episode.
         grouped_rows = {index for rows in explicit_groups.values() for index in rows}
-        counterfactual_losses = torch.stack([
-            per_episode[torch.as_tensor(rows, device=device)].mean()
-            for rows in explicit_groups.values()
+        units: list[tuple[torch.Tensor, int, bool]] = []
+        for rows in explicit_groups.values():
+            row_tensor = torch.as_tensor(rows, device=device)
+            set_ids = {episodes[index].support_set_id for index in rows}
+            if len(set_ids) != 1:
+                raise ValueError("counterfactual views must retain one support-set identity")
+            units.append((per_episode[row_tensor].mean(), set_ids.pop(), False))
+        units.extend(
+            (per_episode[index], episodes[index].support_set_id, episodes[index].is_zero_shot)
+            for index in range(len(episodes)) if index not in grouped_rows
+        )
+        set_keys = list(dict.fromkeys((set_id, is_zero) for _, set_id, is_zero in units))
+        set_losses = torch.stack([
+            torch.stack([value for value, unit_set, unit_zero in units
+                         if (unit_set, unit_zero) == key]).mean()
+            for key in set_keys
         ])
-        independent = [index for index in range(len(episodes)) if index not in grouped_rows]
-        family_terms = [counterfactual_losses.mean()]
-        independent_few = [index for index in independent if not episodes[index].is_zero_shot]
-        independent_zero = [index for index in independent if episodes[index].is_zero_shot]
-        if independent_few:
-            family_terms.append(per_episode[torch.as_tensor(independent_few, device=device)].mean())
-        if independent_zero:
-            family_terms.append(per_episode[torch.as_tensor(independent_zero, device=device)].mean())
-        loss = torch.stack(family_terms).mean()
-        few_ce = per_episode[few_shot].mean() if len(few_shot) else logits.new_zeros(())
-        zero_ce = per_episode[zero_shot].mean() if len(zero_shot) else logits.new_zeros(())
+        set_is_zero = torch.tensor([is_zero for _, is_zero in set_keys], dtype=torch.bool,
+                                   device=device)
+        few_ce = set_losses[~set_is_zero].mean() if bool((~set_is_zero).any()) else logits.new_zeros(())
+        zero_ce = set_losses[set_is_zero].mean() if bool(set_is_zero.any()) else logits.new_zeros(())
+        active = [term for term, present in ((few_ce, bool((~set_is_zero).any())),
+                                             (zero_ce, bool(set_is_zero.any()))) if present]
+        loss = torch.stack(active).mean()
     elif bool(support_set_ids.ge(0).all()):
         unique_ids = list(dict.fromkeys(
             (episode.support_set_id, episode.is_zero_shot) for episode in episodes
@@ -1351,6 +1367,7 @@ def validate(
     draw_kwargs: dict,
     executor: ThreadPoolExecutor | None,
     deployment_matched: bool = False,
+    selection_policy: str = "legacy_enrolled",
 ) -> dict[str, float]:
     """Evaluate a fixed subject-held-out episode draw without consuming test datasets."""
     was_encoder_training = encoder.training
@@ -1482,6 +1499,12 @@ def validate(
     if regime_values:
         family_scores.append(float(np.mean(regime_values)))
     scenario_balanced_f1 = float(np.mean(family_scores)) if family_scores else float("-inf")
+    if selection_policy == "legacy_enrolled":
+        selection_f1 = float(np.mean(list(enrolled_f1.values()))) if enrolled_f1 else float("-inf")
+    elif selection_policy == "scenario_balanced":
+        selection_f1 = scenario_balanced_f1
+    else:
+        raise ValueError(f"unknown validation selection policy {selection_policy!r}")
     return {
         "validation/loss": float(np.average(losses, weights=loss_group_sizes)),
         "validation/encoder_effective_rank": float(np.mean(ranks)),
@@ -1494,8 +1517,11 @@ def validate(
         "validation/learned_dataset_macro_f1": (
             float(np.mean(list(enrolled_f1.values()))) if enrolled_f1 else float("nan")
         ),
-        "validation/selection_dataset_macro_f1": scenario_balanced_f1,
-        "validation/selection_scenario_balanced_dataset_macro_f1": scenario_balanced_f1,
+        "validation/scenario_balanced_dataset_macro_f1": scenario_balanced_f1,
+        "validation/selection_dataset_macro_f1": selection_f1,
+        "validation/selection_policy_scenario_balanced": float(
+            selection_policy == "scenario_balanced"
+        ),
         "validation/panel/fingerprint_48": panel_fingerprint,
         "validation/panel/episode_count": float(len(episodes)),
         **{
@@ -1582,6 +1608,11 @@ def main() -> None:
                         help="share of enrolled support sets with unequal per-candidate counts")
     parser.add_argument("--counterfactual-enrollment-probability", type=float, default=0.0,
                         help="v2-only share of batches replacing one complete episode with matched enrollment views; default 0.25 for contextual, otherwise 0")
+    parser.add_argument(
+        "--open-vocabulary-holdout-fraction", type=float, default=None,
+        help="per-source canonical-label holdout target, excluded globally from optimization and used only for "
+             "subject-held-out internal model selection (default: 0.2 for contextual, 0 otherwise)",
+    )
     parser.add_argument("--rate-augmentation-probability", type=float, default=0.0,
                         help="independent anti-aliased rate perturbation probability per recording")
     parser.add_argument("--modality-dropout-probability", type=float, default=0.0,
@@ -1604,8 +1635,8 @@ def main() -> None:
     parser.add_argument("--freeze-encoder", action=argparse.BooleanOptionalAction, default=None,
                         help="default: train encoder and classifier together")
     parser.add_argument("--classifier", choices=("token_mixer", "neighbors", "residual", "contextual"),
-                        default="contextual",
-                        help="contextual is the active contextual residual classifier; residual "
+                        default="residual",
+                        help="contextual explicitly selects the experimental evidence-aware head; residual "
                              "is the historical scalar-residual control; neighbors is the "
                              "parameter-free control")
     parser.add_argument("--contextual-aux", action=argparse.BooleanOptionalAction, default=True,
@@ -1755,6 +1786,12 @@ def main() -> None:
         args.p_gt_present = DEFAULT_P_GT_PRESENT
     if "--counterfactual-enrollment-probability" not in sys.argv:
         args.counterfactual_enrollment_probability = 0.25 if args.classifier == "contextual" else 0.0
+    if args.open_vocabulary_holdout_fraction is None:
+        args.open_vocabulary_holdout_fraction = 0.2 if args.classifier == "contextual" else 0.0
+    if not 0.0 <= args.open_vocabulary_holdout_fraction < 1.0:
+        parser.error("--open-vocabulary-holdout-fraction must be in [0, 1)")
+    if args.classifier != "contextual" and args.open_vocabulary_holdout_fraction:
+        parser.error("open-vocabulary label holdout is defined only for --classifier contextual")
     if not 0.0 <= args.counterfactual_enrollment_probability <= 1.0:
         parser.error("--counterfactual-enrollment-probability must be in [0, 1]")
     if args.classifier == "neighbors":
@@ -1906,6 +1943,7 @@ def main() -> None:
         saved.setdefault("partial_coverage", list(DEFAULT_PARTIAL_COVERAGE))
         saved.setdefault("variable_support_probability", 0.0)
         saved.setdefault("counterfactual_enrollment_probability", 0.0)
+        saved.setdefault("open_vocabulary_holdout_fraction", 0.0)
         saved.setdefault("rate_augmentation_probability", 0.0)
         saved.setdefault("modality_dropout_probability", 0.0)
         saved.setdefault("device_set_challenge_probability", 0.0)
@@ -1935,6 +1973,7 @@ def main() -> None:
             "partial_coverage": "--partial-coverage",
             "variable_support_probability": "--variable-support-probability",
             "counterfactual_enrollment_probability": "--counterfactual-enrollment-probability",
+            "open_vocabulary_holdout_fraction": "--open-vocabulary-holdout-fraction",
             "rate_augmentation_probability": "--rate-augmentation-probability",
             "modality_dropout_probability": "--modality-dropout-probability",
             "queries_per_support_set": "--queries-per-support-set",
@@ -2026,14 +2065,26 @@ def main() -> None:
         window_seconds=args.window_seconds,
     )
     print(f"[compare] corpus: {index.summary()}", flush=True)
-    corpus = support_corpus_from_index(index)
-    val_corpus = support_corpus_from_index(index, split="val")
+    holdout_labels = open_vocabulary_holdout_labels(
+        index, fraction=float(args.open_vocabulary_holdout_fraction), seed=args.data_seed,
+    )
+    corpus = support_corpus_from_index(index, exclude_labels=holdout_labels)
+    val_corpus = support_corpus_from_index(index, split="val", exclude_labels=holdout_labels)
+    open_vocab_val_corpus = (
+        support_corpus_from_index(index, split="val", include_labels=holdout_labels)
+        if holdout_labels else None
+    )
     if automatic_val_episodes and not args.smoke:
         args.val_episodes = args.val_repeats_per_dataset * len(
             val_corpus.query_labels_by_dataset
         )
     print(f"[compare] support corpus: {corpus.summary()}", flush=True)
     print(f"[compare] validation corpus: {val_corpus.summary()}", flush=True)
+    if open_vocab_val_corpus is not None:
+        print(
+            f"[compare] open-vocabulary holdout: {len(holdout_labels)} labels, "
+            f"{open_vocab_val_corpus.summary()}", flush=True,
+        )
 
     dataset = build_dataset(index, args)
     val_dataset = PretrainDataset(
@@ -2295,7 +2346,8 @@ def main() -> None:
         raise SystemExit("checkpoint frontend has no fitted normalization statistics")
 
     text_of = make_label_text(
-        list(corpus.all_labels) + list(val_corpus.all_labels), device,
+        list(corpus.all_labels) + list(val_corpus.all_labels)
+        + ([] if open_vocab_val_corpus is None else list(open_vocab_val_corpus.all_labels)), device,
     )
     # Preserve the calibration audit record across resumes. The fitted weights already live in
     # the classifier state dict; this metadata records how that initial state was obtained.
@@ -2358,6 +2410,8 @@ def main() -> None:
             "partial_coverage": list(args.partial_coverage),
             "variable_support_probability": args.variable_support_probability,
             "counterfactual_enrollment_probability": args.counterfactual_enrollment_probability,
+            "open_vocabulary_holdout_fraction": args.open_vocabulary_holdout_fraction,
+            "open_vocabulary_holdout_labels": list(holdout_labels),
             "rate_augmentation_probability": args.rate_augmentation_probability,
             "modality_dropout_probability": args.modality_dropout_probability,
             "queries_per_support_set": args.queries_per_support_set,
@@ -2435,6 +2489,8 @@ def main() -> None:
         saved_trajectory.setdefault("evidence_best_path", True)
         saved_trajectory.setdefault("evidence_group_temperature", 0.1)
         saved_trajectory.setdefault("evidence_injection", True)
+        saved_trajectory.setdefault("open_vocabulary_holdout_fraction", 0.0)
+        saved_trajectory.setdefault("open_vocabulary_holdout_labels", [])
         saved_trajectory.setdefault(
             "contextual_aux_comparisons", list(CONTEXTUAL_AUX_COMPARISONS),
         )
@@ -2475,6 +2531,7 @@ def main() -> None:
             ("partial_coverage", list(DEFAULT_PARTIAL_COVERAGE)),
             ("variable_support_probability", 0.0),
             ("counterfactual_enrollment_probability", 0.0),
+            ("open_vocabulary_holdout_fraction", 0.0),
             ("rate_augmentation_probability", 0.0),
             ("modality_dropout_probability", 0.0),
         ):
@@ -2614,7 +2671,34 @@ def main() -> None:
             seed=args.data_seed + 91_003, draw_kwargs=draw_kwargs,
             executor=executor,
             deployment_matched=True,
+            selection_policy=(
+                "scenario_balanced"
+                if isinstance(classifier, EvidenceAwareSupportClassifier)
+                else "legacy_enrolled"
+            ),
         )
+        if (isinstance(classifier, EvidenceAwareSupportClassifier)
+                and open_vocab_val_corpus is not None):
+            heldout = validate(
+                encoder=encoder, classifier=classifier, classifier_mode=args.classifier,
+                corpus=open_vocab_val_corpus, dataset=val_dataset,
+                collate=collate, text_of=text_of, device=device,
+                episodes_count=args.val_episodes, episodes_per_step=args.episodes_per_step,
+                seed=args.data_seed + 191_003, draw_kwargs=draw_kwargs,
+                executor=executor, deployment_matched=True,
+                selection_policy="scenario_balanced",
+            )
+            latest_validation.update({
+                "validation/open_vocabulary/" + key.removeprefix("validation/"): value
+                for key, value in heldout.items()
+            })
+            seen_score = latest_validation["validation/scenario_balanced_dataset_macro_f1"]
+            heldout_score = heldout["validation/scenario_balanced_dataset_macro_f1"]
+            latest_validation["validation/selection_seen_scenario_balanced_f1"] = seen_score
+            latest_validation["validation/selection_open_vocabulary_f1"] = heldout_score
+            latest_validation["validation/selection_dataset_macro_f1"] = float(np.mean((
+                seen_score, heldout_score,
+            )))
         latest_validation["step"] = float(step)
         with log_path.open("a") as handle:
             handle.write(json.dumps({"kind": "validation", **latest_validation}) + "\n")

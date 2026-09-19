@@ -370,6 +370,8 @@ def enrollment_counterfactual_group(
         return replace(episode, support=support, support_candidate=candidates,
                        support_window_groups=groups, support_counts=tuple(candidates.count(slot) for slot in range(len(episode.candidates))),
                        support_per_candidate=max((candidates.count(slot) for slot in range(len(episode.candidates))), default=0),
+                       masked_candidates=tuple(slot for slot in range(len(episode.candidates))
+                                               if slot not in set(candidates)),
                        zero_shot=not support, enrollment_regime=("zero" if not support else "partial"),
                        shrunk=len(support) < len(episode.support), counterfactual_group=group_id,
                        counterfactual_view=name, counterfactual_axis="enrollment",
@@ -1233,6 +1235,11 @@ def draw_batch(
     """
     if not 0.0 <= counterfactual_enrollment_probability <= 1.0:
         raise ValueError("counterfactual_enrollment_probability must be in [0, 1]")
+    if require_query_support and counterfactual_enrollment_probability:
+        raise ValueError(
+            "counterfactual enrollment includes a zero-support view and is incompatible with "
+            "require_query_support"
+        )
 
     if deployment_matched:
         # Keep the deployment episode contract self-contained.  The trainer passes these values

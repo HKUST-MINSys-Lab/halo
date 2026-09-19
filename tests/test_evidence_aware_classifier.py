@@ -157,37 +157,51 @@ def test_support_permutation_is_exactly_equivariant():
 def test_all_active_v2_blocks_receive_finite_gradients():
     model = _model().train()
     data = _inputs()
-    output = model(**data)
-    objective, _ = evidence_aware_objective(
-        output, torch.tensor([0]), data["candidate_mask"], EvidenceAwareObjectiveConfig(),
-    )
-    (-output["logits"][0, 0] + 0.1 * objective).backward()
-    required = (
-        model.motion_adapter, model.acquisition_adapter, model.text_adapter, model.stack,
-        model.router,
-    )
-    for module in required:
-        gradients = [parameter.grad for parameter in module.parameters() if parameter.requires_grad]
-        assert gradients and all(gradient is not None and torch.isfinite(gradient).all()
-                                 for gradient in gradients)
-    assert model.correction_scale.grad is not None
-    assert torch.isfinite(model.correction_scale.grad)
-    for scale in (model.support_evidence_scale, model.candidate_evidence_scale):
-        assert scale.grad is not None and torch.isfinite(scale.grad)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.03)
+    reached = {name: False for name, _ in model.named_parameters()}
+    for _ in range(4):
+        optimizer.zero_grad(set_to_none=True)
+        output = model(**data)
+        objective, _ = evidence_aware_objective(
+            output, torch.tensor([0]), data["candidate_mask"], EvidenceAwareObjectiveConfig(),
+        )
+        (-output["logits"][0, 0] + 0.1 * objective).backward()
+        for name, parameter in model.named_parameters():
+            if parameter.grad is not None:
+                assert torch.isfinite(parameter.grad).all(), name
+                reached[name] |= bool(parameter.grad.abs().max() > 0)
+        optimizer.step()
+    missing = [name for name, was_reached in reached.items() if not was_reached]
+    assert not missing, f"parameters never received a nonzero gradient after gates opened: {missing}"
 
-    model.zero_grad(set_to_none=True)
+
+def test_support_prior_is_continuous_for_tiny_off_roster_mass():
+    sensor = torch.tensor([[0.0]])
+    mask = torch.ones(1, 1, dtype=torch.bool)
+    candidates = torch.ones(1, 3, dtype=torch.bool)
+    uniform = torch.tensor([[-np.log(3.0)]])
+    exact = torch.tensor([[[0.0, -100.0, -100.0]]])
+    almost_exact = torch.tensor([[[-1e-6, -14.0, -14.0]]])
+    first, _ = EvidenceAwareSupportClassifier._support_path(
+        sensor, exact, mask, candidates, uniform,
+    )
+    second, _ = EvidenceAwareSupportClassifier._support_path(
+        sensor, almost_exact, mask, candidates, uniform,
+    )
+    torch.testing.assert_close(first, second, atol=3e-6, rtol=0)
+
+
+def test_fixed_support_floor_is_not_the_learned_temperature_branch():
+    model = _model().eval()
+    data = _inputs(support_bound=torch.tensor([[0, 1, 0]]))
     with torch.no_grad():
-        model.correction_scale.fill_(0.1)
-        model.support_evidence_scale.fill_(0.1)
-        model.candidate_evidence_scale.fill_(0.1)
-    output = model(**data)
-    (-output["logits"][0, 0]).backward()
-    for module in (model.correction_query, model.correction_support,
-                   model.correction_label, model.correction_candidate,
-                   model.support_evidence, model.candidate_evidence):
-        gradients = [parameter.grad for parameter in module.parameters()]
-        assert all(gradient is not None and torch.isfinite(gradient).all()
-                   for gradient in gradients)
+        first = model(**data)
+        model.raw_temperatures[0].add_(2.0)
+        second = model(**data)
+    assert not torch.equal(first["support_status_logits"], second["support_status_logits"])
+    torch.testing.assert_close(
+        first["support_floor_logits"], second["support_floor_logits"], atol=0, rtol=0,
+    )
 
 
 def test_cpu_bfloat16_autocast_is_finite():

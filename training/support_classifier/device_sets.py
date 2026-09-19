@@ -43,11 +43,21 @@ class DeviceSetPlan:
 
 
 def _episode_groups(episodes: list[Episode]) -> list[list[Episode]]:
-    """Group all queries that reuse the same physical support executions."""
-    grouped: dict[tuple[tuple[int, ...], ...], list[Episode]] = defaultdict(list)
+    """Group one recognition problem before planning its device relationship.
+
+    Counterfactual enrollment views deliberately have different support tuples. Their explicit
+    group identity takes precedence so device composition cannot become a second intervention.
+    """
+    grouped: dict[tuple, list[Episode]] = defaultdict(list)
     for episode in episodes:
-        groups = episode.support_window_groups or tuple((index,) for index in episode.support)
-        grouped[tuple(groups)].append(episode)
+        if episode.counterfactual_group >= 0:
+            key = ("counterfactual", episode.counterfactual_group)
+        elif episode.support_set_id >= 0:
+            key = ("support_set", episode.support_set_id)
+        else:
+            groups = episode.support_window_groups or tuple((index,) for index in episode.support)
+            key = ("support_rows", tuple(groups))
+        grouped[key].append(episode)
     return list(grouped.values())
 
 

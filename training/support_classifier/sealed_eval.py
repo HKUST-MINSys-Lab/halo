@@ -50,9 +50,10 @@ from model.support.contextual_classifier import ContextualSupportClassifier
 from model.support.contextual_residual_classifier import ContextualResidualSupportClassifier
 from model.support.evidence_aware_classifier import EvidenceAwareSupportClassifier
 from model.support.factory import (
-    CONTEXTUAL_ARCHITECTURE, CONTEXTUAL_RESIDUAL_ARCHITECTURE, EVIDENCE_AWARE_ARCHITECTURE,
+    CONTEXTUAL_RESIDUAL_ARCHITECTURE, EVIDENCE_AWARE_ARCHITECTURE,
     LEGACY_CONTEXTUAL_ARCHITECTURE,
-    CONTEXTUAL_READOUTS, EVIDENCE_AWARE_READOUTS, LEGACY_CONTEXTUAL_READOUTS, LEARNED_CLASSIFIER_ARCHITECTURES,
+    CONTEXTUAL_CHECKPOINT_ARCHITECTURES, CONTEXTUAL_READOUTS, EVIDENCE_AWARE_READOUTS,
+    LEGACY_CONTEXTUAL_READOUTS, LEARNED_CLASSIFIER_ARCHITECTURES,
     RESIDUAL_ARCHITECTURES, build_classifier_from_blob,
 )
 from training.support_classifier.train import make_label_text
@@ -95,7 +96,7 @@ _PARAMETER_BREAKDOWN_M = {
 }
 _HALO_CLASSIFIER_PARAMETER_CACHE: dict[str, int] = {}
 _HALO_RESIDUAL_HEAD_CACHE: dict[tuple[str, str, bool, bool], torch.nn.Module] = {}
-_HALO_ACQUISITION_VECTOR_CACHE: dict[tuple, np.ndarray] = {}
+_HALO_ACQUISITION_VECTOR_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 TRAINING_BANK_ZERO_SHOT = frozenset({"halo", "harnet5", "harnet10", "limubert_x"})
 # Bump whenever feature extraction semantics, cache inputs, or pooling changes.  This avoids
 # treating an old embedding array as valid after a code-only correction.
@@ -778,17 +779,15 @@ def halo_acquisition_vector(
     if not hasattr(encoder, "descriptor_proj"):
         return np.zeros((int(getattr(encoder, "d_model")),), dtype=np.float32)
     members = stream.devices if isinstance(stream, MultiDeviceEvalStream) else [stream]
-    cache_key = (
-        id(encoder),
-        tuple((
+    cache_key = tuple((
             member.dataset, member.stream, float(member.rate_hz),
             (None if member.effective_source_rate_hz is None
              else float(member.effective_source_rate_hz)),
             tuple(np.asarray(member.mask, dtype=np.bool_).tolist()),
             member.gravity_state, member.perturbation,
-        ) for member in members),
-    )
-    cached = _HALO_ACQUISITION_VECTOR_CACHE.get(cache_key)
+        ) for member in members)
+    encoder_cache = _HALO_ACQUISITION_VECTOR_CACHE.setdefault(encoder, {})
+    cached = encoder_cache.get(cache_key)
     if cached is not None:
         return cached.copy()
     per_device = []
@@ -834,7 +833,7 @@ def halo_acquisition_vector(
             acquisition = F.normalize(text_embedding.float(), dim=-1)
         per_device.append(acquisition.mean(dim=1).squeeze(0))
     value = F.normalize(torch.stack(per_device).mean(dim=0), dim=-1).cpu().numpy().astype(np.float32)
-    _HALO_ACQUISITION_VECTOR_CACHE[cache_key] = value
+    encoder_cache[cache_key] = value
     return value.copy()
 
 
@@ -922,7 +921,7 @@ def _halo_residual_predictions(
 
 _HALO_CONTEXTUAL_HEAD_CACHE: dict[tuple, ContextualSupportClassifier] = {}
 _HALO_CONTEXTUAL_RESIDUAL_HEAD_CACHE: dict[tuple, ContextualResidualSupportClassifier] = {}
-_ACQUISITION_CONDITIONED_ARCHITECTURES = frozenset({CONTEXTUAL_RESIDUAL_ARCHITECTURE, EVIDENCE_AWARE_ARCHITECTURE})
+_ACQUISITION_CONDITIONED_ARCHITECTURES = CONTEXTUAL_CHECKPOINT_ARCHITECTURES
 
 
 @torch.no_grad()

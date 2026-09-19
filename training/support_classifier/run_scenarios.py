@@ -880,12 +880,28 @@ def _requires_cross_support_features(task: Task, k: int) -> bool:
     return bool(task.cross and int(k) > 0)
 
 
+def _evidence_diagnostic_requests(
+    selected_readouts: frozenset[str] | None, *, include_oracle: bool,
+) -> tuple[bool, bool]:
+    """Return explicit branch/oracle requests; omitted readouts mean deployable outputs only."""
+    branches = (
+        selected_readouts is not None
+        and bool(set(EVIDENCE_AWARE_READOUTS) & set(selected_readouts))
+    )
+    oracle = include_oracle or (
+        selected_readouts is not None
+        and "halo-classifier-oracle-better-branch" in selected_readouts
+    )
+    return branches, oracle
+
+
 def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootstrap,
                banks, k: int, window_seconds: float, halo_state=None,
                halo_has_classifier: bool = False,
                halo_requires_acquisition: bool = False,
                halo_architecture: str | None = None,
                selected_readouts: frozenset[str] | None = None,
+               include_oracle_diagnostics: bool = False,
                provider_states=None, prediction_sink=None, cache_read_dirs=(),
                feature_memory_cache=None, manifest: str | None = None,
                timing_sink: dict[str, float] | None = None) -> list[dict]:
@@ -913,7 +929,7 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
     provider_states = {} if provider_states is None else provider_states
     prediction_sink = [] if prediction_sink is None else prediction_sink
 
-    def append_emitted(predictions, *, readout: str) -> None:
+    def append_emitted(predictions, *, readout: str, diagnostic_only: bool = False) -> None:
         emitted = emit_rows(task.query_stream, task.plans, predictions, coverage,
                             model=name, readout=readout, extra=extra_base, **common)
         if task.coverage is not None:
@@ -927,6 +943,9 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
                 row["parameters_m"] = round(_parameter_count_m(
                     name, halo_state, halo_checkpoint=halo_checkpoint, include_classifier=True,
                 ), 6)
+                if diagnostic_only:
+                    row["diagnostic_only"] = True
+                    row["deployable"] = False
         rows.extend(emitted)
         truth = _aligned_labels(task.query_stream)
         for plan, prediction in zip(task.plans, predictions):
@@ -1121,20 +1140,23 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
                     acquisitions=acquisitions,
                 )
                 append_emitted(predicted, readout="halo-classifier")
+            branch_diagnostics_requested, oracle_requested = _evidence_diagnostic_requests(
+                selected_readouts, include_oracle=include_oracle_diagnostics,
+            )
             if (name == "halo" and halo_checkpoint is not None
                     and halo_architecture == EVIDENCE_AWARE_ARCHITECTURE
-                    and halo_classifier_requested):
+                    and (branch_diagnostics_requested or oracle_requested)):
                 diagnostic_predictions = {}
                 for readout, branch in zip(
                     EVIDENCE_AWARE_READOUTS,
-                    ("semantic_status", "support_status", "refined_support"),
+                    ("semantic_status", "support_floor", "refined_support"),
                 ):
                     branch_predictions = _halo_contextual_residual_predictions(
                         features, roster, task.plans, halo_checkpoint, device,
                         branch=branch, acquisitions=acquisitions,
                     )
                     diagnostic_predictions[branch] = branch_predictions
-                    if selected_readouts is None or readout in selected_readouts:
+                    if selected_readouts is not None and readout in selected_readouts:
                         append_emitted(branch_predictions, readout=readout)
                 truth = _aligned_labels(task.query_stream)
                 oracle = []
@@ -1148,9 +1170,11 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
                         else semantic_prediction if semantic_prediction == expected
                         else support_prediction
                     )
-                if (selected_readouts is None
-                        or "halo-classifier-oracle-better-branch" in selected_readouts):
-                    append_emitted(oracle, readout="halo-classifier-oracle-better-branch")
+                if oracle_requested:
+                    append_emitted(
+                        oracle, readout="halo-classifier-oracle-better-branch",
+                        diagnostic_only=True,
+                    )
         except baselines.UnsupportedEvaluationCell as exc:
             rows.append({"model": name, "status": "unsupported", "reason": str(exc),
                          "k": k, "window_seconds": float(window_seconds), **severity_meta})
@@ -1497,6 +1521,10 @@ def main() -> None:
               "deployment classifier plus companion cosine 1-NN for HALO"),
     )
     parser.add_argument("--halo-checkpoint", type=Path, default=None)
+    parser.add_argument(
+        "--include-oracle-diagnostics", action="store_true",
+        help="emit the non-deployable ground-truth branch oracle; never included by default",
+    )
     parser.add_argument("--k", nargs="+", type=int, default=[0, 1, 4, 8, 32],
                         help="representative scenario curve; override explicitly for a wider sweep")
     parser.add_argument("--window-seconds", nargs="+", type=float, default=[8.0],
@@ -1718,6 +1746,7 @@ def main() -> None:
                             halo_architecture=halo_architecture,
                             selected_readouts=(None if args.readouts is None
                                                else frozenset(args.readouts)),
+                            include_oracle_diagnostics=args.include_oracle_diagnostics,
                             provider_states=provider_states,
                             prediction_sink=task_predictions,
                             cache_read_dirs=cache_read_dirs,

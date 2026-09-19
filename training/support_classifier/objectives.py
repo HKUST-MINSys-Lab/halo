@@ -126,9 +126,9 @@ def contextual_path_improvement_objective(
 class EvidenceAwareObjectiveConfig:
     """Auxiliaries for ``support_evidence_aware_v2``.
 
-    The three terms are deliberately all path-improvement contracts.  They do
-    not supervise a router or freeze a branch: each asks an evidence path to be
-    at least as useful as an auditable detached reference.
+    The terms preserve each auditable branch and ask the final mixture to be at
+    least as useful as its best detached input. They do not prescribe a router
+    target or freeze a branch.
     """
     enabled: bool = True
     branch_preservation: bool = True
@@ -179,11 +179,14 @@ def _group_logmeanexp(
 ) -> torch.Tensor:
     """Stable temperature-scaled log-mean-exp for groups of unequal size."""
     inverse = _canonical_group_ids(values, group_ids)
-    grouped = []
-    for group in range(int(inverse.max()) + 1):
-        selected = values[inverse.eq(group)] / temperature
-        grouped.append(temperature * (torch.logsumexp(selected, 0) - math.log(selected.numel())))
-    return torch.stack(grouped)
+    n_groups = int(inverse.max()) + 1
+    scaled = values / temperature
+    maxima = torch.full((n_groups,), float("-inf"), device=values.device, dtype=values.dtype)
+    maxima.scatter_reduce_(0, inverse, scaled, reduce="amax", include_self=True)
+    shifted = torch.exp(scaled - maxima.index_select(0, inverse))
+    totals = torch.zeros_like(maxima).scatter_add_(0, inverse, shifted)
+    counts = torch.zeros_like(maxima).scatter_add_(0, inverse, torch.ones_like(values))
+    return temperature * (maxima + torch.log(totals / counts.clamp_min(1)))
 
 
 def evidence_aware_objective(

@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from baselines.data import EvalStream, source_slice_fingerprint
+from training.support_classifier import run_scenarios as runner
 from training.support_classifier.scenarios import (
     CrossEnrolment,
     build_cross_manifest,
@@ -27,7 +28,6 @@ CHANNELS = ["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"]
 def test_scenario_cli_defaults_to_the_representative_budget(monkeypatch):
     import argparse
     import sys
-    from training.support_classifier import run_scenarios as runner
 
     class Parsed(Exception):
         pass
@@ -394,3 +394,9 @@ def test_cross_manifest_ignores_support_rows_with_no_registered_label():
     assert cross.plans
     for plan in cross.plans:
         assert all(row - cross.offset != 0 for row in plan.support)
+def test_evidence_diagnostics_are_opt_in_and_oracle_is_never_implicit():
+    assert runner._evidence_diagnostic_requests(None, include_oracle=False) == (False, False)
+    assert runner._evidence_diagnostic_requests(
+        frozenset({"halo-classifier-label-meaning-only"}), include_oracle=False,
+    ) == (True, False)
+    assert runner._evidence_diagnostic_requests(None, include_oracle=True) == (False, True)

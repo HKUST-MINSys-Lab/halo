@@ -71,7 +71,14 @@ alter it. Support corrections and status-evidence additions initialize at exactl
 learned scalar gates applied after well-conditioned normalized projections; semantic
 reliance initializes at `1e-3` when supports exist. The v1 residual and failed v1
 contextualize-first heads remain loadable solely for historical reproduction; `--classifier
-contextual` creates v2.
+contextual` creates v2. The CLI default remains the promoted residual control so an omitted model
+flag cannot silently launch an experimental head.
+
+The support status uses a learned query/support temperature, while the separately named support
+floor remains a fixed-temperature diagnostic. Support-label/candidate semantic binding has its own
+learned temperature. One uniform pseudo-support supplies a continuous finite prior over candidates;
+its influence decays with the number of real supports instead of changing discontinuously when an
+off-roster support assigns an arbitrarily small semantic mass.
 
 There is no top-k retrieval or hidden background bank. Every supplied support row participates in
 attention and receives a differentiable score. The `neighbors` control removes the learned classifier and
@@ -91,6 +98,12 @@ preservation, refined-support improvement over the unmodified vote where truth h
 and final-output non-regression against the detached better available branch. The last uses raw
 per-view regret, normalized group log-mean-exp, then one smooth hinge. Active terms are averaged and
 weighted once; no module is manually frozen or assigned to a bespoke objective.
+
+For this arm only, a deterministic 20% per-source target selects a global union of eligible
+canonical labels before the optimizer corpus is built. They remain available only in the subject-held-out internal
+open-vocabulary panel. Primary checkpoint selection equally weights that panel and the ordinary
+seen-label deployment-family panel. This prevents routing decisions from being selected solely on
+the training vocabulary. Historical classifiers keep their original corpus and selection rule.
 
 The current paper roster has two pairwise-disjoint active source roles. This table is explanatory; the
 executable authority is `data/scripts/curate/deployment_policy.py`.

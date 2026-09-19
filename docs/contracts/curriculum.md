@@ -30,17 +30,22 @@ group: complete, partial with truth enrolled, partial with truth withheld, and z
 view records its group id, axis, view name, and intervention. Physical acquisition changes remain
 drawn only from real compatible rows or their declared signal transforms.
 
-Checkpoint selection uses deterministic subject-held-out panels. It averages each deployment
-family first and datasets equally within a panel, then breaks exact ties by lower cross-entropy and
-lower positive regret. Separate zero-support and enrolled diagnostic checkpoints are retained. The
-training log records semantic reliance distributions split by enrollment/acquisition condition,
+Checkpoint selection for the evidence-aware classifier uses two deterministic panels. The first is
+subject-held-out over labels available to optimization. The second reserves a deterministic global
+20% per-source label target, excludes the resulting union globally from every optimizer source, and
+evaluates only subject-held-out recordings of those labels. Each panel averages deployment families first and datasets equally; the primary score gives
+the seen-label and held-out-label panels equal weight, then breaks exact ties by lower
+cross-entropy and lower positive regret. Historical residual and neighbor recipes retain their
+original enrolled subject-held-out selection rule. Separate zero-support and enrolled diagnostic
+checkpoints are retained. The training log records semantic reliance distributions split by enrollment/acquisition condition,
 support-correction RMS and tail magnitude, branch accuracy, positive regret, counterfactual group
 prevalence, realized post-expansion view shares, and the two auxiliary losses.
 
 The active same-query counterfactual implementation varies enrollment only. Acquisition, rate,
 modality, and device-set conditions remain independently sampled curriculum challenges; they are
 not described as counterfactual groups because transformed observations require a distinct loader
-identity. The internal panel is subject-held-out, not source- or label-held-out.
+identity. The evidence-aware internal panel is subject- and label-held-out, but not source-held-out.
+The exact held-out canonical labels are persisted in every run trajectory.
 
 The 2026-09-16 scenario evaluation found the largest classifier gains under partial enrollment,
 cross-placement support, and cross-dataset support. It also found regressions when strong enrolled
@@ -50,7 +55,8 @@ sensor evidence was overridden by the semantic term. This experiment targets tho
 
 - Fixed multiresolution filterbank encoder: 0.5, 1, 2, and 4 second patches in 8 second windows.
 - End-to-end encoder and residual-classifier training for 40,000 optimizer steps.
-- The current eight-source supervised corpus, subject-held-out validation split, seed, optimizer,
+- The current eight-source supervised corpus, subject-held-out validation split, deterministic
+  global label holdout for the evidence-aware arm, seed, optimizer,
   candidate policy, and multi-device policy.
 - The same seven-scenario evaluator, at `k in {1, 8}`, with immutable episode manifests and the
   same HALO 1-NN, prototype, ridge, and learned-classifier readouts.

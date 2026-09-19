@@ -836,3 +836,31 @@ def test_deployment_loss_and_regime_telemetry_weight_support_sets_not_queries():
     torch.testing.assert_close(out["few_shot_ce"], expected_few)
     torch.testing.assert_close(out["zero_shot_ce"], expected_zero)
     torch.testing.assert_close(out["loss"], (expected_few + expected_zero) / 2)
+
+
+def test_counterfactual_views_keep_the_replaced_query_weight():
+    import torch
+
+    from training.support_classifier.sampling import Episode
+    from training.support_classifier.train import episode_loss
+
+    common = dict(support=(), support_candidate=(), candidates=("a", "b"), gt_slot=0,
+                  mode="compatible", requested_support=0, shrunk=False)
+    episodes = [
+        Episode(query=index, support_set_id=0, counterfactual_group=17,
+                counterfactual_view=name, zero_shot=(name == "zero"), **common)
+        for index, name in enumerate(("complete", "partial_a", "partial_b", "zero"))
+    ]
+    episodes.extend((
+        Episode(query=4, support_set_id=0, **common),
+        Episode(query=5, support_set_id=1, zero_shot=True, **common),
+    ))
+    logits = torch.zeros(6, 2, requires_grad=True)
+    result = episode_loss(
+        logits, episodes, {"candidate_mask": torch.ones(6, 2, dtype=torch.bool)},
+        counterfactual_grouping=True,
+    )
+    result["loss"].backward()
+    # Four views jointly replace one query. They therefore carry the same aggregate derivative as
+    # the independent sibling query in the same enrolled support set, not eight times its weight.
+    torch.testing.assert_close(logits.grad[:4, 1].sum(), logits.grad[4, 1])

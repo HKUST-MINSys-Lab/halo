@@ -68,4 +68,5 @@ entries preserve what was believed at the time; current behavior is defined only
 | 2026-09-19 | [2026-09-19-evidence-aware-classifier-repair-plan.md](2026-09-19-evidence-aware-classifier-repair-plan.md) | Evidence-aware classifier repair plan |
 | 2026-09-19 | [2026-09-19-evidence-aware-v2-readiness-audit.md](2026-09-19-evidence-aware-v2-readiness-audit.md) | Evidence-aware v2: implementation and readiness audit |
 | 2026-09-19 | [2026-09-19-evidence-aware-v2-readiness-fixes.md](2026-09-19-evidence-aware-v2-readiness-fixes.md) | Evidence-aware v2 readiness fixes |
+| 2026-09-19 | [2026-09-19-evidence-aware-v2-second-review-fixes.md](2026-09-19-evidence-aware-v2-second-review-fixes.md) | Evidence-aware v2 second-review fixes |
 | 2026-09-19 | [2026-09-19-new-classifier-design-handoff.md](2026-09-19-new-classifier-design-handoff.md) | New classifier design: implementation handoff |

@@ -114,8 +114,8 @@ Semantic-only, prototype, and ridge controls are opt-in diagnostics. Cosine 1-NN
 beside the primary fusion row in the complete-enrollment aggregate curve; neither is selected per
 cell. Scenario tables use equal-weight normalized fusion as the default external-baseline row and
 may retain 1-NN as a diagnostic rather than a headline result. An "either prediction was correct"
-oracle may be reported only as a clearly
-labelled diagnostic ceiling; it is not deployed accuracy. Partial-coverage results are split into
+oracle is opt-in only, carries `diagnostic_only=true` and `deployable=false`, and may be reported
+only as a clearly labelled diagnostic ceiling; it is not deployed accuracy. Partial-coverage results are split into
 truth-enrolled, truth-unenrolled and combined queries, because a support-only method cannot name an
 unenrolled candidate. Also compute the harmonic mean of truth-enrolled and truth-unenrolled
 performance as a diagnostic summary; whether it appears in the main paper or appendix is a later

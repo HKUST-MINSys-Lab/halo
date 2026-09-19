@@ -34,6 +34,8 @@ class EvidenceAwareClassifierConfig:
     max_supports: int = 8192
     support_temperature: float = 0.07
     semantic_temperature: float = 0.07
+    label_temperature: float = 0.07
+    support_floor_temperature: float = 0.07
     temperature_floor: float = 1e-3
     router_hidden: int | None = None
     semantic_reliance_init: float = 1e-3
@@ -46,7 +48,8 @@ class EvidenceAwareClassifierConfig:
             raise ValueError("input_dim must be positive")
         if self.acquisition_dim is not None and self.acquisition_dim < 1:
             raise ValueError("acquisition_dim must be positive")
-        if min(self.support_temperature, self.semantic_temperature) <= self.temperature_floor:
+        if min(self.support_temperature, self.semantic_temperature,
+               self.label_temperature, self.support_floor_temperature) <= self.temperature_floor:
             raise ValueError("initial temperatures must exceed temperature_floor")
         if not 0.0 < self.semantic_reliance_init < 1.0:
             raise ValueError("semantic_reliance_init must be in (0, 1)")
@@ -112,6 +115,7 @@ class EvidenceAwareSupportClassifier(nn.Module):
         self.raw_temperatures = nn.Parameter(torch.tensor([
             _inverse_softplus(self.cfg.support_temperature - self.cfg.temperature_floor),
             _inverse_softplus(self.cfg.semantic_temperature - self.cfg.temperature_floor),
+            _inverse_softplus(self.cfg.label_temperature - self.cfg.temperature_floor),
         ], dtype=torch.float32))
 
     def temperatures(self) -> torch.Tensor:
@@ -120,6 +124,7 @@ class EvidenceAwareSupportClassifier(nn.Module):
     def telemetry(self) -> dict[str, float]:
         tau = self.temperatures().detach()
         return {"classifier/tau_support": float(tau[0]), "classifier/tau_semantic": float(tau[1]),
+                "classifier/tau_label": float(tau[2]),
                 "classifier/semantic_reliance_prior": float(torch.sigmoid(self.semantic_reliance_bias).detach()),
                 "classifier/correction_scale": float(self.correction_scale.detach())}
 
@@ -157,7 +162,10 @@ class EvidenceAwareSupportClassifier(nn.Module):
         pair_logp = _masked_log_softmax(flat, pair_valid.flatten(1), 1).reshape(b, s, c)
         mass = torch.exp(pair_logp.masked_fill(~pair_valid, float("-inf"))).sum(1)
         neutral = uniform_logp.exp()
-        mass = torch.where(mass.gt(0), mass, neutral)
+        # One uniform pseudo-support keeps every valid candidate finite. Scaling the normalized
+        # evidence by the real support count makes the prior decay as observations accumulate and,
+        # unlike replacing exact zeros, is continuous when an off-roster label assigns tiny mass.
+        mass = mass * support_mask.sum(1, keepdim=True).to(mass.dtype) + neutral
         support_logp = _masked_log_softmax(mass.clamp_min(1e-30).log(), candidate_mask, 1)
         return support_logp, pair_logp.flatten(1)
 
@@ -173,6 +181,7 @@ class EvidenceAwareSupportClassifier(nn.Module):
         if not bool(candidate_mask.any(1).all()): raise ValueError("every query needs a candidate")
         if bool((mask & ((bound < -1) | (bound >= c))).any()): raise ValueError("invalid support binding")
 
+    @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.float32)
     def forward(self, *, query_feature: torch.Tensor, support_feature: torch.Tensor,
                 query_acquisition: torch.Tensor, support_acquisition: torch.Tensor,
                 support_label_text: torch.Tensor, support_bound: torch.Tensor,
@@ -191,7 +200,7 @@ class EvidenceAwareSupportClassifier(nn.Module):
         q_motion, s_motion = self.motion_adapter(q0).unsqueeze(1), self.motion_adapter(s0)
         q_acq, s_acq = self.acquisition_adapter(query_acquisition).unsqueeze(1), self.acquisition_adapter(support_acquisition)
         labels, candidates = self.text_adapter(support_label_text), self.text_adapter(candidate_text)
-        tau_support, tau_semantic = self.temperatures()
+        tau_support, tau_semantic, tau_label = self.temperatures()
         has_any = mask.any(1); counts = self._counts(support_bound, mask, c); has_direct = counts.gt(0)
         uniform = -cmask.sum(1, keepdim=True).float().log()
 
@@ -200,7 +209,9 @@ class EvidenceAwareSupportClassifier(nn.Module):
         # query-only branch used when supports are absent or untrustworthy.
         semantic_query = self.motion_adapter(query_feature.float()) + self.acquisition_adapter(query_acquisition.float())
         semantic_status = _masked_log_softmax(torch.einsum("bd,bcd->bc", F.normalize(self.semantic_query(semantic_query.float()), dim=-1), F.normalize(self.semantic_candidate(candidates.float()), dim=-1)) / tau_semantic, cmask, 1)
-        support_status = uniform.expand(-1, c).clone(); support_weight = q0.new_zeros((b, s))
+        support_status = uniform.expand(-1, c).clone()
+        support_floor = uniform.expand(-1, c).clone()
+        support_weight = q0.new_zeros((b, s))
         exact = mask & support_bound.ge(0)
         qsn = F.normalize(q0.float(), dim=-1); ssn = F.normalize(s0.float(), dim=-1)
         query_support_cosine = torch.einsum("bd,bsd->bs", qsn, ssn).float().masked_fill(~mask, 0.0)
@@ -209,7 +220,7 @@ class EvidenceAwareSupportClassifier(nn.Module):
             pre_binding = torch.einsum(
                 "bsd,bcd->bsc", F.normalize(labels.float(), dim=-1),
                 F.normalize(candidates.float(), dim=-1),
-            ) / tau_semantic
+            ) / tau_label
             pre_binding = _masked_log_softmax(
                 pre_binding, cmask[:, None, :].expand(-1, s, -1), 2,
             )
@@ -221,10 +232,16 @@ class EvidenceAwareSupportClassifier(nn.Module):
                 sensor_score[rows], pre_label_logp[rows], mask[rows], cmask[rows], uniform[rows],
             )
             support_status[rows] = status
+            floor, _ = self._support_path(
+                query_support_cosine[rows] / self.cfg.support_floor_temperature,
+                pre_label_logp[rows], mask[rows], cmask[rows], uniform[rows],
+            )
+            support_floor[rows] = floor
             support_weight[rows] = torch.softmax(
                 sensor_score[rows].masked_fill(~mask[rows], float("-inf")), 1,
             ).masked_fill(~mask[rows], 0.0)
         support_status = _masked_log_softmax(support_status, cmask, 1)
+        support_floor = _masked_log_softmax(support_floor, cmask, 1)
         status_features = torch.stack((support_status - uniform, semantic_status - uniform, has_direct.float()), dim=-1)
         pair = self.support_pair_tag(support_pair_slot.clamp(0, self.cfg.max_supports))
         evidence_enabled = float(self.cfg.evidence_injection)
@@ -260,7 +277,7 @@ class EvidenceAwareSupportClassifier(nn.Module):
             correction = self.correction_scale * torch.einsum(
                 "bsd,bcd->bsc", pair_state, candidate_state,
             )
-            binding = torch.einsum("bsd,bcd->bsc", F.normalize(l_h.float(), dim=-1), F.normalize(c_h.float(), dim=-1)) / tau_semantic
+            binding = torch.einsum("bsd,bcd->bsc", F.normalize(l_h.float(), dim=-1), F.normalize(c_h.float(), dim=-1)) / tau_label
             binding = _masked_log_softmax(binding, cmask[:, None, :].expand(-1, s, -1), 2)
             exact_binding = binding.new_full((b, s, c), LOG_FILL)
             exact_binding.scatter_(2, support_bound.clamp_min(0)[..., None], 0.0)
@@ -284,7 +301,7 @@ class EvidenceAwareSupportClassifier(nn.Module):
         log_not_g = (1.0 - semantic_reliance).clamp_min(torch.finfo(semantic_reliance.dtype).tiny).log()
         logits = _masked_log_softmax(torch.logaddexp(log_not_g + refined_support, log_g + semantic_status), cmask, 1)
         out = {"logits": logits.masked_fill(~cmask, NEG), "support_status_logits": support_status.masked_fill(~cmask, NEG),
-               "support_floor_logits": support_status.masked_fill(~cmask, NEG), "neighbor_logits": support_status.masked_fill(~cmask, NEG),
+               "support_floor_logits": support_floor.masked_fill(~cmask, NEG), "neighbor_logits": support_floor.masked_fill(~cmask, NEG),
                "refined_support_logits": refined_support.masked_fill(~cmask, NEG), "contextual_support_logits": refined_support.masked_fill(~cmask, NEG),
                "semantic_status_logits": semantic_status.masked_fill(~cmask, NEG), "semantic_logits": semantic_status.masked_fill(~cmask, NEG),
                "semantic_reliance": semantic_reliance, "semantic_weight": semantic_reliance, "query_support_cosine": query_support_cosine,
@@ -296,7 +313,7 @@ class EvidenceAwareSupportClassifier(nn.Module):
 
     @staticmethod
     def branch_logits(output: dict[str, torch.Tensor], branch: str) -> torch.Tensor:
-        keys = {"final": "logits", "support_status": "support_status_logits", "support_floor": "support_status_logits",
+        keys = {"final": "logits", "support_status": "support_status_logits", "support_floor": "support_floor_logits",
                 "refined_support": "refined_support_logits", "contextual_support": "refined_support_logits",
                 "semantic": "semantic_status_logits", "semantic_status": "semantic_status_logits"}
         if branch not in keys: raise ValueError(f"unknown evidence-aware branch {branch!r}")
