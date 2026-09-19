@@ -30,6 +30,11 @@ group: complete, partial with truth enrolled, partial with truth withheld, and z
 view records its group id, axis, view name, and intervention. Physical acquisition changes remain
 drawn only from real compatible rows or their declared signal transforms.
 
+Checkpoint selection uses deterministic subject-held-out panels. It averages available deployment
+panels equally and datasets equally within a panel, then breaks ties by lower cross-entropy. The
+training log records semantic reliance split by enrollment/acquisition condition, support-correction
+magnitude, counterfactual group prevalence, and the two auxiliary losses.
+
 The 2026-09-16 scenario evaluation found the largest classifier gains under partial enrollment,
 cross-placement support, and cross-dataset support. It also found regressions when strong enrolled
 sensor evidence was overridden by the semantic term. This experiment targets those two behaviors.

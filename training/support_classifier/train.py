@@ -943,6 +943,29 @@ def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, flo
         truth_enrollment.append("enrolled" if supported else "unenrolled")
     add_scenario("truth", truth_enrollment, ("enrolled", "unenrolled"))
 
+    if "semantic_reliance" in result:
+        reliance = result["semantic_reliance"].detach()
+        direct = result["candidate_has_direct_support"].detach()
+        metrics.update({
+            "classifier/semantic_reliance": float(reliance.masked_select(mask).mean()),
+            "classifier/semantic_reliance_direct_support": float(
+                reliance.masked_select(mask & direct).mean()) if bool((mask & direct).any()) else 0.0,
+            "classifier/semantic_reliance_no_direct_support": float(
+                reliance.masked_select(mask & ~direct).mean()) if bool((mask & ~direct).any()) else 0.0,
+            "classifier/support_correction_abs": float(result["support_correction"].detach().abs().mean())
+            if result["support_correction"].numel() else 0.0,
+            "classifier/correction_scale": float(result["correction_scale"].detach()),
+        })
+        for axis, names, values in (
+            ("enrollment", ("complete", "partial", "zero"), [e.enrollment_regime for e in episodes]),
+            ("acquisition", ("compatible", "cross_placement", "cross_dataset"), [e.acquisition_regime for e in episodes]),
+            ("counterfactual_axis", ("enrollment",), [e.counterfactual_axis for e in episodes]),
+        ):
+            for name in names:
+                selected = torch.tensor([value == name for value in values], dtype=torch.bool, device=mask.device)[:, None] & mask
+                if bool(selected.any()):
+                    metrics[f"scenario/{axis}/{name}/semantic_reliance"] = float(reliance.masked_select(selected).mean())
+
     neighbor_logits = result.get("neighbor_logits")
     if neighbor_logits is not None:
         # This is the temperature-scaled differentiable class vote used by the classifier, not
@@ -1354,6 +1377,13 @@ def validate(
         }
         for panel_name, datasets in learned_by_panel.items()
     }
+    # Treat available deployment panels equally, then datasets equally inside each panel.  This
+    # prevents common compatible/enrolled rows from selecting a checkpoint that regresses on a
+    # rarer but predeclared information condition.
+    selection_panels = [
+        float(np.mean(list(values.values()))) for values in panel_f1.values() if values
+    ]
+    scenario_balanced_f1 = float(np.mean(selection_panels)) if selection_panels else float("-inf")
     return {
         "validation/loss": float(np.average(losses, weights=loss_group_sizes)),
         "validation/encoder_effective_rank": float(np.mean(ranks)),
@@ -1366,9 +1396,8 @@ def validate(
         "validation/learned_dataset_macro_f1": (
             float(np.mean(list(enrolled_f1.values()))) if enrolled_f1 else float("nan")
         ),
-        "validation/selection_dataset_macro_f1": (
-            float(np.mean(list(enrolled_f1.values()))) if enrolled_f1 else float("-inf")
-        ),
+        "validation/selection_dataset_macro_f1": scenario_balanced_f1,
+        "validation/selection_scenario_balanced_dataset_macro_f1": scenario_balanced_f1,
         "validation/panel/fingerprint_48": panel_fingerprint,
         "validation/panel/episode_count": float(len(episodes)),
         **{
