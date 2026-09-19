@@ -57,8 +57,12 @@ entries preserve what was believed at the time; current behavior is defined only
 | 2026-09-17 | [2026-09-17-scenario-evaluation-results.md](2026-09-17-scenario-evaluation-results.md) | Deployment-scenario evaluation results - 2026-09-17 |
 | 2026-09-18 | [2026-09-18-debug-sweep-harness-eval.md](2026-09-18-debug-sweep-harness-eval.md) | Debug sweep 3: training harness, curriculum, evaluation metrics and scenarios (2026-09-18) |
 | 2026-09-18 | [2026-09-18-device-set-curriculum.md](2026-09-18-device-set-curriculum.md) | Joint Device-Set Curriculum And Evaluation |
+| 2026-09-18 | [2026-09-18-encoder-isolation-plan.md](2026-09-18-encoder-isolation-plan.md) | Isolating the encoder from the classifier: plan (2026-09-18) |
 | 2026-09-18 | [2026-09-18-eval-dataset-text-audit.md](2026-09-18-eval-dataset-text-audit.md) | Evaluation-dataset expansion and text-pipeline audit |
+| 2026-09-18 | [2026-09-18-gradient-scale-audit.md](2026-09-18-gradient-scale-audit.md) | Support-classifier gradient-scale audit |
 | 2026-09-18 | [2026-09-18-repo-docs-consolidation-plan.md](2026-09-18-repo-docs-consolidation-plan.md) | Repository, documentation and naming consolidation plan (2026-09-18, second pass) |
 | 2026-09-18 | [2026-09-18-repository-consolidation-executed.md](2026-09-18-repository-consolidation-executed.md) | Repository and documentation consolidation executed |
 | 2026-09-18 | [2026-09-18-training-evaluation-readiness.md](2026-09-18-training-evaluation-readiness.md) | Training and evaluation readiness sweep |
-| 2026-09-19 | [2026-09-19-contextual-residual-classifier-implementation.md](2026-09-19-contextual-residual-classifier-implementation.md) | Contextual residual classifier implementation and smoke verification |
+| 2026-09-19 | [2026-09-19-bounded-contextual-residual-v1-results.md](2026-09-19-bounded-contextual-residual-v1-results.md) | Bounded contextual residual v1: training and evaluation |
+| 2026-09-19 | [2026-09-19-contextual-residual-classifier-implementation.md](2026-09-19-contextual-residual-classifier-implementation.md) | Contextual residual classifier implementation |
+| 2026-09-19 | [2026-09-19-evidence-aware-classifier-repair-plan.md](2026-09-19-evidence-aware-classifier-repair-plan.md) | Evidence-aware classifier repair plan |
