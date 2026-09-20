@@ -44,7 +44,10 @@ import baselines
 from baselines import scoring
 from baselines.data import load_eval_stream, load_multi_device_stream, source_slice_fingerprint
 from data.scripts.curate.compatibility import PLACEMENT_SITE
-from model.support.factory import EVIDENCE_AWARE_ARCHITECTURE, EVIDENCE_AWARE_READOUTS
+from model.support.factory import (
+    EVIDENCE_AWARE_ARCHITECTURE, EVIDENCE_AWARE_READOUTS,
+    EVIDENCE_GATED_ARCHITECTURE, EVIDENCE_GATED_READOUTS,
+)
 from data.scripts.curate.deployment_policy import MULTI_DEVICE_EVAL_CELLS, get_stream_spec
 
 from .partial_coverage import (
@@ -77,6 +80,7 @@ from .sealed_eval import (
     _build_training_reference_bank,
     _file_hash,
     _halo_contextual_residual_predictions,
+    _halo_evidence_gated_predictions,
     _halo_residual_predictions,
     halo_acquisition_rows,
     _load_or_encode,
@@ -1140,6 +1144,22 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
                     acquisitions=acquisitions,
                 )
                 append_emitted(predicted, readout="halo-classifier")
+            if (name == "halo" and halo_checkpoint is not None
+                    and halo_architecture == EVIDENCE_GATED_ARCHITECTURE
+                    and selected_readouts is not None):
+                # v4 branch diagnostics are opt-in, exactly like v2's, and there is no oracle row:
+                # the branches are auditable decompositions, not a deployable selection rule.
+                for readout, branch in zip(
+                    EVIDENCE_GATED_READOUTS, ("semantic", "support", "support_floor"),
+                ):
+                    if readout in selected_readouts:
+                        append_emitted(
+                            _halo_evidence_gated_predictions(
+                                features, roster, task.plans, halo_checkpoint, device,
+                                branch=branch,
+                            ),
+                            readout=readout,
+                        )
             branch_diagnostics_requested, oracle_requested = _evidence_diagnostic_requests(
                 selected_readouts, include_oracle=include_oracle_diagnostics,
             )
@@ -1513,7 +1533,7 @@ def main() -> None:
         "--readouts", nargs="+", choices=(
             "1nn", "prototype", "ridge", "equal-weight-normalized-fusion",
             "zero-shot-native-or-bridge", "halo-classifier",
-            *EVIDENCE_AWARE_READOUTS,
+            *EVIDENCE_AWARE_READOUTS, *EVIDENCE_GATED_READOUTS,
             "halo-classifier-oracle-better-branch",
         ), default=None,
         help=("optional readout subset for a controlled diagnostic; omitted reports only "

@@ -51,6 +51,7 @@ from model.support.contextual_residual_classifier import ContextualResidualSuppo
 from model.support.evidence_aware_classifier import EvidenceAwareSupportClassifier
 from model.support.factory import (
     CONTEXTUAL_RESIDUAL_ARCHITECTURE, EVIDENCE_AWARE_ARCHITECTURE,
+    EVIDENCE_GATED_ARCHITECTURE, EVIDENCE_GATED_READOUTS,
     LEGACY_CONTEXTUAL_ARCHITECTURE,
     CONTEXTUAL_CHECKPOINT_ARCHITECTURES, CONTEXTUAL_READOUTS, EVIDENCE_AWARE_READOUTS,
     LEGACY_CONTEXTUAL_READOUTS, LEARNED_CLASSIFIER_ARCHITECTURES,
@@ -865,6 +866,17 @@ def _halo_residual_predictions(
                 features, stream, plans, checkpoint, device,
                 batch_size=batch_size, acquisitions=acquisitions,
             )
+        if blob.get("architecture_version") == EVIDENCE_GATED_ARCHITECTURE:
+            # v4 is a different parameterisation: its ablations are the named branch readouts
+            # (label meaning / trust-weighted vote / untrusted vote), not these two flags.
+            if not (residual_enabled and text_term_enabled):
+                raise ValueError(
+                    "residual ablation flags are not defined for the evidence-gated head; "
+                    "use the branch readouts instead"
+                )
+            return _halo_evidence_gated_predictions(
+                features, stream, plans, checkpoint, device, batch_size=batch_size,
+            )
         if blob.get("architecture_version") == LEGACY_CONTEXTUAL_ARCHITECTURE:
             if not (residual_enabled and text_term_enabled):
                 raise ValueError("residual ablation flags are not defined for the contextual head")
@@ -1151,6 +1163,71 @@ def _halo_residual_diagnostic_predictions(
     return output
 
 
+_HALO_EVIDENCE_GATED_HEAD_CACHE: dict[tuple, object] = {}
+
+
+@torch.no_grad()
+def _halo_evidence_gated_predictions(
+    features: np.ndarray, stream: EvalStream, plans: Sequence[QueryPlan], checkpoint: Path,
+    device: torch.device, *, branch: str = "final", batch_size: int = 64,
+) -> list[str]:
+    """Score ``support_classifier_v4`` on an immutable manifest.
+
+    The head takes exactly the v3 call signature (it consumes no acquisition vector), so this
+    mirrors the residual path. ``branch`` selects an auditable decomposition of the same forward:
+    the final blend, its label-meaning branch, its trust-weighted support vote, or the untrusted
+    closed-form vote that the trust weights are a residual on.
+    """
+    fingerprint = _file_hash(checkpoint)
+    cache_key = (fingerprint, str(device))
+    head = _HALO_EVIDENCE_GATED_HEAD_CACHE.get(cache_key)
+    if head is None:
+        blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        if blob.get("architecture_version") != EVIDENCE_GATED_ARCHITECTURE:
+            raise ValueError("checkpoint is not an evidence-gated classifier")
+        head, _ = build_classifier_from_blob(blob, device=device)
+        _HALO_EVIDENCE_GATED_HEAD_CACHE[cache_key] = head
+    candidates = tuple(stream.eval_labels)
+    table = make_label_text(candidates, device)
+    candidate_text = table.matrix[torch.as_tensor(table.ids(candidates), device=device)].unsqueeze(0)
+    label_to_slot = {label: slot for slot, label in enumerate(candidates)}
+    predictions: list[str] = []
+    for start in range(0, len(plans), batch_size):
+        chunk = plans[start:start + batch_size]
+        b, c = len(chunk), len(candidates)
+        width = max((len(plan.support) for plan in chunk), default=0)
+        rows = np.zeros((b, width), dtype=np.int64)
+        bound = torch.full((b, width), -1, dtype=torch.long, device=device)
+        support_mask = torch.zeros((b, width), dtype=torch.bool, device=device)
+        for row, plan in enumerate(chunk):
+            if plan.support:
+                rows[row, :len(plan.support)] = plan.support
+                bound[row, :len(plan.support)] = torch.as_tensor(
+                    [label_to_slot[label] for label in plan.support_labels], device=device,
+                )
+                support_mask[row, :len(plan.support)] = True
+        support_feature = torch.as_tensor(features[rows], dtype=torch.float32, device=device)
+        support_feature = support_feature * support_mask.unsqueeze(-1)
+        expanded_text = candidate_text.expand(b, -1, -1)
+        support_text = expanded_text.gather(
+            1, bound.clamp_min(0).unsqueeze(-1).expand(-1, -1, candidate_text.shape[-1]),
+        ) * support_mask.unsqueeze(-1)
+        result = head(
+            query_feature=torch.as_tensor(
+                features[[plan.query for plan in chunk]], dtype=torch.float32, device=device,
+            ),
+            support_feature=support_feature, support_label_text=support_text,
+            support_bound=bound, support_mask=support_mask,
+            support_pair_slot=torch.arange(1, width + 1, device=device).unsqueeze(0).expand(b, -1),
+            candidate_text=expanded_text,
+            candidate_mask=torch.ones((b, c), dtype=torch.bool, device=device),
+            candidate_slot=torch.arange(1, c + 1, device=device).unsqueeze(0).expand(b, -1),
+        )
+        logits = head.branch_logits(result, branch)
+        predictions.extend(candidates[index] for index in logits.argmax(dim=1).cpu().tolist())
+    return predictions
+
+
 @torch.no_grad()
 def _halo_token_mixer_predictions(
     features: np.ndarray,
@@ -1174,6 +1251,8 @@ def _halo_token_mixer_predictions(
         return _halo_contextual_residual_predictions(
             features, stream, plans, checkpoint, device, acquisitions=acquisitions,
         )
+    if blob.get("architecture_version") == EVIDENCE_GATED_ARCHITECTURE:
+        return _halo_evidence_gated_predictions(features, stream, plans, checkpoint, device)
     if blob.get("architecture_version") == LEGACY_CONTEXTUAL_ARCHITECTURE:
         return _halo_contextual_predictions(features, stream, plans, checkpoint, device)
     if blob.get("architecture_version") != "support_token_mixer_v1" \
@@ -2024,7 +2103,25 @@ def main() -> None:
                                        "status": "ok", "feature_fingerprint": fingerprint,
                                        "manifest": manifests[manifest_id]["fingerprint"]})
                         all_rows.append(metric)
-                        if is_v2 and not is_residual:
+                        if halo_architecture == EVIDENCE_GATED_ARCHITECTURE:
+                            # v4: the label-meaning branch, the trust-weighted support vote, and
+                            # the untrusted closed-form vote it is a residual on.
+                            for readout, branch in zip(
+                                EVIDENCE_GATED_READOUTS,
+                                ("semantic", "support", "support_floor"),
+                            ):
+                                branch_predicted = _halo_evidence_gated_predictions(
+                                    features, stream, plans, args.halo_checkpoint, device,
+                                    branch=branch,
+                                )
+                                branch_metric = _metric_row(stream, plans, branch_predicted,
+                                                            bootstrap=args.bootstrap)
+                                branch_metric.update({"model": name, "readout": readout, "k": k,
+                                                      "status": "ok",
+                                                      "feature_fingerprint": fingerprint,
+                                                      "manifest": manifests[manifest_id]["fingerprint"]})
+                                all_rows.append(branch_metric)
+                        elif is_v2 and not is_residual:
                             # Contextual head: branch decompositions of the same forward.
                             branches = (
                                 ("semantic", "support_floor", "contextual_support")

@@ -36,6 +36,10 @@ from model.support.evidence_aware_classifier import (
     ARCHITECTURE_VERSION as EVIDENCE_AWARE_ARCHITECTURE,
     EvidenceAwareClassifierConfig, EvidenceAwareSupportClassifier,
 )
+from model.support.evidence_gated_classifier import (
+    ARCHITECTURE_VERSION as EVIDENCE_GATED_ARCHITECTURE,
+    EvidenceGatedClassifierConfig, EvidenceGatedSupportClassifier,
+)
 from model.support.residual_classifier import (
     RegimeSplitSupportClassifier, ResidualClassifierConfig, ResidualSupportClassifier,
     build_support_classifier,
@@ -565,6 +569,59 @@ def episode_text(
     }
 
 
+def corrupt_candidate_text(
+    text: dict[str, torch.Tensor], episodes: list[Episode], *, probability: float, rng,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Scramble the candidate label text of a random subset of enrolled episodes, in place.
+
+    The gates of ``support_classifier_v4`` are label-blind and cannot detect corruption. That is
+    the point: corruption lowers the *expected* reliability of the semantic path as a function of
+    support-evidence quality, so the optimal blend weight moves toward support wherever support
+    evidence is strong. Nothing in the ordinary curriculum supplies that signal.
+
+    Each selected roster is rolled by a nonzero offset over its valid candidates, which is a
+    derangement: every candidate receives another candidate's text, so the semantic path is
+    actively wrong rather than merely uninformative.
+
+    Only episodes whose GROUND TRUTH is enrolled are eligible. A corrupted episode must stay
+    answerable from support alone, otherwise it teaches nothing: with no support for the true
+    candidate its blend weight is forced to 1, its logit is pure (now wrong) text, and no
+    parameter the head controls can reduce that loss. Zero-support and truth-unenrolled episodes
+    would both contribute exactly that noise, so both are excluded.
+
+    Returns the per-episode boolean mask of corrupted rows, or ``None`` when nothing was drawn.
+    """
+    if probability <= 0 or rng is None:
+        return None
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError("text-corruption probability must be in [0, 1]")
+    eligible = np.array([
+        not episode.is_zero_shot
+        and episode.gt_slot < len(episode.support_counts)
+        and episode.support_counts[episode.gt_slot] > 0
+        for episode in episodes
+    ])
+    selected = (rng.random(len(episodes)) < probability) & eligible
+    if not selected.any():
+        return torch.zeros(len(episodes), dtype=torch.bool, device=device)
+    candidate_text = text["candidate_text"]
+    b, c, _ = candidate_text.shape
+    valid = text["candidate_mask"].sum(dim=1).tolist()
+    index = torch.arange(c, device=device).unsqueeze(0).repeat(b, 1)
+    for row in np.nonzero(selected)[0]:
+        width = int(valid[row])
+        if width < 2:  # a single candidate cannot be deranged
+            selected[row] = False
+            continue
+        offset = int(rng.integers(1, width))
+        index[row, :width] = (torch.arange(width, device=device) + offset) % width
+    text["candidate_text"] = candidate_text.gather(
+        1, index.unsqueeze(-1).expand(-1, -1, candidate_text.shape[-1]),
+    )
+    return torch.as_tensor(selected, dtype=torch.bool, device=device)
+
+
 # ------------------------------------------------------------------ loss
 def episode_loss(
     logits: torch.Tensor,           # (B, C)
@@ -771,8 +828,10 @@ def draw_kwargs_from_args(args) -> dict:
         "require_query_support": args.classifier == "neighbors",
         "queries_per_support_set": args.queries_per_support_set,
         "windows_per_execution": args.windows_per_execution,
-        "p_mask_candidate": args.p_mask_candidate if args.classifier in ("residual", "contextual") else 0.0,
-        "p_mask_gt": args.p_mask_gt if args.classifier in ("residual", "contextual") else 0.0,
+        "p_mask_candidate": args.p_mask_candidate
+        if args.classifier in ("residual", "contextual", "evidence_gated") else 0.0,
+        "p_mask_gt": args.p_mask_gt
+        if args.classifier in ("residual", "contextual", "evidence_gated") else 0.0,
     }
 def run_step(
     *,
@@ -782,8 +841,11 @@ def run_step(
     collate,
     encoder,
     classifier: SupportTokenMixer | ResidualSupportClassifier | RegimeSplitSupportClassifier |
-                ContextualResidualSupportClassifier | EvidenceAwareSupportClassifier | None,
+                ContextualResidualSupportClassifier | EvidenceAwareSupportClassifier |
+                EvidenceGatedSupportClassifier | None,
     classifier_mode: str,
+    text_corruption_probability: float = 0.0,
+    text_corruption_rng=None,
     improvement_objective: ImprovementObjectiveConfig | None = None,
     evidence_objective: EvidenceAwareObjectiveConfig | None = None,
     text_of,
@@ -831,6 +893,10 @@ def run_step(
 
     rows = split_encoded(pooled, acquisition, episodes, corpus)
     text = episode_text(episodes, corpus, text_of, device)
+    text_corrupted = corrupt_candidate_text(
+        text, episodes, probability=text_corruption_probability, rng=text_corruption_rng,
+        device=device,
+    )
     query = rows["query_feature"].squeeze(1)
     if classifier_mode == "neighbors":
         if any(episode.is_zero_shot for episode in episodes):
@@ -863,6 +929,19 @@ def run_step(
             support_mask=rows["support_mask"], support_pair_slot=text["support_pair_slot"],
             candidate_text=text["candidate_text"], candidate_mask=text["candidate_mask"],
             candidate_slot=text["candidate_slot"],
+        )
+    elif classifier_mode == "evidence_gated":
+        if not isinstance(classifier, EvidenceGatedSupportClassifier):
+            raise ValueError("evidence-gated mode requires EvidenceGatedSupportClassifier")
+        output = classifier(
+            query_feature=query, support_feature=rows["support_feature"],
+            support_label_text=text["support_label_text"], support_bound=text["support_bound"],
+            support_mask=rows["support_mask"], support_pair_slot=text["support_pair_slot"],
+            candidate_text=text["candidate_text"], candidate_mask=text["candidate_mask"],
+            candidate_slot=text["candidate_slot"],
+            # Corrupted episodes must not teach the encoder or p_text to align with scrambled
+            # labels; they exist only to price the reliability of the semantic path.
+            text_stop_gradient=text_corrupted,
         )
     elif classifier_mode == "contextual":
         if not isinstance(classifier, (ContextualResidualSupportClassifier, EvidenceAwareSupportClassifier)):
@@ -916,6 +995,7 @@ def run_step(
         loss["loss"] = loss["loss"] + auxiliary_weight * auxiliary
         loss.update(auxiliary_metrics)
     return {**loss, **output, "pooled": pooled, "text": text, "rows": rows,
+            "text_corrupted": text_corrupted,
             "device_count": device_count, "readout": classifier_mode,
             "augmentation_rows": augmentation_rows,
             "episode_perturbations": episode_perturbations,
@@ -1153,6 +1233,61 @@ def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, flo
             metrics[f"scenario/perturbation/{scenario_name}_support/recording_fraction"] = float(
                 np.mean([row[augmentation] for row in support_perturbation_fractions])
             )
+    if "trust_features" in result:
+        corrupted = result.get("text_corrupted")
+        metrics["curriculum/text_corrupted_fraction"] = (
+            float(corrupted.float().mean()) if corrupted is not None else 0.0
+        )
+        lam = result["lambda"].detach()
+        enrolled = (result["k_c"].detach().gt(0) & mask)
+        trust = result["trust"].detach()
+        support_rows = trust.ne(0.0) if trust.numel() else trust.bool()
+        metrics["classifier/lambda_enrolled_mean"] = (
+            float(lam.masked_select(enrolled).mean()) if bool(enrolled.any()) else float("nan")
+        )
+        metrics["classifier/lambda_unenrolled_mean"] = (
+            float(lam.masked_select(~result["k_c"].detach().gt(0) & mask).mean())
+            if bool((~result["k_c"].detach().gt(0) & mask).any()) else float("nan")
+        )
+        if bool(enrolled.any()):
+            quantiles = torch.quantile(
+                lam.masked_select(enrolled).float(),
+                torch.tensor([0.1, 0.5, 0.9], device=lam.device),
+            )
+            metrics.update({
+                "classifier/lambda_enrolled_p10": float(quantiles[0]),
+                "classifier/lambda_enrolled_p50": float(quantiles[1]),
+                "classifier/lambda_enrolled_p90": float(quantiles[2]),
+                # Saturation against the declared bound: a run that pins lambda at lambda_max is
+                # the v2 collapse in a bounded costume and must be visible immediately.
+                "classifier/lambda_at_bound_fraction": float(
+                    lam.masked_select(enrolled).gt(0.99 * float(result["lambda_max"]))
+                    .float().mean()
+                ),
+            })
+        if trust.numel() and bool(support_rows.any()):
+            valid_trust = trust.masked_select(support_rows).float()
+            metrics.update({
+                "classifier/trust_abs_mean": float(valid_trust.abs().mean()),
+                "classifier/trust_rms": float(valid_trust.square().mean().sqrt()),
+                "classifier/trust_p95": float(torch.quantile(valid_trust.abs(), 0.95)),
+                "classifier/trust_at_bound_fraction": float(
+                    valid_trust.abs().gt(0.99 * float(result["trust_scale"])).float().mean()
+                ),
+            })
+        for name in ("complete", "partial", "zero"):
+            selected = torch.tensor(
+                [episode.enrollment_regime == name for episode in episodes],
+                dtype=torch.bool, device=lam.device,
+            ).unsqueeze(1) & enrolled
+            if bool(selected.any()):
+                metrics[f"classifier/lambda_enrollment_{name}"] = float(
+                    lam.masked_select(selected).mean()
+                )
+        for lower, upper, name in ((1, 2, "k1"), (2, 8, "k2_7"), (8, 10**9, "k8plus")):
+            selected = (result["k_c"].detach().ge(lower) & result["k_c"].detach().lt(upper) & mask)
+            if bool(selected.any()):
+                metrics[f"classifier/lambda_{name}"] = float(lam.masked_select(selected).mean())
     if "r_support" in result:
         metrics.update({
             "classifier/mean_abs_r_support": (
@@ -1634,11 +1769,21 @@ def main() -> None:
                         help="override checkpoint acquisition-text mode; omitted inherits Phase-A")
     parser.add_argument("--freeze-encoder", action=argparse.BooleanOptionalAction, default=None,
                         help="default: train encoder and classifier together")
-    parser.add_argument("--classifier", choices=("token_mixer", "neighbors", "residual", "contextual"),
+    parser.add_argument("--classifier",
+                        choices=("token_mixer", "neighbors", "residual", "contextual",
+                                 "evidence_gated"),
                         default="residual",
-                        help="contextual explicitly selects the experimental evidence-aware head; residual "
-                             "is the promoted scalar-residual control; neighbors is the "
-                             "parameter-free control; token_mixer is reproduction-only")
+                        help="evidence_gated selects the active experimental v4 head (bounded "
+                             "label-blind trust and blend gates); contextual selects the "
+                             "abandoned evidence-aware v2 head; residual is the promoted "
+                             "scalar-residual control; neighbors is the parameter-free control; "
+                             "token_mixer is reproduction-only")
+    parser.add_argument(
+        "--text-corruption-probability", type=float, default=None,
+        help="v4-only share of enrolled episodes whose candidate label text is deranged, which is "
+             "what prices the reliability of the semantic path (default: 0.25 for "
+             "evidence_gated, otherwise 0)",
+    )
     parser.add_argument("--contextual-aux", action=argparse.BooleanOptionalAction, default=True,
                         help="enable modular path-improvement objectives for contextual training")
     parser.add_argument("--contextual-aux-weight", type=float, default=0.1,
@@ -1786,6 +1931,14 @@ def main() -> None:
         args.p_gt_present = DEFAULT_P_GT_PRESENT
     if "--counterfactual-enrollment-probability" not in sys.argv:
         args.counterfactual_enrollment_probability = 0.25 if args.classifier == "contextual" else 0.0
+    if args.text_corruption_probability is None:
+        args.text_corruption_probability = 0.25 if args.classifier == "evidence_gated" else 0.0
+    if not 0.0 <= args.text_corruption_probability <= 1.0:
+        parser.error("--text-corruption-probability must be in [0, 1]")
+    if args.classifier != "evidence_gated" and args.text_corruption_probability > 0:
+        # The contract is defined only where support-label text is unused. v3 also feeds label
+        # text to its attention stack, so a scrambled roster there is a different experiment.
+        parser.error("--text-corruption-probability is defined only for --classifier evidence_gated")
     if args.open_vocabulary_holdout_fraction is None:
         args.open_vocabulary_holdout_fraction = 0.2 if args.classifier == "contextual" else 0.0
     if not 0.0 <= args.open_vocabulary_holdout_fraction < 1.0:
@@ -1956,6 +2109,7 @@ def main() -> None:
         saved.setdefault("evidence_best_path", True)
         saved.setdefault("evidence_group_temperature", 0.1)
         saved.setdefault("evidence_injection", True)
+        saved.setdefault("text_corruption_probability", 0.0)
         saved.setdefault(
             "polarization",
             bool((resume_blob.get("config") or {}).get("use_polarization", True)),
@@ -1973,6 +2127,7 @@ def main() -> None:
             "partial_coverage": "--partial-coverage",
             "variable_support_probability": "--variable-support-probability",
             "counterfactual_enrollment_probability": "--counterfactual-enrollment-probability",
+            "text_corruption_probability": "--text-corruption-probability",
             "open_vocabulary_holdout_fraction": "--open-vocabulary-holdout-fraction",
             "rate_augmentation_probability": "--rate-augmentation-probability",
             "modality_dropout_probability": "--modality-dropout-probability",
@@ -2151,6 +2306,10 @@ def main() -> None:
             classifier = EvidenceAwareSupportClassifier(
                 spec, EvidenceAwareClassifierConfig(**resume_blob["classifier_config"]),
             ).to(device) if args.classifier == "contextual" else None
+        elif version == EVIDENCE_GATED_ARCHITECTURE:
+            classifier = EvidenceGatedSupportClassifier(
+                spec, EvidenceGatedClassifierConfig(**resume_blob["classifier_config"]),
+            ).to(device) if args.classifier == "evidence_gated" else None
         elif version == "support_token_mixer_v1":
             classifier = SupportTokenMixer(spec, TokenMixerConfig(**resume_blob["classifier_config"])).to(device) \
                 if args.classifier == "token_mixer" else None
@@ -2305,6 +2464,13 @@ def main() -> None:
                 ),
             ).to(device)
             if args.classifier == "contextual" else
+            EvidenceGatedSupportClassifier(
+                spec, EvidenceGatedClassifierConfig(
+                    centring=args.centring, text_temperature=args.text_temperature,
+                    trust_enabled=not args.no_residual, text_term_enabled=not args.no_text_term,
+                ),
+            ).to(device)
+            if args.classifier == "evidence_gated" else
             SupportTokenMixer(spec, TokenMixerConfig()).to(device) if args.classifier == "token_mixer" else None)
     print(f"[compare] classifier={args.classifier}", flush=True)
     improvement_objective = ImprovementObjectiveConfig(
@@ -2615,7 +2781,9 @@ def main() -> None:
         if resume_blob else float("inf")
 
     def payload(step: int) -> dict:
-        if isinstance(classifier, EvidenceAwareSupportClassifier):
+        if isinstance(classifier, EvidenceGatedSupportClassifier):
+            architecture_version = EVIDENCE_GATED_ARCHITECTURE
+        elif isinstance(classifier, EvidenceAwareSupportClassifier):
             architecture_version = EVIDENCE_AWARE_ARCHITECTURE
         elif isinstance(classifier, ContextualResidualSupportClassifier):
             architecture_version = CONTEXTUAL_RESIDUAL_ARCHITECTURE
@@ -2756,6 +2924,10 @@ def main() -> None:
                 encoder=encoder, classifier=classifier, classifier_mode=args.classifier,
                 improvement_objective=improvement_objective,
                 evidence_objective=evidence_objective,
+                text_corruption_probability=args.text_corruption_probability,
+                # A separate stream from the episode draw, so enabling corruption cannot shift
+                # which episodes a seed produces.
+                text_corruption_rng=episode_rng(args.data_seed, step * 7_777_777 + 3),
                 text_of=text_of, device=device, executor=executor, batch=batch,
                 device_set_plans=device_set_plans,
             )

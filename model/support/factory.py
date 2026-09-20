@@ -21,18 +21,23 @@ from model.support.evidence_aware_classifier import (
     ARCHITECTURE_VERSION as EVIDENCE_AWARE_ARCHITECTURE,
     EvidenceAwareClassifierConfig, EvidenceAwareSupportClassifier,
 )
+from model.support.evidence_gated_classifier import (
+    ARCHITECTURE_VERSION as EVIDENCE_GATED_ARCHITECTURE,
+    EvidenceGatedClassifierConfig, EvidenceGatedSupportClassifier,
+)
 from model.support.residual_classifier import ResidualClassifierConfig, build_support_classifier
 
 RESIDUAL_ARCHITECTURES = frozenset({"support_classifier_v2", "support_classifier_v3"})
 LEARNED_CLASSIFIER_ARCHITECTURES = RESIDUAL_ARCHITECTURES | {
     LEGACY_CONTEXTUAL_ARCHITECTURE, CONTEXTUAL_RESIDUAL_ARCHITECTURE,
-    EVIDENCE_AWARE_ARCHITECTURE,
+    EVIDENCE_AWARE_ARCHITECTURE, EVIDENCE_GATED_ARCHITECTURE,
 }
 # ``contextual`` is the CLI mode, not a checkpoint family.  New runs use v2 while v1 remains
 # explicitly addressable for checkpoint loading and historical evaluation.
 CONTEXTUAL_ARCHITECTURE = EVIDENCE_AWARE_ARCHITECTURE
 CONTEXTUAL_CHECKPOINT_ARCHITECTURES = frozenset({CONTEXTUAL_RESIDUAL_ARCHITECTURE, EVIDENCE_AWARE_ARCHITECTURE})
 MODE_TO_ARCHITECTURE = {"residual": "support_classifier_v3", "contextual": EVIDENCE_AWARE_ARCHITECTURE,
+                        "evidence_gated": EVIDENCE_GATED_ARCHITECTURE,
                         "token_mixer": "support_token_mixer_v1"}
 
 # One authoritative lifecycle registry for humans and tooling. Historical architectures remain
@@ -44,19 +49,29 @@ CLASSIFIER_ARCHITECTURE_STATUS = {
     "support_classifier_v3": "promoted-control",
     LEGACY_CONTEXTUAL_ARCHITECTURE: "abandoned-negative-result",
     CONTEXTUAL_RESIDUAL_ARCHITECTURE: "abandoned-negative-result",
-    EVIDENCE_AWARE_ARCHITECTURE: "active-experimental",
+    # v2 completed its matched sealed + scenario evaluation on 2026-09-19 and did not beat the
+    # v3 control (router collapsed onto label meaning); see docs/results/RESULTS.md.
+    EVIDENCE_AWARE_ARCHITECTURE: "abandoned-negative-result",
+    EVIDENCE_GATED_ARCHITECTURE: "active-experimental",
 }
 PROMOTED_CLASSIFIER_ARCHITECTURE = "support_classifier_v3"
-ACTIVE_EXPERIMENTAL_CLASSIFIER_ARCHITECTURE = EVIDENCE_AWARE_ARCHITECTURE
+ACTIVE_EXPERIMENTAL_CLASSIFIER_ARCHITECTURE = EVIDENCE_GATED_ARCHITECTURE
 ABANDONED_CLASSIFIER_ARCHITECTURES = frozenset({
     LEGACY_CONTEXTUAL_ARCHITECTURE,
     CONTEXTUAL_RESIDUAL_ARCHITECTURE,
+    EVIDENCE_AWARE_ARCHITECTURE,
 })
 CONTEXTUAL_READOUTS = ("halo-classifier-semantic-only", "halo-classifier-support-floor",
                        "halo-classifier-contextual-support")
 EVIDENCE_AWARE_READOUTS = (
     "halo-classifier-label-meaning-only", "halo-classifier-unmodified-support-vote",
     "halo-classifier-contextual-support-vote",
+)
+# v4 branch readouts: the final blend, its label-meaning branch, its trust-weighted support vote,
+# and the untrusted closed-form vote the trust weights are a residual on.
+EVIDENCE_GATED_READOUTS = (
+    "halo-classifier-label-meaning-only", "halo-classifier-support-vote",
+    "halo-classifier-untrusted-support-vote",
 )
 LEGACY_CONTEXTUAL_READOUTS = (
     "halo-classifier-semantic-only", "halo-classifier-support-only",
@@ -107,6 +122,14 @@ def build_classifier_from_blob(blob: dict, *, device=None, overrides: dict | Non
         if overrides:
             raise ValueError("residual ablation flags are not defined for the evidence-aware head")
         head = EvidenceAwareSupportClassifier(spec, EvidenceAwareClassifierConfig(**config))
+    elif version == EVIDENCE_GATED_ARCHITECTURE:
+        # Only the two ablation switches may be overridden; a readout must not silently change
+        # capacity, bounds or temperatures, which would make its rows incomparable.
+        allowed = {"trust_enabled", "text_term_enabled"}
+        if set(overrides or {}) - allowed:
+            raise ValueError(f"evidence-gated overrides are limited to {sorted(allowed)}")
+        config.update(overrides or {})
+        head = EvidenceGatedSupportClassifier(spec, EvidenceGatedClassifierConfig(**config))
     else:
         raise ValueError(f"unsupported support-classifier architecture {version!r}")
     head.load_state_dict(blob["classifier"], strict=True)

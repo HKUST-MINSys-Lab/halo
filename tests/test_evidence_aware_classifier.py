@@ -7,7 +7,7 @@ from model.support.evidence_aware_classifier import (
 )
 from model.support.factory import (
     ACTIVE_EXPERIMENTAL_CLASSIFIER_ARCHITECTURE,
-    CLASSIFIER_ARCHITECTURE_STATUS,
+    ABANDONED_CLASSIFIER_ARCHITECTURES, CLASSIFIER_ARCHITECTURE_STATUS,
     LEARNED_CLASSIFIER_ARCHITECTURES,
     PROMOTED_CLASSIFIER_ARCHITECTURE,
     build_classifier_from_blob,
@@ -26,8 +26,12 @@ def _model() -> EvidenceAwareSupportClassifier:
 def test_every_learned_checkpoint_architecture_has_an_explicit_lifecycle():
     assert LEARNED_CLASSIFIER_ARCHITECTURES <= CLASSIFIER_ARCHITECTURE_STATUS.keys()
     assert CLASSIFIER_ARCHITECTURE_STATUS[PROMOTED_CLASSIFIER_ARCHITECTURE] == "promoted-control"
-    assert ACTIVE_EXPERIMENTAL_CLASSIFIER_ARCHITECTURE == ARCHITECTURE_VERSION
-    assert CLASSIFIER_ARCHITECTURE_STATUS[ARCHITECTURE_VERSION] == "active-experimental"
+    # v2 completed its matched sealed and scenario evaluation on 2026-09-19 and did not beat the
+    # v3 control, so it is no longer the active experiment; see docs/results/RESULTS.md.
+    assert CLASSIFIER_ARCHITECTURE_STATUS[ARCHITECTURE_VERSION] == "abandoned-negative-result"
+    assert ARCHITECTURE_VERSION in ABANDONED_CLASSIFIER_ARCHITECTURES
+    assert (CLASSIFIER_ARCHITECTURE_STATUS[ACTIVE_EXPERIMENTAL_CLASSIFIER_ARCHITECTURE]
+            == "active-experimental")
 
 
 def _inputs(*, support_bound=None):
