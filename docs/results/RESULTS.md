@@ -28,13 +28,15 @@ always numbered consistently with the tries (`support_classifier_v4` is T4, not 
 | T3 | `support_evidence_aware_v2` | 2026-09-19 | negative: router at 0.97-0.99 semantic reliance |
 | T4 | `support_classifier_v4` | 2026-09-20 | parity with v3; first try whose routing did not collapse |
 | T5 | `support_classifier_v4` with corruption disabled | 2026-09-20 | corruption-free control; routing collapses onto label meaning |
-| T6 | T4 with corruption as a gate-only auxiliary and a label-blind unenrolled calibration term ([design](../journal/2026-09-20-classifier-t6-design.md)) | built, not trained | pending |
+| T6 | T4 with corruption as a gate-only auxiliary and a label-blind unenrolled calibration term ([design](../journal/2026-09-20-classifier-t6-design.md)) | 2026-09-20 | **beats v3 at k>=4**; over-trust pathology closed; not yet promoted |
+| T7 | T6 with the primitive semantic branch ([design](../journal/2026-09-20-primitive-semantic-path-design.md)) | 2026-09-20 | running |
 
-T4, T5 and T6 share the `support_classifier_v4` architecture string and differ by recipe (config
+T4 through T7 share the `support_classifier_v4` architecture string and differ by recipe (config
 flags and curriculum), which the checkpoint records. The differentiable-neighbours arm is a parameter-free **control**, not a try, and keeps its name.
 
 | run | protocol | encoder conditioning | status | numbers |
 |---|---|---|---|---|
+| **T6** gate-only corruption + unenrolled calibration, step 40k, 2026-09-20 | v5 | acquisition-conditioning-v2 | **beats v3 at k>=4; pathology closed** | [below](#t6-corruption-as-a-gate-only-auxiliary-plus-unenrolled-calibration) |
 | **T5** corruption-free control, step 40k, 2026-09-20 | v5 | acquisition-conditioning-v2 | **control: λ collapses without the curriculum** | [below](#the-corruption-free-control-the-curriculum-is-load-bearing) |
 | **T4** evidence-gated blend, step 40k, 2026-09-20 | v5 | acquisition-conditioning-v2 | **completed, parity with v3** | [below](#t4-the-evidence-gated-blend-support_classifier_v4) |
 | **T3** evidence-aware, step 40k, 2026-09-19 | v5 | acquisition-conditioning-v2 | **completed negative result** | [below](#t3-the-evidence-aware-classifier-support_evidence_aware_v2) |
@@ -451,6 +453,104 @@ Figures: [sealed k-curves](../../results/artifacts/promoted-figures/k_curve_evid
 [`halo_evidence_aware_v2_step40k_scenario_branches_v5_20260919`](../../results/artifacts/halo_evidence_aware_v2_step40k_scenario_branches_v5_20260919/),
 [`halo_evidence_aware_v2_step32500_sealed_v5_20260919`](../../results/artifacts/halo_evidence_aware_v2_step32500_sealed_v5_20260919/),
 [`halo_evidence_aware_v2_step32500_scenarios_v5_20260919`](../../results/artifacts/halo_evidence_aware_v2_step32500_scenarios_v5_20260919/).
+
+### T6: corruption as a gate-only auxiliary, plus unenrolled calibration
+
+**What changed from T4.** Same `support_classifier_v4` architecture, two recipe changes.
+*Corruption became an auxiliary instead of a replacement*: every eligible episode now contributes
+its clean loss, which trains everything, **plus** a deranged-roster view computed with
+`gate_only=True` whose gradient reaches exactly the blend gate. No clean episode is displaced, and
+the enrolled candidates' texts are deranged among themselves so every deliberately wrong semantic
+score still has a learnable gate. *A label-blind calibration term* was added for candidates with no
+support of their own: `text_logit + b(coverage, log |roster|)`, identical for every unenrolled
+candidate of an episode. Design and predictions:
+[T6 design](../journal/2026-09-20-classifier-t6-design.md).
+
+**Run.** `halo_t6_40k_20260920`, code `3876dd0`, 45 minutes, `last.pt` at step 40,000 declared
+before any sealed number existed.
+
+**Verdict: T6 matches or beats v3 nearly everywhere and the over-trust pathology is essentially
+closed. It is the first try that improves on the promoted control.**
+
+Sealed, 8 s, dataset-balanced macro F1 (333/333 manifests identical):
+
+| readout | k=0 | k=1 | k=2 | k=4 | k=8 | k=16 | k=32 | k=128 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **T6 classifier** | 50.2 | 62.4 | 66.5 | **70.2** | **72.7** | **74.6** | **75.8** | **76.5** |
+| T4 classifier | 50.2 | 62.1 | 65.5 | 69.0 | 71.0 | 72.9 | 73.9 | 74.3 |
+| v3 classifier (promoted) | **51.7** | 62.4 | 66.3 | 68.7 | 71.5 | 72.7 | 73.4 | 74.4 |
+| T6 own support vote | - | 60.5 | 65.8 | 69.7 | 72.4 | 74.6 | 76.1 | 77.4 |
+| T6 encoder, cosine 1-NN | - | 60.8 | 65.5 | 69.3 | 71.7 | 73.2 | 74.8 | 76.3 |
+| v3 encoder, cosine 1-NN | - | 60.7 | 65.9 | 69.6 | 72.0 | 73.6 | 74.8 | 77.1 |
+
+T6 leads v3 by +1.5 to +2.4 at every k ≥ 4, matches it at k=1-2, and trails by 1.5 at k=0.
+
+Each classifier against **its own** support vote — the pathology this lineage exists to fix:
+
+| arm | k=1 | k=2 | k=4 | k=8 | k=16 | k=32 | k=64 | k=128 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **T6** | +1.9 | +0.7 | +0.5 | +0.3 | +0.1 | -0.3 | -0.4 | **-0.9** |
+| T4 | +2.3 | +1.0 | +0.5 | -0.3 | -0.5 | -1.1 | -1.8 | -1.9 |
+| v3 | +2.3 | +0.2 | -1.5 | -1.8 | -2.1 | -3.6 | -3.5 | -3.6 |
+
+The learned head now adds value through k=16 and costs under a point at the extreme, against v3's
+crossover at k=2 and -3.6 at k=128.
+
+**Three of the four predictions registered before the run held.** The encoder recovered as
+predicted (1-NN 71.7 at 8 s k=8, against T4's 70.4, T5's (corruption-free) 71.1 and v3's
+72.0), confirming that replace-mode corruption was the cause of T4's encoder regression. The k=128
+deficit came in at -0.9 against a predicted "no worse than -1.9". λ stayed ordered by evidence
+(0.41 / 0.33 / 0.22 at k=1 / 2-7 / ≥8) with no candidate at the 0.85 bound, and the collapse
+detector rose from 0.25 to 0.62 and held. **The partial-coverage prediction was wrong** — see below.
+
+**The collapse detector, and why internal validation is worthless here.** T6's internal enrolled
+score is 0.727, *below* T4's 0.778 and well below T5's collapsed 0.787.
+Its corrupted-view accuracy, measured on deliberately deranged rosters, climbed 0.25 → 0.62. The
+panel shares the training vocabulary and rewards trusting label meaning, so it rates the collapsed
+model highest; the corrupted-view probe separates them cleanly and costs nothing.
+
+**Scenarios, 8 s (737/737 manifests identical).** T6 beats v3 on:
+
+| scenario | k | T6 | v3 |
+|---|---:|---:|---:|
+| new domain (MM-Fit) | 0 | **10.5** | 6.6 |
+| new domain (MM-Fit) | 8 | **61.0** | 57.9 |
+| new domain (MM-Fit) | 32 | **63.0** | 60.6 |
+| device set | 0 | **49.9** | 47.6 |
+| device set | 32 | **68.3** | 66.7 |
+| missing modality | 8 | **66.5** | 64.8 |
+| missing modality | 32 | **68.5** | 65.7 |
+| cross dataset | 32 | **82.6** | 82.0 |
+
+MM-Fit at k=0 exceeds its 10.0 chance level for the first time. T6 trails v3 on **cross placement
+at k ≥ 1** (48.9 against 50.5 at k=8) and marginally on rate mismatch at k=8.
+
+**Partial coverage: the calibration term over-corrected.** Accuracy at k=8:
+
+| arm | all | truth enrolled | truth unenrolled | harmonic mean |
+|---|---:|---:|---:|---:|
+| T6 | 60.1 | 62.2 | **57.8** | **59.9** |
+| T4 | **62.3** | **80.8** | 44.5 | 57.4 |
+| v3 | 60.1 | 66.7 | 53.9 | 59.7 |
+
+The prediction was "truth-enrolled near 80 *and* truth-unenrolled above 50". The unenrolled half
+came in best-of-three at 57.8, but the enrolled half fell to 62.2, below even v3's 66.7. The term
+works — it moves the operating point, and its learned bias settled at +1.11 — but cross-entropy
+plus this single scalar lands on a balanced point rather than the asymmetric one we wanted. The
+harmonic mean is the best of the three arms by 0.2, which is not a meaningful margin.
+
+**Not yet promoted.** T6 leads v3 where evidence is plentiful and loses at k=0 and on cross
+placement; both are semantic-path and representation questions rather than routing ones. Promotion
+should wait for the T7 arm (T7: T6 plus the primitive semantic branch), which targets exactly the k=0
+weakness, and for a `trust_scale` sensitivity check, since trust finished pinned at its bound
+(mean |t| 1.85, p95 2.00 against a limit of 2.0).
+
+Artifacts:
+[sealed](../../results/artifacts/halo_t6_step40k_sealed_v5_20260920/),
+[scenarios](../../results/artifacts/halo_t6_step40k_scenarios_v5_20260920/).
+Figures:
+[k-curves](../../results/artifacts/promoted-figures/k_curve_t6_20260920.png),
+[telemetry](../../results/artifacts/promoted-figures/telemetry_t6_20260920.png).
 
 ### T4: the evidence-gated blend (`support_classifier_v4`)
 
