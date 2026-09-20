@@ -842,6 +842,57 @@ def draw_kwargs_from_args(args) -> dict:
         "p_mask_gt": args.p_mask_gt
         if args.classifier in ("residual", "contextual", "evidence_gated") else 0.0,
     }
+def corrupted_view(
+    classifier, *, query, rows, text, episodes, device, probability: float, rng,
+    with_gradient: bool,
+) -> dict[str, torch.Tensor]:
+    """Re-score the same episodes on a deranged roster, gradient reaching only the blend gate.
+
+    Two uses. As the T6 auxiliary objective (``with_gradient=True``) it is the training signal
+    that prices the reliability of meaning, without displacing a single clean episode. As a probe
+    (``with_gradient=False``) it is the cheapest collapse detector we have: a head that has
+    stopped looking at support evidence scores near zero here, while a disciplined one keeps its
+    support accuracy. Internal validation cannot see that difference (it prefers the collapsed
+    model), so this is reported beside it in every validation.
+
+    Only truth-enrolled episodes are eligible, exactly as in replace mode; the clean ``text`` is
+    never modified.
+    """
+    view = {"candidate_text": text["candidate_text"].clone(),
+            "candidate_mask": text["candidate_mask"]}
+    corrupted = corrupt_candidate_text(view, episodes, probability=probability, rng=rng,
+                                       device=device)
+    zero = query.new_zeros(())
+    empty = {"aux/corrupted_view_loss": zero, "corrupted_view_accuracy": None,
+             "corrupted_view_fraction": zero, "corrupted_view_lambda": None}
+    if corrupted is None or not bool(corrupted.any()):
+        return empty
+    context = torch.enable_grad() if with_gradient else torch.no_grad()
+    with context:
+        scored = classifier(
+            query_feature=query, support_feature=rows["support_feature"],
+            support_label_text=text["support_label_text"], support_bound=text["support_bound"],
+            support_mask=rows["support_mask"], support_pair_slot=text["support_pair_slot"],
+            candidate_text=view["candidate_text"], candidate_mask=text["candidate_mask"],
+            candidate_slot=text["candidate_slot"], gate_only=True,
+        )
+    logits = scored["logits"].masked_fill(~text["candidate_mask"], float("-inf"))
+    target = torch.tensor([episode.gt_slot for episode in episodes], dtype=torch.long,
+                          device=device)
+    per_row = F.nll_loss(torch.log_softmax(logits, dim=-1), target, reduction="none")
+    loss = per_row[corrupted].mean()
+    accuracy = logits.argmax(dim=-1).eq(target)[corrupted].float().mean().detach()
+    enrolled = scored["k_c"].gt(0) & text["candidate_mask"]
+    lam = scored["lambda"].detach()
+    return {
+        "aux/corrupted_view_loss": loss if with_gradient else loss.detach(),
+        "corrupted_view_accuracy": accuracy,
+        "corrupted_view_fraction": corrupted.float().mean(),
+        "corrupted_view_lambda": (lam[corrupted].masked_select(enrolled[corrupted]).mean()
+                                  if bool(enrolled[corrupted].any()) else None),
+    }
+
+
 def run_step(
     *,
     episodes: list[Episode],
@@ -855,6 +906,9 @@ def run_step(
     classifier_mode: str,
     text_corruption_probability: float = 0.0,
     text_corruption_rng=None,
+    text_corruption_mode: str = "replace",
+    text_corruption_aux_weight: float = 1.0,
+    corrupted_view_probe: bool = False,
     improvement_objective: ImprovementObjectiveConfig | None = None,
     evidence_objective: EvidenceAwareObjectiveConfig | None = None,
     text_of,
@@ -902,10 +956,14 @@ def run_step(
 
     rows = split_encoded(pooled, acquisition, episodes, corpus)
     text = episode_text(episodes, corpus, text_of, device)
-    text_corrupted = corrupt_candidate_text(
-        text, episodes, probability=text_corruption_probability, rng=text_corruption_rng,
-        device=device,
-    )
+    if text_corruption_mode not in ("replace", "auxiliary"):
+        raise ValueError(f"unknown text corruption mode {text_corruption_mode!r}")
+    text_corrupted = None
+    if text_corruption_mode == "replace":
+        text_corrupted = corrupt_candidate_text(
+            text, episodes, probability=text_corruption_probability, rng=text_corruption_rng,
+            device=device,
+        )
     query = rows["query_feature"].squeeze(1)
     if classifier_mode == "neighbors":
         if any(episode.is_zero_shot for episode in episodes):
@@ -952,6 +1010,15 @@ def run_step(
             # labels; they exist only to price the reliability of the semantic path.
             text_stop_gradient=text_corrupted,
         )
+        wants_auxiliary = (text_corruption_mode == "auxiliary"
+                           and text_corruption_probability > 0 and text_corruption_rng is not None)
+        if wants_auxiliary or corrupted_view_probe:
+            output.update(corrupted_view(
+                classifier, query=query, rows=rows, text=text, episodes=episodes, device=device,
+                probability=text_corruption_probability if wants_auxiliary else 1.0,
+                rng=text_corruption_rng if wants_auxiliary else np.random.default_rng(0),
+                with_gradient=wants_auxiliary,
+            ))
     elif classifier_mode == "contextual":
         if not isinstance(classifier, (ContextualResidualSupportClassifier, EvidenceAwareSupportClassifier)):
             raise ValueError("contextual mode requires an evidence-aware support classifier")
@@ -971,6 +1038,15 @@ def run_step(
         output["logits"], episodes, text,
         counterfactual_grouping=isinstance(classifier, EvidenceAwareSupportClassifier),
     )
+    if text_corruption_mode == "auxiliary" and "aux/corrupted_view_loss" in output \
+            and output["aux/corrupted_view_loss"].requires_grad:
+        # The corrupted view's loss can reach only the blend gate (see ``gate_only``), so this
+        # term prices the reliability of meaning without removing any clean signal from the
+        # representation. Weight 1.0 gives routing as much signal as the clean objective.
+        loss["main_ce"] = loss["loss"].detach()
+        loss["loss"] = loss["loss"] + float(text_corruption_aux_weight) * output["aux/corrupted_view_loss"]
+        # Consumed; what remains in the result is for logging only.
+        output["aux/corrupted_view_loss"] = output["aux/corrupted_view_loss"].detach()
     if classifier_mode == "contextual" and improvement_objective is not None:
         target = torch.tensor(
             [episode.gt_slot for episode in episodes], dtype=torch.long, device=device,
@@ -1243,6 +1319,14 @@ def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, flo
                 np.mean([row[augmentation] for row in support_perturbation_fractions])
             )
     if "trust_features" in result:
+        if result.get("corrupted_view_accuracy") is not None:
+            # The collapse detector. Read it beside the enrolled score in every validation.
+            metrics["curriculum/corrupted_view_accuracy"] = float(result["corrupted_view_accuracy"])
+            metrics["curriculum/corrupted_view_fraction"] = float(result["corrupted_view_fraction"])
+            if result.get("corrupted_view_lambda") is not None:
+                metrics["classifier/lambda_corrupted_view_mean"] = float(result["corrupted_view_lambda"])
+        if "unenrolled_bias" in result and result["unenrolled_bias"].numel():
+            metrics["classifier/unenrolled_bias_mean"] = float(result["unenrolled_bias"].detach().mean())
         corrupted = result.get("text_corrupted")
         if corrupted is None:
             corrupted = torch.zeros_like(target, dtype=torch.bool)
@@ -1637,6 +1721,8 @@ def validate(
                 episodes=group, corpus=corpus, dataset=dataset, collate=collate,
                 encoder=encoder, classifier=classifier, classifier_mode=classifier_mode,
                 text_of=text_of, device=device, executor=executor,
+                # The collapse detector, reported beside every validation score.
+                corrupted_view_probe=isinstance(classifier, EvidenceGatedSupportClassifier),
             )
         rows.append(prediction_telemetry(result, group))
         losses.append(float(result["loss"]))
@@ -1868,6 +1954,17 @@ def main() -> None:
     )
     parser.add_argument("--primitive-projection-rank", type=int, default=384)
     parser.add_argument(
+        "--text-corruption-mode", choices=("replace", "auxiliary"), default="replace",
+        help="replace (T4): a corrupted episode displaces a clean one, semantic branch "
+             "stop-gradiented. auxiliary (T6): every clean episode also contributes a "
+             "corrupted-roster loss whose gradient reaches only the blend gate",
+    )
+    parser.add_argument("--text-corruption-aux-weight", type=float, default=1.0,
+                        help="weight of the auxiliary corrupted-view loss (auxiliary mode only)")
+    parser.add_argument("--unenrolled-calibration", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="T6: label-blind calibration term for candidates without support")
+    parser.add_argument(
         "--text-corruption-probability", type=float, default=None,
         help="v4-only share of enrolled episodes whose candidate label text is deranged, which is "
              "what prices the reliability of the semantic path (default: 0.25 for "
@@ -2021,7 +2118,18 @@ def main() -> None:
     if "--counterfactual-enrollment-probability" not in sys.argv:
         args.counterfactual_enrollment_probability = 0.25 if args.classifier == "contextual" else 0.0
     if args.text_corruption_probability is None:
-        args.text_corruption_probability = 0.25 if args.classifier == "evidence_gated" else 0.0
+        if args.classifier != "evidence_gated":
+            args.text_corruption_probability = 0.0
+        else:
+            # replace mode displaces episodes, so it is rationed; auxiliary mode displaces
+            # nothing, so every eligible episode contributes its corrupted view.
+            args.text_corruption_probability = 1.0 if args.text_corruption_mode == "auxiliary" else 0.25
+    if args.text_corruption_aux_weight < 0:
+        parser.error("--text-corruption-aux-weight must be non-negative")
+    if args.classifier != "evidence_gated" and (args.text_corruption_mode != "replace"
+                                                or args.unenrolled_calibration):
+        parser.error("--text-corruption-mode auxiliary and --unenrolled-calibration are defined "
+                     "only for --classifier evidence_gated")
     if not 0.0 <= args.text_corruption_probability <= 1.0:
         parser.error("--text-corruption-probability must be in [0, 1]")
     if args.classifier != "evidence_gated" and args.semantic_mode != "text":
@@ -2218,7 +2326,10 @@ def main() -> None:
             "text_corruption_probability",
             saved_args.get("text_corruption_probability", 0.0),
         )
-        for name, default in (("semantic_mode", "text"),
+        for name, default in (("text_corruption_mode", "replace"),
+                              ("text_corruption_aux_weight", 1.0),
+                              ("unenrolled_calibration", False),
+                              ("semantic_mode", "text"),
                               ("primitive_vocabulary", PRIMITIVE_VOCABULARY_VERSION),
                               ("primitive_combiner", "projection"),
                               ("primitive_projection_rank", 384)):
@@ -2246,6 +2357,9 @@ def main() -> None:
             "variable_support_probability": "--variable-support-probability",
             "counterfactual_enrollment_probability": "--counterfactual-enrollment-probability",
             "text_corruption_probability": "--text-corruption-probability",
+            "text_corruption_mode": "--text-corruption-mode",
+            "text_corruption_aux_weight": "--text-corruption-aux-weight",
+            "unenrolled_calibration": ("--unenrolled-calibration", "--no-unenrolled-calibration"),
             "semantic_mode": "--semantic-mode",
             "primitive_vocabulary": "--primitive-vocabulary",
             "primitive_combiner": "--primitive-combiner",
@@ -2592,6 +2706,7 @@ def main() -> None:
                 spec, EvidenceGatedClassifierConfig(
                     centring=args.centring, text_temperature=args.text_temperature,
                     trust_enabled=not args.no_residual, text_term_enabled=not args.no_text_term,
+                    unenrolled_calibration=bool(args.unenrolled_calibration),
                     semantic_mode=args.semantic_mode,
                     primitive_version=args.primitive_vocabulary,
                     primitive_combiner=args.primitive_combiner,
@@ -2726,6 +2841,9 @@ def main() -> None:
             "neutral_acquisition_text": args.neutral_acquisition_text,
             "classifier": args.classifier,
             "text_corruption_probability": float(args.text_corruption_probability),
+            "text_corruption_mode": args.text_corruption_mode,
+            "text_corruption_aux_weight": float(args.text_corruption_aux_weight),
+            "unenrolled_calibration": bool(args.unenrolled_calibration),
             "semantic_mode": args.semantic_mode,
             "primitive_vocabulary": args.primitive_vocabulary,
             "primitive_combiner": args.primitive_combiner,
@@ -3108,6 +3226,8 @@ def main() -> None:
                 improvement_objective=improvement_objective,
                 evidence_objective=evidence_objective,
                 text_corruption_probability=args.text_corruption_probability,
+                text_corruption_mode=args.text_corruption_mode,
+                text_corruption_aux_weight=args.text_corruption_aux_weight,
                 # A separate stream from the episode draw, so enabling corruption cannot shift
                 # which episodes a seed produces.
                 text_corruption_rng=episode_rng(args.data_seed, step * 7_777_777 + 3),

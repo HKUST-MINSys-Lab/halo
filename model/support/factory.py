@@ -57,8 +57,9 @@ CLASSIFIER_ARCHITECTURE_STATUS = {
 # Human-facing names, adopted 2026-09-20. `v3` is the promoted classifier; every experimental
 # replacement is T-numbered in the order it was trained ("T" for try). The architecture strings are
 # NOT numbered consistently with the tries -- `support_classifier_v4` is T4, not a successor to
-# `support_classifier_v3` -- which is why this mapping is explicit. See
-# docs/results/RESULTS.md, "Classifier naming".
+# `support_classifier_v3` -- which is why this mapping is explicit. Tries T4, T5 and T6 all share
+# the v4 architecture string and differ by recipe (config flags and curriculum); this maps an
+# architecture to its BASE try. See docs/results/RESULTS.md, "Classifier naming".
 CLASSIFIER_TRY_NAME = {
     "support_classifier_v3": "v3",
     "support_contextual_mixture_v1": "T1",

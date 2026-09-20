@@ -70,6 +70,7 @@ entries preserve what was believed at the time; current behavior is defined only
 | 2026-09-19 | [2026-09-19-evidence-aware-v2-readiness-fixes.md](2026-09-19-evidence-aware-v2-readiness-fixes.md) | Evidence-aware v2 readiness fixes |
 | 2026-09-19 | [2026-09-19-evidence-aware-v2-second-review-fixes.md](2026-09-19-evidence-aware-v2-second-review-fixes.md) | Evidence-aware v2 second-review fixes |
 | 2026-09-19 | [2026-09-19-new-classifier-design-handoff.md](2026-09-19-new-classifier-design-handoff.md) | New classifier design: implementation handoff |
+| 2026-09-20 | [2026-09-20-classifier-t6-design.md](2026-09-20-classifier-t6-design.md) | T6: what T4 and the corruption-free control taught, put into one design |
 | 2026-09-20 | [2026-09-20-classifier-v4-evidence-gated-design.md](2026-09-20-classifier-v4-evidence-gated-design.md) | Classifier v4: evidence-gated blend on the promoted residual head (agreed design) |
 | 2026-09-20 | [2026-09-20-classifier-v4-implementation.md](2026-09-20-classifier-v4-implementation.md) | Classifier v4 implementation notes, and four deviations from the design entry |
 | 2026-09-20 | [2026-09-20-primitive-semantic-path-design.md](2026-09-20-primitive-semantic-path-design.md) | Primitive-driven semantic alignment: design, label-side audit, and implementation |

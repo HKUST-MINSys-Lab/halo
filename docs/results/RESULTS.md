@@ -28,8 +28,10 @@ always numbered consistently with the tries (`support_classifier_v4` is T4, not 
 | T3 | `support_evidence_aware_v2` | 2026-09-19 | negative: router at 0.97-0.99 semantic reliance |
 | T4 | `support_classifier_v4` | 2026-09-20 | parity with v3; first try whose routing did not collapse |
 | T5 | T4 with the primitive semantic path | built, not trained | pending |
+| T6 | T4 with corruption as a gate-only auxiliary and a label-blind unenrolled calibration term ([design](../journal/2026-09-20-classifier-t6-design.md)) | built, not trained | pending |
 
-The differentiable-neighbours arm is a parameter-free **control**, not a try, and keeps its name.
+T4, T5 and T6 share the `support_classifier_v4` architecture string and differ by recipe (config
+flags and curriculum), which the checkpoint records. The differentiable-neighbours arm is a parameter-free **control**, not a try, and keeps its name.
 
 | run | protocol | encoder conditioning | status | numbers |
 |---|---|---|---|---|

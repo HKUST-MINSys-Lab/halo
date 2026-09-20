@@ -42,9 +42,10 @@ from training.support_classifier.neighbors import differentiable_neighbor_logits
 
 ARCHITECTURE_VERSION = "support_classifier_v4"
 
-# Feature widths are part of the checkpoint contract; changing either requires a new version.
+# Feature widths are part of the checkpoint contract; changing any requires a new version.
 N_TRUST_FEATURES = 11
 N_GATE_FEATURES = 13
+N_UNENROLLED_FEATURES = 2   # roster coverage, log roster size
 
 # Every statistic is bounded and computed in fp32, but a padded row can still carry an arbitrary
 # encoder value, so masked entries are *replaced* rather than merely multiplied by zero.
@@ -76,6 +77,13 @@ class EvidenceGatedClassifierConfig:
     gate_hidden: int = 32
     trust_enabled: bool = True
     text_term_enabled: bool = True
+    # T6: a label-blind calibration term added to candidates that have no support of their own.
+    # It reads only the roster's coverage (fraction of candidates with support) and size, so it
+    # can rebalance the enrolled and unenrolled populations against each other -- the one degree
+    # of freedom partial coverage needs -- without reopening the identity channel that v3's
+    # ``r_candidate`` was. Off by default: T4 checkpoints are unchanged.
+    unenrolled_calibration: bool = False
+    unenrolled_hidden: int = 16
     # Which semantic path feeds the blend. "text" is the promoted cosine path and the default;
     # "primitives" is the compositional path; "text+primitives" combines the two by a FIXED
     # equal-weight sum in log space, never a learned router.
@@ -102,7 +110,7 @@ class EvidenceGatedClassifierConfig:
             raise ValueError("lambda_max must be in (0, 1) so the support path is never deleted")
         if self.trust_scale <= 0:
             raise ValueError("trust_scale must be positive")
-        if self.trust_hidden < 1 or self.gate_hidden < 1:
+        if self.trust_hidden < 1 or self.gate_hidden < 1 or self.unenrolled_hidden < 1:
             raise ValueError("gate hidden widths must be positive")
 
 
@@ -150,6 +158,15 @@ class EvidenceGatedSupportClassifier(nn.Module):
             [_logit(min(value / self.cfg.lambda_max, 1.0 - 1e-4)) for value in prior],
             dtype=torch.float32,
         ))
+        self.unenrolled_norm = self.unenrolled_mlp = None
+        if self.cfg.unenrolled_calibration:
+            self.unenrolled_norm = nn.LayerNorm(N_UNENROLLED_FEATURES)
+            self.unenrolled_mlp = nn.Sequential(
+                nn.Linear(N_UNENROLLED_FEATURES, self.cfg.unenrolled_hidden), nn.GELU(),
+                nn.Linear(self.cfg.unenrolled_hidden, 1),
+            )
+            nn.init.normal_(self.unenrolled_mlp[-1].weight, std=1e-3)
+            nn.init.zeros_(self.unenrolled_mlp[-1].bias)
         self.primitive_head = None
         if self.cfg.semantic_mode != "text":
             self.primitive_head = PrimitiveSemanticHead(d, PrimitiveSemanticConfig(
@@ -345,7 +362,7 @@ class EvidenceGatedSupportClassifier(nn.Module):
         candidate_text: torch.Tensor, candidate_mask: torch.Tensor,
         candidate_slot: torch.Tensor, corpus_mean: torch.Tensor | None = None,
         lambda_override: float | None = None, trust_override: float | None = None,
-        text_stop_gradient: torch.Tensor | None = None,
+        text_stop_gradient: torch.Tensor | None = None, gate_only: bool = False,
     ) -> dict[str, torch.Tensor]:
         """``support_label_text``, ``support_pair_slot`` and ``candidate_slot`` are accepted for
         one shared trainer/evaluator call signature and are deliberately unused: no label-derived
@@ -353,17 +370,27 @@ class EvidenceGatedSupportClassifier(nn.Module):
 
         ``lambda_override`` / ``trust_override`` force a constant for ablation readouts only.
         ``text_stop_gradient`` is a (B,) boolean marking rows whose semantic path must not send
-        gradient into ``p_text`` or the encoder: the label-text corruption curriculum uses it so
-        that a scrambled roster prices the reliability of the semantic path without also training
-        the alignment to fit the scrambled labels.
+        gradient into ``p_text`` or the encoder: the replace-mode label-text corruption curriculum
+        uses it so that a scrambled roster prices the reliability of the semantic path without
+        also training the alignment to fit the scrambled labels.
+
+        ``gate_only`` is the auxiliary-mode corruption contract (T6): the whole forward runs on
+        detached encoder features, trust, semantic branch and calibration, so the loss on this
+        view can reach exactly one thing -- the blend gate (``gate_mlp`` and ``lambda_prior``).
+        Representation trains on clean data; routing trains on the distribution where meaning is
+        unreliable. Those are two jobs, and this keeps them from sharing one loss.
         """
         with torch.autocast(device_type=query_feature.device.type, enabled=False):
+            query_feature, support_feature = query_feature.float(), support_feature.float()
+            if gate_only:
+                query_feature, support_feature = query_feature.detach(), support_feature.detach()
             return self._forward(
-                query_feature=query_feature.float(), support_feature=support_feature.float(),
+                query_feature=query_feature, support_feature=support_feature,
                 support_bound=support_bound, support_mask=support_mask,
                 candidate_text=candidate_text.float(), candidate_mask=candidate_mask,
                 corpus_mean=corpus_mean, lambda_override=lambda_override,
                 trust_override=trust_override, text_stop_gradient=text_stop_gradient,
+                gate_only=gate_only,
             )
 
     def _forward(
@@ -372,6 +399,7 @@ class EvidenceGatedSupportClassifier(nn.Module):
         candidate_text: torch.Tensor, candidate_mask: torch.Tensor,
         corpus_mean: torch.Tensor | None, lambda_override: float | None,
         trust_override: float | None, text_stop_gradient: torch.Tensor | None,
+        gate_only: bool = False,
     ) -> dict[str, torch.Tensor]:
         self._check(query_feature, support_feature, candidate_text, support_bound,
                     support_mask, candidate_mask)
@@ -439,6 +467,8 @@ class EvidenceGatedSupportClassifier(nn.Module):
                     support_mask, torch.full_like(trust, float(trust_override)),
                     torch.zeros_like(trust),
                 )
+            if gate_only:
+                trust = trust.detach()
 
         # 3b. the reweighted vote, as an exact residual on the closed-form floor.  At trust == 0
         # the correction is identically zero, and the floor keeps its own gradient path.
@@ -493,6 +523,8 @@ class EvidenceGatedSupportClassifier(nn.Module):
                 (text_logits + primitive_logits).masked_fill(~candidate_mask, float("-inf")),
                 dim=-1,
             )
+        if gate_only:
+            semantic_logits = semantic_logits.detach()
         if text_stop_gradient is not None:
             if text_stop_gradient.shape != (b,):
                 raise ValueError("text_stop_gradient must be one boolean per episode")
@@ -533,10 +565,29 @@ class EvidenceGatedSupportClassifier(nn.Module):
         lam = lam.masked_fill(~candidate_mask, 0.0)
 
         logits = (1.0 - lam) * metric_part + lam * semantic_logits
+        unenrolled_bias = logits.new_zeros((b, 1))
+        if self.unenrolled_mlp is not None:
+            roster = candidate_mask.sum(dim=1, keepdim=True).to(logits.dtype)
+            coverage = (k_c.gt(0) & candidate_mask).sum(dim=1, keepdim=True).to(logits.dtype) \
+                / roster.clamp_min(1.0)
+            unenrolled_bias = self.unenrolled_mlp(self.unenrolled_norm(
+                torch.cat((coverage, roster.log()), dim=-1),
+            ))
+            if gate_only:
+                # A corrupted view has an enrolled truth by construction, so it would teach the
+                # calibration the wrong lesson about rosters whose truth is unenrolled.
+                unenrolled_bias = unenrolled_bias.detach()
+            # Only candidates without support of their own; a fully unenrolled roster receives a
+            # constant shift, which cancels in the softmax.
+            logits = logits + torch.where(
+                k_c.eq(0) & candidate_mask, unenrolled_bias.expand_as(logits),
+                torch.zeros_like(logits),
+            )
         return {
             "logits": logits.masked_fill(~candidate_mask, -1e30),
             "support_weight": weight, "k_c": k_c,
             "trust": trust, "lambda": lam, "mean_trust": mean_trust,
+            "unenrolled_bias": unenrolled_bias.squeeze(-1),
             "neighbor_logits": base_logits, "metric_logits": metric_logits,
             "metric_part": metric_part, "text_logits": text_logits,
             "semantic_logits": semantic_logits,

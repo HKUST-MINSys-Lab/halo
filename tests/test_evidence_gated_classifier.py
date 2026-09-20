@@ -521,3 +521,87 @@ def test_every_lifecycle_architecture_has_a_try_name():
     # The retired token mixer predates the scheme and is deliberately unnamed.
     assert missing == {"support_token_mixer_v1", "support_classifier_v2"}, missing
     assert len(set(CLASSIFIER_TRY_NAME.values())) == len(CLASSIFIER_TRY_NAME), "duplicate try name"
+
+
+# --------------------------------------------------------------------- T6: calibration and gate-only view
+def test_unenrolled_calibration_is_off_by_default_and_label_blind():
+    """Off by default (T4 checkpoints unchanged); on, it shifts only unenrolled candidates, by an
+    amount that depends on roster coverage and size alone -- never on which label."""
+    spec = AttentionSpec(d_model=D_MODEL, n_heads=4, ffn_mult=2, dropout=0.0)
+    off = EvidenceGatedSupportClassifier(spec, EvidenceGatedClassifierConfig(text_dim=TEXT_DIM)).eval()
+    assert off.unenrolled_mlp is None
+    on = EvidenceGatedSupportClassifier(spec, EvidenceGatedClassifierConfig(
+        text_dim=TEXT_DIM, unenrolled_calibration=True)).eval()
+    on.load_state_dict({**on.state_dict(), **off.state_dict()}, strict=True)
+    with torch.no_grad():
+        on.unenrolled_mlp[-1].weight.normal_(std=1.0); on.unenrolled_mlp[-1].bias.fill_(0.7)
+    batch = make_episode(seed=21)
+    a, b = off(**batch), on(**batch)
+    valid = batch["candidate_mask"]; enrolled = a["k_c"].gt(0) & valid; unenrolled = a["k_c"].eq(0) & valid
+    assert bool(unenrolled.any()) and bool(enrolled.any())
+    torch.testing.assert_close(a["logits"][enrolled], b["logits"][enrolled])
+    shift = (b["logits"] - a["logits"])
+    assert float(shift[unenrolled].abs().min()) > 1e-4
+    # The same shift for every unenrolled candidate of an episode: it cannot prefer one label.
+    for row in range(valid.shape[0]):
+        row_shift = shift[row][unenrolled[row]]
+        if row_shift.numel() > 1:
+            assert float((row_shift - row_shift[0]).abs().max()) < 1e-6
+    # And identical under a relabelled roster with the same coverage.
+    scrambled = dict(batch)
+    scrambled["candidate_text"] = torch.roll(batch["candidate_text"], 1, dims=1) * valid.unsqueeze(-1)
+    torch.testing.assert_close(on(**scrambled)["unenrolled_bias"], b["unenrolled_bias"])
+
+
+def test_gate_only_view_reaches_exactly_the_blend_gate():
+    """T6's auxiliary contract: the corrupted view's loss may train lambda and nothing else."""
+    spec = AttentionSpec(d_model=D_MODEL, n_heads=4, ffn_mult=2, dropout=0.0)
+    head = EvidenceGatedSupportClassifier(spec, EvidenceGatedClassifierConfig(
+        text_dim=TEXT_DIM, unenrolled_calibration=True, semantic_mode="text+primitives"))
+    with torch.no_grad():
+        head.primitive_head.values.copy_(F.normalize(torch.randn_like(head.primitive_head.values), dim=-1))
+    batch = make_episode(seed=22)
+    batch["query_feature"] = batch["query_feature"].requires_grad_(True)
+    batch["support_feature"] = batch["support_feature"].requires_grad_(True)
+    out = head(**batch, gate_only=True)
+    valid = batch["candidate_mask"]
+    loss = F.cross_entropy(out["logits"].masked_fill(~valid, -1e30), torch.tensor([0, 1, 0]))
+    loss.backward()
+    live = {name for name, p in head.named_parameters() if p.grad is not None and float(p.grad.abs().sum()) > 0}
+    assert live, "the gate received no gradient at all"
+    assert all(name.startswith(("gate_mlp", "gate_norm", "lambda_prior")) for name in live), sorted(live)
+    assert any(name.startswith("gate_mlp") for name in live)
+    for tensor in (batch["query_feature"], batch["support_feature"]):
+        assert tensor.grad is None or float(tensor.grad.abs().sum()) == 0.0, "encoder features were trained"
+
+
+def test_corrupted_view_helper_leaves_clean_text_untouched():
+    import numpy as np
+
+    from training.support_classifier.train import corrupted_view
+
+    spec = AttentionSpec(d_model=D_MODEL, n_heads=4, ffn_mult=2, dropout=0.0)
+    head = EvidenceGatedSupportClassifier(spec, EvidenceGatedClassifierConfig(text_dim=TEXT_DIM))
+    batch = make_episode(seed=23, b=4, c=4)
+    original = batch["candidate_text"].clone()
+    k_c = head(**batch)["k_c"]
+    episodes = [_StubEpisode(zero_shot=False, gt_slot=int(k_c[i].argmax()),
+                             support_counts=tuple(int(x) for x in k_c[i][batch["candidate_mask"][i]]))
+                for i in range(4)]
+    text = {key: batch[key] for key in ("candidate_text", "candidate_mask", "support_label_text",
+                                        "support_bound", "support_pair_slot", "candidate_slot")}
+    rows = {"support_feature": batch["support_feature"], "support_mask": batch["support_mask"]}
+    probe = corrupted_view(head, query=batch["query_feature"], rows=rows, text=text,
+                           episodes=episodes, device="cpu", probability=1.0,
+                           rng=np.random.default_rng(0), with_gradient=False)
+    assert torch.equal(text["candidate_text"], original), "the clean roster was modified"
+    assert probe["corrupted_view_accuracy"] is not None
+    assert not probe["aux/corrupted_view_loss"].requires_grad
+    assert 0.0 <= float(probe["corrupted_view_accuracy"]) <= 1.0
+    trained = corrupted_view(head, query=batch["query_feature"], rows=rows, text=text,
+                             episodes=episodes, device="cpu", probability=1.0,
+                             rng=np.random.default_rng(0), with_gradient=True)
+    assert trained["aux/corrupted_view_loss"].requires_grad
+    assert corrupted_view(head, query=batch["query_feature"], rows=rows, text=text,
+                          episodes=episodes, device="cpu", probability=0.0,
+                          rng=np.random.default_rng(0), with_gradient=True)["corrupted_view_accuracy"] is None
