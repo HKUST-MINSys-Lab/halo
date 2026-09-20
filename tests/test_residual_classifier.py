@@ -137,6 +137,16 @@ def test_validation_telemetry_keeps_conditional_gate_metrics_with_explicit_fract
     assert got["scenario/support_count/0/semantic_weight"] == pytest.approx(0.5)
 
 
+def test_validation_telemetry_weights_corrupted_view_by_corrupted_rows():
+    got = weighted_present_metrics([
+        {"curriculum/corrupted_view_fraction": 0.1,
+         "curriculum/corrupted_view_accuracy": 0.0},
+        {"curriculum/corrupted_view_fraction": 0.9,
+         "curriculum/corrupted_view_accuracy": 1.0},
+    ], [10, 10])
+    assert got["curriculum/corrupted_view_accuracy"] == pytest.approx(0.9)
+
+
 def test_prediction_telemetry_reports_neighbor_rescues_and_overturns():
     episodes = [
         Episode(

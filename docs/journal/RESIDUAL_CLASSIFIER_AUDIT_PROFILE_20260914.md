@@ -217,7 +217,7 @@ Recheck the short profile after correctness fixes before launching.
 
 ## Reproducibility
 
-Harness: `training/support_classifier/profile.py` (now explicitly exercises the residual head).
+Harness: `training/support_classifier/training_profile.py` (now explicitly exercises the residual head).
 Artifacts: `training/support_classifier/evaluations/residual_audit_20260914/`:
 
 - `workers.json`: complete timings, shapes, episode hashes and clipped module gradient norms.
@@ -229,8 +229,8 @@ Artifacts: `training/support_classifier/evaluations/residual_audit_20260914/`:
 From the `halo/` directory, using `/home/alex/code/HALO/legacy_code/.venv/bin/python`:
 
 ```bash
-python -m training.support_classifier.profile --workers 2 4 8 --steps 96 --warmup 16 --out /tmp/residual-workers.json
-python -m training.support_classifier.profile --workers 8 --steps 12 --warmup 4 --validation-support-sets 64 --out /tmp/residual-validation.json
+python -m training.support_classifier.training_profile --workers 2 4 8 --steps 96 --warmup 16 --out /tmp/residual-workers.json
+python -m training.support_classifier.training_profile --workers 8 --steps 12 --warmup 4 --validation-support-sets 64 --out /tmp/residual-validation.json
 python training/support_classifier/evaluations/residual_audit_20260914/probes.py
 python -m pytest -q tests/test_residual_classifier.py tests/test_support_classifier_sampling.py tests/test_support_classifier_loader.py tests/test_sealed_eval.py
 ```

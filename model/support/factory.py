@@ -69,12 +69,35 @@ CLASSIFIER_TRY_NAME = {
 }
 
 
-def classifier_try_name(architecture: str) -> str:
-    """The name to use in discussion and documents for a persisted architecture."""
+def classifier_architecture_base_try_name(architecture: str) -> str:
+    """Human-facing base name for an architecture, not a particular training recipe."""
     try:
         return CLASSIFIER_TRY_NAME[architecture]
     except KeyError as exc:
         raise ValueError(f"no try name registered for {architecture!r}") from exc
+
+
+def classifier_try_name(architecture: str, *, trajectory: dict | None = None) -> str:
+    """Return a recipe-aware experimental name for a persisted classifier run.
+
+    ``support_classifier_v4`` is shared by T4, T5, and T6. Its architecture string alone is
+    therefore intentionally insufficient: callers must supply the saved trajectory to avoid
+    silently labelling one recipe as another.
+    """
+    if architecture != EVIDENCE_GATED_ARCHITECTURE:
+        return classifier_architecture_base_try_name(architecture)
+    if trajectory is None:
+        raise ValueError("support_classifier_v4 requires its saved trajectory for a T-number")
+    mode = trajectory.get("text_corruption_mode", "replace")
+    probability = float(trajectory.get("text_corruption_probability", 0.0))
+    calibrated = bool(trajectory.get("unenrolled_calibration", False))
+    if mode == "auxiliary" and calibrated:
+        return "T6"
+    if probability == 0.0:
+        return "T5"
+    if mode == "replace" and not calibrated:
+        return "T4"
+    raise ValueError(f"unrecognized support_classifier_v4 recipe: {trajectory!r}")
 
 
 PROMOTED_CLASSIFIER_ARCHITECTURE = "support_classifier_v3"

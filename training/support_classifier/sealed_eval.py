@@ -11,6 +11,9 @@ import argparse
 import hashlib
 import json
 import os
+import platform
+import subprocess
+import sys
 import time
 import weakref
 from collections import OrderedDict
@@ -1636,6 +1639,37 @@ def _atomic_json(path: Path, value: object) -> None:
     os.replace(temporary, path)
 
 
+def _run_provenance(argv: list[str], *, device: torch.device, halo_checkpoint: Path | None) -> dict:
+    """Persist the evaluator revision and model identity beside every sealed result."""
+    try:
+        revision = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+        status = subprocess.check_output(
+            ["git", "status", "--porcelain=v1"], text=True, stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        revision, status = None, None
+    checkpoint = halo_checkpoint.resolve() if halo_checkpoint is not None else None
+    return {
+        "protocol": "sealed-support-conditioned-v3-20260920",
+        "argv": argv,
+        "git_revision": revision,
+        "dirty_worktree": bool(status) if status is not None else None,
+        "python": platform.python_version(),
+        "numpy": np.__version__,
+        "torch": torch.__version__,
+        "device": str(device),
+        "halo_checkpoint": str(checkpoint) if checkpoint else None,
+        "halo_checkpoint_sha256": _file_hash(checkpoint) if checkpoint else None,
+        "baseline_adapters": {
+            name: type(baselines.REGISTRY[name]).__qualname__
+            for name in sorted(baselines.REGISTRY)
+        },
+        "feature_cache_schema": FEATURE_CACHE_SCHEMA,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
@@ -2303,6 +2337,9 @@ def main() -> None:
         "n_cells": len(requested_cells),
         "complete": True,
     })
+    _atomic_json(args.out / "run_provenance.json", _run_provenance(
+        list(sys.argv), device=device, halo_checkpoint=args.halo_checkpoint,
+    ))
     (args.out / "episode_manifests.json").write_text(json.dumps(manifests, indent=2) + "\n")
     (args.out / "results.json").write_text(json.dumps(all_rows, indent=2, allow_nan=True) + "\n")
     _write_markdown(all_rows, args.out / "RESULTS.md")

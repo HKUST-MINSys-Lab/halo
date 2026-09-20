@@ -163,8 +163,9 @@ def scenario_value(rows, model, readout, scenario, k, cells, split="all"):
 
 def best_baseline(base, scenario, k, cells):
     best = None
-    readouts = ("1nn",) if k > 0 else ("equal-weight-normalized-fusion", "native_zero_support",
-                                       "training-bank-1nn-conse")
+    # The scenario headline uses the preregistered common deployable readout.  Native and 1-NN
+    # rows remain in the artifacts as explicitly labelled diagnostic companions.
+    readouts = ("equal-weight-normalized-fusion",)
     for model, name in BASELINES.items():
         for readout in readouts:
             v, _ = scenario_value(base, model, readout, scenario, k, cells)
@@ -201,17 +202,18 @@ def scenario_tables(arms, base, lines):
                                   for r in ("halo-classifier", "1nn")] + ["best baseline"]
     lines.append("| " + " | ".join(header) + " |")
     lines.append("|---" * len(header) + "|")
-    cells = arms[0][2] if arms else None
+    shared_cells = (set.intersection(*(set(arm_cells) for _, _, arm_cells in arms))
+                    if arms else None)
     for scenario, sname in SCENARIOS.items():
         for k in SCEN_KS:
             vals = []
             for label, rows, arm_cells in arms:
                 for readout in ("halo-classifier", "1nn"):
-                    v, n = scenario_value(rows, "halo", readout, scenario, k, None)
+                    v, n = scenario_value(rows, "halo", readout, scenario, k, arm_cells)
                     vals.append("-" if v is None else f"{v:.1f}")
             if all(v == "-" for v in vals):
                 continue
-            b = best_baseline(base, scenario, k, None)
+            b = best_baseline(base, scenario, k, shared_cells)
             vals.append("-" if b is None else f"{b[0]:.1f} {b[1]}")
             lines.append(f"| {sname} | {k} | " + " | ".join(vals) + " |")
     lines.append("\n### Partial coverage by truth split, 8 s, macro F1 (k=8)\n")
@@ -219,7 +221,7 @@ def scenario_tables(arms, base, lines):
     lines.append("|---|---:|---:|---:|")
     for label, rows, arm_cells in arms:
         for readout in halo_readouts(rows):
-            vals = [scenario_value(rows, "halo", readout, "s1_partial_coverage", 8, None, s)[0]
+            vals = [scenario_value(rows, "halo", readout, "s1_partial_coverage", 8, arm_cells, s)[0]
                     for s in ("all", "truth_enrolled", "truth_unenrolled")]
             if any(v is not None for v in vals):
                 lines.append(f"| {label} / {readout} | " + " | ".join(

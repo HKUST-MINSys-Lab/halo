@@ -25,20 +25,24 @@ Date: 2026-09-20. Status: **built, smoke-tested, not trained.** T6 is a recipe o
 
 ## The two changes
 
-**Corruption as a gate-only auxiliary, not a data replacement.** Every truth-enrolled episode
-contributes its clean loss, which trains everything, plus a second loss on the same episode with a
-deranged roster, computed with `gate_only=True`: encoder features, trust, the semantic branch and
+**Corruption as a gate-only auxiliary, not a data replacement.** Every eligible episode contributes
+its clean loss, which trains everything, plus a second loss on the same episode with the texts of
+enrolled candidates deranged among themselves. Unenrolled candidate text remains intact, so every
+corrupted semantic score has a learnable gate and the partial-enrollment episode stays answerable.
+The second view is computed with `gate_only=True`: encoder features, trust, the semantic branch and
 the calibration term are all detached, so that loss can reach exactly the blend gate (`gate_mlp`,
-`lambda_prior`). Asserted by `test_gate_only_view_reaches_exactly_the_blend_gate`.
+`lambda_prior`). Its per-row CE is first averaged by support set and receives the same regime weight
+as clean few-shot CE. Asserted by `test_gate_only_view_reaches_exactly_the_blend_gate`.
 
 Three consequences. The representation loses nothing, which should recover the curriculum's half
-of the encoder gap. Corruption runs on 100% of eligible episodes rather than 25%, so routing gets
-four times the signal. And the design principle becomes literal: *representation trains on clean
-data; routing trains on the distribution where meaning is unreliable.* Those were always two jobs,
-and T4 paid for doing them with one loss.
+of the encoder gap. Corruption produces four times as many corrupted views per eligible episode as
+the prior 25% replacement recipe, before support-set and regime balancing. And the design principle
+becomes literal: *representation trains on clean data; routing trains on the distribution where
+meaning is unreliable.* Those were always two jobs, and T4 paid for doing them with one loss.
 
 **A label-blind calibration term for unenrolled candidates.** A candidate with no support of its
-own receives `text_logit + b(coverage, log |roster|)`, where `b` is a 69-parameter MLP. It cannot
+own receives `text_logit + b(coverage, log |roster|)`, where `b` is a 69-parameter MLP applied
+directly to those two scalar features. It cannot
 see which label it is; it can only learn how much to favour "the answer is something nobody
 enrolled" as a function of how much of the roster is enrolled. It is identical for every unenrolled
 candidate of an episode (so it cannot prefer a label), trains on clean views only (a corrupted view
@@ -51,10 +55,12 @@ weight between semantic halves.
 
 ## The collapse detector
 
-`corrupted_view` doubles as a probe: accuracy on a deranged roster at k ≥ 1, reported as
+`corrupted_view` doubles as a probe: accuracy on an enrolled-text derangement at k ≥ 1, reported as
 `curriculum/corrupted_view_accuracy` in every training log step and, with a fixed derangement,
-in every validation. A head that has stopped looking at support evidence scores near zero here; a
-disciplined one keeps its support accuracy. It is label-blind by construction and would have
+in every validation. Complete- and partial-enrollment corrupted fractions and accuracies are logged
+separately, and aggregate accuracy is weighted by the number of corrupted rows. A head that has
+stopped looking at support evidence scores near zero here; a disciplined one keeps its support
+accuracy. It is label-blind by construction and would have
 flagged T1, T2, T3 and the corruption-free control within the first few thousand steps — the
 runs internal validation rated most highly.
 
@@ -70,7 +76,8 @@ defaults to 1.0. Primary checkpoint `last.pt` at step 40,000, as for every arm s
 
 ## Verification
 
-* Full suite 1055 passed, 1 skipped; 3 new contract tests.
+* Full suite 1058 passed, 1 skipped; calibration, corruption, resume, telemetry, and provenance
+  contracts are covered by focused tests.
 * Real-data CUDA smoke, 6 steps with both mechanisms on: finite losses, all telemetry present in
   training and validation, checkpoint written with `unenrolled_calibration=True` and
   `text_corruption_mode=auxiliary` recorded.

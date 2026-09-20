@@ -1,6 +1,6 @@
 # Evaluation protocol: support-conditioned HAR
 
-> Last verified against code: 2026-09-19. A score is reportable only when the run records the data split,
+> Last verified against code: 2026-09-20. A score is reportable only when the run records the data split,
 > encoder checkpoint, baseline adapter revision, episode manifest, and support/candidate settings.
 
 > **Operational status:** `training.support_classifier.sealed_eval` is the only sealed-test entry
@@ -78,11 +78,10 @@ For each eligible representation, report these readouts on exactly the same epis
    predictions are identical at `k=0`.
 4. **Differentiable neighbours:** HALO encoder-development objective only; it is not reported as an
    adaptation mechanism for released baseline models.
-5. **HALO evidence-aware classifier:** the learned support-conditioned classifier. It computes
-   auditable support-vote and label-meaning distributions before contextualizing query, support,
-   paired support-label, candidate-label, runtime acquisition, and status-quo evidence. It refines
-   support comparisons and learns candidate-specific semantic reliance, then normalizes their
-   probability mixture. Evaluation must reconstruct
+5. **HALO evidence-gated classifier:** the learned support-conditioned classifier. It computes
+   auditable centered support-vote and label-meaning distributions, then uses bounded,
+   label-blind candidate gates to choose their relative reliance. It does not use the retired
+   contextual-token mixer. Evaluation must reconstruct
    acquisition vectors from each query and support stream separately; cross-stream scenarios may
    not replace them with zeros or reuse the query configuration for supports.
 
@@ -184,7 +183,7 @@ steps, runtime, and seed so the adapter budget is explicit.
 
 For every promoted result, save:
 
-- code commit and checkpoint hashes;
+- code commit and checkpoint hashes, including sealed `run_provenance.json`;
 - split and episode-manifest hashes;
 - raw source-slice hashes, duration, ordered device set, multi-device mode, and padding fraction;
 - `C` and `k` distributions;

@@ -27,7 +27,7 @@ always numbered consistently with the tries (`support_classifier_v4` is T4, not 
 | T2 | `support_contextual_residual_v1` | 2026-09-19 | negative |
 | T3 | `support_evidence_aware_v2` | 2026-09-19 | negative: router at 0.97-0.99 semantic reliance |
 | T4 | `support_classifier_v4` | 2026-09-20 | parity with v3; first try whose routing did not collapse |
-| T5 | T4 with the primitive semantic path | built, not trained | pending |
+| T5 | `support_classifier_v4` with corruption disabled | 2026-09-20 | corruption-free control; routing collapses onto label meaning |
 | T6 | T4 with corruption as a gate-only auxiliary and a label-blind unenrolled calibration term ([design](../journal/2026-09-20-classifier-t6-design.md)) | built, not trained | pending |
 
 T4, T5 and T6 share the `support_classifier_v4` architecture string and differ by recipe (config
@@ -35,7 +35,7 @@ flags and curriculum), which the checkpoint records. The differentiable-neighbou
 
 | run | protocol | encoder conditioning | status | numbers |
 |---|---|---|---|---|
-| **T4** corruption-free control, step 40k, 2026-09-20 | v5 | acquisition-conditioning-v2 | **control: λ collapses without the curriculum** | [below](#the-corruption-free-control-the-curriculum-is-load-bearing) |
+| **T5** corruption-free control, step 40k, 2026-09-20 | v5 | acquisition-conditioning-v2 | **control: λ collapses without the curriculum** | [below](#the-corruption-free-control-the-curriculum-is-load-bearing) |
 | **T4** evidence-gated blend, step 40k, 2026-09-20 | v5 | acquisition-conditioning-v2 | **completed, parity with v3** | [below](#t4-the-evidence-gated-blend-support_classifier_v4) |
 | **T3** evidence-aware, step 40k, 2026-09-19 | v5 | acquisition-conditioning-v2 | **completed negative result** | [below](#t3-the-evidence-aware-classifier-support_evidence_aware_v2) |
 | **T3** evidence-aware, step 32,500 companion, 2026-09-19 | v5 | acquisition-conditioning-v2 | **completed negative result** | [below](#t3-the-evidence-aware-classifier-support_evidence_aware_v2) |
@@ -540,14 +540,15 @@ unenrolled half near 54; half of that was achieved.
 
 #### The corruption-free control: the curriculum is load-bearing
 
-`halo_t4_nocorrupt_40k_20260920` is T4 trained identically — same code, seed, steps and gate
-bounds — with one flag changed, `--text-corruption-probability 0`. It was run to attribute T4's
+`halo_t4_nocorrupt_40k_20260920` is **T5**, trained identically to T4 — same code, seed, steps and
+gate bounds — with one flag changed, `--text-corruption-probability 0`. The historical directory
+name predates the recipe naming convention. It was run to attribute T4's
 encoder regression, and it answered a larger question instead.
 
 | 8 s, k=8 | λ at k=1 / k=2-7 / k≥8 | classifier | its own support vote | deficit | encoder 1-NN |
 |---|---|---:|---:|---:|---:|
 | T4 (corruption 0.25) | 0.44 / 0.40 / 0.22 | 71.0 | 71.2 | **-0.3** | 70.4 |
-| T4 corruption-free | **0.81 / 0.78 / 0.82** | 63.7 | 72.4 | **-8.7** | 71.1 |
+| T5 corruption-free | **0.81 / 0.78 / 0.82** | 63.7 | 72.4 | **-8.7** | 71.1 |
 | v3 | 1.61 / 0.82 / 0.51 (per bucket) | 71.5 | 73.3 | -1.8 | 72.0 |
 
 **Without the curriculum λ stops depending on evidence at all.** It sits at 0.81-0.82 for every

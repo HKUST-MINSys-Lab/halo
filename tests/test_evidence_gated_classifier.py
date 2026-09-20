@@ -21,6 +21,7 @@ from model.support.evidence_gated_classifier import (
 )
 from model.support.factory import (
     CLASSIFIER_ARCHITECTURE_STATUS, CLASSIFIER_TRY_NAME, build_classifier_from_blob,
+    classifier_architecture_base_try_name,
     classifier_try_name,
 )
 from training.support_classifier.neighbors import differentiable_neighbor_logits
@@ -431,10 +432,12 @@ def test_gates_run_in_fp32_under_autocast(dtype):
 class _StubEpisode:
     """Only the fields ``corrupt_candidate_text`` reads."""
 
-    def __init__(self, *, zero_shot: bool, gt_slot: int, support_counts: tuple[int, ...]):
+    def __init__(self, *, zero_shot: bool, gt_slot: int, support_counts: tuple[int, ...],
+                 support_set_id: int = 0):
         self.is_zero_shot = zero_shot
         self.gt_slot = gt_slot
         self.support_counts = support_counts
+        self.support_set_id = support_set_id
 
 
 def _corruption_batch():
@@ -466,7 +469,7 @@ def test_corruption_selects_only_answerable_episodes():
     assert mask.tolist() == [True, False, False, True]
 
 
-def test_corruption_is_a_derangement_of_the_valid_roster():
+def test_corruption_deranges_only_enrolled_candidate_text():
     import numpy as np
 
     from training.support_classifier.train import corrupt_candidate_text
@@ -480,10 +483,16 @@ def test_corruption_is_a_derangement_of_the_valid_roster():
         valid = text["candidate_mask"][row]
         moved = ~torch.isclose(text["candidate_text"][row], original[row]).all(dim=-1)
         if mask[row]:
-            assert bool(moved[valid].all()), "a candidate kept its own label text"
+            enrolled = torch.zeros_like(valid)
+            enrolled[:len(episodes[row].support_counts)] = torch.tensor(
+                [count > 0 for count in episodes[row].support_counts], dtype=torch.bool,
+            )
+            enrolled &= valid
+            assert bool(moved[enrolled].all()), "an enrolled candidate kept its own label text"
+            assert not bool(moved[valid & ~enrolled].any()), "unenrolled text was corrupted"
             assert not bool(moved[~valid].any()), "a padded slot was rewritten"
-            before = {tuple(v.tolist()) for v in original[row][valid]}
-            after = {tuple(v.tolist()) for v in text["candidate_text"][row][valid]}
+            before = {tuple(v.tolist()) for v in original[row][enrolled]}
+            after = {tuple(v.tolist()) for v in text["candidate_text"][row][enrolled]}
             assert before == after, "corruption invented text instead of permuting the roster"
         else:
             assert not bool(moved.any())
@@ -515,7 +524,20 @@ def test_corruption_is_deterministic_for_a_seed_and_off_by_default():
 def test_every_lifecycle_architecture_has_a_try_name():
     """The architecture strings are not numbered consistently with the tries, so the mapping is
     explicit and must stay complete. See docs/results/RESULTS.md, "Classifier naming"."""
-    assert classifier_try_name(ARCHITECTURE_VERSION) == "T4"
+    assert classifier_architecture_base_try_name(ARCHITECTURE_VERSION) == "T4"
+    with pytest.raises(ValueError, match="requires its saved trajectory"):
+        classifier_try_name(ARCHITECTURE_VERSION)
+    assert classifier_try_name(ARCHITECTURE_VERSION, trajectory={
+        "text_corruption_mode": "replace", "text_corruption_probability": 0.25,
+        "unenrolled_calibration": False,
+    }) == "T4"
+    assert classifier_try_name(ARCHITECTURE_VERSION, trajectory={
+        "text_corruption_probability": 0.0,
+    }) == "T5"
+    assert classifier_try_name(ARCHITECTURE_VERSION, trajectory={
+        "text_corruption_mode": "auxiliary", "text_corruption_probability": 1.0,
+        "unenrolled_calibration": True,
+    }) == "T6"
     assert classifier_try_name("support_classifier_v3") == "v3"
     missing = set(CLASSIFIER_ARCHITECTURE_STATUS) - set(CLASSIFIER_TRY_NAME)
     # The retired token mixer predates the scheme and is deliberately unnamed.
@@ -541,7 +563,7 @@ def test_unenrolled_calibration_is_off_by_default_and_label_blind():
     assert bool(unenrolled.any()) and bool(enrolled.any())
     torch.testing.assert_close(a["logits"][enrolled], b["logits"][enrolled])
     shift = (b["logits"] - a["logits"])
-    assert float(shift[unenrolled].abs().min()) > 1e-4
+    assert float(shift[unenrolled].abs().min().detach()) > 1e-4
     # The same shift for every unenrolled candidate of an episode: it cannot prefer one label.
     for row in range(valid.shape[0]):
         row_shift = shift[row][unenrolled[row]]
@@ -551,6 +573,18 @@ def test_unenrolled_calibration_is_off_by_default_and_label_blind():
     scrambled = dict(batch)
     scrambled["candidate_text"] = torch.roll(batch["candidate_text"], 1, dims=1) * valid.unsqueeze(-1)
     torch.testing.assert_close(on(**scrambled)["unenrolled_bias"], b["unenrolled_bias"])
+
+
+def test_unenrolled_calibration_features_preserve_coverage_and_roster_size():
+    """Regression for two-feature LayerNorm, which erased both calibration inputs."""
+    k_c = torch.tensor([[1, 0, 0, 0], [1, 1, 0, 0], [1, 1, 0, 0]])
+    masks = torch.tensor([[1, 1, 1, 0], [1, 1, 1, 0], [1, 1, 1, 1]], dtype=torch.bool)
+    features = EvidenceGatedSupportClassifier._unenrolled_calibration_features(k_c, masks)
+    # Same roster, different coverage; same coverage, different roster. Both must remain visible.
+    assert features[0, 0] != features[1, 0]
+    assert features[1, 1] != features[2, 1]
+    assert not torch.equal(features[0], features[1])
+    assert not torch.equal(features[1], features[2])
 
 
 def test_gate_only_view_reaches_exactly_the_blend_gate():
@@ -605,3 +639,17 @@ def test_corrupted_view_helper_leaves_clean_text_untouched():
     assert corrupted_view(head, query=batch["query_feature"], rows=rows, text=text,
                           episodes=episodes, device="cpu", probability=0.0,
                           rng=np.random.default_rng(0), with_gradient=True)["corrupted_view_accuracy"] is None
+
+
+def test_corrupted_auxiliary_loss_is_balanced_by_support_set():
+    from training.support_classifier.train import _balanced_corrupted_view_loss
+
+    per_row = torch.tensor([1.0, 3.0, 10.0])
+    corrupted = torch.tensor([True, True, True])
+    episodes = [
+        _StubEpisode(zero_shot=False, gt_slot=0, support_counts=(1, 1), support_set_id=4),
+        _StubEpisode(zero_shot=False, gt_slot=0, support_counts=(1, 1), support_set_id=4),
+        _StubEpisode(zero_shot=False, gt_slot=0, support_counts=(1, 1), support_set_id=9),
+    ]
+    # Equal support-set weighting: mean([mean(1, 3), mean(10)]) = 6, not row mean 14/3.
+    assert _balanced_corrupted_view_loss(per_row, corrupted, episodes) == pytest.approx(6.0)

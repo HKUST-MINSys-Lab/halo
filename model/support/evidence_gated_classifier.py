@@ -158,9 +158,8 @@ class EvidenceGatedSupportClassifier(nn.Module):
             [_logit(min(value / self.cfg.lambda_max, 1.0 - 1e-4)) for value in prior],
             dtype=torch.float32,
         ))
-        self.unenrolled_norm = self.unenrolled_mlp = None
+        self.unenrolled_mlp = None
         if self.cfg.unenrolled_calibration:
-            self.unenrolled_norm = nn.LayerNorm(N_UNENROLLED_FEATURES)
             self.unenrolled_mlp = nn.Sequential(
                 nn.Linear(N_UNENROLLED_FEATURES, self.cfg.unenrolled_hidden), nn.GELU(),
                 nn.Linear(self.cfg.unenrolled_hidden, 1),
@@ -230,6 +229,16 @@ class EvidenceGatedSupportClassifier(nn.Module):
         for index, lower in enumerate(self.cfg.lambda_buckets[1:], start=1):
             bucket = torch.where(k_c >= lower, torch.full_like(bucket, index), bucket)
         return bucket
+
+    @staticmethod
+    def _unenrolled_calibration_features(
+        k_c: torch.Tensor, candidate_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Label-blind episode scalars for the shared unenrolled-candidate bias."""
+        roster = candidate_mask.sum(dim=1, keepdim=True).to(k_c.dtype)
+        coverage = (k_c.gt(0) & candidate_mask).sum(dim=1, keepdim=True).to(k_c.dtype) \
+            / roster.clamp_min(1.0)
+        return torch.cat((coverage, roster.log()), dim=-1)
 
     # ------------------------------------------------------------------ statistics
     @staticmethod
@@ -567,12 +576,11 @@ class EvidenceGatedSupportClassifier(nn.Module):
         logits = (1.0 - lam) * metric_part + lam * semantic_logits
         unenrolled_bias = logits.new_zeros((b, 1))
         if self.unenrolled_mlp is not None:
-            roster = candidate_mask.sum(dim=1, keepdim=True).to(logits.dtype)
-            coverage = (k_c.gt(0) & candidate_mask).sum(dim=1, keepdim=True).to(logits.dtype) \
-                / roster.clamp_min(1.0)
-            unenrolled_bias = self.unenrolled_mlp(self.unenrolled_norm(
-                torch.cat((coverage, roster.log()), dim=-1),
-            ))
+            calibration_features = self._unenrolled_calibration_features(k_c, candidate_mask)
+            # These are already small, bounded-or-log-scaled scalar quantities. LayerNorm across
+            # two features would erase their absolute values, so preserve both coordinates for
+            # the calibration MLP.
+            unenrolled_bias = self.unenrolled_mlp(calibration_features)
             if gate_only:
                 # A corrupted view has an enrolled truth by construction, so it would teach the
                 # calibration the wrong lesson about rosters whose truth is unenrolled.

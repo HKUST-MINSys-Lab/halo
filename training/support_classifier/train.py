@@ -587,15 +587,13 @@ def corrupt_candidate_text(
     support-evidence quality, so the optimal blend weight moves toward support wherever support
     evidence is strong. Nothing in the ordinary curriculum supplies that signal.
 
-    Each selected roster is rolled by a nonzero offset over its valid candidates, which is a
-    derangement: every candidate receives another candidate's text, so the semantic path is
-    actively wrong rather than merely uninformative.
+    Each selected roster deranges only texts attached to candidates that have their own support.
+    Unenrolled candidates retain their semantic text. This keeps a partial-enrollment episode
+    answerable: every deliberately wrong semantic score has a learnable support-vs-semantic gate,
+    while an unenrolled candidate remains on its required semantic route.
 
-    Only episodes whose GROUND TRUTH is enrolled are eligible. A corrupted episode must stay
-    answerable from support alone, otherwise it teaches nothing: with no support for the true
-    candidate its blend weight is forced to 1, its logit is pure (now wrong) text, and no
-    parameter the head controls can reduce that loss. Zero-support and truth-unenrolled episodes
-    would both contribute exactly that noise, so both are excluded.
+    An eligible episode has an enrolled ground truth and at least two enrolled candidates. A
+    single enrolled candidate cannot be deranged without moving text onto an unenrolled candidate.
 
     Returns the per-episode boolean mask of corrupted rows, or ``None`` when nothing was drawn.
     """
@@ -607,6 +605,7 @@ def corrupt_candidate_text(
         not episode.is_zero_shot
         and episode.gt_slot < len(episode.support_counts)
         and episode.support_counts[episode.gt_slot] > 0
+        and sum(count > 0 for count in episode.support_counts) >= 2
         for episode in episodes
     ])
     selected = (rng.random(len(episodes)) < probability) & eligible
@@ -618,15 +617,40 @@ def corrupt_candidate_text(
     index = torch.arange(c, device=device).unsqueeze(0).repeat(b, 1)
     for row in np.nonzero(selected)[0]:
         width = int(valid[row])
-        if width < 2:  # a single candidate cannot be deranged
+        enrolled_slots = [slot for slot in range(width)
+                          if slot < len(episodes[row].support_counts)
+                          and episodes[row].support_counts[slot] > 0]
+        if len(enrolled_slots) < 2:  # defensive: the eligibility contract above
             selected[row] = False
             continue
-        offset = int(rng.integers(1, width))
-        index[row, :width] = (torch.arange(width, device=device) + offset) % width
+        offset = int(rng.integers(1, len(enrolled_slots)))
+        source = enrolled_slots[offset:] + enrolled_slots[:offset]
+        index[row, enrolled_slots] = torch.as_tensor(source, device=device)
     text["candidate_text"] = candidate_text.gather(
         1, index.unsqueeze(-1).expand(-1, -1, candidate_text.shape[-1]),
     )
     return torch.as_tensor(selected, dtype=torch.bool, device=device)
+
+
+def _balanced_corrupted_view_loss(
+    per_row: torch.Tensor,
+    corrupted: torch.Tensor,
+    episodes: list[Episode],
+) -> torch.Tensor:
+    """Average a corrupted gate view by support set, matching enrolled clean CE weighting."""
+    selected = torch.nonzero(corrupted, as_tuple=False).flatten().tolist()
+    if not selected:
+        return per_row.new_zeros(())
+    by_set: dict[int, list[int]] = {}
+    for index in selected:
+        episode = episodes[index]
+        if episode.is_zero_shot:
+            raise ValueError("a corrupted gate view cannot be zero-shot")
+        by_set.setdefault(episode.support_set_id, []).append(index)
+    return torch.stack([
+        per_row[torch.as_tensor(indices, device=per_row.device)].mean()
+        for indices in by_set.values()
+    ]).mean()
 
 
 # ------------------------------------------------------------------ loss
@@ -775,7 +799,14 @@ def weighted_present_metrics(
             "classifier_accuracy", "rescue_rate", "overturn_rate", "preserve_rate",
             "both_wrong_rate", "net_gain",
         }
-        fraction_key = f"{key.rsplit('/', 1)[0]}/fraction" if conditional else None
+        if key in {"curriculum/corrupted_view_accuracy", "classifier/lambda_corrupted_view_mean"}:
+            # Corruption is sampled conditionally within each validation group. Weight its
+            # summary by the realized corrupted count, not the complete group size.
+            fraction_key = "curriculum/corrupted_view_fraction"
+        elif (key.startswith("curriculum/corrupted_view_") and key.endswith("_accuracy")):
+            fraction_key = key.removesuffix("_accuracy") + "_fraction"
+        else:
+            fraction_key = f"{key.rsplit('/', 1)[0]}/fraction" if conditional else None
         present = []
         for row, weight in zip(rows, weights):
             if key not in row:
@@ -855,8 +886,8 @@ def corrupted_view(
     support accuracy. Internal validation cannot see that difference (it prefers the collapsed
     model), so this is reported beside it in every validation.
 
-    Only truth-enrolled episodes are eligible, exactly as in replace mode; the clean ``text`` is
-    never modified.
+    Only truth-enrolled episodes with at least two enrolled candidates are eligible; the clean
+    ``text`` is never modified.
     """
     view = {"candidate_text": text["candidate_text"].clone(),
             "candidate_mask": text["candidate_mask"]}
@@ -864,7 +895,11 @@ def corrupted_view(
                                        device=device)
     zero = query.new_zeros(())
     empty = {"aux/corrupted_view_loss": zero, "corrupted_view_accuracy": None,
-             "corrupted_view_fraction": zero, "corrupted_view_lambda": None}
+             "corrupted_view_fraction": zero, "corrupted_view_lambda": None,
+             "corrupted_view_complete_accuracy": None,
+             "corrupted_view_complete_fraction": zero,
+             "corrupted_view_partial_accuracy": None,
+             "corrupted_view_partial_fraction": zero}
     if corrupted is None or not bool(corrupted.any()):
         return empty
     context = torch.enable_grad() if with_gradient else torch.no_grad()
@@ -880,16 +915,27 @@ def corrupted_view(
     target = torch.tensor([episode.gt_slot for episode in episodes], dtype=torch.long,
                           device=device)
     per_row = F.nll_loss(torch.log_softmax(logits, dim=-1), target, reduction="none")
-    loss = per_row[corrupted].mean()
+    loss = _balanced_corrupted_view_loss(per_row, corrupted, episodes)
     accuracy = logits.argmax(dim=-1).eq(target)[corrupted].float().mean().detach()
     enrolled = scored["k_c"].gt(0) & text["candidate_mask"]
+    complete = (enrolled | ~text["candidate_mask"]).all(dim=1)
     lam = scored["lambda"].detach()
+    split = {}
+    prediction = logits.argmax(dim=-1).eq(target)
+    for name, row_mask in (("complete", complete), ("partial", ~complete)):
+        selected = corrupted & row_mask
+        split[f"corrupted_view_{name}_fraction"] = selected.float().mean()
+        split[f"corrupted_view_{name}_accuracy"] = (
+            prediction[selected].float().mean().detach() if bool(selected.any()) else None
+        )
     return {
         "aux/corrupted_view_loss": loss if with_gradient else loss.detach(),
         "corrupted_view_accuracy": accuracy,
         "corrupted_view_fraction": corrupted.float().mean(),
+        "corrupted_view_selected_count": corrupted.sum().detach(),
         "corrupted_view_lambda": (lam[corrupted].masked_select(enrolled[corrupted]).mean()
                                   if bool(enrolled[corrupted].any()) else None),
+        **split,
     }
 
 
@@ -1042,9 +1088,16 @@ def run_step(
             and output["aux/corrupted_view_loss"].requires_grad:
         # The corrupted view's loss can reach only the blend gate (see ``gate_only``), so this
         # term prices the reliability of meaning without removing any clean signal from the
-        # representation. Weight 1.0 gives routing as much signal as the clean objective.
+        # representation. Match the clean few-shot branch's regime weight: with mixed zero/few
+        # batches it is 1/2, otherwise it is 1. This keeps the configured ratio meaningful.
         loss["main_ce"] = loss["loss"].detach()
-        loss["loss"] = loss["loss"] + float(text_corruption_aux_weight) * output["aux/corrupted_view_loss"]
+        clean_few_weight = 0.5 if any(e.is_zero_shot for e in episodes) \
+            and any(not e.is_zero_shot for e in episodes) else 1.0
+        loss["auxiliary_effective_weight"] = output["aux/corrupted_view_loss"].new_tensor(
+            float(text_corruption_aux_weight) * clean_few_weight,
+        ).detach()
+        loss["loss"] = loss["loss"] + loss["auxiliary_effective_weight"] \
+            * output["aux/corrupted_view_loss"]
         # Consumed; what remains in the result is for logging only.
         output["aux/corrupted_view_loss"] = output["aux/corrupted_view_loss"].detach()
     if classifier_mode == "contextual" and improvement_objective is not None:
@@ -1323,6 +1376,16 @@ def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, flo
             # The collapse detector. Read it beside the enrolled score in every validation.
             metrics["curriculum/corrupted_view_accuracy"] = float(result["corrupted_view_accuracy"])
             metrics["curriculum/corrupted_view_fraction"] = float(result["corrupted_view_fraction"])
+            metrics["curriculum/corrupted_view_selected_count"] = float(
+                result["corrupted_view_selected_count"]
+            )
+            for name in ("complete", "partial"):
+                accuracy = result.get(f"corrupted_view_{name}_accuracy")
+                if accuracy is not None:
+                    metrics[f"curriculum/corrupted_view_{name}_accuracy"] = float(accuracy)
+                metrics[f"curriculum/corrupted_view_{name}_fraction"] = float(
+                    result[f"corrupted_view_{name}_fraction"]
+                )
             if result.get("corrupted_view_lambda") is not None:
                 metrics["classifier/lambda_corrupted_view_mean"] = float(result["corrupted_view_lambda"])
         if "unenrolled_bias" in result and result["unenrolled_bias"].numel():
@@ -1333,7 +1396,11 @@ def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, flo
         else:
             corrupted = corrupted.detach().bool()
         corruption_eligible = torch.tensor(
-            [value == "enrolled" for value in truth_enrollment],
+            [not episode.is_zero_shot
+             and episode.gt_slot < len(episode.support_counts)
+             and episode.support_counts[episode.gt_slot] > 0
+             and sum(count > 0 for count in episode.support_counts) >= 2
+             for episode in episodes],
             dtype=torch.bool, device=target.device,
         )
         metrics["curriculum/text_corruption_eligible_fraction"] = float(
@@ -2969,6 +3036,9 @@ def main() -> None:
             ("rate_augmentation_probability", 0.0),
             ("modality_dropout_probability", 0.0),
             ("text_corruption_probability", saved_args.get("text_corruption_probability", 0.0)),
+            ("text_corruption_mode", "replace"),
+            ("text_corruption_aux_weight", 1.0),
+            ("unenrolled_calibration", False),
         ):
             saved_trajectory.setdefault(field, saved_args.get(field, default))
         for field, default in (
