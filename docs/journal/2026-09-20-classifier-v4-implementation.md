@@ -55,7 +55,7 @@ roster sizes.
 * Real-data training smoke on CUDA: 6 steps, two validations, `--text-corruption-probability 1.0`,
   checkpoint written, finite losses, classifier gradient norms 0.7-2.7 and encoder 4.6-26.7.
   Realised corruption fraction equals `1 - zero_shot_rate` exactly, as designed.
-* Sealed-evaluator smoke with the smoke checkpoint (k=1, 8 s, 13 cells): all four readouts emitted.
+* Sealed-evaluator smoke with the smoke checkpoint (k=1, 8 s, 13 cells): all then-defined readouts emitted.
   The trust-weighted vote equals the untrusted vote to the displayed precision (trust is near zero
   at init), the vote tracks 1-NN (55.0 against 56.0), and the blend sits between the vote and the
   untrained label-meaning branch (43.6 between 55.0 and 14.4).
@@ -66,6 +66,19 @@ roster sizes.
   matches a brute-force reference; the "best support of another candidate" feature is exact;
   forward passes are deterministic; CPU and CUDA agree to 1.4e-6; lambda falls 0.55 -> 0.30 as k
   goes 1 -> 8 and stays at 1.0 for unenrolled candidates.
+
+## Readiness repairs (2026-09-20)
+
+The initial implementation review found three result-blocking omissions, all repaired before the
+first v4 run: the closed-form text bridge is now initialized for v4; text-corruption probability
+and the full classifier configuration are part of the immutable resume trajectory; and the support
+rank feature now assigns equal similarities one shared rank, preserving permutation invariance.
+
+The trainer now reports corruption eligibility and realized rate, clean/corrupted branch accuracy
+and lambda, and signed/absolute trust by acquisition regime. The evaluator includes complete-blend
+text-off and trust-off ablations; support-only diagnostics are unavailable at k=0 rather than
+silently producing arbitrary predictions. A CUDA smoke verified a fitted text bridge (32 rows,
+mean cosine 0.919), finite losses, finite gradients, and a one-step resume.
 
 ## Not built
 

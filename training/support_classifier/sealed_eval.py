@@ -51,7 +51,7 @@ from model.support.contextual_residual_classifier import ContextualResidualSuppo
 from model.support.evidence_aware_classifier import EvidenceAwareSupportClassifier
 from model.support.factory import (
     CONTEXTUAL_RESIDUAL_ARCHITECTURE, EVIDENCE_AWARE_ARCHITECTURE,
-    EVIDENCE_GATED_ARCHITECTURE, EVIDENCE_GATED_READOUTS,
+    EVIDENCE_GATED_ARCHITECTURE, EVIDENCE_GATED_READOUTS, EVIDENCE_GATED_SEMANTIC_READOUTS,
     LEGACY_CONTEXTUAL_ARCHITECTURE,
     CONTEXTUAL_CHECKPOINT_ARCHITECTURES, CONTEXTUAL_READOUTS, EVIDENCE_AWARE_READOUTS,
     LEGACY_CONTEXTUAL_READOUTS, LEARNED_CLASSIFIER_ARCHITECTURES,
@@ -1166,17 +1166,45 @@ def _halo_residual_diagnostic_predictions(
 _HALO_EVIDENCE_GATED_HEAD_CACHE: dict[tuple, object] = {}
 
 
+def _evidence_gated_semantic_readouts(checkpoint: Path) -> tuple[str, ...]:
+    """The semantic-half readouts, only for a checkpoint whose blend actually has two halves."""
+    blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if blob.get("architecture_version") != EVIDENCE_GATED_ARCHITECTURE:
+        return ()
+    mode = (blob.get("classifier_config") or {}).get("semantic_mode", "text")
+    return EVIDENCE_GATED_SEMANTIC_READOUTS if mode == "text+primitives" else ()
+
+
+def _evidence_gated_readout_spec(readout: str) -> tuple[str, float | None, float | None]:
+    """Map a diagnostic name to its branch and optional in-forward ablation override."""
+    specs = {
+        "halo-classifier-label-meaning-only": ("semantic", None, None),
+        "halo-classifier-support-vote": ("support", None, None),
+        "halo-classifier-untrusted-support-vote": ("support_floor", None, None),
+        # These retain the complete output path and differ in exactly one source of evidence.
+        "halo-classifier-text-off-blend": ("final", 0.0, None),
+        "halo-classifier-trust-off-blend": ("final", None, 0.0),
+        # Halves of the semantic branch; defined only when the checkpoint has a primitive path.
+        "halo-classifier-semantic-text-only": ("semantic_text", None, None),
+        "halo-classifier-semantic-primitives-only": ("semantic_primitives", None, None),
+    }
+    try:
+        return specs[readout]
+    except KeyError as exc:
+        raise ValueError(f"unknown evidence-gated readout {readout!r}") from exc
+
+
 @torch.no_grad()
 def _halo_evidence_gated_predictions(
     features: np.ndarray, stream: EvalStream, plans: Sequence[QueryPlan], checkpoint: Path,
-    device: torch.device, *, branch: str = "final", batch_size: int = 64,
+    device: torch.device, *, branch: str = "final", lambda_override: float | None = None,
+    trust_override: float | None = None, batch_size: int = 64,
 ) -> list[str]:
     """Score ``support_classifier_v4`` on an immutable manifest.
 
     The head takes exactly the v3 call signature (it consumes no acquisition vector), so this
-    mirrors the residual path. ``branch`` selects an auditable decomposition of the same forward:
-    the final blend, its label-meaning branch, its trust-weighted support vote, or the untrusted
-    closed-form vote that the trust weights are a residual on.
+    mirrors the residual path. ``branch`` selects an auditable decomposition of the same forward.
+    The optional overrides retain the complete blend while ablating only text or trust.
     """
     fingerprint = _file_hash(checkpoint)
     cache_key = (fingerprint, str(device))
@@ -1222,6 +1250,8 @@ def _halo_evidence_gated_predictions(
             candidate_text=expanded_text,
             candidate_mask=torch.ones((b, c), dtype=torch.bool, device=device),
             candidate_slot=torch.arange(1, c + 1, device=device).unsqueeze(0).expand(b, -1),
+            lambda_override=lambda_override,
+            trust_override=trust_override,
         )
         logits = head.branch_logits(result, branch)
         predictions.extend(candidates[index] for index in logits.argmax(dim=1).cpu().tolist())
@@ -1838,6 +1868,25 @@ def main() -> None:
                                            "feature_fingerprint": fingerprint,
                                            "manifest": manifests[manifest_id]["fingerprint"]})
                             all_rows.append(metric)
+                            # At k=0 the blend IS the semantic branch, so the question worth
+                            # answering here is which half of it produced the answer. This is the
+                            # attribution for the zero-shot claim and the primary MM-Fit cell.
+                            for readout in _evidence_gated_semantic_readouts(args.halo_checkpoint):
+                                branch, _, _ = _evidence_gated_readout_spec(readout)
+                                semantic_metric = _metric_row(
+                                    stream, plans,
+                                    _halo_evidence_gated_predictions(
+                                        features, stream, plans, args.halo_checkpoint, device,
+                                        branch=branch,
+                                    ),
+                                    bootstrap=args.bootstrap,
+                                )
+                                semantic_metric.update({
+                                    "model": name, "readout": readout, "k": k, "status": "ok",
+                                    "feature_fingerprint": fingerprint,
+                                    "manifest": manifests[manifest_id]["fingerprint"],
+                                })
+                                all_rows.append(semantic_metric)
                             if is_v2 and args.classifier_isolation:
                                 diagnostic_predictions = _halo_residual_diagnostic_predictions(
                                     features, stream, plans, args.halo_checkpoint, device,
@@ -2104,15 +2153,38 @@ def main() -> None:
                                        "manifest": manifests[manifest_id]["fingerprint"]})
                         all_rows.append(metric)
                         if halo_architecture == EVIDENCE_GATED_ARCHITECTURE:
-                            # v4: the label-meaning branch, the trust-weighted support vote, and
-                            # the untrusted closed-form vote it is a residual on.
-                            for readout, branch in zip(
-                                EVIDENCE_GATED_READOUTS,
-                                ("semantic", "support", "support_floor"),
-                            ):
+                            # v4 diagnostics. Support evidence does not exist at k=0, and a
+                            # text-off blend is undefined for an unenrolled candidate, so do not
+                            # fabricate branch scores for those information conditions.
+                            for readout in (EVIDENCE_GATED_READOUTS
+                                            + _evidence_gated_semantic_readouts(
+                                                args.halo_checkpoint)):
+                                if k == 0 and readout not in {
+                                    "halo-classifier-label-meaning-only",
+                                    "halo-classifier-semantic-text-only",
+                                    "halo-classifier-semantic-primitives-only",
+                                }:
+                                    all_rows.append({
+                                        "model": name, "readout": readout, "k": k,
+                                        "dataset": dataset, "stream": stream_id,
+                                        "status": "n/a", "reason": "no enrolled support at k=0",
+                                    })
+                                    continue
+                                if (readout == "halo-classifier-text-off-blend"
+                                        and any(len(plan.support_labels) < len(stream.eval_labels)
+                                                for plan in plans)):
+                                    all_rows.append({
+                                        "model": name, "readout": readout, "k": k,
+                                        "dataset": dataset, "stream": stream_id,
+                                        "status": "n/a",
+                                        "reason": "text-off blend is undefined with unenrolled candidates",
+                                    })
+                                    continue
+                                branch, lambda_override, trust_override = _evidence_gated_readout_spec(readout)
                                 branch_predicted = _halo_evidence_gated_predictions(
                                     features, stream, plans, args.halo_checkpoint, device,
-                                    branch=branch,
+                                    branch=branch, lambda_override=lambda_override,
+                                    trust_override=trust_override,
                                 )
                                 branch_metric = _metric_row(stream, plans, branch_predicted,
                                                             bootstrap=args.bootstrap)

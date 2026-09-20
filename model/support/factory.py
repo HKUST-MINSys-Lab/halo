@@ -72,6 +72,12 @@ EVIDENCE_AWARE_READOUTS = (
 EVIDENCE_GATED_READOUTS = (
     "halo-classifier-label-meaning-only", "halo-classifier-support-vote",
     "halo-classifier-untrusted-support-vote",
+    "halo-classifier-text-off-blend", "halo-classifier-trust-off-blend",
+)
+# Emitted only for checkpoints whose semantic mode combines both paths: the attribution question
+# for the primitive semantic path is what each half of the semantic branch contributes.
+EVIDENCE_GATED_SEMANTIC_READOUTS = (
+    "halo-classifier-semantic-text-only", "halo-classifier-semantic-primitives-only",
 )
 LEGACY_CONTEXTUAL_READOUTS = (
     "halo-classifier-semantic-only", "halo-classifier-support-only",

@@ -35,6 +35,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from model.blocks import AttentionSpec
+from model.support.primitive_semantics import (
+    PRIMITIVE_VOCABULARY_VERSION, PrimitiveSemanticConfig, PrimitiveSemanticHead,
+)
 from training.support_classifier.neighbors import differentiable_neighbor_logits
 
 ARCHITECTURE_VERSION = "support_classifier_v4"
@@ -73,8 +76,19 @@ class EvidenceGatedClassifierConfig:
     gate_hidden: int = 32
     trust_enabled: bool = True
     text_term_enabled: bool = True
+    # Which semantic path feeds the blend. "text" is the promoted cosine path and the default;
+    # "primitives" is the compositional path; "text+primitives" combines the two by a FIXED
+    # equal-weight sum in log space, never a learned router.
+    semantic_mode: str = "text"
+    primitive_version: str = PRIMITIVE_VOCABULARY_VERSION
+    primitive_combiner: str = "projection"
+    primitive_projection_rank: int = 384
+    primitive_profile_temperature: float = 0.05
+    primitive_logit_scale: float = 10.0
 
     def __post_init__(self) -> None:
+        if self.semantic_mode not in SEMANTIC_MODES:
+            raise ValueError(f"semantic_mode must be one of {SEMANTIC_MODES}")
         if self.text_dim < 1 or self.max_candidates < 2 or self.max_supports < 0:
             raise ValueError("invalid evidence-gated capacity")
         if self.temperature <= 0 or self.text_temperature <= 0:
@@ -90,6 +104,9 @@ class EvidenceGatedClassifierConfig:
             raise ValueError("trust_scale must be positive")
         if self.trust_hidden < 1 or self.gate_hidden < 1:
             raise ValueError("gate hidden widths must be positive")
+
+
+SEMANTIC_MODES = ("text", "primitives", "text+primitives")
 
 
 def _logit(value: float) -> float:
@@ -133,6 +150,15 @@ class EvidenceGatedSupportClassifier(nn.Module):
             [_logit(min(value / self.cfg.lambda_max, 1.0 - 1e-4)) for value in prior],
             dtype=torch.float32,
         ))
+        self.primitive_head = None
+        if self.cfg.semantic_mode != "text":
+            self.primitive_head = PrimitiveSemanticHead(d, PrimitiveSemanticConfig(
+                version=self.cfg.primitive_version, text_dim=self.cfg.text_dim,
+                combiner=self.cfg.primitive_combiner,
+                projection_rank=self.cfg.primitive_projection_rank,
+                profile_temperature=self.cfg.primitive_profile_temperature,
+                logit_scale=self.cfg.primitive_logit_scale,
+            ))
         self.register_buffer("corpus_mean", torch.full((d,), float("nan")), persistent=True)
 
     # ------------------------------------------------------------------ helpers
@@ -214,19 +240,19 @@ class EvidenceGatedSupportClassifier(nn.Module):
     @staticmethod
     def _normalised_rank(similarity: torch.Tensor, support_mask: torch.Tensor,
                          n_support: torch.Tensor) -> torch.Tensor:
-        """Fraction of valid supports ranked above each support.  O(k log k), not O(k^2).
+        """Tie-aware fraction of valid supports ranked above each support.
 
-        A stable descending sort makes ties deterministic, so the feature is reproducible for a
-        fixed batch composition.  Invalid slots sort last and are masked by the caller.
+        The earlier stable-sort ordinal rank made equal similarities depend on support-row order.
+        This formulation gives tied rows the same rank and is invariant to support permutation.
+        The support axis is bounded by the episode contract, so the explicit pairwise comparison is
+        both clearer and negligible relative to encoder execution.
         """
-        masked = similarity.masked_fill(~support_mask, float("-inf"))
-        order = torch.argsort(masked, dim=1, descending=True, stable=True)
-        position = torch.zeros_like(order)
-        position.scatter_(
-            1, order, torch.arange(similarity.shape[1], device=similarity.device)
-            .expand_as(order).contiguous(),
+        above = similarity.unsqueeze(1) > similarity.unsqueeze(2)
+        valid_other = support_mask.unsqueeze(2)
+        rank = (above & valid_other).sum(dim=2).to(similarity.dtype)
+        return torch.where(
+            support_mask, rank / n_support.clamp_min(1.0), torch.zeros_like(rank),
         )
-        return position.to(similarity.dtype) / n_support.clamp_min(1.0)
 
     def _trust_features(
         self, *, similarity: torch.Tensor, slots: torch.Tensor, support_mask: torch.Tensor,
@@ -424,21 +450,40 @@ class EvidenceGatedSupportClassifier(nn.Module):
                           / k_c.clamp_min(1.0))
 
         # 4. semantic path as a log-probability over the roster, so lambda is a true blend.
-        query_text = self.p_text(query_feature).float()
-        if text_stop_gradient is not None:
-            if text_stop_gradient.shape != (b,):
-                raise ValueError("text_stop_gradient must be one boolean per episode")
-            query_text = torch.where(
-                text_stop_gradient.view(b, 1), query_text.detach(), query_text,
-            )
         text_cosine = torch.einsum(
-            "bd,bcd->bc", F.normalize(query_text, dim=-1),
+            "bd,bcd->bc", F.normalize(self.p_text(query_feature).float(), dim=-1),
             F.normalize(candidate_text.float(), dim=-1),
         )
         text_logits = torch.log_softmax(
             (text_cosine / self.cfg.text_temperature).masked_fill(~candidate_mask, float("-inf")),
             dim=-1,
         )
+        primitive = None
+        primitive_logits = None
+        if self.primitive_head is not None:
+            primitive = self.primitive_head(query_feature, candidate_text, candidate_mask)
+            primitive_logits = primitive["logits"]
+        if self.cfg.semantic_mode == "text":
+            semantic_logits = text_logits
+        elif self.cfg.semantic_mode == "primitives":
+            semantic_logits = primitive_logits
+        else:
+            # Fixed equal weights in log space: the product of the two distributions, renormalised.
+            # Deliberately not learned; a learned weight here is the router we removed.
+            semantic_logits = torch.log_softmax(
+                (text_logits + primitive_logits).masked_fill(~candidate_mask, float("-inf")),
+                dim=-1,
+            )
+        if text_stop_gradient is not None:
+            if text_stop_gradient.shape != (b,):
+                raise ValueError("text_stop_gradient must be one boolean per episode")
+            # Detach the whole semantic branch on corrupted rows: a scrambled roster must price
+            # the reliability of meaning without training p_text, the primitive keys or the
+            # encoder to fit the scramble. lambda still receives gradient, because d(loss)/d(lambda)
+            # needs the branch's value, not its gradient.
+            semantic_logits = torch.where(
+                text_stop_gradient.view(b, 1), semantic_logits.detach(), semantic_logits,
+            )
         # A candidate with no support has no vote probability; its reference is the uniform prior
         # of an uninformative complete vote, exactly as in v3.
         uniform_log_prior = -candidate_mask.sum(dim=1, keepdim=True).to(metric_logits.dtype).log()
@@ -462,13 +507,20 @@ class EvidenceGatedSupportClassifier(nn.Module):
         # not learned, and it is the only place lambda may reach 1.
         lam = torch.where(k_c.eq(0), torch.ones_like(lam), lam).masked_fill(~candidate_mask, 0.0)
 
-        logits = (1.0 - lam) * metric_part + lam * text_logits
+        logits = (1.0 - lam) * metric_part + lam * semantic_logits
         return {
             "logits": logits.masked_fill(~candidate_mask, -1e30),
             "support_weight": weight, "k_c": k_c,
             "trust": trust, "lambda": lam, "mean_trust": mean_trust,
             "neighbor_logits": base_logits, "metric_logits": metric_logits,
             "metric_part": metric_part, "text_logits": text_logits,
+            "semantic_logits": semantic_logits,
+            **({} if primitive is None else {
+                "primitive_logits": primitive_logits,
+                "primitive_profile": primitive["primitive_profile"],
+                "candidate_primitive_profile": primitive["candidate_primitive_profile"],
+                "primitive_axis_entropy": primitive["axis_entropy"],
+            }),
             "text_score": text_cosine / self.cfg.text_temperature,
             "trust_features": trust_features, "gate_features": gate_features,
             # The declared bounds travel with the output so telemetry can report saturation
@@ -481,12 +533,20 @@ class EvidenceGatedSupportClassifier(nn.Module):
     def branch_logits(output: dict[str, torch.Tensor], branch: str) -> torch.Tensor:
         """Named auditable branches of one forward pass, for evaluation readouts."""
         keys = {"final": "logits", "support": "metric_part", "support_floor": "neighbor_logits",
-                "semantic": "text_logits"}
+                "semantic": "semantic_logits", "semantic_text": "text_logits",
+                "semantic_primitives": "primitive_logits"}
         if branch not in keys:
             raise ValueError(f"unknown evidence-gated branch {branch!r}")
+        if keys[branch] not in output:
+            raise ValueError(
+                f"branch {branch!r} is not available for this checkpoint's semantic mode"
+            )
         return output[keys[branch]]
 
     def telemetry(self) -> dict[str, float]:
         prior = (self.cfg.lambda_max * torch.sigmoid(self.lambda_prior.detach())).tolist()
-        return {f"classifier/lambda_prior_{bucket}": float(value)
-                for bucket, value in zip(self.cfg.lambda_buckets, prior)}
+        out = {f"classifier/lambda_prior_{bucket}": float(value)
+               for bucket, value in zip(self.cfg.lambda_buckets, prior)}
+        if self.primitive_head is not None:
+            out.update(self.primitive_head.telemetry())
+        return out

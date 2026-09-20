@@ -38,6 +38,9 @@ from model.support.contextual_residual_classifier import (
 from model.support.evidence_aware_classifier import (
     EvidenceAwareClassifierConfig, EvidenceAwareSupportClassifier,
 )
+from model.support.evidence_gated_classifier import (
+    EvidenceGatedClassifierConfig, EvidenceGatedSupportClassifier,
+)
 from training.support_classifier.train import (
     TAU_SUPPORT,
     PrefetchLoader,
@@ -108,6 +111,12 @@ def _gradient_breakdown(encoder, classifier) -> dict[str, float]:
                     else classifier.semantic_gate
                 ),
             })
+        elif isinstance(classifier, EvidenceGatedSupportClassifier):
+            modules.update({
+                "classifier/text_bridge": classifier.p_text,
+                "classifier/trust_gate": classifier.trust_mlp,
+                "classifier/lambda_gate": classifier.gate_mlp,
+            })
         else:
             modules.update({
                 "classifier/signal_proj": classifier.signal_proj,
@@ -122,7 +131,7 @@ def _gradient_breakdown(encoder, classifier) -> dict[str, float]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workers", type=int, nargs="+", default=[8, 12, 16])
-    parser.add_argument("--classifier", choices=("contextual", "residual", "neighbors"),
+    parser.add_argument("--classifier", choices=("contextual", "residual", "evidence_gated", "neighbors"),
                         default="contextual")
     parser.add_argument("--support-temperature", type=float, default=TAU_SUPPORT,
                         help="diagnostic support-vote temperature")
@@ -243,6 +252,13 @@ def main() -> None:
                     ),
                 ).to(device).train()
                 if args.classifier == "residual" else
+                EvidenceGatedSupportClassifier(
+                    spec, EvidenceGatedClassifierConfig(
+                        temperature=args.support_temperature,
+                        text_temperature=args.text_temperature,
+                    ),
+                ).to(device).train()
+                if args.classifier == "evidence_gated" else
                 EvidenceAwareSupportClassifier(
                     spec, EvidenceAwareClassifierConfig(
                         support_temperature=args.support_temperature,
@@ -252,7 +268,7 @@ def main() -> None:
                 ).to(device).train()
                 if args.classifier == "contextual" else None
             )
-            if isinstance(classifier, ResidualSupportClassifier):
+            if isinstance(classifier, (ResidualSupportClassifier, EvidenceGatedSupportClassifier)):
                 initialise_text_projection(
                     classifier, encoder, dataset, corpus, collate, text,
                     np.random.default_rng(7), device, batches=1, batch_size=64, executor=None,
@@ -464,10 +480,18 @@ def main() -> None:
                     for name in (
                         "logits", "metric_part", "text_part", "r_candidate", "text_score",
                         "support_floor_logits", "contextual_support_logits", "semantic_logits",
-                        "semantic_weight",
+                        "semantic_weight", "text_logits", "metric_logits", "neighbor_logits", "lambda",
                     )
                     if name in output and output[name].shape == episode_vectors["candidate_mask"].shape
                 } if classifier is not None else {}),
+                "evidence_gate_magnitudes": ({
+                    "trust_mean": float(output["trust"].detach().float().mean()),
+                    "trust_abs_mean": float(output["trust"].detach().float().abs().mean()),
+                    "trust_max_abs": float(output["trust"].detach().float().abs().max()),
+                    "lambda_enrolled_mean": float(output["lambda"].detach().masked_select(
+                        output["k_c"].detach().gt(0) & episode_vectors["candidate_mask"]
+                    ).mean()),
+                } if isinstance(classifier, EvidenceGatedSupportClassifier) else {}),
                 "timing_samples_ms": timings,
                 "shape_samples": shape_samples,
             }

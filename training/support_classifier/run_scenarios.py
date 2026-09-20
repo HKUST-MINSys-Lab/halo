@@ -46,7 +46,7 @@ from baselines.data import load_eval_stream, load_multi_device_stream, source_sl
 from data.scripts.curate.compatibility import PLACEMENT_SITE
 from model.support.factory import (
     EVIDENCE_AWARE_ARCHITECTURE, EVIDENCE_AWARE_READOUTS,
-    EVIDENCE_GATED_ARCHITECTURE, EVIDENCE_GATED_READOUTS,
+    EVIDENCE_GATED_ARCHITECTURE, EVIDENCE_GATED_READOUTS, EVIDENCE_GATED_SEMANTIC_READOUTS,
 )
 from data.scripts.curate.deployment_policy import MULTI_DEVICE_EVAL_CELLS, get_stream_spec
 
@@ -82,6 +82,7 @@ from .sealed_eval import (
     _halo_contextual_residual_predictions,
     _halo_evidence_gated_predictions,
     _halo_residual_predictions,
+    _evidence_gated_readout_spec,
     halo_acquisition_rows,
     _load_or_encode,
     _aligned_labels,
@@ -984,6 +985,7 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
             halo_classifier_requested = name == "halo" and halo_has_classifier and (
                 selected_readouts is None or "halo-classifier" in selected_readouts
                 or bool(set(EVIDENCE_AWARE_READOUTS) & set(selected_readouts or ()))
+                or bool(set(EVIDENCE_GATED_READOUTS) & set(selected_readouts or ()))
                 or "halo-classifier-oracle-better-branch" in (selected_readouts or ())
             )
             companion_1nn_required = k > 0 and (
@@ -1149,14 +1151,26 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
                     and selected_readouts is not None):
                 # v4 branch diagnostics are opt-in, exactly like v2's, and there is no oracle row:
                 # the branches are auditable decompositions, not a deployable selection rule.
-                for readout, branch in zip(
-                    EVIDENCE_GATED_READOUTS, ("semantic", "support", "support_floor"),
-                ):
+                for readout in EVIDENCE_GATED_READOUTS + EVIDENCE_GATED_SEMANTIC_READOUTS:
                     if readout in selected_readouts:
+                        # At k=0 the blend is the semantic branch, so its two halves are exactly
+                        # the attribution the new-domain cell needs; support branches are not
+                        # defined without enrollment.
+                        if k == 0 and readout not in {
+                            "halo-classifier-label-meaning-only",
+                            *EVIDENCE_GATED_SEMANTIC_READOUTS,
+                        }:
+                            continue
+                        if (readout == "halo-classifier-text-off-blend"
+                                and any(len(plan.support_labels) < len(task.candidates)
+                                        for plan in task.plans)):
+                            continue
+                        branch, lambda_override, trust_override = _evidence_gated_readout_spec(readout)
                         append_emitted(
                             _halo_evidence_gated_predictions(
                                 features, roster, task.plans, halo_checkpoint, device,
-                                branch=branch,
+                                branch=branch, lambda_override=lambda_override,
+                                trust_override=trust_override,
                             ),
                             readout=readout,
                         )
@@ -1534,6 +1548,7 @@ def main() -> None:
             "1nn", "prototype", "ridge", "equal-weight-normalized-fusion",
             "zero-shot-native-or-bridge", "halo-classifier",
             *EVIDENCE_AWARE_READOUTS, *EVIDENCE_GATED_READOUTS,
+            *EVIDENCE_GATED_SEMANTIC_READOUTS,
             "halo-classifier-oracle-better-branch",
         ), default=None,
         help=("optional readout subset for a controlled diagnostic; omitted reports only "

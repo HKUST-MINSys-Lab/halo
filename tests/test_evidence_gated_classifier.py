@@ -154,7 +154,7 @@ def test_gates_are_blind_to_label_identity():
 def test_support_path_can_never_be_deleted():
     """With lambda pinned at its bound and every support maximally distrusted, support still moves
     the argmax. A blend that can reach 1.0 would make this impossible; that is how v2 collapsed."""
-    head = make_head()
+    head = make_head(text_temperature=1.0)
     b, c, k = 1, 3, 4
     device = "cpu"
     query = torch.zeros(b, D_MODEL)
@@ -179,13 +179,20 @@ def test_support_path_can_never_be_deleted():
         "candidate_text": text, "candidate_mask": candidate_mask,
         "candidate_slot": torch.arange(1, c + 1).unsqueeze(0),
     }
+    # Make the constructed disagreement deterministic: the text path votes for candidate 1,
+    # while the support path strongly votes for candidate 0.
+    with torch.no_grad():
+        head.p_text.weight.zero_()
+        head.p_text.bias.zero_()
+        head.p_text.weight[0, 0] = 1.0
     pinned = head(**batch, lambda_override=head.cfg.lambda_max,
                   trust_override=-head.cfg.trust_scale)
     without_support = head(**batch, lambda_override=1.0)
     assert not torch.allclose(pinned["logits"], without_support["logits"]), \
         "support evidence vanished from the output at the lambda bound"
     gap = (pinned["logits"] - without_support["logits"]).abs().max()
-    assert float(gap) > 1e-3
+    assert float(gap.detach()) > 1e-3
+    assert pinned["logits"].argmax(dim=1).item() != without_support["logits"].argmax(dim=1).item()
 
 
 def test_every_gate_parameter_receives_a_nonzero_gradient():
@@ -225,6 +232,33 @@ def test_support_permutation_invariance():
     assert torch.allclose(
         first["trust"].index_select(1, order), second["trust"], atol=1e-5,
     )
+
+
+def test_support_permutation_invariance_with_tied_similarities():
+    """Ties must not turn a support-set statistic into an accidental row-position feature."""
+    head = make_head()
+    with torch.no_grad():
+        head.trust_mlp[-1].weight.normal_(std=1.0)
+        head.gate_mlp[-1].weight.normal_(std=1.0)
+    batch = make_episode(b=1, c=3, k=4, seed=31)
+    query = torch.zeros_like(batch["query_feature"])
+    query[:, 0] = 1.0
+    support = torch.zeros_like(batch["support_feature"])
+    support[:, :, 0] = 1.0  # every valid support has exactly the same cosine to the query
+    batch["query_feature"] = query
+    batch["support_feature"] = support
+    batch["support_mask"][:] = True
+    batch["support_bound"][:] = torch.tensor([[0, 1, 0, 1]])
+    first = head(**batch)
+    order = torch.tensor([1, 0, 3, 2])
+    permuted = dict(batch)
+    for key in ("support_feature", "support_label_text", "support_bound", "support_mask",
+                "support_pair_slot"):
+        permuted[key] = batch[key].index_select(1, order)
+    second = head(**permuted)
+    assert torch.allclose(first["logits"], second["logits"], atol=1e-6)
+    assert torch.allclose(first["lambda"], second["lambda"], atol=1e-6)
+    assert torch.allclose(first["trust"].index_select(1, order), second["trust"], atol=1e-6)
 
 
 def test_candidate_permutation_equivariance():
@@ -284,7 +318,7 @@ def test_text_stop_gradient_detaches_only_the_selected_rows():
     batch["query_feature"] = batch["query_feature"].requires_grad_(True)
     stop = torch.tensor([True, False, False])
     out = head(**batch, text_stop_gradient=stop)
-    out["text_logits"].sum().backward()
+    out["semantic_logits"].sum().backward()
     grad = batch["query_feature"].grad
     assert float(grad[0].abs().sum()) == 0.0
     assert float(grad[1].abs().sum()) > 0.0

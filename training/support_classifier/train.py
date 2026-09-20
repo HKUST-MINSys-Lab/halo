@@ -40,6 +40,13 @@ from model.support.evidence_gated_classifier import (
     ARCHITECTURE_VERSION as EVIDENCE_GATED_ARCHITECTURE,
     EvidenceGatedClassifierConfig, EvidenceGatedSupportClassifier,
 )
+from model.support.primitive_semantics import (
+    PRIMITIVE_VOCABULARY_VERSION, VOCABULARIES,
+    axis_names as _primitive_axis_names, axis_sizes as _primitive_axis_sizes,
+)
+
+PRIMITIVE_AXIS_NAMES = _primitive_axis_names()
+PRIMITIVE_AXIS_SIZES = _primitive_axis_sizes()
 from model.support.residual_classifier import (
     RegimeSplitSupportClassifier, ResidualClassifierConfig, ResidualSupportClassifier,
     build_support_classifier,
@@ -1235,13 +1242,28 @@ def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, flo
             )
     if "trust_features" in result:
         corrupted = result.get("text_corrupted")
-        metrics["curriculum/text_corrupted_fraction"] = (
-            float(corrupted.float().mean()) if corrupted is not None else 0.0
+        if corrupted is None:
+            corrupted = torch.zeros_like(target, dtype=torch.bool)
+        else:
+            corrupted = corrupted.detach().bool()
+        corruption_eligible = torch.tensor(
+            [value == "enrolled" for value in truth_enrollment],
+            dtype=torch.bool, device=target.device,
+        )
+        metrics["curriculum/text_corruption_eligible_fraction"] = float(
+            corruption_eligible.float().mean()
+        )
+        metrics["curriculum/text_corrupted_fraction"] = float(corrupted.float().mean())
+        metrics["curriculum/text_corrupted_eligible_fraction"] = (
+            float(corrupted[corruption_eligible].float().mean())
+            if bool(corruption_eligible.any()) else 0.0
         )
         lam = result["lambda"].detach()
         enrolled = (result["k_c"].detach().gt(0) & mask)
         trust = result["trust"].detach()
-        support_rows = trust.ne(0.0) if trust.numel() else trust.bool()
+        # Neutral trust is a valid learned value. Use the structural mask rather than filtering
+        # support rows by their scalar output, otherwise the reported distribution is biased.
+        support_rows = result["rows"]["support_mask"].detach()
         metrics["classifier/lambda_enrolled_mean"] = (
             float(lam.masked_select(enrolled).mean()) if bool(enrolled.any()) else float("nan")
         )
@@ -1284,10 +1306,56 @@ def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, flo
                 metrics[f"classifier/lambda_enrollment_{name}"] = float(
                     lam.masked_select(selected).mean()
                 )
+        if "primitive_axis_entropy" in result:
+            entropy = result["primitive_axis_entropy"].detach()
+            sizes = torch.tensor(PRIMITIVE_AXIS_SIZES, dtype=entropy.dtype, device=entropy.device)
+            # Normalised so 1.0 is "no information at all about this axis". A region the device
+            # set cannot see should sit near 1.0: that is the implied observability mask.
+            normalised = entropy / sizes.log().clamp_min(1e-6)
+            for index, axis in enumerate(PRIMITIVE_AXIS_NAMES):
+                metrics[f"classifier/primitive_entropy/{axis}"] = float(normalised[:, index].mean())
+            metrics["classifier/primitive_entropy_mean"] = float(normalised.mean())
+            for name, branch in (("text", "text_logits"), ("primitives", "primitive_logits")):
+                if branch in result:
+                    prediction = result[branch].detach().masked_fill(~mask, -1e30).argmax(dim=1)
+                    metrics[f"classifier/semantic_branch_accuracy/{name}"] = float(
+                        prediction.eq(target).float().mean()
+                    )
         for lower, upper, name in ((1, 2, "k1"), (2, 8, "k2_7"), (8, 10**9, "k8plus")):
             selected = (result["k_c"].detach().ge(lower) & result["k_c"].detach().lt(upper) & mask)
             if bool(selected.any()):
                 metrics[f"classifier/lambda_{name}"] = float(lam.masked_select(selected).mean())
+        for name, selected_rows in (("clean", ~corrupted), ("corrupted", corrupted)):
+            selected = selected_rows.unsqueeze(1) & enrolled
+            if bool(selected.any()):
+                metrics[f"classifier/lambda_{name}_enrolled_mean"] = float(
+                    lam.masked_select(selected).mean()
+                )
+        # The 3k acceptance screen needs branch behavior, not only the final loss. These are all
+        # derived from the same forward pass and therefore add no training-time compute.
+        for name, branch_logits in (
+            ("semantic", result["semantic_logits"]),
+            ("support", result["metric_part"]),
+            ("support_floor", result["neighbor_logits"]),
+            ("final", result["logits"]),
+        ):
+            predicted = branch_logits.detach().masked_fill(~mask, float("-inf")).argmax(dim=1)
+            correct = predicted.eq(target)
+            metrics[f"classifier/branch_accuracy/{name}"] = float(correct.float().mean())
+            for corruption_name, selected_rows in (("clean", ~corrupted), ("corrupted", corrupted)):
+                if bool(selected_rows.any()):
+                    metrics[f"classifier/branch_accuracy_{corruption_name}/{name}"] = float(
+                        correct[selected_rows].float().mean()
+                    )
+        for regime in ("compatible", "cross_placement", "cross_dataset"):
+            selected_rows = torch.tensor(
+                [episode.acquisition_regime == regime for episode in episodes],
+                dtype=torch.bool, device=trust.device,
+            ).unsqueeze(1) & support_rows
+            if bool(selected_rows.any()):
+                values = trust.masked_select(selected_rows).float()
+                metrics[f"classifier/trust_{regime}_mean"] = float(values.mean())
+                metrics[f"classifier/trust_{regime}_abs_mean"] = float(values.abs().mean())
     if "r_support" in result:
         metrics.update({
             "classifier/mean_abs_r_support": (
@@ -1458,7 +1526,8 @@ def fit_text_projection(
 
 
 @torch.no_grad()
-def initialise_text_projection(classifier: ResidualSupportClassifier | RegimeSplitSupportClassifier, encoder, dataset, corpus,
+def initialise_text_projection(classifier: ResidualSupportClassifier | RegimeSplitSupportClassifier |
+                               EvidenceGatedSupportClassifier, encoder, dataset, corpus,
                                collate, text_of, rng, device, *, batches: int, batch_size: int,
                                executor: ThreadPoolExecutor | None) -> dict[str, float]:
     """Closed-form ridge bridge from pooled motion vectors to frozen SBERT label vectors."""
@@ -1779,6 +1848,20 @@ def main() -> None:
                              "scalar-residual control; neighbors is the parameter-free control; "
                              "token_mixer is reproduction-only")
     parser.add_argument(
+        "--semantic-mode", choices=("text", "primitives", "text+primitives"), default="text",
+        help="v4-only semantic path: the promoted cosine path, the compositional primitive path, "
+             "or both combined at fixed equal weight in log space",
+    )
+    parser.add_argument(
+        "--primitive-vocabulary", default=PRIMITIVE_VOCABULARY_VERSION,
+        help="primitive vocabulary version; the -scrambled variant is the grounding control",
+    )
+    parser.add_argument(
+        "--primitive-combiner", choices=("fixed", "projection"), default="projection",
+        help="fixed cosine compatibility, or one shared identity-initialised learned projection",
+    )
+    parser.add_argument("--primitive-projection-rank", type=int, default=384)
+    parser.add_argument(
         "--text-corruption-probability", type=float, default=None,
         help="v4-only share of enrolled episodes whose candidate label text is deranged, which is "
              "what prices the reliability of the semantic path (default: 0.25 for "
@@ -1935,6 +2018,12 @@ def main() -> None:
         args.text_corruption_probability = 0.25 if args.classifier == "evidence_gated" else 0.0
     if not 0.0 <= args.text_corruption_probability <= 1.0:
         parser.error("--text-corruption-probability must be in [0, 1]")
+    if args.classifier != "evidence_gated" and args.semantic_mode != "text":
+        parser.error("--semantic-mode is defined only for --classifier evidence_gated")
+    if args.primitive_vocabulary not in VOCABULARIES:
+        parser.error(f"unknown --primitive-vocabulary {args.primitive_vocabulary!r}")
+    if not 1 <= args.primitive_projection_rank <= 384:
+        parser.error("--primitive-projection-rank must be in [1, 384]")
     if args.classifier != "evidence_gated" and args.text_corruption_probability > 0:
         # The contract is defined only where support-label text is unused. v3 also feeds label
         # text to its attention stack, so a scrambled roster there is a different experiment.
@@ -2109,7 +2198,23 @@ def main() -> None:
         saved.setdefault("evidence_best_path", True)
         saved.setdefault("evidence_group_temperature", 0.1)
         saved.setdefault("evidence_injection", True)
-        saved.setdefault("text_corruption_probability", 0.0)
+        # v4 initially omitted this from its trajectory. Its complete run arguments are present in
+        # affected checkpoints, so migrate from there rather than silently disabling corruption.
+        saved_args = resume_blob.get("args") or {}
+        saved.setdefault(
+            "text_corruption_probability",
+            saved_args.get("text_corruption_probability", 0.0),
+        )
+        for name, default in (("semantic_mode", "text"),
+                              ("primitive_vocabulary", PRIMITIVE_VOCABULARY_VERSION),
+                              ("primitive_combiner", "projection"),
+                              ("primitive_projection_rank", 384)):
+            # Early v4 run configs serialized these future fields as null. Treat null exactly as
+            # an absent field so their original text-only behavior remains resumable.
+            if saved.get(name) is None:
+                saved[name] = saved_args.get(name) or default
+        if saved.get("classifier_config") is None:
+            saved["classifier_config"] = resume_blob.get("classifier_config")
         saved.setdefault(
             "polarization",
             bool((resume_blob.get("config") or {}).get("use_polarization", True)),
@@ -2128,6 +2233,10 @@ def main() -> None:
             "variable_support_probability": "--variable-support-probability",
             "counterfactual_enrollment_probability": "--counterfactual-enrollment-probability",
             "text_corruption_probability": "--text-corruption-probability",
+            "semantic_mode": "--semantic-mode",
+            "primitive_vocabulary": "--primitive-vocabulary",
+            "primitive_combiner": "--primitive-combiner",
+            "primitive_projection_rank": "--primitive-projection-rank",
             "open_vocabulary_holdout_fraction": "--open-vocabulary-holdout-fraction",
             "rate_augmentation_probability": "--rate-augmentation-probability",
             "modality_dropout_probability": "--modality-dropout-probability",
@@ -2173,7 +2282,9 @@ def main() -> None:
             setattr(args, field, saved_value)
         # These values are captured in the residual classifier's state/config, not a mutable
         # run flag. Reject attempts to pretend they can be changed on an existing optimizer.
-        if resume_blob.get("architecture_version") in {"support_classifier_v2", "support_classifier_v3"}:
+        if resume_blob.get("architecture_version") in {
+            "support_classifier_v2", "support_classifier_v3", EVIDENCE_GATED_ARCHITECTURE,
+        }:
             for option in ("--centring", "--no-residual", "--no-text-term", "--separate-trunk",
                            "--text-temperature", "--adaptive-text-gate",
                            "--no-adaptive-text-gate"):
@@ -2468,6 +2579,10 @@ def main() -> None:
                 spec, EvidenceGatedClassifierConfig(
                     centring=args.centring, text_temperature=args.text_temperature,
                     trust_enabled=not args.no_residual, text_term_enabled=not args.no_text_term,
+                    semantic_mode=args.semantic_mode,
+                    primitive_version=args.primitive_vocabulary,
+                    primitive_combiner=args.primitive_combiner,
+                    primitive_projection_rank=args.primitive_projection_rank,
                 ),
             ).to(device)
             if args.classifier == "evidence_gated" else
@@ -2518,12 +2633,15 @@ def main() -> None:
     # Preserve the calibration audit record across resumes. The fitted weights already live in
     # the classifier state dict; this metadata records how that initial state was obtained.
     p_text_init = resume_blob.get("p_text_init") if resume_blob is not None else None
-    if resume_blob is None and isinstance(classifier, (ResidualSupportClassifier, RegimeSplitSupportClassifier)):
+    if resume_blob is None and isinstance(
+            classifier,
+            (ResidualSupportClassifier, RegimeSplitSupportClassifier, EvidenceGatedSupportClassifier),
+    ):
         p_text_init = initialise_text_projection(
             classifier, encoder, dataset, corpus, collate, text_of, rng, device,
             batches=args.calib_batches, batch_size=args.calib_batch_size, executor=executor,
         )
-        print(f"[compare] initialized residual text bridge on {int(p_text_init['n'])} rows "
+        print(f"[compare] initialized classifier text bridge on {int(p_text_init['n'])} rows "
               f"(cos={p_text_init['mean_cosine']:.3f})", flush=True)
 
     if frontend is not None and hasattr(frontend, "adaptation_parameters") \
@@ -2594,10 +2712,16 @@ def main() -> None:
             "mode": args.mode,
             "neutral_acquisition_text": args.neutral_acquisition_text,
             "classifier": args.classifier,
+            "text_corruption_probability": float(args.text_corruption_probability),
+            "semantic_mode": args.semantic_mode,
+            "primitive_vocabulary": args.primitive_vocabulary,
+            "primitive_combiner": args.primitive_combiner,
+            "primitive_projection_rank": int(args.primitive_projection_rank),
             "classifier_config": (dataclasses.asdict(classifier.cfg)
                                   if isinstance(classifier, (
                                       ResidualSupportClassifier, RegimeSplitSupportClassifier,
                                       ContextualResidualSupportClassifier, EvidenceAwareSupportClassifier,
+                                      EvidenceGatedSupportClassifier,
                                   )) else None),
             "contextual_aux": bool(args.contextual_aux),
             "contextual_aux_weight": float(args.contextual_aux_weight),
@@ -2700,14 +2824,26 @@ def main() -> None:
             ("open_vocabulary_holdout_fraction", 0.0),
             ("rate_augmentation_probability", 0.0),
             ("modality_dropout_probability", 0.0),
+            ("text_corruption_probability", saved_args.get("text_corruption_probability", 0.0)),
         ):
             saved_trajectory.setdefault(field, saved_args.get(field, default))
+        for field, default in (
+            ("semantic_mode", "text"),
+            ("primitive_vocabulary", PRIMITIVE_VOCABULARY_VERSION),
+            ("primitive_combiner", "projection"),
+            ("primitive_projection_rank", 384),
+        ):
+            if saved_trajectory.get(field) is None:
+                saved_trajectory[field] = saved_args.get(field) or default
+        if saved_trajectory.get("classifier_config") is None:
+            saved_trajectory["classifier_config"] = resume_blob.get("classifier_config")
         saved_trajectory.setdefault(
             "classifier_config",
             (dataclasses.asdict(classifier.cfg)
              if isinstance(classifier, (
                  ResidualSupportClassifier, RegimeSplitSupportClassifier,
                  ContextualResidualSupportClassifier, EvidenceAwareSupportClassifier,
+                 EvidenceGatedSupportClassifier,
              )) else None),
         )
         # `regime_split` was added to ResidualClassifierConfig after some snapshots were written;
@@ -2720,8 +2856,24 @@ def main() -> None:
             defaults = dataclasses.asdict(classifier.cfg)
             for field in ("regime_split", "adaptive_text_gate", "text_gate_hidden"):
                 saved_trajectory["classifier_config"].setdefault(field, defaults[field])
+        if (saved_trajectory.get("classifier_config") is not None
+                and resume_blob.get("architecture_version") == EVIDENCE_GATED_ARCHITECTURE):
+            # Semantic-path extensions are additive configuration defaults. Populate them from
+            # the classifier reconstructed from this checkpoint so an older v4 run resumes under
+            # its original text path instead of being rejected merely because newer fields exist.
+            defaults = dataclasses.asdict(classifier.cfg)
+            for field, value in defaults.items():
+                saved_trajectory["classifier_config"].setdefault(field, value)
         if saved_trajectory != trajectory:
-            raise SystemExit("resume trajectory differs from the checkpoint configuration")
+            differing = sorted(
+                key for key in set(saved_trajectory) | set(trajectory)
+                if saved_trajectory.get(key) != trajectory.get(key)
+            )
+            raise SystemExit(
+                "resume trajectory differs from the checkpoint configuration: "
+                + ", ".join(differing[:12])
+                + (" ..." if len(differing) > 12 else "")
+            )
         optimizer.load_state_dict(resume_blob["optimizer"])
         start_step = int(resume_blob["step"])
         torch.set_rng_state(resume_blob["rng"]["torch"])
