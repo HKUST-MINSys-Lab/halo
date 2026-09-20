@@ -33,6 +33,7 @@ The differentiable-neighbours arm is a parameter-free **control**, not a try, an
 
 | run | protocol | encoder conditioning | status | numbers |
 |---|---|---|---|---|
+| **T4** corruption-free control, step 40k, 2026-09-20 | v5 | acquisition-conditioning-v2 | **control: λ collapses without the curriculum** | [below](#the-corruption-free-control-the-curriculum-is-load-bearing) |
 | **T4** evidence-gated blend, step 40k, 2026-09-20 | v5 | acquisition-conditioning-v2 | **completed, parity with v3** | [below](#t4-the-evidence-gated-blend-support_classifier_v4) |
 | **T3** evidence-aware, step 40k, 2026-09-19 | v5 | acquisition-conditioning-v2 | **completed negative result** | [below](#t3-the-evidence-aware-classifier-support_evidence_aware_v2) |
 | **T3** evidence-aware, step 32,500 companion, 2026-09-19 | v5 | acquisition-conditioning-v2 | **completed negative result** | [below](#t3-the-evidence-aware-classifier-support_evidence_aware_v2) |
@@ -534,6 +535,40 @@ every candidate, and it did move: truth-enrolled accuracy rises 14.1 points, mos
 1-NN ceiling of 87.6, while truth-unenrolled falls 9.4. Overall accuracy improves, the harmonic
 mean does not. The design's stated target was to raise the enrolled half *while keeping* the
 unenrolled half near 54; half of that was achieved.
+
+#### The corruption-free control: the curriculum is load-bearing
+
+`halo_t4_nocorrupt_40k_20260920` is T4 trained identically — same code, seed, steps and gate
+bounds — with one flag changed, `--text-corruption-probability 0`. It was run to attribute T4's
+encoder regression, and it answered a larger question instead.
+
+| 8 s, k=8 | λ at k=1 / k=2-7 / k≥8 | classifier | its own support vote | deficit | encoder 1-NN |
+|---|---|---:|---:|---:|---:|
+| T4 (corruption 0.25) | 0.44 / 0.40 / 0.22 | 71.0 | 71.2 | **-0.3** | 70.4 |
+| T4 corruption-free | **0.81 / 0.78 / 0.82** | 63.7 | 72.4 | **-8.7** | 71.1 |
+| v3 | 1.61 / 0.82 / 0.51 (per bucket) | 71.5 | 73.3 | -1.8 | 72.0 |
+
+**Without the curriculum λ stops depending on evidence at all.** It sits at 0.81-0.82 for every
+support count — flat, with 1.3% of candidates pinned at the 0.85 bound — instead of falling from
+0.44 to 0.22 as evidence accumulates. The classifier then lands 6 to 15 points *below its own
+support vote* across the k grid (-6.4 at k=1, -15.0 at k=128), which is the same collapse T1, T2
+and T3 produced, contained only by `λ_max`. Every scenario is worse than both T4 and v3, most
+sharply the new-domain cell (42.5 against T4's 59.0) and partial coverage (49.6 against 58.1).
+
+**Internal validation is meanwhile higher than the corrupted arm's** — enrolled dataset-macro F1
+0.787 against 0.778, zero-support 0.841 against 0.836. That is the whole diagnosis in one line: the
+internal panel shares the training vocabulary, where trusting label meaning *is* the correct
+policy, so it rates the collapsed arm more highly. No selection rule computed on that panel could
+have caught this.
+
+So the corruption curriculum is not a regulariser that happened to help; it is the only thing in
+the recipe that prices the reliability of meaning, and the bounded gate alone does not substitute
+for it. It does cost a little encoder quality: 1-NN recovers from 70.4 to 71.1 without it, against
+v3's 72.0, so roughly half of T4's encoder gap is the curriculum and the other half is unexplained.
+
+Artifacts:
+[sealed](../../results/artifacts/halo_t4_nocorrupt_step40k_sealed_v5_20260920/),
+[scenarios](../../results/artifacts/halo_t4_nocorrupt_step40k_scenarios_v5_20260920/).
 
 Artifacts:
 [sealed](../../results/artifacts/halo_evidence_gated_v4_step40k_sealed_v5_20260920/),
