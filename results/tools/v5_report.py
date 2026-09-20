@@ -99,7 +99,12 @@ def sealed_value(rows, model, readout, window, k, cells, dataset=None):
 def halo_readouts(rows):
     order = ["halo-classifier", "halo-classifier-residual-off",
              "halo-classifier-label-meaning-only", "halo-classifier-unmodified-support-vote",
-             "halo-classifier-contextual-support-vote", "1nn", "training-bank-1nn-conse"]
+             "halo-classifier-contextual-support-vote",
+             # v4 branch decompositions
+             "halo-classifier-support-vote", "halo-classifier-untrusted-support-vote",
+             "halo-classifier-text-off-blend", "halo-classifier-trust-off-blend",
+             "halo-classifier-semantic-text-only", "halo-classifier-semantic-primitives-only",
+             "1nn", "training-bank-1nn-conse"]
     present = {row.get("readout") for row in rows if row.get("model") == "halo"}
     return [r for r in order if r in present]
 

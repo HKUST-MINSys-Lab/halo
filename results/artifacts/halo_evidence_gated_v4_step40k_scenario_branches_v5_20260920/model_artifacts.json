@@ -1,0 +1,6 @@
+{
+  "halo": {
+    "checkpoint": "/home/alex/code/HALO/halo/runs/support-classifier/halo_evidence_gated_v4_40k_20260920/last.pt",
+    "checkpoint_sha256": "4e0070891dd2c7842bbd53bb3b5de41c79b5f903dfc97b90b2608967bee2099c"
+  }
+}

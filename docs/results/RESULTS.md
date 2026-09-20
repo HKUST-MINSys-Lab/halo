@@ -14,6 +14,7 @@ directory name. "Arm" means a training run; "readout" means how a trained checkp
 
 | run | protocol | encoder conditioning | status | numbers |
 |---|---|---|---|---|
+| HALO classifier v4 (evidence-gated), step 40k, 2026-09-20 | v5 | acquisition-conditioning-v2 | **completed, parity with v3** | [below](#classifier-v4-the-evidence-gated-blend) |
 | HALO evidence-aware v2, step 40k, 2026-09-19 | v5 | acquisition-conditioning-v2 | **completed negative result** | [below](#the-evidence-aware-v2-follow-up) |
 | HALO evidence-aware v2, step 32,500 companion, 2026-09-19 | v5 | acquisition-conditioning-v2 | **completed negative result** | [below](#the-evidence-aware-v2-follow-up) |
 | HALO bounded contextual residual v1, step 35k, 2026-09-19 | v5 | acquisition-conditioning-v2 | **completed negative result** | [record](../journal/2026-09-19-bounded-contextual-residual-v1-results.md) |
@@ -428,6 +429,100 @@ Figures: [sealed k-curves](../../results/artifacts/promoted-figures/k_curve_evid
 [`halo_evidence_aware_v2_step40k_scenario_branches_v5_20260919`](../../results/artifacts/halo_evidence_aware_v2_step40k_scenario_branches_v5_20260919/),
 [`halo_evidence_aware_v2_step32500_sealed_v5_20260919`](../../results/artifacts/halo_evidence_aware_v2_step32500_sealed_v5_20260919/),
 [`halo_evidence_aware_v2_step32500_scenarios_v5_20260919`](../../results/artifacts/halo_evidence_aware_v2_step32500_scenarios_v5_20260919/).
+
+### Classifier v4: the evidence-gated blend
+
+**What it is.** `support_classifier_v4` replaces v3's three text-driven output terms with two
+bounded, label-blind gates on top of the same closed-form support vote: a per-support trust scalar
+`|t| ≤ 2` that reweights the vote, and a per-candidate blend weight `λ ≤ 0.85` that mixes the vote
+with the label-meaning path. Neither gate can see label text, text confidence or slot identity, and
+`λ_max < 1` means no setting can delete the support path. A label-text corruption curriculum (25% of
+truth-enrolled episodes get a deranged roster, with the semantic branch stop-gradiented) supplies
+the signal that prices the reliability of meaning. Design and implementation:
+[design](../journal/2026-09-20-classifier-v4-evidence-gated-design.md),
+[implementation](../journal/2026-09-20-classifier-v4-implementation.md).
+
+**Run.** `halo_evidence_gated_v4_40k_20260920`, code `ba5c3c5` (= lab `main` at launch), 43 minutes.
+Primary checkpoint `last.pt` at step 40,000, declared before any sealed number existed. The head is
+50,615 parameters against v3's 1,728,404.
+
+**Verdict: the diagnosed failure is roughly halved; the arm lands at parity with v3 overall.**
+
+Each classifier against **its own** support vote, dataset-balanced macro F1 (positive = the learned
+head adds value over its own floor):
+
+| window | arm | k=1 | k=2 | k=4 | k=8 | k=16 | k=32 | k=64 | k=128 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8 s | **v4** | +2.3 | +1.0 | +0.5 | -0.3 | -0.5 | -1.1 | -1.8 | **-1.9** |
+| 8 s | v3 | +2.3 | +0.2 | -1.5 | -1.8 | -2.1 | -3.6 | -3.5 | **-3.6** |
+| 4 s | **v4** | +2.7 | +1.6 | +0.7 | +0.3 | -0.2 | -1.2 | -1.5 | -1.9 |
+| 4 s | v3 | +3.1 | +1.4 | -0.2 | -0.8 | -2.1 | -3.0 | -3.2 | -3.5 |
+| 16 s | **v4** | +1.2 | +0.5 | +0.1 | +0.1 | -0.7 | -1.0 | -1.1 | -3.2 |
+| 16 s | v3 | +1.2 | -0.8 | -1.2 | -1.4 | -2.4 | -3.2 | -3.4 | -4.5 |
+
+The crossover where the head stops helping moves from k=2 to k=8, and the deficit at k=128 halves.
+The over-trust is reduced, not eliminated.
+
+Sealed aggregate, 8 s (333/333 manifests identical):
+
+| readout | k=0 | k=1 | k=2 | k=4 | k=8 | k=16 | k=32 | k=64 | k=128 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| v4 classifier | 50.2 | 62.1 | 65.5 | 69.0 | 71.0 | 72.9 | 73.9 | 74.3 | 74.3 |
+| v4 untrusted support vote | - | 59.7 | 64.5 | 68.5 | 71.2 | 73.4 | 75.0 | 76.2 | 76.2 |
+| v4 trust-weighted support vote | - | 59.3 | 65.0 | 68.6 | 71.2 | 73.3 | 74.7 | 75.9 | 76.0 |
+| v4 label-meaning branch | - | 50.2 | 50.2 | 50.2 | 50.2 | 50.2 | 50.2 | 50.2 | 50.2 |
+| v4 encoder, cosine 1-NN | - | 59.8 | 64.4 | 68.0 | 70.4 | 72.0 | 74.1 | 75.6 | 76.2 |
+| v3 classifier (promoted) | 51.7 | 62.4 | 66.3 | 68.7 | 71.5 | 72.7 | 73.4 | 74.1 | 74.4 |
+| v3 encoder, cosine 1-NN | - | 60.7 | 65.9 | 69.6 | 72.0 | 73.6 | 74.8 | 76.5 | 77.1 |
+
+**Why parity rather than a win: the encoder regressed.** v4's encoder scores 70.4 under cosine 1-NN
+at k=8 against v3's 72.0, and its zero-shot semantic path 50.2 against 51.7, consistently across all
+three window lengths. The head is better at using evidence; the representation it learned is
+slightly weaker, and the two cancel. Whether the corruption curriculum causes that (it withholds
+semantic gradient on a quarter of enrolled episodes) or it is seed variation is not established
+here; a corruption-off arm would separate them.
+
+**The gates behaved as designed, which is what three previous generations failed to do.**
+λ orders itself by evidence — 0.54 at k=1, 0.43 at k=2-7, 0.34 at k≥8 — with **no candidate at the
+0.85 bound at any point in training**, and trust stays inside its ±2 bound (mean |t| 0.63, p95 1.69
+at the end). Contrast v2, whose router reached 0.97-0.99 semantic reliance by step 7,500 and stayed.
+
+**Scenarios, 8 s, k=8** (737/737 manifests identical), v4 against v3:
+
+| scenario | v4 | v3 | Δ |
+|---|---:|---:|---:|
+| partial coverage | 58.1 | 57.2 | +0.9 |
+| new domain (MM-Fit) | 59.0 | 57.9 | +1.1 |
+| device set | 66.2 | 65.7 | +0.4 |
+| missing modality | 65.0 | 64.8 | +0.2 |
+| rate mismatch | 70.8 | 71.8 | -1.0 |
+| cross placement | 48.2 | 50.5 | -2.3 |
+| cross dataset | 78.2 | 81.0 | -2.8 |
+
+The two losses are the scenarios that most depend on representation quality, consistent with the
+weaker encoder rather than with the head.
+
+**Partial coverage: the mechanism worked and chose a different operating point.** Accuracy at k=8:
+
+| arm | all | truth enrolled | truth unenrolled | harmonic mean |
+|---|---:|---:|---:|---:|
+| v4 classifier | **62.3** | **80.8** | 44.5 | 57.4 |
+| v3 classifier | 60.1 | 66.7 | 53.9 | **59.7** |
+| either arm, 1-NN | 43.2 | 87.6 | 0.0 | 0.0 |
+
+The per-candidate λ was introduced precisely to stop one global trade-off from being forced on
+every candidate, and it did move: truth-enrolled accuracy rises 14.1 points, most of the way to the
+1-NN ceiling of 87.6, while truth-unenrolled falls 9.4. Overall accuracy improves, the harmonic
+mean does not. The design's stated target was to raise the enrolled half *while keeping* the
+unenrolled half near 54; half of that was achieved.
+
+Artifacts:
+[sealed](../../results/artifacts/halo_evidence_gated_v4_step40k_sealed_v5_20260920/),
+[scenarios](../../results/artifacts/halo_evidence_gated_v4_step40k_scenarios_v5_20260920/),
+[branch diagnostics](../../results/artifacts/halo_evidence_gated_v4_step40k_scenario_branches_v5_20260920/).
+Figures:
+[k-curves against each arm's own vote](../../results/artifacts/promoted-figures/k_curve_evidence_gated_v4_20260920.png),
+[training telemetry](../../results/artifacts/promoted-figures/telemetry_evidence_gated_v4_20260920.png).
 
 ### Limitations of the current record
 
