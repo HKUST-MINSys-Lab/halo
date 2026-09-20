@@ -64,11 +64,13 @@ applied identically to primitive sentences and to candidate labels.
 
 Why this is not the collapse we spent a week diagnosing:
 
-* the projection is **shared** — whatever it does to a training label it does to an unseen one, so
-  it cannot single out a vocabulary. A per-primitive free value vector could, which is why the
-  value bank is a frozen buffer and never a parameter (`test_value_bank_is_frozen`);
+* the projection is **shared** — it applies the same learned metric to training and unseen labels.
+  That is an out-of-vocabulary compatibility contract, not a guarantee against overfitting; the
+  held-out-label development screen is the relevant test. A per-primitive free value vector would
+  add a separate, less constrained failure mode, which is why the value bank is frozen;
 * it is **identity-initialised**, so step 0 is exactly the fixed design;
-* the primitive bottleneck and its uniform-block neutrality survive;
+* the primitive bottleneck and its uniform-block neutrality survive. This is an algebraic
+  property, not evidence that a particular body region is unobserved;
 * combining with the text path is a **fixed equal-weight sum in log space**, never a learned
   weight. A learned weight between two label-derived paths is the router we removed
   (`test_semantic_combination_has_no_learned_weight`).
@@ -96,8 +98,8 @@ permutes the primitive profiles with the text automatically — the two semantic
 disagree about which roster they are scoring.
 
 `semantic_mode="text"` is the default and constructs no primitive head at all, so a v4 checkpoint
-trained today is unchanged. The primitive head adds 148,512 parameters, almost all of them the
-384x384 projection.
+trained today is unchanged. At the active `d_model=128`, the primitive head adds **151,584**
+parameters: 147,456 in the 384x384 projection and 4,128 in its sensor-to-primitive keys.
 
 ## 5. Verification
 
@@ -117,17 +119,17 @@ trained today is unchanged. The primitive head adds 148,512 parameters, almost a
 
 Four arms, one recipe, one seed, identical manifests: **v4-text** (control), **v4-primitives**,
 **v4-text+primitives**, and **v4-primitives-scrambled** (`--primitive-vocabulary
-primitives-v1-scrambled`). The scrambled arm is not optional: if it matches the grounded arm, the
-gain came from capacity, not from meaning, exactly as the scrambled-vocabulary control once
-exposed the old mixer's gain as semantic rather than structural.
+primitives-v1-scrambled`). The scrambled arm is a grouping-control diagnostic. It cannot alone
+separate capacity from meaning, so any claim about grounding also needs held-out-label results and
+a matched nonsemantic-bank control selected without sealed data.
 
 Primary cells: MM-Fit `k=0` (6.6 today, chance 10.0); sealed `k=0` across the six datasets, which
 must not regress; cross-placement `k=0` (42.2); partial-coverage truth-unenrolled accuracy (53.9).
 
-3k screens before the arms: per-primitive AUC on held-out subjects; **axis entropy versus device
-set**, where a region no device can see should sit near maximal entropy — that is the implied mask,
-and it is measurable from the telemetry added here; and identity-versus-learned projection on
-MM-Fit, which measures whether the compatibility is memorising the 155 training profiles.
+3k screens before the arms: per-primitive AUC only where independently defensible primitive
+targets exist; axis entropy versus device set as a calibration diagnostic, not an observability
+mask; and identity-versus-learned projection on held-out-label development data, which tests
+whether compatibility is memorising the training profiles.
 
 ## 7. Risks, stated plainly
 

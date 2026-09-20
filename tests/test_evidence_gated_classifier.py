@@ -301,6 +301,42 @@ def test_padding_may_hold_non_finite_values():
     assert torch.isfinite(out["trust_features"]).all()
 
 
+def test_padding_may_hold_non_finite_values_in_backward():
+    """Padding safety is a differentiable contract, not merely a finite forward pass."""
+    head = make_head()
+    batch = make_episode(seed=51)
+    batch["query_feature"] = batch["query_feature"].requires_grad_(True)
+    batch["support_feature"] = batch["support_feature"].masked_fill(
+        ~batch["support_mask"].unsqueeze(-1), float("nan"),
+    ).requires_grad_(True)
+    batch["candidate_text"] = batch["candidate_text"].masked_fill(
+        ~batch["candidate_mask"].unsqueeze(-1), float("inf"),
+    )
+    out = head(**batch)
+    torch.nn.functional.cross_entropy(out["logits"], torch.zeros(3, dtype=torch.long)).backward()
+    assert torch.isfinite(batch["query_feature"].grad).all()
+    assert torch.isfinite(batch["support_feature"].grad.masked_select(
+        batch["support_mask"].unsqueeze(-1)
+    )).all()
+    for _, parameter in head.named_parameters():
+        assert parameter.grad is None or torch.isfinite(parameter.grad).all()
+
+
+def test_rank_is_padding_invariant_for_negative_cosines():
+    similarity = torch.tensor([[-0.8, -0.2]])
+    mask = torch.ones_like(similarity, dtype=torch.bool)
+    short = EvidenceGatedSupportClassifier._normalised_rank(
+        similarity, mask, mask.sum(dim=1, keepdim=True),
+    )
+    padded = torch.cat((similarity, torch.zeros((1, 3))), dim=1)
+    padded_mask = torch.cat((mask, torch.zeros((1, 3), dtype=torch.bool)), dim=1)
+    long = EvidenceGatedSupportClassifier._normalised_rank(
+        padded, padded_mask, padded_mask.sum(dim=1, keepdim=True),
+    )
+    assert torch.equal(short, long[:, :2])
+    assert torch.all(long[:, 2:] == 0)
+
+
 def test_whole_batch_without_support_falls_back_to_meaning():
     head = make_head()
     batch = make_episode(seed=6, zero_support_rows=(0, 1, 2))
@@ -327,6 +363,8 @@ def test_text_stop_gradient_detaches_only_the_selected_rows():
 def test_ablation_overrides_reproduce_the_named_branches():
     head = make_head()
     batch = make_episode(seed=8)
+    # Text-off is defined only for complete enrollment.
+    batch["support_bound"][:] = torch.tensor([[0, 1, 2, 0, 1, -1]]).expand(3, -1)
     text_off = head(**batch, lambda_override=0.0)
     enrolled = text_off["k_c"].gt(0) & batch["candidate_mask"]
     assert torch.allclose(
@@ -335,6 +373,12 @@ def test_ablation_overrides_reproduce_the_named_branches():
     )
     trust_off = head(**batch, trust_override=0.0)
     assert torch.allclose(trust_off["metric_logits"], trust_off["neighbor_logits"], atol=1e-6)
+
+
+def test_text_off_rejects_any_unenrolled_candidate():
+    head = make_head()
+    with pytest.raises(ValueError, match="unenrolled"):
+        head(**make_episode(seed=52), lambda_override=0.0)
 
 
 def test_branch_logits_names_are_stable():

@@ -1,6 +1,6 @@
 # Classifier v4: evidence-gated blend on the promoted residual head (agreed design)
 
-Date: 2026-09-20. Status: **agreed design, not built.** This entry records the design discussion
+Date: 2026-09-20. Status: **implemented; no full-budget training yet.** This entry records the design discussion
 that followed the evidence-aware v2 negative result
 ([results record](../results/RESULTS.md#the-evidence-aware-v2-follow-up)). It is the handoff for
 whoever implements it. Supersedes the contextual-lineage handoff in

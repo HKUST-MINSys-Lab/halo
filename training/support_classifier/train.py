@@ -780,6 +780,8 @@ def weighted_present_metrics(
         for row, weight in zip(rows, weights):
             if key not in row:
                 continue
+            if not np.isfinite(row[key]):
+                continue
             effective_weight = float(weight)
             if fraction_key is not None and fraction_key in row:
                 effective_weight *= float(row[fraction_key])
@@ -1264,13 +1266,13 @@ def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, flo
         # Neutral trust is a valid learned value. Use the structural mask rather than filtering
         # support rows by their scalar output, otherwise the reported distribution is biased.
         support_rows = result["rows"]["support_mask"].detach()
-        metrics["classifier/lambda_enrolled_mean"] = (
-            float(lam.masked_select(enrolled).mean()) if bool(enrolled.any()) else float("nan")
-        )
-        metrics["classifier/lambda_unenrolled_mean"] = (
-            float(lam.masked_select(~result["k_c"].detach().gt(0) & mask).mean())
-            if bool((~result["k_c"].detach().gt(0) & mask).any()) else float("nan")
-        )
+        unenrolled = ~result["k_c"].detach().gt(0) & mask
+        if bool(enrolled.any()):
+            metrics["classifier/lambda_enrolled_mean"] = float(lam.masked_select(enrolled).mean())
+            metrics["classifier/lambda_enrolled_count"] = float(enrolled.sum())
+        if bool(unenrolled.any()):
+            metrics["classifier/lambda_unenrolled_mean"] = float(lam.masked_select(unenrolled).mean())
+            metrics["classifier/lambda_unenrolled_count"] = float(unenrolled.sum())
         if bool(enrolled.any()):
             quantiles = torch.quantile(
                 lam.masked_select(enrolled).float(),
@@ -1341,8 +1343,12 @@ def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, flo
         ):
             predicted = branch_logits.detach().masked_fill(~mask, float("-inf")).argmax(dim=1)
             correct = predicted.eq(target)
-            metrics[f"classifier/branch_accuracy/{name}"] = float(correct.float().mean())
+            defined = has_support if name in {"support", "support_floor"} else torch.ones_like(has_support)
+            if bool(defined.any()):
+                metrics[f"classifier/branch_accuracy/{name}"] = float(correct[defined].float().mean())
+                metrics[f"classifier/branch_accuracy/{name}_count"] = float(defined.sum())
             for corruption_name, selected_rows in (("clean", ~corrupted), ("corrupted", corrupted)):
+                selected_rows = selected_rows & defined
                 if bool(selected_rows.any()):
                     metrics[f"classifier/branch_accuracy_{corruption_name}/{name}"] = float(
                         correct[selected_rows].float().mean()
@@ -2178,6 +2184,13 @@ def main() -> None:
                 "of silently selecting a current or legacy sampler"
             )
         saved = dict(resume_blob["trajectory"])
+        # The validation panel participates in checkpoint selection.  A continuation must not
+        # silently replace a small smoke panel with the automatic full panel (or vice versa).
+        if saved.get("validation_episodes") is not None:
+            args.val_episodes = int(saved["validation_episodes"])
+            automatic_val_episodes = False
+        if saved.get("validation_repeats_per_dataset") is not None:
+            args.val_repeats_per_dataset = int(saved["validation_repeats_per_dataset"])
         # Checkpoints predating the deployment-challenge curriculum reproduce their historical
         # single-mode sampler when resumed.
         saved.setdefault("acquisition_mix", None)
@@ -2717,6 +2730,8 @@ def main() -> None:
             "primitive_vocabulary": args.primitive_vocabulary,
             "primitive_combiner": args.primitive_combiner,
             "primitive_projection_rank": int(args.primitive_projection_rank),
+            "validation_episodes": int(args.val_episodes),
+            "validation_repeats_per_dataset": int(args.val_repeats_per_dataset),
             "classifier_config": (dataclasses.asdict(classifier.cfg)
                                   if isinstance(classifier, (
                                       ResidualSupportClassifier, RegimeSplitSupportClassifier,
@@ -2758,6 +2773,7 @@ def main() -> None:
     start_step = 0
     if resume_blob is not None:
         saved_trajectory = dict(resume_blob.get("trajectory") or {})
+        saved_args = resume_blob.get("args") or {}
         # A continuation intentionally extends the total cosine horizon.  ``steps`` is therefore
         # not an invariant of the model/data trajectory: every other field remains exact-match
         # guarded below.  This lets a completed run be extended without silently changing its
@@ -2806,6 +2822,17 @@ def main() -> None:
         saved_trajectory.setdefault("multispan_compression_scale", None)
         saved_trajectory.setdefault("multispan_stem", None)
         saved_trajectory.setdefault("freeze_kernels", False)
+        # Older checkpoints did not persist this panel; retain their historical serialized CLI
+        # value when available. Newly written checkpoints always carry the exact panel size.
+        saved_trajectory.setdefault(
+            "validation_episodes", int(
+                saved_args.get("val_episodes") or args.val_episodes
+            ),
+        )
+        saved_trajectory.setdefault(
+            "validation_repeats_per_dataset",
+            int(saved_args.get("val_repeats_per_dataset") or args.val_repeats_per_dataset),
+        )
         # Candidate masking changes the information condition, not merely logging.  Historical
         # residual snapshots predate explicit trajectory fields but used these initial defaults.
         saved_trajectory.setdefault("p_mask_candidate", 0.25)
@@ -2814,7 +2841,6 @@ def main() -> None:
         # checkpoint remains evaluable, but resuming it under a different sampler would not be a
         # continuation of the same experiment.
         saved_trajectory.setdefault("curriculum_sampler_schema", "cartesian-fallback-v1")
-        saved_args = resume_blob.get("args") or {}
         for field, default in (
             ("acquisition_mix", None),
             ("enrollment_mix", None),
@@ -2949,6 +2975,11 @@ def main() -> None:
             "architecture_version": architecture_version,
             "classifier": None if classifier is None else classifier.state_dict(),
             "classifier_config": None if classifier is None else dataclasses.asdict(classifier.cfg),
+            "primitive_provenance": (
+                classifier.primitive_head.provenance
+                if isinstance(classifier, EvidenceGatedSupportClassifier)
+                and classifier.primitive_head is not None else None
+            ),
             "attention_spec": dataclasses.asdict(spec),
             "p_text_init": p_text_init,
             "args": {key: (str(value) if isinstance(value, Path) else value)

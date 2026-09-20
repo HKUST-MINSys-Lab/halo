@@ -17,19 +17,17 @@ six-step smoke run.**
 | `training/support_classifier/run_scenarios.py` | v4 routing, and opt-in branch readouts (no oracle row) |
 | `tests/test_evidence_gated_classifier.py` | 21 tests: structure, bounds, the three acceptance tests, invariances, NaN safety, checkpoint round-trip, autocast, and the corruption curriculum |
 
-The head is **50,615 parameters** against v3's 1,728,404, because it has no attention stack at all;
+The text-only head is **50,487 parameters** against v3's 1,728,404, because it has no attention stack at all;
 `p_text` (128x384) is most of it. The two gates are about 1.5k parameters together.
 
 ## Deviations from the design entry
 
 **1. Step-0 parity is near, not exact — and the reason matters.** The design asked for zero-init
-output layers and bit-for-bit parity with the closed-form vote. Zero-init is wrong here: the trust
-head's output *bias* is shift-invariant (a constant added to every support cancels in the softmax
-over supports), so with a zero output weight the trust MLP would receive **no gradient at all,
-ever**, not merely at step 0. Both output layers are therefore initialised at std 1e-3, which keeps
-step 0 within a few 1e-3 of the closed-form vote and leaves every parameter trainable from step
-one. Exact equality is asserted separately under `trust_override=0`. The acceptance test was
-rewritten accordingly, and the nonzero-gradient test is what caught this.
+output layers and bit-for-bit parity with the closed-form vote. With zero-init, the final output
+weight receives gradient on the first step but the earlier hidden layers do not until that final
+weight moves. Both output layers therefore use std 1e-3, keeping step 0 near the closed-form vote
+while giving all gate layers signal immediately. Exact equality is asserted separately under
+`trust_override=0`.
 
 **2. Text corruption applies only to truth-enrolled episodes.** The design said "episodes with
 k >= 1". That is wrong for truth-unenrolled queries: with no support for the true candidate its
@@ -90,3 +88,17 @@ mean cosine 0.919), finite losses, finite gradients, and a one-step resume.
 * The 3k screens themselves, and the v3 text-only / base scenario readouts that are step 1 of the
   design's sequencing.
 * Any training run. The arm is not launched.
+
+## Readiness repairs, second pass (2026-09-20)
+
+The primitive-path sweep repaired result-blocking mechanics before any full run: support rank is
+now tie-aware and linear-memory; masked support and candidate slots are sanitized before every
+differentiable normalization; and text-off is explicitly unavailable unless every candidate has
+support. Both sealed and scenario evaluators now identify coverage by distinct candidate labels,
+with scenario diagnostics emitting an `n/a` record rather than disappearing silently.
+
+Validation-panel size is now part of the immutable resume trajectory, so checkpoint selection
+cannot compare a smoke panel with a resumed full panel. Conditional telemetry omits undefined
+strata rather than writing NaN and reports support branch scores only where support exists. Primitive
+fixed-combiner weights are frozen equal weights, primitive vocabulary provenance is serialized and
+verified on load, and the profiler can explicitly profile each semantic mode.

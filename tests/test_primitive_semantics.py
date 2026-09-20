@@ -97,6 +97,14 @@ def test_value_bank_is_frozen():
     assert not any(name.startswith("values") for name, _ in head.named_parameters())
 
 
+def test_fixed_combiner_is_genuinely_fixed_and_bounded():
+    head = make_head(combiner="fixed")
+    assert "axis_weight" not in dict(head.named_parameters())
+    query, text, mask = make_batch(seed=12)
+    agreement = head.agreement(head.profile(query), head.candidate_profile(text, mask))
+    assert bool((agreement >= 0).all()) and bool((agreement <= 1).all())
+
+
 def test_profiles_are_per_axis_distributions():
     head = make_head()
     query, text, mask = make_batch()
@@ -145,7 +153,7 @@ def test_uniform_axis_is_neutral_across_candidates():
     # Constant across the valid candidates of a row, therefore invisible after the softmax.
     high = difference.masked_fill(~mask, float("-inf")).amax(dim=1)
     low = difference.masked_fill(~mask, float("inf")).amin(dim=1)
-    assert float((high - low).abs().max()) < 1e-6
+    assert float((high - low).abs().max().detach()) < 1e-6
 
 
 def test_label_side_is_a_pure_function_of_the_label_embedding():
@@ -255,6 +263,7 @@ def test_checkpoint_round_trip_carries_the_vocabulary():
         "classifier": head.state_dict(),
         "classifier_config": dataclasses.asdict(head.cfg),
         "attention_spec": dataclasses.asdict(head.spec),
+        "primitive_provenance": head.primitive_head.provenance,
     }
     restored, _ = build_classifier_from_blob(blob)
     assert restored.cfg.semantic_mode == "text+primitives"
@@ -263,6 +272,23 @@ def test_checkpoint_round_trip_carries_the_vocabulary():
     batch = v4_batch(seed=10)
     with torch.no_grad():
         torch.testing.assert_close(head(**batch)["logits"], restored(**batch)["logits"])
+    blob["primitive_provenance"] = {
+        **blob["primitive_provenance"], "primitive_vocabulary_hash": "mismatch",
+    }
+    with pytest.raises(ValueError, match="provenance"):
+        build_classifier_from_blob(blob)
+
+
+def test_primitive_head_sanitizes_nonfinite_padded_candidate_text():
+    head = make_head()
+    query, text, mask = make_batch(seed=13)
+    query.requires_grad_()
+    text[~mask] = float("nan")
+    output = head(query, text, mask)
+    torch.nn.functional.nll_loss(output["logits"], torch.tensor([0, 1, 2])).backward()
+    assert torch.isfinite(query.grad).all()
+    assert all(parameter.grad is None or torch.isfinite(parameter.grad).all()
+               for parameter in head.parameters())
 
 
 def test_scrambled_vocabulary_is_selectable_and_changes_scores():

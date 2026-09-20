@@ -2171,7 +2171,7 @@ def main() -> None:
                                     })
                                     continue
                                 if (readout == "halo-classifier-text-off-blend"
-                                        and any(len(plan.support_labels) < len(stream.eval_labels)
+                                        and any(set(plan.support_labels) < set(stream.eval_labels)
                                                 for plan in plans)):
                                     all_rows.append({
                                         "model": name, "readout": readout, "k": k,

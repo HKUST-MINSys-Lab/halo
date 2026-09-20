@@ -42,8 +42,11 @@ def differentiable_neighbor_logits(
     if not bool(support_mask.any(dim=1).all()):
         raise ValueError("differentiable neighbours require at least one valid support per query")
 
+    safe_support = torch.where(
+        support_mask.unsqueeze(-1), support.float(), torch.zeros_like(support.float()),
+    )
     similarity = torch.einsum(
-        "bd,bkd->bk", F.normalize(query.float(), dim=-1), F.normalize(support.float(), dim=-1),
+        "bd,bkd->bk", F.normalize(query.float(), dim=-1), F.normalize(safe_support, dim=-1),
     ) / temperature
     weight = torch.softmax(similarity.masked_fill(~support_mask, float("-inf")), dim=1)
     weight = torch.where(support_mask, weight, torch.zeros_like(weight))

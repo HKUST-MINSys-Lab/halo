@@ -41,6 +41,7 @@ from model.support.evidence_aware_classifier import (
 from model.support.evidence_gated_classifier import (
     EvidenceGatedClassifierConfig, EvidenceGatedSupportClassifier,
 )
+from model.support.primitive_semantics import PRIMITIVE_VOCABULARY_VERSION, VOCABULARIES
 from training.support_classifier.train import (
     TAU_SUPPORT,
     PrefetchLoader,
@@ -116,6 +117,8 @@ def _gradient_breakdown(encoder, classifier) -> dict[str, float]:
                 "classifier/text_bridge": classifier.p_text,
                 "classifier/trust_gate": classifier.trust_mlp,
                 "classifier/lambda_gate": classifier.gate_mlp,
+                **({"classifier/primitive": classifier.primitive_head}
+                   if classifier.primitive_head is not None else {}),
             })
         else:
             modules.update({
@@ -137,6 +140,10 @@ def main() -> None:
                         help="diagnostic support-vote temperature")
     parser.add_argument("--text-temperature", type=float, default=0.07,
                         help="diagnostic query-to-label temperature")
+    parser.add_argument("--semantic-mode", choices=("text", "primitives", "text+primitives"),
+                        default="text", help="v4 semantic path to profile")
+    parser.add_argument("--primitive-vocabulary", choices=tuple(VOCABULARIES),
+                        default=PRIMITIVE_VOCABULARY_VERSION)
     parser.add_argument("--support-sets", type=int, default=4,
                         help="independent support sets per optimizer step")
     parser.add_argument("--queries-per-support-set", type=int, default=4)
@@ -256,6 +263,8 @@ def main() -> None:
                     spec, EvidenceGatedClassifierConfig(
                         temperature=args.support_temperature,
                         text_temperature=args.text_temperature,
+                        semantic_mode=args.semantic_mode,
+                        primitive_version=args.primitive_vocabulary,
                     ),
                 ).to(device).train()
                 if args.classifier == "evidence_gated" else
@@ -456,6 +465,11 @@ def main() -> None:
                     for key in shape_samples[0]
                 },
                 "loss": float(loss.detach()),
+                "semantic_mode": (args.semantic_mode
+                                  if args.classifier == "evidence_gated" else None),
+                "primitive_vocabulary": (args.primitive_vocabulary
+                                           if args.classifier == "evidence_gated"
+                                           and args.semantic_mode != "text" else None),
                 "gradient_norms": {
                     name: float(torch.stack([p.grad.float().norm().square() for p in module.parameters()
                                              if p.grad is not None]).sum().sqrt())

@@ -30,14 +30,16 @@ sentences and to candidate labels.
 
 Why that is safe where the abandoned contextual lineage was not:
 
-* the projection is **shared**: whatever it does to a training label it does to an unseen one, so
-  it cannot single out a vocabulary.  A per-primitive free value vector could, which is why the
-  value bank is a frozen buffer and never a parameter;
+* the projection is **shared**: it applies the same learned metric to training and unseen labels.
+  This preserves an out-of-vocabulary compatibility contract, but does not itself rule out
+  overfitting; that needs held-out-label validation. A per-primitive free value vector would add a
+  separate failure mode, which is why the value bank is frozen and never a parameter;
 * it is **identity-initialised**, so step 0 is exactly the fixed cosine design;
-* the primitive bottleneck stays, so a uniform axis remains neutral across candidates (see
-  ``agreement``) and observability is implied rather than declared;
-* the **scrambled-sentence control** is registered as its own vocabulary version.  If a scrambled
-  run matches a grounded one, the gain came from capacity, not from meaning.
+* the primitive bottleneck stays, so a uniform axis is algebraically neutral across candidates
+  (see ``agreement``). This is not, by itself, evidence about sensor observability;
+* the **scrambled-sentence control** is registered as its own vocabulary version. It tests how
+  primitive sentence grouping contributes, but retains the same meaningful sentences and cannot
+  alone establish a capacity-versus-grounding conclusion.
 """
 
 from __future__ import annotations
@@ -233,13 +235,17 @@ class PrimitiveSemanticHead(nn.Module):
         self.register_buffer("values", F.normalize(values.float(), dim=-1), persistent=True)
         self.keys = nn.Linear(d_model, k)
         if self.cfg.combiner == "projection":
-            # ONE shared map, applied identically to primitive sentences and candidate labels, so
-            # it cannot special-case a vocabulary. Identity-initialised: step 0 is the fixed design.
+            # ONE shared map, applied identically to primitive sentences and candidate labels.
+            # This preserves the same transformation contract for unseen labels; it does not by
+            # itself prevent overfitting, which is tested with held-out-label development data.
+            # Identity-initialised: step 0 is the fixed design.
             weight = torch.zeros(self.cfg.projection_rank, self.cfg.text_dim)
             torch.nn.init.eye_(weight)
             self.projection = nn.Parameter(weight)
         else:
-            self.axis_weight = nn.Parameter(torch.ones(len(self.slices)))
+            # Keep the historical state key for checkpoint compatibility, but make the fixed
+            # comparison genuinely fixed and normalized rather than an unconstrained side path.
+            self.register_buffer("axis_weight", torch.ones(len(self.slices)), persistent=True)
 
     # ------------------------------------------------------------------ pieces
     def profile(self, query_feature: torch.Tensor) -> torch.Tensor:
@@ -282,10 +288,9 @@ class PrimitiveSemanticHead(nn.Module):
         confident wrong block costs. No mask is declared and none is learned.
         """
         if self.cfg.combiner == "fixed":
-            terms = [self.axis_weight[index] * torch.einsum(
-                "bv,bcv->bc", profile[:, block], candidate_profile[..., block],
-            ) for index, block in enumerate(self.slices)]
-            return torch.stack(terms, dim=0).sum(dim=0) / len(self.slices)
+            terms = [torch.einsum("bv,bcv->bc", profile[:, block], candidate_profile[..., block])
+                     for block in self.slices]
+            return torch.stack(terms, dim=0).mean(dim=0)
         return torch.einsum("bk,bck->bc", profile, candidate_profile) / len(self.slices)
 
     def forward(self, query_feature: torch.Tensor, candidate_text: torch.Tensor,
@@ -294,8 +299,11 @@ class PrimitiveSemanticHead(nn.Module):
             raise ValueError("candidate text and mask disagree on batch or roster size")
         if candidate_text.shape[-1] != self.cfg.text_dim:
             raise ValueError("candidate text width does not match the vocabulary's text dimension")
+        safe_candidate_text = torch.where(
+            candidate_mask.unsqueeze(-1), candidate_text, torch.zeros_like(candidate_text),
+        )
         profile = self.profile(query_feature)
-        candidate = self.candidate_profile(candidate_text, candidate_mask)
+        candidate = self.candidate_profile(safe_candidate_text, candidate_mask)
         score = self.cfg.logit_scale * self.agreement(profile, candidate)
         logits = torch.log_softmax(score.masked_fill(~candidate_mask, float("-inf")), dim=-1)
         entropy = torch.stack([
@@ -311,8 +319,7 @@ class PrimitiveSemanticHead(nn.Module):
             weight = self.projection.detach()
             eye = torch.eye(weight.shape[0], weight.shape[1], device=weight.device)
             return {"classifier/primitive_projection_drift": float((weight - eye).abs().mean())}
-        return {f"classifier/primitive_axis_weight/{axis}": float(value)
-                for axis, value in zip(self.axes, self.axis_weight.detach())}
+        return {}
 
     @property
     def provenance(self) -> dict:

@@ -952,6 +952,7 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
                     row["diagnostic_only"] = True
                     row["deployable"] = False
         rows.extend(emitted)
+
         truth = _aligned_labels(task.query_stream)
         for plan, prediction in zip(task.plans, predictions):
             query = int(plan.query)
@@ -973,6 +974,10 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
                 "truth": str(truth[query]),
                 "prediction": str(prediction),
             })
+
+    def append_inapplicable(readout: str, reason: str) -> None:
+        rows.append({"model": name, "readout": readout, "status": "n/a", "reason": reason,
+                     **extra_base, **common})
 
     for name in models:
         model_started = time.perf_counter()
@@ -1160,10 +1165,14 @@ def score_task(task: Task, *, models, device, cache_dir, halo_checkpoint, bootst
                             "halo-classifier-label-meaning-only",
                             *EVIDENCE_GATED_SEMANTIC_READOUTS,
                         }:
+                            append_inapplicable(readout, "no enrolled support at k=0")
                             continue
                         if (readout == "halo-classifier-text-off-blend"
-                                and any(len(plan.support_labels) < len(task.candidates)
+                                and any(set(plan.support_labels) < set(task.candidates)
                                         for plan in task.plans)):
+                            append_inapplicable(
+                                readout, "text-off blend is undefined with unenrolled candidates",
+                            )
                             continue
                         branch, lambda_override, trust_override = _evidence_gated_readout_spec(readout)
                         append_emitted(

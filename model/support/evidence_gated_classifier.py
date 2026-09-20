@@ -242,14 +242,25 @@ class EvidenceGatedSupportClassifier(nn.Module):
                          n_support: torch.Tensor) -> torch.Tensor:
         """Tie-aware fraction of valid supports ranked above each support.
 
-        The earlier stable-sort ordinal rank made equal similarities depend on support-row order.
-        This formulation gives tied rows the same rank and is invariant to support permutation.
-        The support axis is bounded by the episode contract, so the explicit pairwise comparison is
-        both clearer and negligible relative to encoder execution.
+        A stable ordinal rank makes tied supports depend on row order.  Pairwise comparisons avoid
+        that but allocate O(K^2) memory, which is unacceptable for large support banks.  Sorting
+        once lets every equal-valued run share its first ordinal position, i.e. the number of
+        *strictly* higher valid supports, in O(K log K) time and O(K) memory.
         """
-        above = similarity.unsqueeze(1) > similarity.unsqueeze(2)
-        valid_other = support_mask.unsqueeze(2)
-        rank = (above & valid_other).sum(dim=2).to(similarity.dtype)
+        k = similarity.shape[1]
+        if k == 0:
+            return torch.zeros_like(similarity)
+        masked = similarity.masked_fill(~support_mask, float("-inf"))
+        values, order = masked.sort(dim=1, descending=True, stable=True)
+        valid_sorted = support_mask.gather(1, order)
+        ordinal = torch.arange(k, device=similarity.device).view(1, k).expand_as(order)
+        begins = valid_sorted & (
+            ~torch.cat((torch.zeros_like(valid_sorted[:, :1]),
+                        valid_sorted[:, :-1] & values[:, 1:].eq(values[:, :-1])), dim=1)
+        )
+        first = torch.where(begins, ordinal, torch.zeros_like(ordinal)).cummax(dim=1).values
+        rank_sorted = torch.where(valid_sorted, first, torch.zeros_like(first))
+        rank = torch.zeros_like(rank_sorted).scatter(1, order, rank_sorted).to(similarity.dtype)
         return torch.where(
             support_mask, rank / n_support.clamp_min(1.0), torch.zeros_like(rank),
         )
@@ -366,7 +377,15 @@ class EvidenceGatedSupportClassifier(nn.Module):
                     support_mask, candidate_mask)
         b, c = candidate_mask.shape
         k = support_feature.shape[1]
-        q, s = self._centre(query_feature, support_feature, support_mask, corpus_mean)
+        # Invalid slots are allowed to carry arbitrary data because padding comes from collate
+        # buffers.  Replace them before *any* operation that can propagate NaN/Inf in backward.
+        safe_support = torch.where(
+            support_mask.unsqueeze(-1), support_feature, torch.zeros_like(support_feature),
+        )
+        safe_candidate_text = torch.where(
+            candidate_mask.unsqueeze(-1), candidate_text, torch.zeros_like(candidate_text),
+        )
+        q, s = self._centre(query_feature, safe_support, support_mask, corpus_mean)
         k_c = self._k_per_candidate(support_bound, support_mask, c)
         has_support = support_mask.any(dim=1)
         slots = support_bound.clamp_min(0)
@@ -452,7 +471,7 @@ class EvidenceGatedSupportClassifier(nn.Module):
         # 4. semantic path as a log-probability over the roster, so lambda is a true blend.
         text_cosine = torch.einsum(
             "bd,bcd->bc", F.normalize(self.p_text(query_feature).float(), dim=-1),
-            F.normalize(candidate_text.float(), dim=-1),
+            F.normalize(safe_candidate_text.float(), dim=-1),
         )
         text_logits = torch.log_softmax(
             (text_cosine / self.cfg.text_temperature).masked_fill(~candidate_mask, float("-inf")),
@@ -461,7 +480,7 @@ class EvidenceGatedSupportClassifier(nn.Module):
         primitive = None
         primitive_logits = None
         if self.primitive_head is not None:
-            primitive = self.primitive_head(query_feature, candidate_text, candidate_mask)
+            primitive = self.primitive_head(query_feature, safe_candidate_text, candidate_mask)
             primitive_logits = primitive["logits"]
         if self.cfg.semantic_mode == "text":
             semantic_logits = text_logits
@@ -497,15 +516,21 @@ class EvidenceGatedSupportClassifier(nn.Module):
         )
         raw_gate = self.gate_mlp(self.gate_norm(gate_features)).squeeze(-1)
         lam = self.cfg.lambda_max * torch.sigmoid(self.lambda_prior[self._bucket(k_c)] + raw_gate)
+        has_candidate_support = k_c.gt(0) & candidate_mask
         if not self.cfg.text_term_enabled:
-            if bool((~has_support).any()):
-                raise ValueError("supportless candidates require the text term")
+            if bool((~has_candidate_support & candidate_mask).any()):
+                raise ValueError("candidates without support require the text term")
             lam = torch.zeros_like(lam)
         if lambda_override is not None:
+            if (float(lambda_override) == 0.0
+                    and bool((~has_candidate_support & candidate_mask).any())):
+                raise ValueError("text-off blend is undefined with unenrolled candidates")
             lam = torch.full_like(lam, float(lambda_override))
         # A candidate with no support of its own can only be named by meaning.  This is forced,
         # not learned, and it is the only place lambda may reach 1.
-        lam = torch.where(k_c.eq(0), torch.ones_like(lam), lam).masked_fill(~candidate_mask, 0.0)
+        if lambda_override is None:
+            lam = torch.where(k_c.eq(0), torch.ones_like(lam), lam)
+        lam = lam.masked_fill(~candidate_mask, 0.0)
 
         logits = (1.0 - lam) * metric_part + lam * semantic_logits
         return {

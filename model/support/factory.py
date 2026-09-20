@@ -139,6 +139,11 @@ def build_classifier_from_blob(blob: dict, *, device=None, overrides: dict | Non
     else:
         raise ValueError(f"unsupported support-classifier architecture {version!r}")
     head.load_state_dict(blob["classifier"], strict=True)
+    expected_primitive = blob.get("primitive_provenance")
+    if expected_primitive is not None:
+        primitive = getattr(head, "primitive_head", None)
+        if primitive is None or primitive.provenance != expected_primitive:
+            raise ValueError("primitive vocabulary provenance differs from the checkpoint")
     if device is not None:
         head = head.to(device)
     return head.eval(), version
