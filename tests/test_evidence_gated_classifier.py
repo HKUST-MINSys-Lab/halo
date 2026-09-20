@@ -607,6 +607,10 @@ def test_gate_only_view_reaches_exactly_the_blend_gate():
     assert any(name.startswith("gate_mlp") for name in live)
     for tensor in (batch["query_feature"], batch["support_feature"]):
         assert tensor.grad is None or float(tensor.grad.abs().sum()) == 0.0, "encoder features were trained"
+    # Every branch diagnostic is detached as well, so an auxiliary loss added later cannot train
+    # the semantic path from a corrupted view by reaching through one of them.
+    for key in ("semantic_logits", "text_logits", "primitive_logits"):
+        assert not out[key].requires_grad, f"{key} kept a live graph under gate_only"
 
 
 def test_corrupted_view_helper_leaves_clean_text_untouched():

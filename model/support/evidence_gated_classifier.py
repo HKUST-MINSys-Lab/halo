@@ -534,6 +534,13 @@ class EvidenceGatedSupportClassifier(nn.Module):
             )
         if gate_only:
             semantic_logits = semantic_logits.detach()
+            # Defence in depth: the branch diagnostics are detached too, so a future auxiliary
+            # loss built on one of them cannot silently train the semantic path from a corrupted
+            # view. Only `semantic_logits` feeds the blend, so this changes no current behaviour.
+            text_logits = text_logits.detach()
+            if primitive_logits is not None:
+                primitive_logits = primitive_logits.detach()
+                primitive = {key: value.detach() for key, value in primitive.items()}
         if text_stop_gradient is not None:
             if text_stop_gradient.shape != (b,):
                 raise ValueError("text_stop_gradient must be one boolean per episode")
