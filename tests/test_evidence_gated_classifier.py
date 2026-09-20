@@ -19,7 +19,10 @@ from model.support.evidence_gated_classifier import (
     ARCHITECTURE_VERSION, N_GATE_FEATURES, N_TRUST_FEATURES,
     EvidenceGatedClassifierConfig, EvidenceGatedSupportClassifier,
 )
-from model.support.factory import build_classifier_from_blob
+from model.support.factory import (
+    CLASSIFIER_ARCHITECTURE_STATUS, CLASSIFIER_TRY_NAME, build_classifier_from_blob,
+    classifier_try_name,
+)
 from training.support_classifier.neighbors import differentiable_neighbor_logits
 
 D_MODEL, TEXT_DIM = 32, 384
@@ -507,3 +510,14 @@ def test_corruption_is_deterministic_for_a_seed_and_off_by_default():
         untouched, episodes, probability=0.0, rng=np.random.default_rng(0), device="cpu",
     ) is None
     assert torch.equal(untouched["candidate_text"], original)
+
+
+def test_every_lifecycle_architecture_has_a_try_name():
+    """The architecture strings are not numbered consistently with the tries, so the mapping is
+    explicit and must stay complete. See docs/results/RESULTS.md, "Classifier naming"."""
+    assert classifier_try_name(ARCHITECTURE_VERSION) == "T4"
+    assert classifier_try_name("support_classifier_v3") == "v3"
+    missing = set(CLASSIFIER_ARCHITECTURE_STATUS) - set(CLASSIFIER_TRY_NAME)
+    # The retired token mixer predates the scheme and is deliberately unnamed.
+    assert missing == {"support_token_mixer_v1", "support_classifier_v2"}, missing
+    assert len(set(CLASSIFIER_TRY_NAME.values())) == len(CLASSIFIER_TRY_NAME), "duplicate try name"

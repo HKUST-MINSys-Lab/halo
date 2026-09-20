@@ -12,15 +12,34 @@ No sealed result has ever selected a checkpoint or tuned a threshold.
 Names collide easily in this project, so use this index rather than inferring a run from a
 directory name. "Arm" means a training run; "readout" means how a trained checkpoint is scored.
 
+### Classifier naming (adopted 2026-09-20)
+
+**`v3` is the promoted classifier — the one to beat. Every experimental replacement is `T`-numbered
+in the order it was trained (T for "try").** Use these names in discussion and in every new
+document; the architecture strings below are what checkpoints and code carry, and they are not
+always numbered consistently with the tries (`support_classifier_v4` is T4, not a successor to
+`support_classifier_v3`). That mismatch is exactly why this table exists.
+
+| name | architecture string in code and checkpoints | trained | verdict |
+|---|---|---|---|
+| **v3** | `support_classifier_v3` | 2026-09-18 | **promoted control**; still the best overall |
+| T1 | `support_contextual_mixture_v1` | 2026-09-18 | failed: the gate collapsed onto label meaning (0.996) |
+| T2 | `support_contextual_residual_v1` | 2026-09-19 | negative |
+| T3 | `support_evidence_aware_v2` | 2026-09-19 | negative: router at 0.97-0.99 semantic reliance |
+| T4 | `support_classifier_v4` | 2026-09-20 | parity with v3; first try whose routing did not collapse |
+| T5 | T4 with the primitive semantic path | built, not trained | pending |
+
+The differentiable-neighbours arm is a parameter-free **control**, not a try, and keeps its name.
+
 | run | protocol | encoder conditioning | status | numbers |
 |---|---|---|---|---|
-| HALO classifier v4 (evidence-gated), step 40k, 2026-09-20 | v5 | acquisition-conditioning-v2 | **completed, parity with v3** | [below](#classifier-v4-the-evidence-gated-blend) |
-| HALO evidence-aware v2, step 40k, 2026-09-19 | v5 | acquisition-conditioning-v2 | **completed negative result** | [below](#the-evidence-aware-v2-follow-up) |
-| HALO evidence-aware v2, step 32,500 companion, 2026-09-19 | v5 | acquisition-conditioning-v2 | **completed negative result** | [below](#the-evidence-aware-v2-follow-up) |
-| HALO bounded contextual residual v1, step 35k, 2026-09-19 | v5 | acquisition-conditioning-v2 | **completed negative result** | [record](../journal/2026-09-19-bounded-contextual-residual-v1-results.md) |
-| HALO residual arm, step 40k, 2026-09-18 | v5 | acquisition-conditioning-v2 | **current** | below |
+| **T4** evidence-gated blend, step 40k, 2026-09-20 | v5 | acquisition-conditioning-v2 | **completed, parity with v3** | [below](#t4-the-evidence-gated-blend-support_classifier_v4) |
+| **T3** evidence-aware, step 40k, 2026-09-19 | v5 | acquisition-conditioning-v2 | **completed negative result** | [below](#t3-the-evidence-aware-classifier-support_evidence_aware_v2) |
+| **T3** evidence-aware, step 32,500 companion, 2026-09-19 | v5 | acquisition-conditioning-v2 | **completed negative result** | [below](#t3-the-evidence-aware-classifier-support_evidence_aware_v2) |
+| **T2** bounded contextual residual, step 35k, 2026-09-19 | v5 | acquisition-conditioning-v2 | **completed negative result** | [record](../journal/2026-09-19-bounded-contextual-residual-v1-results.md) |
+| **v3** residual arm (the classifier to beat), step 40k, 2026-09-18 | v5 | acquisition-conditioning-v2 | **current** | below |
 | HALO neighbours arm, step 40k, 2026-09-18 | v5 | acquisition-conditioning-v2 | **current** | below |
-| HALO contextual arm, step 40k, 2026-09-18 | v5 | acquisition-conditioning-v2 | **failed, recorded** | below |
+| **T1** contextualise-first mixture, step 40k, 2026-09-18 | v5 | acquisition-conditioning-v2 | **failed, recorded** | below |
 | Released baselines, 2026-09-18 | v5 | n/a | **current** | below |
 | HALO residual v3 `curriculum1234`, 2026-09-16 | v4 scenarios | combined-text-v1 | superseded | [artifact](../../results/artifacts/scenarios_halo_classifier_v3_20260917/) |
 | HALO residual v3 `curriculum12`, 2026-09-16 | v4 scenarios | combined-text-v1 | superseded | [summary](../../results/artifacts/historical-evaluations/scenarios_curriculum12_20260916/SUMMARY.md) |
@@ -276,7 +295,7 @@ Reading the scenario tables:
   zero-support episodes, so its zero-support validation is undefined by design.
 
 
-### The contextual arm: a recorded negative result
+### T1: the contextualise-first mixture (`support_contextual_mixture_v1`)
 
 A third arm trained the contextualise-first semantic-voting head
 (`support_contextual_mixture_v1`, the approved [2026-09-17 plan](../journal/2026-09-17-contextual-classifier-plan.md)):
@@ -329,7 +348,7 @@ place.
 Artifacts: [`halo_contextual_sealed_v5_20260918`](../../results/artifacts/halo_contextual_sealed_v5_20260918/),
 [`halo_contextual_scenarios_v5_20260918`](../../results/artifacts/halo_contextual_scenarios_v5_20260918/).
 
-### The bounded contextual residual v1 follow-up
+### T2: the bounded contextual residual (`support_contextual_residual_v1`)
 
 The 2026-09-19 replacement restored a soft support-vote floor, bounded contextual corrections,
 per-candidate label-meaning weighting, and modular path-improvement losses. In human-facing tables
@@ -342,7 +361,7 @@ scores 51.7/62.4/71.5/73.4/74.4. The learned support matcher improves the soft v
 decomposition, sealed rows, and scenario rows are in the
 [2026-09-19 result record](../journal/2026-09-19-bounded-contextual-residual-v1-results.md).
 
-### The evidence-aware v2 follow-up
+### T3: the evidence-aware classifier (`support_evidence_aware_v2`)
 
 **What it is.** `support_evidence_aware_v2` computes an auditable support vote and a label-meaning
 (semantic) distribution, injects both as evidence into a contextualising attention stack over query,
@@ -430,7 +449,7 @@ Figures: [sealed k-curves](../../results/artifacts/promoted-figures/k_curve_evid
 [`halo_evidence_aware_v2_step32500_sealed_v5_20260919`](../../results/artifacts/halo_evidence_aware_v2_step32500_sealed_v5_20260919/),
 [`halo_evidence_aware_v2_step32500_scenarios_v5_20260919`](../../results/artifacts/halo_evidence_aware_v2_step32500_scenarios_v5_20260919/).
 
-### Classifier v4: the evidence-gated blend
+### T4: the evidence-gated blend (`support_classifier_v4`)
 
 **What it is.** `support_classifier_v4` replaces v3's three text-driven output terms with two
 bounded, label-blind gates on top of the same closed-form support vote: a per-support trust scalar

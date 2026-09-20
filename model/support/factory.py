@@ -54,6 +54,28 @@ CLASSIFIER_ARCHITECTURE_STATUS = {
     EVIDENCE_AWARE_ARCHITECTURE: "abandoned-negative-result",
     EVIDENCE_GATED_ARCHITECTURE: "active-experimental",
 }
+# Human-facing names, adopted 2026-09-20. `v3` is the promoted classifier; every experimental
+# replacement is T-numbered in the order it was trained ("T" for try). The architecture strings are
+# NOT numbered consistently with the tries -- `support_classifier_v4` is T4, not a successor to
+# `support_classifier_v3` -- which is why this mapping is explicit. See
+# docs/results/RESULTS.md, "Classifier naming".
+CLASSIFIER_TRY_NAME = {
+    "support_classifier_v3": "v3",
+    "support_contextual_mixture_v1": "T1",
+    "support_contextual_residual_v1": "T2",
+    "support_evidence_aware_v2": "T3",
+    "support_classifier_v4": "T4",
+}
+
+
+def classifier_try_name(architecture: str) -> str:
+    """The name to use in discussion and documents for a persisted architecture."""
+    try:
+        return CLASSIFIER_TRY_NAME[architecture]
+    except KeyError as exc:
+        raise ValueError(f"no try name registered for {architecture!r}") from exc
+
+
 PROMOTED_CLASSIFIER_ARCHITECTURE = "support_classifier_v3"
 ACTIVE_EXPERIMENTAL_CLASSIFIER_ARCHITECTURE = EVIDENCE_GATED_ARCHITECTURE
 ABANDONED_CLASSIFIER_ARCHITECTURES = frozenset({
