@@ -29,13 +29,14 @@ always numbered consistently with the tries (`support_classifier_v4` is T4, not 
 | T4 | `support_classifier_v4` | 2026-09-20 | parity with v3; first try whose routing did not collapse |
 | T5 | `support_classifier_v4` with corruption disabled | 2026-09-20 | corruption-free control; routing collapses onto label meaning |
 | T6 | T4 with corruption as a gate-only auxiliary and a label-blind unenrolled calibration term ([design](../journal/2026-09-20-classifier-t6-design.md)) | 2026-09-20 | **beats v3 at k>=4**; over-trust pathology closed; not yet promoted |
-| T7 | T6 with the primitive semantic branch ([design](../journal/2026-09-20-primitive-semantic-path-design.md)) | 2026-09-20 | running |
+| T7 | T6 with the primitive semantic branch ([design](../journal/2026-09-20-primitive-semantic-path-design.md)) | 2026-09-20 | best sealed arm; **disqualified by a 15-point foreign-vocabulary regression** |
 
 T4 through T7 share the `support_classifier_v4` architecture string and differ by recipe (config
 flags and curriculum), which the checkpoint records. The differentiable-neighbours arm is a parameter-free **control**, not a try, and keeps its name.
 
 | run | protocol | encoder conditioning | status | numbers |
 |---|---|---|---|---|
+| **T7** T6 + primitive semantic branch, step 40k, 2026-09-20 | v5 | acquisition-conditioning-v2 | **best sealed; MM-Fit regression** | [below](#t7-t6-plus-the-primitive-semantic-branch) |
 | **T6** gate-only corruption + unenrolled calibration, step 40k, 2026-09-20 | v5 | acquisition-conditioning-v2 | **beats v3 at k>=4; pathology closed** | [below](#t6-corruption-as-a-gate-only-auxiliary-plus-unenrolled-calibration) |
 | **T5** corruption-free control, step 40k, 2026-09-20 | v5 | acquisition-conditioning-v2 | **control: λ collapses without the curriculum** | [below](#the-corruption-free-control-the-curriculum-is-load-bearing) |
 | **T4** evidence-gated blend, step 40k, 2026-09-20 | v5 | acquisition-conditioning-v2 | **completed, parity with v3** | [below](#t4-the-evidence-gated-blend-support_classifier_v4) |
@@ -453,6 +454,86 @@ Figures: [sealed k-curves](../../results/artifacts/promoted-figures/k_curve_evid
 [`halo_evidence_aware_v2_step40k_scenario_branches_v5_20260919`](../../results/artifacts/halo_evidence_aware_v2_step40k_scenario_branches_v5_20260919/),
 [`halo_evidence_aware_v2_step32500_sealed_v5_20260919`](../../results/artifacts/halo_evidence_aware_v2_step32500_sealed_v5_20260919/),
 [`halo_evidence_aware_v2_step32500_scenarios_v5_20260919`](../../results/artifacts/halo_evidence_aware_v2_step32500_scenarios_v5_20260919/).
+
+### T7: T6 plus the primitive semantic branch
+
+**What changed from T6.** One flag: `--semantic-mode text+primitives`. The semantic branch becomes
+a fixed equal-weight sum in log space of the promoted cosine path and the primitive path (32
+primitives in 10 axes, label side a fixed function of the label string, shared identity-initialised
+compatibility projection). Nothing else differs. Design:
+[primitive semantic path](../journal/2026-09-20-primitive-semantic-path-design.md).
+
+**Run.** `halo_t7_40k_20260920`, code `3876dd0`, 46 minutes training.
+
+**Verdict: the best sealed arm we have produced, and not promotable, because of one scenario.**
+
+Sealed, 8 s, dataset-balanced macro F1 (333/333 manifests identical):
+
+| readout | k=0 | k=1 | k=2 | k=4 | k=8 | k=16 | k=32 | k=128 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **T7 classifier** | **51.9** | **62.7** | **66.6** | **70.6** | **73.1** | **75.0** | **76.2** | **77.9** |
+| T6 classifier | 50.2 | 62.4 | 66.5 | 70.2 | 72.7 | 74.6 | 75.8 | 76.5 |
+| v3 classifier (promoted) | 51.7 | 62.4 | 66.3 | 68.7 | 71.5 | 72.7 | 73.4 | 74.4 |
+| T7 own support vote | - | 60.8 | 65.4 | 69.7 | 72.7 | 74.7 | 76.3 | 78.3 |
+| T7 encoder, cosine 1-NN | - | 61.0 | 65.3 | 69.0 | 71.8 | 73.0 | 74.4 | 75.9 |
+
+T7 leads v3 at **every** k, by +3.5 at k=128, and its deficit against its own support vote is
+-0.4 at k=128 against v3's -3.6 and T6's -0.9.
+
+**The two semantic halves are complementary on seen vocabulary.** At 8 s, `k=0` (where the blend is
+the semantic branch): text half alone **50.6**, primitive half alone **42.9**, combined **51.9**.
+The combination beats both halves, which is the result the primitive design predicted and the
+opposite of the dilution that makes released-baseline fusion rows worthless. It also closes T6's
+only sealed weakness: k=0 moves 50.2 → 51.9, from 1.5 behind v3 to marginally ahead.
+
+**Scenarios, 8 s** (737/737 manifests identical). T7 leads v3 almost everywhere, including the
+cross-placement cell that no arm in this lineage had previously won:
+
+| scenario | k | T7 | T6 | v3 |
+|---|---:|---:|---:|---:|
+| partial coverage | 8 | **58.2** | 57.2 | 57.2 |
+| cross placement | 8 | **51.1** | 48.9 | 50.5 |
+| cross dataset | 32 | **83.6** | 82.6 | 82.0 |
+| rate mismatch | 32 | **74.7** | 73.1 | 73.1 |
+| device set | 32 | **69.1** | 68.3 | 66.7 |
+| **new domain (MM-Fit)** | **8** | **45.8** | **61.0** | **57.9** |
+
+Partial coverage is the best split any arm has produced: 62.0 truth-enrolled and 60.2
+truth-unenrolled at k=8 (harmonic mean 61.1, against v3's 59.7 and T6's 59.9), finally achieving
+the balance the calibration term was added for.
+
+**The disqualifying result, and its mechanism.** On MM-Fit, the only foreign-vocabulary source, T7
+scores 45.8 at k=8 where T6 reaches 61.0. A per-branch diagnostic on that scenario
+(`halo_t7_mmfit_diag`) shows why:
+
+| MM-Fit readout | k=1 | k=8 |
+|---|---:|---:|
+| support vote | 42.7 | 47.5 |
+| full classifier | 23.3 | 26.8 |
+| semantic, text half | 10.2 | 10.2 |
+| semantic, primitive half | **3.7** | **3.7** |
+
+The support evidence is intact. Both semantic halves are at or below the 10.0 chance level, and the
+primitive half is **confidently wrong rather than uninformative**. Because both semantic paths are
+log-probabilities with unbounded negative range, a confidently wrong half can flip an argmax even at
+a small blend weight, so the classifier lands 20 points below its own support vote. λ cannot rescue
+this: it is label-blind by design, so it can learn "distrust meaning when evidence is strong" but
+never "distrust meaning because this vocabulary is foreign".
+
+This is dilution of a strong path by a weak one, in exactly the condition the primitive vocabulary
+was built to serve. Two candidate repairs, neither tested: bound the semantic branch's confidence
+(clamp its log-probabilities, or raise the primitive profile temperature so it cannot be peaked),
+or give λ a label-blind proxy for vocabulary familiarity, which is a new and unproven input class.
+The scrambled-vocabulary control remains unrun and would say how much of the seen-vocabulary gain is
+grounding rather than capacity.
+
+**Standing recommendation: T6 is the promotion candidate, not T7.** T6 beats v3 at every k ≥ 4 with
+no scenario regression worse than 1.6, while T7 buys +1.4 sealed macro F1 at k=128 and a 15-point
+loss on foreign vocabulary — the capability the project exists to demonstrate.
+
+Artifacts:
+[sealed](../../results/artifacts/halo_t7_step40k_sealed_v5_20260920/),
+[scenarios](../../results/artifacts/halo_t7_step40k_scenarios_v5_20260920/).
 
 ### T6: corruption as a gate-only auxiliary, plus unenrolled calibration
 
