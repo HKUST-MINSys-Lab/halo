@@ -2054,8 +2054,9 @@ def main() -> None:
              "what prices the reliability of the semantic path (default: 0.25 for "
              "evidence_gated, otherwise 0)",
     )
-    parser.add_argument("--contextual-aux", action=argparse.BooleanOptionalAction, default=True,
-                        help="enable modular path-improvement objectives for contextual training")
+    parser.add_argument("--contextual-aux", action=argparse.BooleanOptionalAction, default=None,
+                        help="enable modular path-improvement objectives for the contextual head; "
+                             "default on only for --classifier contextual")
     parser.add_argument("--contextual-aux-weight", type=float, default=0.1,
                         help="global weight on the mean of active path-improvement losses")
     parser.add_argument("--contextual-aux-margin", type=float, default=0.0)
@@ -2065,11 +2066,11 @@ def main() -> None:
                         default=list(CONTEXTUAL_AUX_COMPARISONS),
                         help="named better-over-reference comparisons; an empty list disables all")
     parser.add_argument("--evidence-branch-preservation", action=argparse.BooleanOptionalAction,
-                        default=True, help="v2: preserve independently useful support and semantic branches")
+                        default=None, help="contextual v2: preserve independently useful branches")
     parser.add_argument("--evidence-best-path", action=argparse.BooleanOptionalAction,
-                        default=True, help="v2: grouped final-over-best-branch non-regression")
+                        default=None, help="contextual v2: grouped final-over-best-branch non-regression")
     parser.add_argument("--evidence-injection", action=argparse.BooleanOptionalAction,
-                        default=True, help="v2: inject pre-context path status into entity tokens")
+                        default=None, help="contextual v2: inject pre-context path status into tokens")
     parser.add_argument("--evidence-group-temperature", type=float, default=0.1,
                         help="v2: log-mean-exp temperature across counterfactual views")
     parser.add_argument("--centring", choices=("none", "support_mean", "corpus_mean"),
@@ -2201,6 +2202,27 @@ def main() -> None:
         args.p_gt_present = DEFAULT_P_GT_PRESENT
     if "--counterfactual-enrollment-probability" not in sys.argv:
         args.counterfactual_enrollment_probability = 0.25 if args.classifier == "contextual" else 0.0
+    contextual_switches = {
+        "contextual_aux": "--contextual-aux",
+        "evidence_branch_preservation": "--evidence-branch-preservation",
+        "evidence_best_path": "--evidence-best-path",
+        "evidence_injection": "--evidence-injection",
+    }
+    if args.classifier == "contextual":
+        for field in contextual_switches:
+            if getattr(args, field) is None:
+                setattr(args, field, True)
+    else:
+        explicitly_enabled = [option for field, option in contextual_switches.items()
+                              if option in sys.argv and getattr(args, field) is True]
+        if explicitly_enabled and args.resume is None:
+            parser.error(
+                f"{'/'.join(explicitly_enabled)} applies only to --classifier contextual; "
+                "the evidence-gated head uses its corrupted-view gate objective"
+            )
+        for field in contextual_switches:
+            setattr(args, field, False)
+        args.contextual_aux_comparisons = []
     # The promoted v4 recipe (T6) is the default for evidence_gated; both switches stay explicit
     # in the saved trajectory, so a checkpoint never depends on what the default was that day.
     if args.text_corruption_mode is None:
@@ -2416,6 +2438,16 @@ def main() -> None:
         saved.setdefault("evidence_best_path", True)
         saved.setdefault("evidence_group_temperature", 0.1)
         saved.setdefault("evidence_injection", True)
+        # These switches were historically serialized as true for every classifier even though
+        # run_step applies them only to the contextual lineage. Canonicalize the inert values on
+        # resume so provenance describes the objective that actually runs; optimizer/model state
+        # is unchanged because the switches never participated in evidence-gated computation.
+        if saved.get("classifier", "token_mixer") != "contextual":
+            saved["contextual_aux"] = False
+            saved["contextual_aux_comparisons"] = []
+            saved["evidence_branch_preservation"] = False
+            saved["evidence_best_path"] = False
+            saved["evidence_injection"] = False
         # v4 initially omitted this from its trajectory. Its complete run arguments are present in
         # affected checkpoints, so migrate from there rather than silently disabling corruption.
         saved_args = resume_blob.get("args") or {}
@@ -2650,8 +2682,15 @@ def main() -> None:
                 spec, EvidenceAwareClassifierConfig(**resume_blob["classifier_config"]),
             ).to(device) if args.classifier == "contextual" else None
         elif version == EVIDENCE_GATED_ARCHITECTURE:
+            classifier_state = resume_blob["classifier"]
+            primitive_values = next((
+                classifier_state[key]
+                for key in ("primitive_head.anchors", "primitive_head.values")
+                if key in classifier_state
+            ), None)
             classifier = EvidenceGatedSupportClassifier(
                 spec, EvidenceGatedClassifierConfig(**resume_blob["classifier_config"]),
+                primitive_values=primitive_values,
             ).to(device) if args.classifier == "evidence_gated" else None
         elif version == "support_token_mixer_v1":
             classifier = SupportTokenMixer(spec, TokenMixerConfig(**resume_blob["classifier_config"])).to(device) \

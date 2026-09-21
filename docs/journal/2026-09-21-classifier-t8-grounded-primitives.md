@@ -30,16 +30,21 @@ push-ups — and their averaged profile is still "vigorous, hard impacts, postur
 Averaging attributes is meaningful where averaging identities is not. The primitive sentences
 leave the scoring path entirely, which also retires the exemplar-bias concern.
 
-The learnable repair is now a 32×32 identity-initialised bilinear form in primitive space
-(`combiner="bilinear"`, 1,024 parameters) instead of a 384×384 projection in text space. The
-primitive head is 5,152 parameters against T7's 151,584.
+The learnable repair is now ten identity-initialised per-axis bilinear forms in primitive space
+(`combiner="bilinear"`, 106 parameters) instead of a 384×384 projection in text space. Each block
+is independently max-entry-normalized and no cross-axis parameters exist, so its probability-
+weighted score remains bounded and intensity cannot become an arbitrary code for posture. This
+normalization also has finite gradients at the identity initialization; SVD normalization did not
+because the identity has repeated singular values. Dense matrices from the early T8 smoke migrate
+strictly by retaining their diagonal axis blocks.
 
-**2. The semantic halves combine as an OR, floored.**
-`semantic_combination="mixture"`: each half's probabilities are floored at `1e-3`, averaged with
-equal fixed weights, renormalised. The branch can never fall below half the better half, and no
-half can be confident beyond the floor. Asserted by `test_mixture_never_falls_below_half_the_
-better_half`. T7's log-space product remains available as `log_sum` and is the default, so T7
-checkpoints are unchanged.
+**2. The semantic halves combine as an exact probability-space OR.**
+`semantic_combination="mixture"` uses a numerically stable equal arithmetic mixture. It is already
+normalized and the branch cannot fall below half the better half. The former clamp-then-renormalize
+implementation did not actually satisfy that bound for large rosters and was repaired before full
+T8 training. Asserted adversarially at the declared 256-candidate capacity by
+`test_mixture_never_falls_below_half_the_better_half`. T7's log-space product remains available as
+`log_sum` and is the default, so T7 checkpoints are unchanged.
 
 ## The pre-registered screen (Step 6.1) — run, on CPU, before anything else
 
@@ -64,13 +69,14 @@ have weaker neighbours. MM-Fit is the real test, and it is still one dataset wit
 
 ## Verification
 
-* Full suite 1072 passed, 1 skipped; 14 new contract tests (annotation coverage and validity, the
+* Full suite 1,076 passed, 1 skipped after the readiness repair; contract tests cover annotation coverage and validity, the
   scrambled control, one-distribution-per-axis, own-profile recovery, convexity of inherited
-  profiles, combiner/label-side compatibility, bilinear trainability, mixture lower bound and
-  floor, T7 default unchanged, gate-only isolation with the annotated side, checkpoint round trip,
+  profiles, combiner/label-side compatibility, bounded bilinear trainability, the adversarial
+  mixture lower bound, T7 default unchanged, gate-only isolation, offline checkpoint round trip,
   try-name resolution to `T8`).
-* Six-step CUDA smoke with the full recipe: finite losses, primitive and corrupted-view telemetry
-  present, anchors and profiles round-trip in the checkpoint, `classifier_try_name` returns `T8`.
+* Three-step CUDA smoke plus a one-step resume with the full repaired recipe: finite losses and
+  gradients, primitive and corrupted-view telemetry present, anchors and profiles round-trip in
+  the checkpoint without regenerating them, and `classifier_try_name` returns `T8`.
 * Sealed-evaluator smoke (k = 0, 1; 8 s): the checkpoint loads with the new config fields and
   every readout emits, including both semantic halves at k = 0.
 

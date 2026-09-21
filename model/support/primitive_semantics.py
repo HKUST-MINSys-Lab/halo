@@ -283,10 +283,15 @@ class PrimitiveSemanticHead(nn.Module):
             # vocabulary, which is the failure this whole design is avoiding.
             self.register_buffer("values", F.normalize(values.float(), dim=-1), persistent=True)
         if self.cfg.combiner == "bilinear":
-            # Identity-initialised repair in primitive space: "sensor primitive i is evidence for
-            # label primitive j". It cannot see label identity; it can overfit the 155 annotated
-            # profiles, which the identity-versus-learned control on foreign vocabulary measures.
-            self.interaction = nn.Parameter(torch.eye(k))
+            # Identity-initialised repair in primitive space. At use time each axis block is
+            # independently max-entry-normalized and cross-axis entries are ignored. Since both
+            # operands are probability vectors, their bilinear score is a convex combination of
+            # matrix entries and is therefore bounded by that maximum. Unlike an SVD-based
+            # spectral norm, this has finite gradients at the repeated singular values of the
+            # identity initialization.
+            self.interaction_blocks = nn.ParameterList([
+                nn.Parameter(torch.eye(block.stop - block.start)) for block in self.slices
+            ])
         elif self.cfg.combiner == "projection":
             # ONE shared map, applied identically to primitive sentences and candidate labels.
             # This preserves the same transformation contract for unseen labels; it does not by
@@ -301,6 +306,20 @@ class PrimitiveSemanticHead(nn.Module):
             self.register_buffer("axis_weight", torch.ones(len(self.slices)), persistent=True)
 
     # ------------------------------------------------------------------ pieces
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        """Migrate the pre-readiness T8 smoke's dense interaction into axis blocks."""
+        legacy_key = prefix + "interaction"
+        if legacy_key in state_dict and not any(
+                prefix + f"interaction_blocks.{index}" in state_dict
+                for index in range(len(self.slices))):
+            legacy = state_dict.pop(legacy_key)
+            for index, block in enumerate(self.slices):
+                state_dict[prefix + f"interaction_blocks.{index}"] = legacy[block, block]
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs,
+        )
+
     def profile(self, query_feature: torch.Tensor) -> torch.Tensor:
         """Per-axis distributions over primitives, from the pooled recording vector alone."""
         logits = self.keys(query_feature.float())
@@ -346,8 +365,9 @@ class PrimitiveSemanticHead(nn.Module):
     def agreement(self, profile: torch.Tensor, candidate_profile: torch.Tensor) -> torch.Tensor:
         """Per-axis dot product of two distributions.
 
-        Averaged over axes, so the result is in [0, 1] regardless of how many axes a vocabulary
-        has and ``logit_scale`` means the same thing across vocabulary versions.
+        Averaged over axes. Fixed/projection scores are in [0, 1]; the bounded bilinear repair is
+        in [-1, 1]. Thus ``logit_scale`` retains a stable meaning across vocabulary versions and
+        throughout training.
 
         A uniform sensor block contributes ``1/V`` to EVERY candidate and therefore cancels in the
         softmax over candidates. That is what makes observability implied: a head that cannot see a
@@ -359,8 +379,18 @@ class PrimitiveSemanticHead(nn.Module):
                      for block in self.slices]
             return torch.stack(terms, dim=0).mean(dim=0)
         if self.cfg.combiner == "bilinear":
-            return torch.einsum("bi,ij,bcj->bc", profile, self.interaction, candidate_profile) \
-                / len(self.slices)
+            terms = []
+            for block, matrix in zip(self.slices, self.interaction_blocks):
+                # p^T M q is a convex combination of M's entries for probability vectors p and q.
+                # Bounding each entry therefore bounds the score. clamp_min(1) preserves the exact
+                # identity initialization and amax has a defined subgradient when diagonal maxima
+                # are tied, unlike the spectral norm at identity.
+                matrix = matrix / matrix.abs().amax().clamp_min(1.0)
+                terms.append(torch.einsum(
+                    "bv,vw,bcw->bc", profile[:, block], matrix,
+                    candidate_profile[..., block],
+                ))
+            return torch.stack(terms, dim=0).mean(dim=0)
         return torch.einsum("bk,bck->bc", profile, candidate_profile) / len(self.slices)
 
     def forward(self, query_feature: torch.Tensor, candidate_text: torch.Tensor,
@@ -386,9 +416,12 @@ class PrimitiveSemanticHead(nn.Module):
     # ------------------------------------------------------------------ reporting
     def telemetry(self) -> dict[str, float]:
         if self.cfg.combiner == "bilinear":
-            weight = self.interaction.detach()
-            eye = torch.eye(weight.shape[0], device=weight.device)
-            return {"classifier/primitive_interaction_drift": float((weight - eye).abs().mean())}
+            deviations = []
+            for weight in self.interaction_blocks:
+                detached = weight.detach()
+                eye = torch.eye(detached.shape[0], device=detached.device)
+                deviations.append((detached - eye).abs().reshape(-1))
+            return {"classifier/primitive_interaction_drift": float(torch.cat(deviations).mean())}
         if self.cfg.combiner == "projection":
             weight = self.projection.detach()
             eye = torch.eye(weight.shape[0], weight.shape[1], device=weight.device)

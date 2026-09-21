@@ -33,7 +33,7 @@ always numbered consistently with the tries (`support_classifier_v4` is T4, not 
 | T5 | `support_classifier_v4` with corruption disabled | 2026-09-20 | corruption-free control; routing collapses onto label meaning |
 | T6 | T4 with corruption as a gate-only auxiliary and a label-blind unenrolled calibration term ([design](../journal/2026-09-20-classifier-t6-design.md)) | 2026-09-20 | **promoted as v4 on 2026-09-21** |
 | T7 | T6 with the primitive semantic branch ([design](../journal/2026-09-20-primitive-semantic-path-design.md)) | 2026-09-20 | best sealed arm; **disqualified by a 15-point foreign-vocabulary regression** |
-| T8 | T7 with a written, training-label-only annotated label side and a floored probability-space mixture ([design](../journal/2026-09-21-classifier-t8-grounded-primitives.md)) | built, not trained | held-out label-side screen 0.82 vs T7's 0.34 |
+| T8 | T7 with a written, training-label-only annotated label side and an exact probability-space mixture ([design](../journal/2026-09-21-classifier-t8-grounded-primitives.md)) | built, not trained | held-out label-side screen 0.82 vs T7's 0.34 |
 
 T4 through T8 share the `support_classifier_v4` architecture string and differ by recipe (config
 flags and curriculum), which the checkpoint records. The differentiable-neighbours arm is a parameter-free **control**, not a try, and keeps its name.
@@ -624,11 +624,10 @@ works â€” it moves the operating point, and its learned bias settled at +1.11 â€
 plus this single scalar lands on a balanced point rather than the asymmetric one we wanted. The
 harmonic mean is the best of the three arms by 0.2, which is not a meaningful margin.
 
-**Not yet promoted.** T6 leads v3 where evidence is plentiful and loses at k=0 and on cross
-placement; both are semantic-path and representation questions rather than routing ones. Promotion
-should wait for the T7 arm (T7: T6 plus the primitive semantic branch), which targets exactly the k=0
-weakness, and for a `trust_scale` sensitivity check, since trust finished pinned at its bound
-(mean |t| 1.85, p95 2.00 against a limit of 2.0).
+**Historical decision at completion.** T6 was initially held pending T7 because it lost at k=0 and
+on cross placement. T7 subsequently improved the sealed aggregate but failed the foreign-vocabulary
+scenario by 15 points, so T6 was promoted as v4 on 2026-09-21. Its trust saturation remains a
+documented limitation (mean |t| 1.85, p95 2.00 against a limit of 2.0).
 
 Artifacts:
 [sealed](../../results/artifacts/halo_t6_step40k_sealed_v5_20260920/),

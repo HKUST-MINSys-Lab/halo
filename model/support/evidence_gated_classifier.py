@@ -28,6 +28,7 @@ support (or one candidate) at a time.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -97,18 +98,22 @@ class EvidenceGatedClassifierConfig:
     primitive_annotation_version: str = "annotations-v1"
     primitive_label_map_temperature: float = 0.05
     # How the two semantic halves combine in "text+primitives". "log_sum" (T7) is a product of
-    # distributions: an AND, in which a confidently wrong half is a veto. "mixture" is a
-    # probability-space average with a floor: an OR, which cannot fall below half the better half.
+    # distributions: an AND, in which a confidently wrong half is a veto. "mixture" is a stable
+    # arithmetic probability mixture: an OR that cannot fall below half the better half when
+    # semantic_floor is zero.
     semantic_combination: str = "log_sum"
-    semantic_floor: float = 1e-3
+    # Historical field name retained in the checkpoint contract. It is now a TOTAL uniform
+    # smoothing mass rather than a per-candidate clamp. Zero gives the exact half-better bound;
+    # epsilon > 0 gives (1-epsilon)/2 while keeping the result exactly normalized.
+    semantic_floor: float = 0.0
 
     def __post_init__(self) -> None:
         if self.semantic_mode not in SEMANTIC_MODES:
             raise ValueError(f"semantic_mode must be one of {SEMANTIC_MODES}")
         if self.semantic_combination not in SEMANTIC_COMBINATIONS:
             raise ValueError(f"semantic_combination must be one of {SEMANTIC_COMBINATIONS}")
-        if not 0.0 < self.semantic_floor < 0.5:
-            raise ValueError("semantic_floor must be in (0, 0.5)")
+        if not 0.0 <= self.semantic_floor < 0.5:
+            raise ValueError("semantic_floor must be in [0, 0.5)")
         if self.text_dim < 1 or self.max_candidates < 2 or self.max_supports < 0:
             raise ValueError("invalid evidence-gated capacity")
         if self.temperature <= 0 or self.text_temperature <= 0:
@@ -130,6 +135,37 @@ SEMANTIC_MODES = ("text", "primitives", "text+primitives")
 SEMANTIC_COMBINATIONS = ("log_sum", "mixture")
 
 
+def probability_semantic_mixture(
+    first: torch.Tensor, second: torch.Tensor, candidate_mask: torch.Tensor, *,
+    smoothing: float = 0.0,
+) -> torch.Tensor:
+    """Stable equal mixture of two log-probability distributions.
+
+    With zero smoothing, ``p_mix[c] >= 0.5 * max(p_first[c], p_second[c])`` exactly. Optional
+    smoothing is a total uniform mass, not a per-candidate clamp, so normalization cannot silently
+    weaken the bound by a roster-size-dependent amount.
+    """
+    if first.shape != second.shape or first.shape != candidate_mask.shape:
+        raise ValueError("semantic distributions and candidate mask must have identical shapes")
+    if not 0.0 <= float(smoothing) < 0.5:
+        raise ValueError("semantic smoothing must be in [0, 0.5)")
+    # Both branches use -inf at padded candidate positions. logaddexp(-inf, -inf) has an
+    # undefined backward (NaN derivatives), and masking only its output is too late to prevent
+    # those NaNs. Substitute a finite value before arithmetic; padded positions are restored to
+    # -inf below and therefore never contribute to the objective.
+    first_safe = first.float().masked_fill(~candidate_mask, 0.0)
+    second_safe = second.float().masked_fill(~candidate_mask, 0.0)
+    log_mix = torch.logaddexp(first_safe, second_safe) - math.log(2.0)
+    if smoothing:
+        roster = candidate_mask.sum(dim=-1, keepdim=True).to(log_mix.dtype).clamp_min(1.0)
+        log_uniform = -roster.log()
+        log_mix = torch.logaddexp(
+            log_mix + math.log1p(-float(smoothing)),
+            log_uniform + math.log(float(smoothing)),
+        )
+    return log_mix.masked_fill(~candidate_mask, float("-inf"))
+
+
 def _logit(value: float) -> float:
     return float(torch.logit(torch.tensor(value, dtype=torch.float64)))
 
@@ -137,7 +173,8 @@ def _logit(value: float) -> float:
 class EvidenceGatedSupportClassifier(nn.Module):
     """Closed-form paths, then two bounded label-blind scalars, then one blend."""
 
-    def __init__(self, spec: AttentionSpec, cfg: EvidenceGatedClassifierConfig | None = None):
+    def __init__(self, spec: AttentionSpec, cfg: EvidenceGatedClassifierConfig | None = None, *,
+                 primitive_values: torch.Tensor | None = None):
         super().__init__()
         self.spec, self.cfg = spec, cfg or EvidenceGatedClassifierConfig()
         d = spec.d_model
@@ -190,7 +227,7 @@ class EvidenceGatedSupportClassifier(nn.Module):
                 label_side=self.cfg.primitive_label_side,
                 annotation_version=self.cfg.primitive_annotation_version,
                 label_map_temperature=self.cfg.primitive_label_map_temperature,
-            ))
+            ), values=primitive_values)
         self.register_buffer("corpus_mean", torch.full((d,), float("nan")), persistent=True)
 
     # ------------------------------------------------------------------ helpers
@@ -549,18 +586,12 @@ class EvidenceGatedSupportClassifier(nn.Module):
                 dim=-1,
             )
         else:
-            # Fixed equal weights in probability space, each half floored first: an OR. The T7
-            # post-mortem found the primitive half confidently wrong on a foreign vocabulary, and
-            # under the log-space product one such half vetoes the other. Here the branch can never
-            # fall below half the better half, and no half can be confident beyond the floor.
-            floor = self.cfg.semantic_floor
-            halves = [torch.where(candidate_mask, logp.exp().clamp_min(floor), torch.zeros_like(logp))
-                      for logp in (text_logits, primitive_logits)]
-            mixed = 0.5 * (halves[0] + halves[1])
-            mixed = mixed / mixed.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-            semantic_logits = torch.where(
-                candidate_mask, mixed.clamp_min(1e-12).log(),
-                torch.full_like(mixed, float("-inf")),
+            # Fixed equal weights in probability space: an OR. Unlike a clamp-then-renormalize
+            # implementation, this has a roster-size-independent lower bound and remains stable
+            # when one branch assigns a probability too small to represent after exponentiation.
+            semantic_logits = probability_semantic_mixture(
+                text_logits, primitive_logits, candidate_mask,
+                smoothing=self.cfg.semantic_floor,
             )
         if gate_only:
             semantic_logits = semantic_logits.detach()

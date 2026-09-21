@@ -12,10 +12,11 @@ profile by inheriting from annotated labels that are *near it in text space* -- 
 inherits from jumping, squats and push-ups, which share its attributes even though none shares its
 name. Averaging attributes is meaningful where averaging identities is not.
 
-Protocol discipline: **training labels only.** No sealed or scenario label appears here, a test
-asserts the key set equals the supervised training vocabulary exactly, and the text is hashed so
-an edit cannot silently reuse a version name. The scrambled version permutes the profiles across
-labels and is the control that separates grounding from capacity.
+Protocol discipline: **training labels only.** A test asserts that the key set equals the
+supervised training vocabulary exactly, and the text is hashed so an edit cannot silently reuse a
+version name. Some training concepts also occur verbatim in sealed datasets; those are explicitly
+seen-vocabulary evaluations, not evaluation-only annotations. The scrambled version permutes the
+profiles across labels and is the control that separates grounding from capacity.
 
 Each entry is ``intensity rhythm impact travel posture regularity upper_limbs lower_limbs trunk
 head`` in vocabulary order. Treadmill locomotion is ``stationary``: the body does not move across

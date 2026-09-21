@@ -99,9 +99,21 @@ def classifier_try_name(architecture: str, *, trajectory: dict | None = None) ->
         # primitive semantic branch and stays experimental.
         if trajectory.get("semantic_mode", "text") == "text":
             return "v4"
-        # T8 grounds the label side on written annotations and mixes the halves in probability
-        # space; T7 is the sentence-cosine label side with the log-space product.
-        return "T8" if trajectory.get("primitive_label_side", "sentences") == "annotated" else "T7"
+        # T8 is one exact registered recipe, not every experiment that happens to use annotations.
+        # In particular, its scrambled grounding control must never appear under the primary name.
+        if trajectory.get("primitive_label_side", "sentences") != "annotated":
+            return "T7"
+        annotations = trajectory.get("primitive_annotations", "annotations-v1")
+        exact_t8 = (
+            trajectory.get("semantic_mode") == "text+primitives"
+            and trajectory.get("semantic_combination", "log_sum") == "mixture"
+            and trajectory.get("primitive_combiner", "bilinear") == "bilinear"
+        )
+        if exact_t8 and annotations == "annotations-v1":
+            return "T8"
+        if exact_t8 and annotations == "annotations-v1-scrambled":
+            return "T8-scrambled-control"
+        raise ValueError("unregistered annotated primitive recipe; assign it an explicit name")
     if probability == 0.0:
         return "T5"
     if mode == "replace" and not calibrated:
@@ -123,7 +135,7 @@ PROMOTED_RECIPE = {
     "semantic_mode": "text",
 }
 SUPERSEDED_CLASSIFIER_ARCHITECTURE = "support_classifier_v3"
-# The active experiment is T7, a recipe (semantic_mode != "text") on the promoted architecture.
+# The active experiment is T8, a recipe on the promoted architecture.
 ACTIVE_EXPERIMENTAL_CLASSIFIER_ARCHITECTURE = EVIDENCE_GATED_ARCHITECTURE
 ABANDONED_CLASSIFIER_ARCHITECTURES = frozenset({
     LEGACY_CONTEXTUAL_ARCHITECTURE,
@@ -204,12 +216,26 @@ def build_classifier_from_blob(blob: dict, *, device=None, overrides: dict | Non
         if set(overrides or {}) - allowed:
             raise ValueError(f"evidence-gated overrides are limited to {sorted(allowed)}")
         config.update(overrides or {})
-        head = EvidenceGatedSupportClassifier(spec, EvidenceGatedClassifierConfig(**config))
+        state = blob["classifier"]
+        primitive_values = None
+        # Primitive banks are persistent checkpoint buffers. Supply them to the constructor so
+        # restoration never invokes MiniLM merely to allocate tensors that load_state_dict would
+        # immediately overwrite. This keeps evaluation offline and makes the checkpoint complete.
+        for key in ("primitive_head.anchors", "primitive_head.values"):
+            if key in state:
+                primitive_values = state[key]
+                break
+        head = EvidenceGatedSupportClassifier(
+            spec, EvidenceGatedClassifierConfig(**config), primitive_values=primitive_values,
+        )
     else:
         raise ValueError(f"unsupported support-classifier architecture {version!r}")
     head.load_state_dict(blob["classifier"], strict=True)
     expected_primitive = blob.get("primitive_provenance")
     if expected_primitive is not None:
+        expected_primitive = dict(expected_primitive)
+        # T7 predates the explicit label-side field; sentence compatibility was its only path.
+        expected_primitive.setdefault("primitive_label_side", "sentences")
         primitive = getattr(head, "primitive_head", None)
         if primitive is None or primitive.provenance != expected_primitive:
             raise ValueError("primitive vocabulary provenance differs from the checkpoint")
