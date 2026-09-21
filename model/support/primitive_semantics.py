@@ -177,6 +177,13 @@ def vocabulary_hash(version: str = PRIMITIVE_VOCABULARY_VERSION) -> str:
     return digest.hexdigest()
 
 
+def _anchor_text_matrix(labels, device=None) -> torch.Tensor:
+    """Frozen text embeddings of annotated labels, from the repo's one text encoder."""
+    from training.support_classifier.train import label_text_matrix
+
+    return label_text_matrix(list(labels), device)
+
+
 def primitive_value_matrix(version: str = PRIMITIVE_VOCABULARY_VERSION, device=None) -> torch.Tensor:
     """Frozen sentence embeddings of the vocabulary, from the repo's one text encoder."""
     from training.support_classifier.train import label_text_matrix
@@ -185,7 +192,8 @@ def primitive_value_matrix(version: str = PRIMITIVE_VOCABULARY_VERSION, device=N
 
 
 # --------------------------------------------------------------------------- head
-COMBINERS = ("fixed", "projection")
+COMBINERS = ("fixed", "projection", "bilinear")
+LABEL_SIDES = ("sentences", "annotated")
 
 
 @dataclass(frozen=True)
@@ -199,12 +207,31 @@ class PrimitiveSemanticConfig:
     # Temperature of the label-side softmax within an axis, and the scale of the final score.
     profile_temperature: float = 0.05
     logit_scale: float = 10.0
+    # Where the label side comes from. "sentences": SBERT similarity to the primitive sentences
+    # (T7; measured about half random per axis). "annotated": a frozen map fitted on written
+    # profiles of the training labels, so an unseen label inherits attributes from annotated
+    # labels near it in text space. See ``primitive_annotations``.
+    label_side: str = "sentences"
+    annotation_version: str = "annotations-v1"
+    annotation_smoothing: float = 0.05
+    # Temperature of the similarity-weighted average over annotated anchors ("annotated" only).
+    label_map_temperature: float = 0.05
 
     def __post_init__(self) -> None:
         if self.version not in VOCABULARIES:
             raise ValueError(f"unknown primitive vocabulary {self.version!r}")
         if self.combiner not in COMBINERS:
             raise ValueError(f"combiner must be one of {COMBINERS}")
+        if self.label_side not in LABEL_SIDES:
+            raise ValueError(f"label_side must be one of {LABEL_SIDES}")
+        # The projection acts in text space, which the annotated label side never enters; the
+        # bilinear repair acts in primitive space, which the sentence label side does not need.
+        allowed = {"sentences": ("fixed", "projection"), "annotated": ("fixed", "bilinear")}
+        if self.combiner not in allowed[self.label_side]:
+            raise ValueError(f"combiner {self.combiner!r} is not defined for label_side "
+                             f"{self.label_side!r}; use one of {allowed[self.label_side]}")
+        if self.label_map_temperature <= 0 or not 0.0 <= self.annotation_smoothing < 1.0:
+            raise ValueError("label map temperature must be positive and smoothing in [0, 1)")
         if not 1 <= self.projection_rank <= self.text_dim:
             raise ValueError("projection rank must be in [1, text_dim]")
         if self.profile_temperature <= 0 or self.logit_scale <= 0:
@@ -226,15 +253,41 @@ class PrimitiveSemanticHead(nn.Module):
         self.slices = axis_slices(self.cfg.version)
         self.axes = axis_names(self.cfg.version)
         k = n_primitives(self.cfg.version)
-        if values is None:
-            values = primitive_value_matrix(self.cfg.version)
-        if values.shape != (k, self.cfg.text_dim):
-            raise ValueError("primitive value bank does not match the vocabulary")
-        # Frozen: a trainable value bank would drift into a lookup over the training vocabulary,
-        # which is the failure this whole design is avoiding.
-        self.register_buffer("values", F.normalize(values.float(), dim=-1), persistent=True)
         self.keys = nn.Linear(d_model, k)
-        if self.cfg.combiner == "projection":
+        if self.cfg.label_side == "annotated":
+            # The knowledge half of the common ground: frozen text embeddings of the annotated
+            # training labels and their written profiles. Both travel in the checkpoint, so an
+            # evaluator never re-encodes them, and the annotation hash is recorded in provenance.
+            from model.support.primitive_annotations import (
+                ANNOTATIONS, annotation_hash, annotation_profile_matrix,
+            )
+            if self.cfg.annotation_version not in ANNOTATIONS:
+                raise ValueError(f"unknown annotation version {self.cfg.annotation_version!r}")
+            labels, profiles = annotation_profile_matrix(
+                self.cfg.annotation_version, smoothing=self.cfg.annotation_smoothing,
+                vocabulary_version=self.cfg.version,
+            )
+            anchors = values if values is not None else _anchor_text_matrix(labels)
+            if anchors.shape != (len(labels), self.cfg.text_dim):
+                raise ValueError("anchor embeddings do not match the annotated labels")
+            self.register_buffer("anchors", F.normalize(anchors.float(), dim=-1), persistent=True)
+            self.register_buffer("anchor_profiles", profiles.float(), persistent=True)
+            self.annotation_hash = annotation_hash(self.cfg.annotation_version)
+            self.annotated_labels = labels
+        else:
+            if values is None:
+                values = primitive_value_matrix(self.cfg.version)
+            if values.shape != (k, self.cfg.text_dim):
+                raise ValueError("primitive value bank does not match the vocabulary")
+            # Frozen: a trainable value bank would drift into a lookup over the training
+            # vocabulary, which is the failure this whole design is avoiding.
+            self.register_buffer("values", F.normalize(values.float(), dim=-1), persistent=True)
+        if self.cfg.combiner == "bilinear":
+            # Identity-initialised repair in primitive space: "sensor primitive i is evidence for
+            # label primitive j". It cannot see label identity; it can overfit the 155 annotated
+            # profiles, which the identity-versus-learned control on foreign vocabulary measures.
+            self.interaction = nn.Parameter(torch.eye(k))
+        elif self.cfg.combiner == "projection":
             # ONE shared map, applied identically to primitive sentences and candidate labels.
             # This preserves the same transformation contract for unseen labels; it does not by
             # itself prevent overfitting, which is tested with held-out-label development data.
@@ -256,6 +309,17 @@ class PrimitiveSemanticHead(nn.Module):
             profile[:, block] = torch.softmax(logits[:, block], dim=-1)
         return profile
 
+    def _annotated_profile(self, candidate_text: torch.Tensor) -> torch.Tensor:
+        """Similarity-weighted average of the annotated anchors' profiles.
+
+        A convex combination of per-axis distributions is itself a per-axis distribution, so
+        nothing needs renormalising, and the weights are auditable: which annotated labels an
+        unseen label inherited from is ``softmax(cos / T)`` over the anchors.
+        """
+        labels = F.normalize(candidate_text.float(), dim=-1)
+        weight = torch.softmax(labels @ self.anchors.T / self.cfg.label_map_temperature, dim=-1)
+        return weight @ self.anchor_profiles
+
     def _compatibility(self, candidate_text: torch.Tensor) -> torch.Tensor:
         """(B, C, K) compatibility between each candidate label and each primitive."""
         labels = F.normalize(candidate_text.float(), dim=-1)
@@ -267,7 +331,10 @@ class PrimitiveSemanticHead(nn.Module):
 
     def candidate_profile(self, candidate_text: torch.Tensor,
                           candidate_mask: torch.Tensor) -> torch.Tensor:
-        """The label side, softmaxed within each axis: a fixed function of the label string."""
+        """The label side: a fixed function of the label string, one distribution per axis."""
+        if self.cfg.label_side == "annotated":
+            profile = self._annotated_profile(candidate_text)
+            return torch.where(candidate_mask.unsqueeze(-1), profile, torch.zeros_like(profile))
         compatibility = self._compatibility(candidate_text)
         profile = torch.empty_like(compatibility)
         for block in self.slices:
@@ -291,6 +358,9 @@ class PrimitiveSemanticHead(nn.Module):
             terms = [torch.einsum("bv,bcv->bc", profile[:, block], candidate_profile[..., block])
                      for block in self.slices]
             return torch.stack(terms, dim=0).mean(dim=0)
+        if self.cfg.combiner == "bilinear":
+            return torch.einsum("bi,ij,bcj->bc", profile, self.interaction, candidate_profile) \
+                / len(self.slices)
         return torch.einsum("bk,bck->bc", profile, candidate_profile) / len(self.slices)
 
     def forward(self, query_feature: torch.Tensor, candidate_text: torch.Tensor,
@@ -315,6 +385,10 @@ class PrimitiveSemanticHead(nn.Module):
 
     # ------------------------------------------------------------------ reporting
     def telemetry(self) -> dict[str, float]:
+        if self.cfg.combiner == "bilinear":
+            weight = self.interaction.detach()
+            eye = torch.eye(weight.shape[0], device=weight.device)
+            return {"classifier/primitive_interaction_drift": float((weight - eye).abs().mean())}
         if self.cfg.combiner == "projection":
             weight = self.projection.detach()
             eye = torch.eye(weight.shape[0], weight.shape[1], device=weight.device)
@@ -323,7 +397,12 @@ class PrimitiveSemanticHead(nn.Module):
 
     @property
     def provenance(self) -> dict:
-        return {"primitive_vocabulary_version": self.cfg.version,
-                "primitive_vocabulary_hash": vocabulary_hash(self.cfg.version),
-                "primitive_combiner": self.cfg.combiner,
-                "primitive_projection_rank": self.cfg.projection_rank}
+        out = {"primitive_vocabulary_version": self.cfg.version,
+               "primitive_vocabulary_hash": vocabulary_hash(self.cfg.version),
+               "primitive_combiner": self.cfg.combiner,
+               "primitive_projection_rank": self.cfg.projection_rank,
+               "primitive_label_side": self.cfg.label_side}
+        if self.cfg.label_side == "annotated":
+            out["primitive_annotation_version"] = self.cfg.annotation_version
+            out["primitive_annotation_hash"] = self.annotation_hash
+        return out

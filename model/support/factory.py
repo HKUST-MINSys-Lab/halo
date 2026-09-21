@@ -97,7 +97,11 @@ def classifier_try_name(architecture: str, *, trajectory: dict | None = None) ->
     if mode == "auxiliary" and calibrated:
         # The T6 recipe was promoted on 2026-09-21 and is called v4 from then on; T7 adds the
         # primitive semantic branch and stays experimental.
-        return "T7" if trajectory.get("semantic_mode", "text") != "text" else "v4"
+        if trajectory.get("semantic_mode", "text") == "text":
+            return "v4"
+        # T8 grounds the label side on written annotations and mixes the halves in probability
+        # space; T7 is the sentence-cosine label side with the log-space product.
+        return "T8" if trajectory.get("primitive_label_side", "sentences") == "annotated" else "T7"
     if probability == 0.0:
         return "T5"
     if mode == "replace" and not calibrated:

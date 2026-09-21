@@ -33,8 +33,9 @@ always numbered consistently with the tries (`support_classifier_v4` is T4, not 
 | T5 | `support_classifier_v4` with corruption disabled | 2026-09-20 | corruption-free control; routing collapses onto label meaning |
 | T6 | T4 with corruption as a gate-only auxiliary and a label-blind unenrolled calibration term ([design](../journal/2026-09-20-classifier-t6-design.md)) | 2026-09-20 | **promoted as v4 on 2026-09-21** |
 | T7 | T6 with the primitive semantic branch ([design](../journal/2026-09-20-primitive-semantic-path-design.md)) | 2026-09-20 | best sealed arm; **disqualified by a 15-point foreign-vocabulary regression** |
+| T8 | T7 with a written, training-label-only annotated label side and a floored probability-space mixture ([design](../journal/2026-09-21-classifier-t8-grounded-primitives.md)) | built, not trained | held-out label-side screen 0.82 vs T7's 0.34 |
 
-T4 through T7 share the `support_classifier_v4` architecture string and differ by recipe (config
+T4 through T8 share the `support_classifier_v4` architecture string and differ by recipe (config
 flags and curriculum), which the checkpoint records. The differentiable-neighbours arm is a parameter-free **control**, not a try, and keeps its name.
 
 | run | protocol | encoder conditioning | status | numbers |

@@ -93,10 +93,22 @@ class EvidenceGatedClassifierConfig:
     primitive_projection_rank: int = 384
     primitive_profile_temperature: float = 0.05
     primitive_logit_scale: float = 10.0
+    primitive_label_side: str = "sentences"
+    primitive_annotation_version: str = "annotations-v1"
+    primitive_label_map_temperature: float = 0.05
+    # How the two semantic halves combine in "text+primitives". "log_sum" (T7) is a product of
+    # distributions: an AND, in which a confidently wrong half is a veto. "mixture" is a
+    # probability-space average with a floor: an OR, which cannot fall below half the better half.
+    semantic_combination: str = "log_sum"
+    semantic_floor: float = 1e-3
 
     def __post_init__(self) -> None:
         if self.semantic_mode not in SEMANTIC_MODES:
             raise ValueError(f"semantic_mode must be one of {SEMANTIC_MODES}")
+        if self.semantic_combination not in SEMANTIC_COMBINATIONS:
+            raise ValueError(f"semantic_combination must be one of {SEMANTIC_COMBINATIONS}")
+        if not 0.0 < self.semantic_floor < 0.5:
+            raise ValueError("semantic_floor must be in (0, 0.5)")
         if self.text_dim < 1 or self.max_candidates < 2 or self.max_supports < 0:
             raise ValueError("invalid evidence-gated capacity")
         if self.temperature <= 0 or self.text_temperature <= 0:
@@ -115,6 +127,7 @@ class EvidenceGatedClassifierConfig:
 
 
 SEMANTIC_MODES = ("text", "primitives", "text+primitives")
+SEMANTIC_COMBINATIONS = ("log_sum", "mixture")
 
 
 def _logit(value: float) -> float:
@@ -174,6 +187,9 @@ class EvidenceGatedSupportClassifier(nn.Module):
                 projection_rank=self.cfg.primitive_projection_rank,
                 profile_temperature=self.cfg.primitive_profile_temperature,
                 logit_scale=self.cfg.primitive_logit_scale,
+                label_side=self.cfg.primitive_label_side,
+                annotation_version=self.cfg.primitive_annotation_version,
+                label_map_temperature=self.cfg.primitive_label_map_temperature,
             ))
         self.register_buffer("corpus_mean", torch.full((d,), float("nan")), persistent=True)
 
@@ -525,12 +541,26 @@ class EvidenceGatedSupportClassifier(nn.Module):
             semantic_logits = text_logits
         elif self.cfg.semantic_mode == "primitives":
             semantic_logits = primitive_logits
-        else:
+        elif self.cfg.semantic_combination == "log_sum":
             # Fixed equal weights in log space: the product of the two distributions, renormalised.
             # Deliberately not learned; a learned weight here is the router we removed.
             semantic_logits = torch.log_softmax(
                 (text_logits + primitive_logits).masked_fill(~candidate_mask, float("-inf")),
                 dim=-1,
+            )
+        else:
+            # Fixed equal weights in probability space, each half floored first: an OR. The T7
+            # post-mortem found the primitive half confidently wrong on a foreign vocabulary, and
+            # under the log-space product one such half vetoes the other. Here the branch can never
+            # fall below half the better half, and no half can be confident beyond the floor.
+            floor = self.cfg.semantic_floor
+            halves = [torch.where(candidate_mask, logp.exp().clamp_min(floor), torch.zeros_like(logp))
+                      for logp in (text_logits, primitive_logits)]
+            mixed = 0.5 * (halves[0] + halves[1])
+            mixed = mixed / mixed.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            semantic_logits = torch.where(
+                candidate_mask, mixed.clamp_min(1e-12).log(),
+                torch.full_like(mixed, float("-inf")),
             )
         if gate_only:
             semantic_logits = semantic_logits.detach()

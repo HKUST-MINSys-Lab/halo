@@ -2016,10 +2016,26 @@ def main() -> None:
         help="primitive vocabulary version; the -scrambled variant is the grounding control",
     )
     parser.add_argument(
-        "--primitive-combiner", choices=("fixed", "projection"), default="projection",
-        help="fixed cosine compatibility, or one shared identity-initialised learned projection",
+        "--primitive-combiner", choices=("fixed", "projection", "bilinear"), default=None,
+        help="fixed compatibility; a shared identity-initialised text-space projection "
+             "(sentences label side); or an identity-initialised primitive-space repair "
+             "(annotated label side). Default: projection for sentences, bilinear for annotated",
     )
     parser.add_argument("--primitive-projection-rank", type=int, default=384)
+    parser.add_argument(
+        "--primitive-label-side", choices=("sentences", "annotated"), default="sentences",
+        help="sentences (T7): SBERT similarity to the primitive sentences; annotated (T8): a "
+             "frozen map fitted on written profiles of the training labels",
+    )
+    parser.add_argument("--primitive-annotations", default="annotations-v1",
+                        help="annotation version; the -scrambled variant is the grounding control")
+    parser.add_argument("--primitive-label-map-temperature", type=float, default=0.05,
+                        help="temperature of the similarity-weighted average over annotated anchors")
+    parser.add_argument(
+        "--semantic-combination", choices=("log_sum", "mixture"), default="log_sum",
+        help="how text and primitive halves combine: log-space product (T7, a veto) or a "
+             "floored probability-space mixture (T8, never below half the better half)",
+    )
     parser.add_argument(
         "--text-corruption-mode", choices=("replace", "auxiliary"), default=None,
         help="replace (T4): a corrupted episode displaces a clean one, semantic branch "
@@ -2210,6 +2226,13 @@ def main() -> None:
         parser.error("--semantic-mode is defined only for --classifier evidence_gated")
     if args.primitive_vocabulary not in VOCABULARIES:
         parser.error(f"unknown --primitive-vocabulary {args.primitive_vocabulary!r}")
+    if args.primitive_combiner is None:
+        args.primitive_combiner = "bilinear" if args.primitive_label_side == "annotated" else "projection"
+    from model.support.primitive_annotations import ANNOTATIONS as _ANNOTATIONS
+    if args.primitive_annotations not in _ANNOTATIONS:
+        parser.error(f"unknown --primitive-annotations {args.primitive_annotations!r}")
+    if args.primitive_label_map_temperature <= 0:
+        parser.error("--primitive-label-map-temperature must be positive")
     if not 1 <= args.primitive_projection_rank <= 384:
         parser.error("--primitive-projection-rank must be in [1, 384]")
     if args.classifier != "evidence_gated" and args.text_corruption_probability > 0:
@@ -2406,7 +2429,11 @@ def main() -> None:
                               ("semantic_mode", "text"),
                               ("primitive_vocabulary", PRIMITIVE_VOCABULARY_VERSION),
                               ("primitive_combiner", "projection"),
-                              ("primitive_projection_rank", 384)):
+                              ("primitive_projection_rank", 384),
+                              ("primitive_label_side", "sentences"),
+                              ("primitive_annotations", "annotations-v1"),
+                              ("primitive_label_map_temperature", 0.05),
+                              ("semantic_combination", "log_sum")):
             # Early v4 run configs serialized these future fields as null. Treat null exactly as
             # an absent field so their original text-only behavior remains resumable.
             if saved.get(name) is None:
@@ -2438,6 +2465,10 @@ def main() -> None:
             "primitive_vocabulary": "--primitive-vocabulary",
             "primitive_combiner": "--primitive-combiner",
             "primitive_projection_rank": "--primitive-projection-rank",
+            "primitive_label_side": "--primitive-label-side",
+            "primitive_annotations": "--primitive-annotations",
+            "primitive_label_map_temperature": "--primitive-label-map-temperature",
+            "semantic_combination": "--semantic-combination",
             "open_vocabulary_holdout_fraction": "--open-vocabulary-holdout-fraction",
             "rate_augmentation_probability": "--rate-augmentation-probability",
             "modality_dropout_probability": "--modality-dropout-probability",
@@ -2785,6 +2816,10 @@ def main() -> None:
                     primitive_version=args.primitive_vocabulary,
                     primitive_combiner=args.primitive_combiner,
                     primitive_projection_rank=args.primitive_projection_rank,
+                    primitive_label_side=args.primitive_label_side,
+                    primitive_annotation_version=args.primitive_annotations,
+                    primitive_label_map_temperature=args.primitive_label_map_temperature,
+                    semantic_combination=args.semantic_combination,
                 ),
             ).to(device)
             if args.classifier == "evidence_gated" else
@@ -2922,6 +2957,10 @@ def main() -> None:
             "primitive_vocabulary": args.primitive_vocabulary,
             "primitive_combiner": args.primitive_combiner,
             "primitive_projection_rank": int(args.primitive_projection_rank),
+            "primitive_label_side": args.primitive_label_side,
+            "primitive_annotations": args.primitive_annotations,
+            "primitive_label_map_temperature": float(args.primitive_label_map_temperature),
+            "semantic_combination": args.semantic_combination,
             "validation_episodes": int(args.val_episodes),
             "validation_repeats_per_dataset": int(args.val_repeats_per_dataset),
             "classifier_config": (dataclasses.asdict(classifier.cfg)

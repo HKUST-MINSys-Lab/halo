@@ -74,4 +74,5 @@ entries preserve what was believed at the time; current behavior is defined only
 | 2026-09-20 | [2026-09-20-classifier-v4-evidence-gated-design.md](2026-09-20-classifier-v4-evidence-gated-design.md) | Classifier v4: evidence-gated blend on the promoted residual head (agreed design) |
 | 2026-09-20 | [2026-09-20-classifier-v4-implementation.md](2026-09-20-classifier-v4-implementation.md) | Classifier v4 implementation notes, and four deviations from the design entry |
 | 2026-09-20 | [2026-09-20-primitive-semantic-path-design.md](2026-09-20-primitive-semantic-path-design.md) | Primitive-driven semantic alignment: design, label-side audit, and implementation |
+| 2026-09-21 | [2026-09-21-classifier-t8-grounded-primitives.md](2026-09-21-classifier-t8-grounded-primitives.md) | T8: the primitive path with a grounded label side |
 | 2026-09-21 | [2026-09-21-v4-promotion-and-primitive-path-postmortem.md](2026-09-21-v4-promotion-and-primitive-path-postmortem.md) | v4 promoted (the T6 recipe), and why the primitive semantic path failed on foreign vocabulary |
