@@ -534,10 +534,15 @@ def test_every_lifecycle_architecture_has_a_try_name():
     assert classifier_try_name(ARCHITECTURE_VERSION, trajectory={
         "text_corruption_probability": 0.0,
     }) == "T5"
+    # The T6 recipe was promoted as v4 on 2026-09-21; with the primitive branch it is T7.
     assert classifier_try_name(ARCHITECTURE_VERSION, trajectory={
         "text_corruption_mode": "auxiliary", "text_corruption_probability": 1.0,
         "unenrolled_calibration": True,
-    }) == "T6"
+    }) == "v4"
+    assert classifier_try_name(ARCHITECTURE_VERSION, trajectory={
+        "text_corruption_mode": "auxiliary", "text_corruption_probability": 1.0,
+        "unenrolled_calibration": True, "semantic_mode": "text+primitives",
+    }) == "T7"
     assert classifier_try_name("support_classifier_v3") == "v3"
     missing = set(CLASSIFIER_ARCHITECTURE_STATUS) - set(CLASSIFIER_TRY_NAME)
     # The retired token mixer predates the scheme and is deliberately unnamed.

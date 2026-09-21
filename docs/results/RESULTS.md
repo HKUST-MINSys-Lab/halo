@@ -14,21 +14,24 @@ directory name. "Arm" means a training run; "readout" means how a trained checkp
 
 ### Classifier naming (adopted 2026-09-20)
 
-**`v3` is the promoted classifier — the one to beat. Every experimental replacement is `T`-numbered
-in the order it was trained (T for "try").** Use these names in discussion and in every new
+**`v4` is the promoted classifier as of 2026-09-21 — the one to beat. It is the T6 recipe on
+`support_classifier_v4`. `v3` (`support_classifier_v3`) was promoted from 2026-09-18 to
+2026-09-21. Every experimental replacement is `T`-numbered in the order it was trained (T for
+"try"); a try that gets promoted keeps its T-number in history and gains a `v` name.** Use these names in discussion and in every new
 document; the architecture strings below are what checkpoints and code carry, and they are not
 always numbered consistently with the tries (`support_classifier_v4` is T4, not a successor to
 `support_classifier_v3`). That mismatch is exactly why this table exists.
 
 | name | architecture string in code and checkpoints | trained | verdict |
 |---|---|---|---|
-| **v3** | `support_classifier_v3` | 2026-09-18 | **promoted control**; still the best overall |
+| **v4** | `support_classifier_v4`, T6 recipe (trainer default for `--classifier evidence_gated`) | 2026-09-20 | **promoted 2026-09-21**; beats v3 at every k ≥ 4, over-trust pathology closed |
+| v3 | `support_classifier_v3` | 2026-09-18 | promoted 2026-09-18 → 2026-09-21, superseded by v4 |
 | T1 | `support_contextual_mixture_v1` | 2026-09-18 | failed: the gate collapsed onto label meaning (0.996) |
 | T2 | `support_contextual_residual_v1` | 2026-09-19 | negative |
 | T3 | `support_evidence_aware_v2` | 2026-09-19 | negative: router at 0.97-0.99 semantic reliance |
 | T4 | `support_classifier_v4` | 2026-09-20 | parity with v3; first try whose routing did not collapse |
 | T5 | `support_classifier_v4` with corruption disabled | 2026-09-20 | corruption-free control; routing collapses onto label meaning |
-| T6 | T4 with corruption as a gate-only auxiliary and a label-blind unenrolled calibration term ([design](../journal/2026-09-20-classifier-t6-design.md)) | 2026-09-20 | **beats v3 at k>=4**; over-trust pathology closed; not yet promoted |
+| T6 | T4 with corruption as a gate-only auxiliary and a label-blind unenrolled calibration term ([design](../journal/2026-09-20-classifier-t6-design.md)) | 2026-09-20 | **promoted as v4 on 2026-09-21** |
 | T7 | T6 with the primitive semantic branch ([design](../journal/2026-09-20-primitive-semantic-path-design.md)) | 2026-09-20 | best sealed arm; **disqualified by a 15-point foreign-vocabulary regression** |
 
 T4 through T7 share the `support_classifier_v4` architecture string and differ by recipe (config
@@ -37,13 +40,13 @@ flags and curriculum), which the checkpoint records. The differentiable-neighbou
 | run | protocol | encoder conditioning | status | numbers |
 |---|---|---|---|---|
 | **T7** T6 + primitive semantic branch, step 40k, 2026-09-20 | v5 | acquisition-conditioning-v2 | **best sealed; MM-Fit regression** | [below](#t7-t6-plus-the-primitive-semantic-branch) |
-| **T6** gate-only corruption + unenrolled calibration, step 40k, 2026-09-20 | v5 | acquisition-conditioning-v2 | **beats v3 at k>=4; pathology closed** | [below](#t6-corruption-as-a-gate-only-auxiliary-plus-unenrolled-calibration) |
+| **v4 (T6)** gate-only corruption + unenrolled calibration, step 40k, 2026-09-20 | v5 | acquisition-conditioning-v2 | **promoted 2026-09-21** | [below](#t6-corruption-as-a-gate-only-auxiliary-plus-unenrolled-calibration) |
 | **T5** corruption-free control, step 40k, 2026-09-20 | v5 | acquisition-conditioning-v2 | **control: λ collapses without the curriculum** | [below](#the-corruption-free-control-the-curriculum-is-load-bearing) |
 | **T4** evidence-gated blend, step 40k, 2026-09-20 | v5 | acquisition-conditioning-v2 | **completed, parity with v3** | [below](#t4-the-evidence-gated-blend-support_classifier_v4) |
 | **T3** evidence-aware, step 40k, 2026-09-19 | v5 | acquisition-conditioning-v2 | **completed negative result** | [below](#t3-the-evidence-aware-classifier-support_evidence_aware_v2) |
 | **T3** evidence-aware, step 32,500 companion, 2026-09-19 | v5 | acquisition-conditioning-v2 | **completed negative result** | [below](#t3-the-evidence-aware-classifier-support_evidence_aware_v2) |
 | **T2** bounded contextual residual, step 35k, 2026-09-19 | v5 | acquisition-conditioning-v2 | **completed negative result** | [record](../journal/2026-09-19-bounded-contextual-residual-v1-results.md) |
-| **v3** residual arm (the classifier to beat), step 40k, 2026-09-18 | v5 | acquisition-conditioning-v2 | **current** | below |
+| **v3** residual arm, step 40k, 2026-09-18 | v5 | acquisition-conditioning-v2 | superseded by v4 on 2026-09-21 | below |
 | HALO neighbours arm, step 40k, 2026-09-18 | v5 | acquisition-conditioning-v2 | **current** | below |
 | **T1** contextualise-first mixture, step 40k, 2026-09-18 | v5 | acquisition-conditioning-v2 | **failed, recorded** | below |
 | Released baselines, 2026-09-18 | v5 | n/a | **current** | below |
@@ -527,7 +530,7 @@ or give λ a label-blind proxy for vocabulary familiarity, which is a new and un
 The scrambled-vocabulary control remains unrun and would say how much of the seen-vocabulary gain is
 grounding rather than capacity.
 
-**Standing recommendation: T6 is the promotion candidate, not T7.** T6 beats v3 at every k ≥ 4 with
+**T6 was promoted as v4 on 2026-09-21; T7 was not.** T6 beats v3 at every k ≥ 4 with
 no scenario regression worse than 1.6, while T7 buys +1.4 sealed macro F1 at k=128 and a 15-point
 loss on foreign vocabulary — the capability the project exists to demonstrate.
 

@@ -2000,12 +2000,12 @@ def main() -> None:
     parser.add_argument("--classifier",
                         choices=("token_mixer", "neighbors", "residual", "contextual",
                                  "evidence_gated"),
-                        default="residual",
-                        help="evidence_gated selects the active experimental v4 head (bounded "
-                             "label-blind trust and blend gates); contextual selects the "
-                             "abandoned evidence-aware v2 head; residual is the promoted "
-                             "scalar-residual control; neighbors is the parameter-free control; "
-                             "token_mixer is reproduction-only")
+                        default="evidence_gated",
+                        help="evidence_gated is the promoted classifier (v4, the T6 recipe: "
+                             "bounded label-blind trust and blend gates, corruption as a gate-only "
+                             "auxiliary, unenrolled calibration); residual is the superseded v3 "
+                             "control; contextual is the abandoned T3 head; neighbors is the "
+                             "parameter-free control; token_mixer is reproduction-only")
     parser.add_argument(
         "--semantic-mode", choices=("text", "primitives", "text+primitives"), default="text",
         help="v4-only semantic path: the promoted cosine path, the compositional primitive path, "
@@ -2021,7 +2021,7 @@ def main() -> None:
     )
     parser.add_argument("--primitive-projection-rank", type=int, default=384)
     parser.add_argument(
-        "--text-corruption-mode", choices=("replace", "auxiliary"), default="replace",
+        "--text-corruption-mode", choices=("replace", "auxiliary"), default=None,
         help="replace (T4): a corrupted episode displaces a clean one, semantic branch "
              "stop-gradiented. auxiliary (T6): every clean episode also contributes a "
              "corrupted-roster loss whose gradient reaches only the blend gate",
@@ -2029,8 +2029,9 @@ def main() -> None:
     parser.add_argument("--text-corruption-aux-weight", type=float, default=1.0,
                         help="weight of the auxiliary corrupted-view loss (auxiliary mode only)")
     parser.add_argument("--unenrolled-calibration", action=argparse.BooleanOptionalAction,
-                        default=False,
-                        help="T6: label-blind calibration term for candidates without support")
+                        default=None,
+                        help="label-blind calibration term for candidates without support "
+                             "(default: on for evidence_gated, the promoted v4 recipe)")
     parser.add_argument(
         "--text-corruption-probability", type=float, default=None,
         help="v4-only share of enrolled episodes whose candidate label text is deranged, which is "
@@ -2184,6 +2185,12 @@ def main() -> None:
         args.p_gt_present = DEFAULT_P_GT_PRESENT
     if "--counterfactual-enrollment-probability" not in sys.argv:
         args.counterfactual_enrollment_probability = 0.25 if args.classifier == "contextual" else 0.0
+    # The promoted v4 recipe (T6) is the default for evidence_gated; both switches stay explicit
+    # in the saved trajectory, so a checkpoint never depends on what the default was that day.
+    if args.text_corruption_mode is None:
+        args.text_corruption_mode = "auxiliary" if args.classifier == "evidence_gated" else "replace"
+    if args.unenrolled_calibration is None:
+        args.unenrolled_calibration = args.classifier == "evidence_gated"
     if args.text_corruption_probability is None:
         if args.classifier != "evidence_gated":
             args.text_corruption_probability = 0.0

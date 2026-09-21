@@ -30,8 +30,11 @@ def test_every_learned_checkpoint_architecture_has_an_explicit_lifecycle():
     # v3 control, so it is no longer the active experiment; see docs/results/RESULTS.md.
     assert CLASSIFIER_ARCHITECTURE_STATUS[ARCHITECTURE_VERSION] == "abandoned-negative-result"
     assert ARCHITECTURE_VERSION in ABANDONED_CLASSIFIER_ARCHITECTURES
-    assert (CLASSIFIER_ARCHITECTURE_STATUS[ACTIVE_EXPERIMENTAL_CLASSIFIER_ARCHITECTURE]
-            == "active-experimental")
+    # Since the 2026-09-21 promotion the active experiment (T7) is a recipe on the promoted
+    # architecture, so that architecture's lifecycle status is the promoted one.
+    assert CLASSIFIER_ARCHITECTURE_STATUS[ACTIVE_EXPERIMENTAL_CLASSIFIER_ARCHITECTURE] in {
+        "active-experimental", "promoted-control",
+    }
 
 
 def _inputs(*, support_bound=None):

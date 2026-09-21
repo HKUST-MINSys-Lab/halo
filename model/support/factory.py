@@ -46,13 +46,16 @@ MODE_TO_ARCHITECTURE = {"residual": "support_classifier_v3", "contextual": EVIDE
 CLASSIFIER_ARCHITECTURE_STATUS = {
     "support_token_mixer_v1": "retired-reproduction-only",
     "support_classifier_v2": "historical-checkpoint-only",
-    "support_classifier_v3": "promoted-control",
+    # Promoted 2026-09-18, superseded 2026-09-21 by the T6 recipe of support_classifier_v4 ("v4").
+    "support_classifier_v3": "superseded-control",
     LEGACY_CONTEXTUAL_ARCHITECTURE: "abandoned-negative-result",
     CONTEXTUAL_RESIDUAL_ARCHITECTURE: "abandoned-negative-result",
     # v2 completed its matched sealed + scenario evaluation on 2026-09-19 and did not beat the
     # v3 control (router collapsed onto label meaning); see docs/results/RESULTS.md.
     EVIDENCE_AWARE_ARCHITECTURE: "abandoned-negative-result",
-    EVIDENCE_GATED_ARCHITECTURE: "active-experimental",
+    # Promoted 2026-09-21 as "v4", in its T6 recipe (see PROMOTED_RECIPE). T7 remains an active
+    # experiment on the same architecture string.
+    EVIDENCE_GATED_ARCHITECTURE: "promoted-control",
 }
 # Human-facing names, adopted 2026-09-20. `v3` is the promoted classifier; every experimental
 # replacement is T-numbered in the order it was trained ("T" for try). The architecture strings are
@@ -92,7 +95,9 @@ def classifier_try_name(architecture: str, *, trajectory: dict | None = None) ->
     probability = float(trajectory.get("text_corruption_probability", 0.0))
     calibrated = bool(trajectory.get("unenrolled_calibration", False))
     if mode == "auxiliary" and calibrated:
-        return "T6"
+        # The T6 recipe was promoted on 2026-09-21 and is called v4 from then on; T7 adds the
+        # primitive semantic branch and stays experimental.
+        return "T7" if trajectory.get("semantic_mode", "text") != "text" else "v4"
     if probability == 0.0:
         return "T5"
     if mode == "replace" and not calibrated:
@@ -100,7 +105,21 @@ def classifier_try_name(architecture: str, *, trajectory: dict | None = None) ->
     raise ValueError(f"unrecognized support_classifier_v4 recipe: {trajectory!r}")
 
 
-PROMOTED_CLASSIFIER_ARCHITECTURE = "support_classifier_v3"
+PROMOTED_CLASSIFIER_ARCHITECTURE = EVIDENCE_GATED_ARCHITECTURE
+PROMOTED_CLASSIFIER_NAME = "v4"
+# The promoted classifier is a RECIPE on support_classifier_v4, not the architecture alone: the
+# T6 training recipe, i.e. corruption as a gate-only auxiliary on every eligible episode plus the
+# label-blind unenrolled calibration term, with the promoted cosine semantic path. These are the
+# trainer's defaults for --classifier evidence_gated since 2026-09-21; the T4 recipe remains
+# reachable with --text-corruption-mode replace --no-unenrolled-calibration.
+PROMOTED_RECIPE = {
+    "text_corruption_mode": "auxiliary",
+    "text_corruption_probability": 1.0,
+    "unenrolled_calibration": True,
+    "semantic_mode": "text",
+}
+SUPERSEDED_CLASSIFIER_ARCHITECTURE = "support_classifier_v3"
+# The active experiment is T7, a recipe (semantic_mode != "text") on the promoted architecture.
 ACTIVE_EXPERIMENTAL_CLASSIFIER_ARCHITECTURE = EVIDENCE_GATED_ARCHITECTURE
 ABANDONED_CLASSIFIER_ARCHITECTURES = frozenset({
     LEGACY_CONTEXTUAL_ARCHITECTURE,
