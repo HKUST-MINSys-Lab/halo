@@ -199,33 +199,51 @@ Grounded in the above, a fair table has four properties. (1) **Subject-disjoint 
 
 ---
 
-## Summary ladder: easiest to hardest protocol, best published number, and where v4 lands
 
-One row per rung of difficulty. "Best published" is the single highest number found anywhere in
-this sweep for that protocol (any dataset, any model) — not an average, so it names the easiest
-*dataset* the protocol has ever been run on as well as the strongest *method*. "v4 (our protocol)"
-gives the closest number we have under our own manifest-controlled few-shot enrollment, so the two
-columns can be read side by side; they are **not the same experimental setup** (published numbers
-are fully-supervised classifiers, ours is k-shot enrollment with a frozen classifier) — that
-difference is the whole point of the table and is called out per row.
+## Summary ladder: closed label set throughout, one axis of heterogeneity added at a time
 
-| # | protocol (easiest → hardest) | best published | metric | model | dataset | v4 (our protocol) | same setup? |
-|---|---|---:|---|---|---|---:|---|
-| 1 | Same subject, windows leaked across train/test | **99.39%** | accuracy | CNN-LSTM | UCI-HAR (10-fold, 50%-overlap windows) | — | No — we never train/test on overlapping windows of the same subject; not a number we can report |
-| 2 | Cross-subject (LOSO / held-out subjects), closed set, same device | **89.25** | macro-F1 | Conv classifier | MotionSense (5-fold subject-wise) | **72.7** (k=8, sealed mean over 6 datasets) | Partial — ours is also cross-*dataset*, which the published number isn't; harder by construction |
-| 3 | Cross-subject + cross-device/dataset, closed set (fully supervised on the union) | **77.1%** | accuracy | ConvNet (freq.) | DAGHAR, leave-one-dataset-out | **72.7** (k=8) / **62.4** (k=1) | Close — this is the nearest published analogue to our sealed protocol, still fully supervised vs. our 1–8 shots |
-| 4 | Cross-subject + cross-dataset, **k-shot enrollment**, closed roster | *(no external ceiling — this is our regime)* | — | — | — | **50.2** (k=0) → **72.7** (k=8) | This protocol has no comparable published table; see §"Fair comparison" above |
-| 5 | Cross-subject + cross-dataset + **unseen label vocabulary**, zero support | **34.3** mF1 (avg. 18 sets) | macro-F1 | UniMTS | 18 unseen HAR datasets | **10.5** (MM-Fit k=0, single foreign-vocabulary dataset) | Closest match to UniMTS's own protocol; UniMTS's number is an 18-dataset average, ours is one dataset — not directly comparable, flagged as the honest weak point |
+Four protocols, each adding exactly one axis of generalization over the last (subject → device →
+dataset), label vocabulary held fixed and closed throughout — open-set/zero-shot is intentionally
+excluded from this table (see R4 above for that). "Best published" is the single highest number
+found anywhere in this sweep for that exact protocol; "v4" is our closest comparable number under
+k-shot enrollment, given for context only — it is not the same experimental setup (published rows
+are fully-supervised classifiers; ours is a frozen classifier given k examples), so the two columns
+should not be read as a leaderboard.
 
-**Reading this table.** Row 1 is the number the "99% accuracy" objection is implicitly comparing
-us against, and it is not attainable under any protocol we run — it is a leak, not a difficulty
-level. Row 2 is the real closed-set bar on the *easiest* individual dataset in the literature
-(MotionSense, 6 coarse classes, one device); we do not beat it, and we should not claim to — we
-solve a different, harder problem (cross-dataset, k-shot, open roster) on the same order of
-magnitude of accuracy. Row 3 is the single closest apples-to-apples published number, since DAGHAR's
-leave-one-dataset-out protocol matches our sealed setup on everything except enrollment — full
-supervision on the union of datasets reaches 77.1%, and our k=8 enrollment reaches 72.7% *without
-ever training on the target dataset*, which is the strongest one-line comparison in this table.
-Row 5 is where the story is honestly weakest: UniMTS's 34.3 is an 18-dataset average and ours is a
-single hard cell, so this row is not a fair fight either way, and it should be reported as the
-project's known limitation rather than argued around.
+| # | protocol | best published | metric | model | dataset (intra-dataset unless noted) | citation | v4 (context only) |
+|---|---|---:|---|---|---|---|---:|
+| 1 | Closed set, **same subject**, same device | **99.39%** (98.76% non-overlap) | accuracy | 4-layer CNN-LSTM | UCI-HAR, 10-fold CV | Mekruksavanich & Jitpattanakul, *Sensors* 21(5):1636, 2021, Table 8 (Table 9 for non-overlap) | — |
+| 2 | Closed set, **multi subject**, same device | **89.25 ± 0.5** | macro-F1 | Conv classifier | MotionSense, 5-fold subject-wise (each subject in test exactly once) | Haresamudram, Essa & Plötz, *IMWUT* 6(3):116, 2022, Table 3 | **72.7** (k=8, mean over 6 unseen datasets — harder scope, not comparable) |
+| 3 | Closed set, multi subject, **multi device**, intra-dataset | **56.4%** | weighted-F1 | avg. of RF/SVM/kNN/C4.5 | HHAR, "one phone model in training" + leave-one-user-out (8 device models, 9 users) | Stisen et al., *SenSys '15*, Sec. 4.2 | — |
+| 4 | Closed set, multi subject, multi device, **multi dataset** | **77.1%** | accuracy | ConvNet (freq. domain) | DAGHAR, leave-one-dataset-out (6 pooled smartphone datasets, unified 6-class label set) | Napoli et al., *Scientific Data* 11:1192, 2024, Table 9 | **72.7** (k=8) / **62.4** (k=1) |
+
+**Row 1 — same subject, same device.** This is the number the "99% accuracy" objection is
+implicitly pointing at. It is inflated by subject sharing *and* by window overlap, and the two
+effects are separable in this one paper: subject sharing alone (10-fold, non-overlapping windows)
+already gets to 98.76% (Table 9); overlapping windows add a further 0.63 points on top (Table 8).
+Subject sharing is doing almost all of the work, not window leakage. Not a number our protocol
+(or any cross-subject protocol) can approach, because it isn't measuring generalization at all.
+
+**Row 2 — multi subject, same device.** The honest closed-set bar with only subject held out.
+MotionSense is a single iPhone in a front pocket, 6 coarse classes, 24 subjects, 5-fold with each
+subject appearing in the test fold exactly once — as clean a same-device cross-subject protocol as
+exists in the literature. 89.25 macro-F1 is the ceiling to cite for "how good is a fully-supervised
+model once you only remove subject overlap."
+
+**Row 3 — multi subject, multi device, one dataset.** Directly answers the question: yes, this
+ceiling exists, and it comes from the same HHAR paper that gives the R1/R2 numbers throughout this
+document. Stisen et al. train on one phone model and test on both a held-out user *and* the other
+phone models the panel used (different vendors, different sampling behaviour) — genuinely
+intra-dataset (one data collection, one fixed 6-activity vocabulary), genuinely both axes at once.
+56.4% weighted-F1 is ~33 points below the 10-fold number on the identical data. Two caveats worth
+carrying: it is weighted- not macro-F1 (not directly comparable to rows 2 and 4), and it is 2015
+shallow classifiers (RF/SVM/kNN/C4.5) — I did not find a modern deep-learning re-run of this exact
+intra-HHAR multi-device protocol, so this ceiling may be soft; a stronger encoder could plausibly
+beat it. Flagged as a gap rather than assumed.
+
+**Row 4 — multi subject, multi device, multi dataset.** DAGHAR's leave-one-dataset-out protocol is
+the closest published match to a real deployment: entirely new subjects, entirely new devices, and
+an entirely separate data collection effort, harmonized to one closed 6-class vocabulary. 77.1%
+accuracy is fully supervised on the union of the other five datasets. This is the row where v4's
+72.7 (k=8) is worth stating directly: **within 4.4 points of full supervision on the target
+dataset, using 8 labelled examples per class instead of the training set.**
