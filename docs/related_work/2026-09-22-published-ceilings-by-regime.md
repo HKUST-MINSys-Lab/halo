@@ -196,3 +196,36 @@ Grounded in the above, a fair table has four properties. (1) **Subject-disjoint 
 - Springer / Nature landing pages (BME Online 2024 orientation study; DAGHAR) redirected to login; DAGHAR was recovered via PMC.
 - RelCon's venue (ICLR 2025) is reported by the fetch as "likely" and is not independently verified here; the IMU2CLIP venue given by the fetch tool was inconsistent, so only the arXiv identifier is cited.
 - WHAR Arena per-dataset best macro-F1 for PAMAP2 / RealWorld / USC-HAD / HHAR / Opportunity could not be read from the text dump of Fig. 6 (column-major matrix); only the values stated in the prose are used.
+
+---
+
+## Summary ladder: easiest to hardest protocol, best published number, and where v4 lands
+
+One row per rung of difficulty. "Best published" is the single highest number found anywhere in
+this sweep for that protocol (any dataset, any model) — not an average, so it names the easiest
+*dataset* the protocol has ever been run on as well as the strongest *method*. "v4 (our protocol)"
+gives the closest number we have under our own manifest-controlled few-shot enrollment, so the two
+columns can be read side by side; they are **not the same experimental setup** (published numbers
+are fully-supervised classifiers, ours is k-shot enrollment with a frozen classifier) — that
+difference is the whole point of the table and is called out per row.
+
+| # | protocol (easiest → hardest) | best published | metric | model | dataset | v4 (our protocol) | same setup? |
+|---|---|---:|---|---|---|---:|---|
+| 1 | Same subject, windows leaked across train/test | **99.39%** | accuracy | CNN-LSTM | UCI-HAR (10-fold, 50%-overlap windows) | — | No — we never train/test on overlapping windows of the same subject; not a number we can report |
+| 2 | Cross-subject (LOSO / held-out subjects), closed set, same device | **89.25** | macro-F1 | Conv classifier | MotionSense (5-fold subject-wise) | **72.7** (k=8, sealed mean over 6 datasets) | Partial — ours is also cross-*dataset*, which the published number isn't; harder by construction |
+| 3 | Cross-subject + cross-device/dataset, closed set (fully supervised on the union) | **77.1%** | accuracy | ConvNet (freq.) | DAGHAR, leave-one-dataset-out | **72.7** (k=8) / **62.4** (k=1) | Close — this is the nearest published analogue to our sealed protocol, still fully supervised vs. our 1–8 shots |
+| 4 | Cross-subject + cross-dataset, **k-shot enrollment**, closed roster | *(no external ceiling — this is our regime)* | — | — | — | **50.2** (k=0) → **72.7** (k=8) | This protocol has no comparable published table; see §"Fair comparison" above |
+| 5 | Cross-subject + cross-dataset + **unseen label vocabulary**, zero support | **34.3** mF1 (avg. 18 sets) | macro-F1 | UniMTS | 18 unseen HAR datasets | **10.5** (MM-Fit k=0, single foreign-vocabulary dataset) | Closest match to UniMTS's own protocol; UniMTS's number is an 18-dataset average, ours is one dataset — not directly comparable, flagged as the honest weak point |
+
+**Reading this table.** Row 1 is the number the "99% accuracy" objection is implicitly comparing
+us against, and it is not attainable under any protocol we run — it is a leak, not a difficulty
+level. Row 2 is the real closed-set bar on the *easiest* individual dataset in the literature
+(MotionSense, 6 coarse classes, one device); we do not beat it, and we should not claim to — we
+solve a different, harder problem (cross-dataset, k-shot, open roster) on the same order of
+magnitude of accuracy. Row 3 is the single closest apples-to-apples published number, since DAGHAR's
+leave-one-dataset-out protocol matches our sealed setup on everything except enrollment — full
+supervision on the union of datasets reaches 77.1%, and our k=8 enrollment reaches 72.7% *without
+ever training on the target dataset*, which is the strongest one-line comparison in this table.
+Row 5 is where the story is honestly weakest: UniMTS's 34.3 is an 18-dataset average and ours is a
+single hard cell, so this row is not a fair fight either way, and it should be reported as the
+project's known limitation rather than argued around.
