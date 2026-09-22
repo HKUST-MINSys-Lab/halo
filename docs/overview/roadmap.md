@@ -85,19 +85,46 @@ pool structured the way deployment pools are:
 - **partial coverage**: some roster entries absent from the pool; **distractors**: pool windows from
   outside the roster.
 
-Mechanism: a fifth role, `ROLE_UNLABELED`, in
-[`model/support/roles.py`](../../model/support/roles.py). Unlabelled tokens carry no candidate
-binding, so they cannot enter the parameter-free vote; they act only through the learned residual.
-Consequently **N=0 reproduces the current model exactly** (the sealed table stays valid as the N=0
-column) and `residual_enabled=False` gives provably zero unlabelled gain — the ablation is clean by
-construction. To keep attention cost flat, the pool is summarised into a handful of tokens (mean plus
-a few centroids) rather than N raw tokens.
+Mechanism: **the transductive method is the head.** The pool enters training exactly where it
+enters inference — through the unrolled transductive iterations — not through a new token role. What
+is trained is the encoder, the recording pool, and `p_text` (the projection that supplies HALO's k=0
+text prototypes; the analogue of CLIP's image–text alignment). **The v4 learned head — residual
+attention stack, gated text blend, corruption auxiliary, unenrolled calibration — is not used in
+rung 2**, at training or at inference; it remains the rung-3 case-study vehicle. An earlier draft of
+this section proposed a `ROLE_UNLABELED` token acting through v4's residual. That would give HALO a
+private inference path and break the identical-inference invariant, so it is withdrawn (to be
+recorded in the next journal entry).
+
+Two N=0 checks, not one: (i) **architectural** — the same checkpoint with the pool removed must give
+a bit-identical forward pass; (ii) **inductive floor** — the retrained encoder's own N=0 k-curve must
+not fall below v4's encoder at any k. The sealed table remains the N=0 column for v4's encoder, not
+for the new arm.
 
 **End-to-end means unrolled.** The transductive method above runs inside the training forward pass
 on the episode's pool, and the loss backpropagates through it into the encoder — meta-learning the
 deployment procedure (cf. Hu et al. 2020, arXiv:2004.12696). Exposure alone is not assumed to
 suffice: Ochal et al. (IEEE TAI, 10.1109/tai.2023.3298303) show many meta-learners "will not
 automatically learn to balance from exposure to imbalanced training tasks".
+
+### Comparison structure
+
+Three baseline tiers, two of which need no new baseline training, and a four-step HALO ladder in
+which each step changes one thing.
+
+| tier | baselines | isolates | new training |
+|---|---|---|---|
+| 1 | frozen released checkpoints + the transductive method | off-the-shelf reality | none |
+| 2 | the corpus-matched arms (built 2026-09-22; trained with differentiable neighbours on our corpus) + the transductive method | "you just saw our corpus" | none — existing checkpoints, new readout |
+| 3 | HALO trained through the unrolled method | the claim | HALO only |
+
+HALO ladder, all from random initialisation on our corpus: (1) plain cross-entropy → (2) +
+heterogeneity curriculum, **which is today's v4 encoder** → (3) + unlabelled-pool episodes with the
+differentiable-neighbour objective, no unrolling (Ren 2018 style; objective-matched to tier 2) →
+(4) + unrolled transductive loss. Step 3→4 is "trained through the procedure"; 2→3 is exposure alone;
+1→2 is the existing curriculum. Optional tier 4: the unrolled loss dropped into the cheapest matched
+arm (HARNet, 32 min) as a transfer check — not required for the claim.
+
+**Invariant: inference is identical for everyone, HALO included.** Unrolling is training-time only.
 
 ### Registered threats and their matched controls
 
