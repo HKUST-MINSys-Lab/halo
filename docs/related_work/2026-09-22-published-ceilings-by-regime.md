@@ -200,50 +200,77 @@ Grounded in the above, a fair table has four properties. (1) **Subject-disjoint 
 ---
 
 
+
 ## Summary ladder: closed label set throughout, one axis of heterogeneity added at a time
 
 Four protocols, each adding exactly one axis of generalization over the last (subject → device →
 dataset), label vocabulary held fixed and closed throughout — open-set/zero-shot is intentionally
-excluded from this table (see R4 above for that). "Best published" is the single highest number
-found anywhere in this sweep for that exact protocol; "v4" is our closest comparable number under
-k-shot enrollment, given for context only — it is not the same experimental setup (published rows
-are fully-supervised classifiers; ours is a frozen classifier given k examples), so the two columns
-should not be read as a leaderboard.
+excluded from this table (see R4 above for that).
 
-| # | protocol | best published | metric | model | dataset (intra-dataset unless noted) | citation | v4 (context only) |
-|---|---|---:|---|---|---|---|---:|
-| 1 | Closed set, **same subject**, same device | **99.39%** (98.76% non-overlap) | accuracy | 4-layer CNN-LSTM | UCI-HAR, 10-fold CV | Mekruksavanich & Jitpattanakul, *Sensors* 21(5):1636, 2021, Table 8 (Table 9 for non-overlap) | — |
-| 2 | Closed set, **multi subject**, same device | **89.25 ± 0.5** | macro-F1 | Conv classifier | MotionSense, 5-fold subject-wise (each subject in test exactly once) | Haresamudram, Essa & Plötz, *IMWUT* 6(3):116, 2022, Table 3 | **72.7** (k=8, mean over 6 unseen datasets — harder scope, not comparable) |
-| 3 | Closed set, multi subject, **multi device**, intra-dataset | **56.4%** | weighted-F1 | avg. of RF/SVM/kNN/C4.5 | HHAR, "one phone model in training" + leave-one-user-out (8 device models, 9 users) | Stisen et al., *SenSys '15*, Sec. 4.2 | — |
-| 4 | Closed set, multi subject, multi device, **multi dataset** | **77.1%** | accuracy | ConvNet (freq. domain) | DAGHAR, leave-one-dataset-out (6 pooled smartphone datasets, unified 6-class label set) | Napoli et al., *Scientific Data* 11:1192, 2024, Table 9 | **72.7** (k=8) / **62.4** (k=1) |
+**Both accuracy and macro-F1 are reported wherever the source paper reports them, and marked "not
+reported" otherwise — they are not interconvertible without the full confusion matrix, so a missing
+value is never backfilled or estimated.** Checking this directly (below) turned up something worth
+knowing on its own: **none of the four source papers reports both metrics.** HHAR (Stisen et al.,
+verified from the full text) defines "Avg. F1-score" as its only metric and never states a raw
+accuracy anywhere in the paper. DAGHAR (Napoli et al., verified from the full text) reports accuracy
+only in both its within-dataset and cross-dataset tables ("macro-F1 not stated"). Whether
+Haresamudram et al. 2022 (row 2) also reports accuracy alongside its macro-F1 could not be confirmed
+in this pass (PDF table extraction failed; not re-attempted) — marked unconfirmed rather than assumed.
 
-**Row 1 — same subject, same device.** This is the number the "99% accuracy" objection is
-implicitly pointing at. It is inflated by subject sharing *and* by window overlap, and the two
-effects are separable in this one paper: subject sharing alone (10-fold, non-overlapping windows)
-already gets to 98.76% (Table 9); overlapping windows add a further 0.63 points on top (Table 8).
-Subject sharing is doing almost all of the work, not window leakage. Not a number our protocol
-(or any cross-subject protocol) can approach, because it isn't measuring generalization at all.
+| # | protocol | best published | accuracy | macro/weighted-F1 | model | dataset (intra-dataset unless noted) | citation |
+|---|---|---|---:|---:|---|---|---|
+| 1 | Closed set, **same subject**, same device | 4-layer CNN-LSTM, UCI-HAR, 10-fold CV | **99.39%** (98.76% w/o window overlap) | 99.83% (type not specified in source) | UCI-HAR, 10-fold | Mekruksavanich & Jitpattanakul, *Sensors* 21(5):1636, 2021, Table 8/9 |
+| 2 | Closed set, **multi subject**, same device | Conv classifier, MotionSense, 5-fold subject-wise | not confirmed | **89.25 ± 0.5** macro-F1 | MotionSense, 24 subjects, 5-fold (each subject in test exactly once) | Haresamudram, Essa & Plötz, *IMWUT* 6(3):116, 2022, Table 3 |
+| 3 | Closed set, multi subject, **multi device**, intra-dataset | avg. of RF/SVM/kNN/C4.5, HHAR, one phone model trained → tested on others + held-out user | **not reported by source** | **56.4%** weighted-F1 (average over 4 classifiers × 3 feature types — see caveat) | HHAR, 9 users, 8 device models, "one-model + leave-one-user-out" | Stisen et al., *SenSys'15*, §4.2 |
+| 4 | Closed set, multi subject, multi device, **multi dataset** | ConvNet (freq. domain), DAGHAR, leave-one-dataset-out | **77.1%** | not reported by source | DAGHAR, 225 pooled subjects across 6 datasets, unified 6-class label set | Napoli et al., *Scientific Data* 11:1192, 2024, Table 9 |
 
-**Row 2 — multi subject, same device.** The honest closed-set bar with only subject held out.
-MotionSense is a single iPhone in a front pocket, 6 coarse classes, 24 subjects, 5-fold with each
-subject appearing in the test fold exactly once — as clean a same-device cross-subject protocol as
-exists in the literature. 89.25 macro-F1 is the ceiling to cite for "how good is a fully-supervised
-model once you only remove subject overlap."
+### Why row 3 (56.4%) is not directly comparable to row 4 (77.1%), verified against both primary sources
 
-**Row 3 — multi subject, multi device, one dataset.** Directly answers the question: yes, this
-ceiling exists, and it comes from the same HHAR paper that gives the R1/R2 numbers throughout this
-document. Stisen et al. train on one phone model and test on both a held-out user *and* the other
-phone models the panel used (different vendors, different sampling behaviour) — genuinely
-intra-dataset (one data collection, one fixed 6-activity vocabulary), genuinely both axes at once.
-56.4% weighted-F1 is ~33 points below the 10-fold number on the identical data. Two caveats worth
-carrying: it is weighted- not macro-F1 (not directly comparable to rows 2 and 4), and it is 2015
-shallow classifiers (RF/SVM/kNN/C4.5) — I did not find a modern deep-learning re-run of this exact
-intra-HHAR multi-device protocol, so this ceiling may be soft; a stronger encoder could plausibly
-beat it. Flagged as a gap rather than assumed.
+This looked like a contradiction — more heterogeneity (row 4 adds a whole extra axis, cross-dataset,
+on top of row 3's cross-subject + cross-device) scoring *higher* than row 3. Reading both papers in
+full resolves it into four separable, evidenced causes, not one "different era" excuse:
 
-**Row 4 — multi subject, multi device, multi dataset.** DAGHAR's leave-one-dataset-out protocol is
-the closest published match to a real deployment: entirely new subjects, entirely new devices, and
-an entirely separate data collection effort, harmonized to one closed 6-class vocabulary. 77.1%
-accuracy is fully supervised on the union of the other five datasets. This is the row where v4's
-72.7 (k=8) is worth stating directly: **within 4.4 points of full supervision on the target
-dataset, using 8 labelled examples per class instead of the training set.**
+1. **Different metrics.** 56.4% weighted-F1 was never comparable to 77.1% accuracy in the first place.
+2. **Row 3 is an average over weak and strong methods; row 4 is the single best.** Stisen's 56.4% is
+   averaged over 4 classifiers × 3 feature types (12 combinations), including combinations their own
+   paper names as badly hurt by heterogeneity — frequency-domain features are "impacted by far the
+   most," and C4.5 is called out as prone to overfitting. DAGHAR's 77.1% is one cherry-picked best
+   model (ConvNet, frequency domain). This is a mean compared against a maximum, and the table above
+   should be read with that asymmetry in mind rather than as four values of the same kind of ceiling.
+3. **DAGHAR's harmonization removes exactly the heterogeneity HHAR is measuring the cost of.** Stisen
+   et al. name and quantify two dominant heterogeneity sources: sensor/gravity bias (devices deviate
+   up to ±7.5% of g at rest under otherwise identical conditions) and sampling-rate heterogeneity
+   (worth "more than 30 percentage points" when corrected by interpolation, their own mitigation
+   experiment). Their HHAR evaluation applies **no preprocessing** — verbatim: *"For the scope of the
+   evaluation of the effect of sensing heterogeneity on HAR in this section, we do not perform any
+   preprocessing steps."* DAGHAR's pipeline does the opposite before any model sees the data: *"We
+   then resample the data to 20 Hz and remove gravity acceleration by applying a high-pass 3rd order
+   Butterworth filter with a cutoff frequency of 0.3 Hz."* Row 4's ceiling is measured downstream of
+   eliminating the two effects row 3 exists to quantify the cost of.
+4. **The subject pool differs by 25×.** HHAR: 9 users total, so leave-one-user-out trains on 8. DAGHAR:
+   225 subjects pooled across KU-HAR (90), WISDM (51), UCI-HAR (30), MotionSense (24), RealWorld-Thigh
+   (15) and RealWorld-Waist (15); leave-one-dataset-out still trains on 135–210 of them depending on
+   which dataset is held out.
+
+None of this reopens row 4's comparison to v4 — both are closed-set, cross-subject, cross-device
+*and* cross-dataset, at comparable scale, so that pairing stays clean. It is rows 3 and 4 specifically
+that are not a fair consecutive pair on a single monotonic difficulty axis, and the table should not
+be read as implying one.
+
+**DAGHAR's exact label set** (Table 3, for completeness): sit, stand, walk, upstairs, downstairs, run
+— the walk/upstairs/downstairs triplet is the same classically hard-to-separate group HHAR also
+tests; DAGHAR's paper does not quantify pairwise confusability beyond noting these form a "mid-energy
+cluster" distinct from sit/stand (low-energy) and run (high-energy) in an MMD-based analysis.
+
+**Row 1's F1 type is unconfirmed.** The 99.83% F1 cited alongside 99.39% accuracy for UCI-HAR was
+captured from the source table but not verified as macro- vs weighted-averaged in this pass; given
+UCI-HAR's six classes are close to balanced, the two would not diverge much, but this is stated as
+an assumption, not a confirmed fact.
+
+**Row 4 is still the strongest direct claim available for v4.** DAGHAR's leave-one-dataset-out
+protocol is the closest published match to our sealed setup — same three axes of heterogeneity, same
+metric family (accuracy), comparable subject scale — and it is fully supervised on the target
+dataset's peers. **v4 at k=8 (72.7% dataset-balanced macro-F1) sits within 4.4 points of DAGHAR's
+77.1% accuracy ceiling, using 8 labelled examples per class instead of a training set.** The metric
+mismatch (our macro-F1 vs DAGHAR's accuracy) should still be disclosed if this comparison is used in
+the paper, even though the two protocols otherwise line up well.
