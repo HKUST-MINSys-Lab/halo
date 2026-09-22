@@ -1,114 +1,223 @@
-# Experiment Roadmap
+# Experiment roadmap: the three-regime plan
 
-Last verified against code: 2026-09-19.
+Last verified against code: 2026-09-22. This is the single forward-looking plan. It supersedes the
+classifier-versus-neighbours roadmap, archived at
+[`docs/archive/roadmap-classifier-vs-neighbours-20260919.md`](../archive/roadmap-classifier-vs-neighbours-20260919.md).
+The reasoning, literature and retractions behind every choice here are in the
+[2026-09-22 decision record](../journal/2026-09-22-three-regimes-and-unsupervised-adaptation-decisions.md);
+this file states only what is decided.
 
-This is the single forward-looking experiment record for the active support-conditioned HAR
-system. It separates completed exploratory work from experiments that can produce a current result.
-The architecture and protocol are defined in
-[`design_of_record.md`](../contracts/design_of_record.md) and
-[`evaluation_protocol.md`](../contracts/evaluation_protocol.md); this document defines the order
-in which claims are tested.
+**Status: pre-registration. Nothing in regimes 1 or 2 has been run.** Stage U reads sealed data, so
+this plan is written before any number is read, and it runs only on explicit go.
 
-## Question
+## Standing rules
 
-Can a heterogeneous physical-time encoder and support-conditioned semantic classifier improve
-adaptation beyond a simple nearest-neighbor rule?
+- Two data roles only: supervised training sources and the sealed six. No development split.
+- Every readout is applied **identically to all six encoders** (HALO v4 and the five released
+  baselines). A method that cannot be applied to one of them is not used.
+- Pre-register, then read. Registered predictions and threats are listed below and are not edited
+  after a result is read; a later journal entry names what changed.
+- Report metrics uniformly: accuracy **and** macro-F1 wherever a label is available.
+- Declare subject-independent evaluation everywhere (all subjects pooled; the harder setting).
 
-The answer requires separating representation quality from classifier reasoning. A better score
-from a learned head alone is not evidence of a better encoder; a better encoder score alone does
-not establish that semantic mixing is useful.
+## Regime 1 — discovery
 
-## Established Exploratory Evidence
+*Deployment provides unlabelled recordings. Roster and K are unknown. Tests the encoder, not a
+clustering algorithm.*
 
-The following work was useful for choosing experiments, but is not a promoted result under the
-current sealed protocol:
+Protocol copied from Lowe et al., *An Empirical Study into Clustering of Unseen Datasets with
+Self-Supervised Encoders* (TMLR 2024, arXiv:2406.02465) — the same experiment in vision.
 
-| finding | historical artifact | current use |
+| element | decision |
+|---|---|
+| algorithm | k-means++ with 10 restarts. Agglomerative (Ward) is a robustness check on the same result, not a second method. |
+| features | L2-normalised; report raw and PCA-to-64-d, because encoder dimensionality spans 72-d to 4608-d. |
+| K | estimated by silhouette and Davies–Bouldin over k ∈ [2, 30]. **|K̂ − K| is reported as a metric in its own right.** |
+| metric 1 — partition quality | AMI and ARI primary; Hungarian accuracy for comparability; NMI reported only with its cluster-count bias disclosed. |
+| metric 2 — semantic geometry | **Representational Similarity Analysis**: Spearman correlation between the K×K centroid-distance matrix and the K×K label-text-distance matrix (Kriegeskorte 2008; Dwivedi & Roig CVPR 2019). Projection-free, therefore fair to HARNet and LiMU-BERT, which have no text encoder. |
+| metric 2, secondary | cluster-naming accuracy: oracle-Hungarian (literature's number) vs model-Hungarian on the encoder's own cluster×name cosine matrix vs greedy argmax. The oracle − model gap **is the naming cost**. HARNet and LiMU-BERT are named through our ConSE bridge, disclosed. |
+| label-free proxy | silhouette in a UMAP-reduced space, which Lowe et al. find tracks clustering quality without labels — a signal a real deployment could use. |
+| data | existing sealed feature caches, all six encoders, CPU. |
+
+Registered caveat on RSA: alignment metrics can be driven by a small subset of dimensions (Bertram
+et al. 2026, arXiv:2605.05907); report a dimension-ablation check alongside.
+
+## Regime 2 — unlabelled adaptation: the N-curve
+
+*Deployment provides the roster and a growing pool of unlabelled recordings. No label is ever
+provided. The load-bearing regime.*
+
+Per-window zero-shot is stateless, so its accuracy is provably flat in the amount of unlabelled
+data. The experiment is a curve in **N**, the size of the unlabelled pool, at fixed k:
+
+> N ∈ {0, 50, 100, 500, 2000, all}, log-spaced; k ∈ {0, 1, 2, 4, 8}. At N=0 the method must
+> reproduce the published sealed number exactly — that is the self-consistency check.
+
+Pools exist: the sealed manifests give 39 cells at k=8, 552–16,828 query windows, median ~450 per
+class.
+
+### The one established method
+
+**Transductive Zero-Shot and Few-Shot CLIP** (Martin et al., CVPR 2024,
+10.1109/cvpr52733.2024.02722) — provisional. The latest method designed for text-initialised
+prototypes at k=0, handling k=0 and k>0 in one framework; same lineage as PADDLE. Applied
+identically to all six encoders, with pool-mean centring (the existing `corpus_mean` knob).
+
+Two things are checked before the choice is final, in the build: that its block
+majorisation–minimisation update can be unrolled differentiably for training (see below); and how
+it behaves under imbalanced, partially-covered pools. **Fallback: PADDLE** (Martin et al. 2022,
+arXiv:2210.14545) — hyperparameter-free, built for query classes drawn from a larger set than the
+support set. Same first author; the swap costs nothing narratively.
+
+Cited for properties, **not** run as arms: OSLO (open-set), α-TIM (imbalance), Burzer et al. 2026
+MAP-EM (the HAR-native competitor; its stated limitation — assumes known active classes — is our
+regime).
+
+### HALO's contribution arm: trained through the procedure
+
+The curriculum gains episodes that contain an **unlabelled pool** alongside the k supports, with the
+pool structured the way deployment pools are:
+
+- drawn from a **different acquisition** (device / placement / rate) than the supports — the axis
+  no vision paper has;
+- **Dirichlet-imbalanced** marginals, so the robustness Veilleux et al. show is missing is trained in
+  rather than hoped for;
+- **partial coverage**: some roster entries absent from the pool; **distractors**: pool windows from
+  outside the roster.
+
+Mechanism: a fifth role, `ROLE_UNLABELED`, in
+[`model/support/roles.py`](../../model/support/roles.py). Unlabelled tokens carry no candidate
+binding, so they cannot enter the parameter-free vote; they act only through the learned residual.
+Consequently **N=0 reproduces the current model exactly** (the sealed table stays valid as the N=0
+column) and `residual_enabled=False` gives provably zero unlabelled gain — the ablation is clean by
+construction. To keep attention cost flat, the pool is summarised into a handful of tokens (mean plus
+a few centroids) rather than N raw tokens.
+
+**End-to-end means unrolled.** The transductive method above runs inside the training forward pass
+on the episode's pool, and the loss backpropagates through it into the encoder — meta-learning the
+deployment procedure (cf. Hu et al. 2020, arXiv:2004.12696). Exposure alone is not assumed to
+suffice: Ochal et al. (IEEE TAI, 10.1109/tai.2023.3298303) show many meta-learners "will not
+automatically learn to balance from exposure to imbalanced training tasks".
+
+### Registered threats and their matched controls
+
+| threat | source | control |
 |---|---|---|
-| End-to-end differentiable-neighbor training substantially improved the encoder over random initialization. | `IMWUT_DIFFERENTIABLE_NEIGHBORS_20260908.md` | Retain neighbors as the encoder-only control. |
-| Future-JEPA improved frozen representations but not the end-to-end adapted route. | `journal/2026-09-13-jepa-value-measured.md` | Retired; preserve as a negative result, not an active arm. |
-| Earlier learned support engines did not consistently beat the same encoder with 1-NN. | `IMWUT_MATCHED_ADAPTATION_20260908.md` | Require a direct same-encoder neighbor comparison for every new semantic head. |
+| transductive gains are an artefact of balanced pools | Veilleux et al. 2022 (arXiv:2204.11181): drops "even below inductive" under Dirichlet marginals | balanced-pool arm; per-cell imbalance reported |
+| exposure to heterogeneous pools does not by itself confer robustness | Ochal et al. | curriculum-only arm (no unrolling) vs unrolled arm |
+| episodic training is unnecessary; plain CE suffices | Laenen & Bertinetto NeurIPS 2021; Burzer et al. validate for HAR; Zhang 2024 (arXiv:2402.00092). Counter: LibFewShot (TPAMI) | plain-CE control |
+| the model exploits the pool's acquisition fingerprint, not its class structure | — | same-config **disjoint-class** pool: gain survives ⇒ domain adaptation; vanishes ⇒ class structure |
+| pseudo-label confirmation bias and cluster collapse | Wang et al. CVPR 2022 (10.1109/cvpr52688.2022.01424) | confidence threshold, per-class cap, **collapse rate reported** |
+| encoder overfits the unrolled method and regresses inductively | — | k=0 and k-curve at N=0 must not regress |
 
-Those experiments used earlier source rosters, candidate ranges, manifests, and classifier designs.
-They may be cited as ablation history, but their scores must not be pooled with current sealed-test
-results or presented as current baseline comparisons.
+### What is dropped, and why
 
-## Current Experiment Ladder
+- **Class-prior correction (SLD).** Esuli, Molinari & Sebastiani (ACM TOIS 2020, 10.1145/3433164):
+  helps only with ≤5 classes and a calibrated classifier; otherwise "negative rather than positive".
+  Our rosters are 6–8 and text-cosine is uncalibrated.
+- **TENT.** Needs BatchNorm affines; not all six encoders have them — unfair by construction.
+- **LaplacianShot** as primary. Balanced-benchmark era; superseded for our regime.
+- **"Clustering with known K" (the former U-0b).** With the roster known it is a worse version of
+  zero-shot; the only justification is transduction, which is what regime 2 now measures.
+- **Estimated-K as the deployment case (U-0c) and kNN purity as a headline (U-0a).** K is given by
+  the roster in regime 2; in regime 1 |K̂ − K| is one metric among several. kNN purity survives only as
+  a one-line diagnostic.
+- **Seeded k-means as U-2.** The unrolled transductive method subsumes it.
 
-Each row uses the current disjoint rosters and the immutable manifest produced by
-`training.support_classifier.sealed_eval`.
+## Regime 3 — labelled adaptation
 
-| order | condition | encoder updates | head updates | purpose |
-|---:|---|---|---|---|
-| 0 | released external baselines | none | none | Establish released-checkpoint 1-NN, prototype, ridge, and native `k=0` reference rows. |
-| 1 | HALO initialized / neighbors | none after initialization | none | Random-encoder and implementation floor. |
-| 2 | HALO supervised end-to-end / neighbors | yes | none | Measure what direct enrollment training can teach the encoder without semantic-head capacity. |
-| 3 | HALO frozen encoder / evidence-aware v2 classifier | no | yes | Test classifier reasoning independently of encoder adaptation. |
-| 4 | HALO end-to-end / evidence-aware v2 classifier | yes | yes | Test the complete system against the matched neighbors control. |
-| 5 | released encoder / HALO classifier | no | yes | Isolate classifier value from HALO encoder value under both aggregate and scenario manifests. |
+*Deployment provides k labelled examples per class.*
 
-The one-second fixed filterbank is retained as the compact architectural control. The current
-multiresolution filterbank is the only planned extension. Do not add a new frontend until this
-ladder identifies a specific representation failure.
+- **k-curve, parameters frozen** (the existing sealed table, v4): demoted to a **case study**. It
+  answers a niche need and is no longer the headline.
+- **Fine-tuning at matched k, every model including HALO**: the headline adaptation result. Ladder
+  by cost — linear probe on frozen features (closed form; TransfHAR's mechanism) → small classifier
+  (the frozen-projection path built 2026-09-22) → LoRA / full fine-tune. Scored against the honest
+  closed-set bar of **~77–80 %** (DAGHAR LODO, fully supervised, multi-subject/device/dataset). Build
+  cost: HALO's own-encoder fine-tune path does not exist yet; NormWear has none and its authors never
+  fine-tune.
 
-## Retired JEPA experiment
+## Registered predictions
 
-Future-JEPA is not in the active ladder. Its frozen-versus-adapted comparison is recorded in
-[2026-09-13-jepa-value-measured.md](../journal/2026-09-13-jepa-value-measured.md): it improved a
-frozen representation, but the gain disappeared once the supervised neighbor objective adapted the
-encoder. The code and exact result rows remain reproducible but must not be used as current model
-references.
+1. Regime 1: HALO leads AMI/ARI on the sealed six by roughly its 1-NN margin; RSA is where the gap
+   opens; MM-Fit at k=0 is where we lose. Absolute clustering numbers will be low (subject-independent
+   HAR clustering runs ACC 26–51 even for trained deep models); the criterion is a margin.
+2. Regime 2, established method on all six: modest gains (a few points), **negative on some cells
+   for some encoders** — going negative is the norm in this literature (Burzer's baselines: −12.8 pp).
+   The curve rises steeply and plateaus within a few hundred windows per class.
+3. Regime 2, HALO curriculum arm: a reliably non-negative, steeper curve than any baseline under the
+   same procedure. If the established method is flat on all six, the curriculum arm has nothing to
+   improve on and is not built.
+4. Regime 3: HALO's fine-tuned curve matches or exceeds the baselines' at every k; reaching ~77–80 %
+   at large k is the bar, not a prediction.
 
-## Classifier Experiment
+## Sequencing and gates
 
-The active experiment is `support_evidence_aware_v2`. It computes auditable support and semantic
-status-quo paths before contextualization, then learns candidate-specific support corrections and
-semantic reliance. It is mechanically validated but has no full-duration result yet. The promoted
-control remains `support_classifier_v3`. Both `support_contextual_mixture_v1` and
-`support_contextual_residual_v1` are abandoned negative results; the two-head token mixer is
-retired. They remain loadable only for historical reproduction. The current implementation record
-is [the 2026-09-19 handoff](../journal/2026-09-19-new-classifier-design-handoff.md), followed by the
-[second-review fixes](../journal/2026-09-19-evidence-aware-v2-second-review-fixes.md).
+1. **This document and the journal entry** — done 2026-09-22.
+2. **Build regime 1 and the regime-2 established arm** on cached features. Build + tests + smoke;
+   nothing runs without explicit go. Includes the shared-module extraction in the code plan below.
+3. **Run regimes 1 and 2 (established)** on go. CPU, ~hours.
+4. **Gate:** build the curriculum arm only if prediction 2's curve rises for at least one encoder.
+5. **Regime 3** fine-tune paths. The expensive build; last.
 
-The necessary comparison is always the same encoder and the same manifest under `neighbors` versus
-`evidence-aware-v2`. A learned classifier that does not exceed the neighbor control is not promoted as a
-useful component, even if its absolute score is high.
+## Open decisions
 
-## Reporting Rules
+- Regime 1 and 2 on the sealed six only, or MM-Fit as well.
+- Build the curriculum arm now or after the gate in step 4 (recommendation: after).
+- An embodied evaluation source (Ego-Exo4D IMU) so the headline framing can be scored.
 
-* Use `k = 0, 1, 2, 4, 8, 16, 32, 64, 128` when a sealed stream can form the requested
-  execution-disjoint enrollment. `k=0` and `k>0` are separate information conditions.
-* Report macro F1, balanced accuracy, subject bootstrap intervals, candidate count, and query
-  count per sealed dataset/stream before any aggregate.
-* Baselines use author-released checkpoints. On the complete-enrollment curve at `k>0`, show
-  equal-weight normalized fusion and 1-NN; every candidate receives `k` supports. At `k=0`, show
-  equal-weight normalized fusion and a separate released-native row where available. Scenario
-  tables use equal-weight normalized fusion as the default baseline readout. Unsupported native
-  cells are `N/A`.
-* Every result artifact contains macro F1, balanced accuracy, and accuracy. Partial-enrollment
-  artifacts also contain truth-enrolled, truth-unenrolled, combined, and harmonic-mean summaries.
-* Record commit, checkpoint hash, corpus fingerprint, immutable manifest fingerprint, runtime,
-  peak memory, and whether the encoder/head were frozen.
-* A historical table is comparable only to another result with the same representation checkpoint,
-  source roster, candidate policy, enrolled-execution definition, manifest, and metric. Otherwise
-  it is an ablation reference, not a numeric baseline.
+## Code organisation plan
 
-## Active curriculum experiment
+*A plan. No code is moved by this document.* Regime 3 is the working pipeline that produced every
+published number, so the rule is **extract, don't rewrite**, and every move is verified bit-exact
+against an existing cached artifact before it lands.
 
-The 2026-09-17 [heterogeneity and metadata audit](../journal/2026-09-17-heterogeneity-metadata-audit.md)
-separates deployment heterogeneity from nuisance augmentation and from metadata/text-backend
-ablations. Complete the source-label/device/exposure checks before making stronger unseen-domain
-claims. Baseline-encoder plus HALO-classifier training remains planned but explicitly deferred.
+**Principle: separate by concern, not by regime.** All three regimes share the six encoders, the
+feature caches, the sealed manifests, the metrics, and provenance. What differs is only the readout on
+top of cached features. So regimes are thin drivers over shared modules, not parallel copies.
 
-The staged deployment-challenge experiment is specified in
-[`curriculum.md`](../contracts/curriculum.md).
-It changes acquisition/enrollment episode construction and can add truthful rate/modality
-perturbations. The current classifier consumes the encoder's single pooled runtime-acquisition
-vector and trains with modular path-improvement objectives; explicit per-field classifier tokens
-remain unnecessary unless the pooled contract fails an ablation.
+Today
+[`training/support_classifier/sealed_eval.py`](../../training/support_classifier/sealed_eval.py)
+(2,382 lines) bundles feature caching, manifest construction, eight model-specific readouts, metrics,
+provenance and the CLI. Regimes 1 and 2 need the first two and the last two but none of the readouts.
+Copying them creates two versions; importing them makes regime 1 depend on regime 3's file.
 
-## Promotion Gate
+Target layout:
 
-Add a run to `docs/results/RESULTS.md` only after the sealed evaluator produced per-stream machine
-readouts from a frozen checkpoint. Internal validation selects training checkpoints and detects
-failures; it is never a test result.
+```text
+evaluation/                      NEW package — consumes checkpoints + manifests, produces artifacts
+  encoders.py                    ← from sealed_eval: HALO + baseline feature extraction, _load_or_encode
+  manifests.py                   ← from sealed_eval: QueryPlan, *_cells, build_manifest, manifest_fingerprint
+  features.py                    ← from sealed_eval: FeatureMemoryCache, cache keys, file hashes
+  metrics.py                     ← from sealed_eval: _metric_row  +  NEW: ami, ari, hungarian_acc, rsa, naming_acc
+  provenance.py                  ← from sealed_eval: run provenance, atomic JSON  +  NEW: regime/method registry
+  regime1_discovery/             NEW: cluster.py, rsa.py, name.py, run.py
+  regime2_unlabeled/             NEW: transductive.py (the one method, also importable by training), ncurve.py, run.py
+  regime3_labeled/               sealed_eval.py, run_scenarios.py, run_partial_coverage.py,
+                                 frozen_baseline_adaptation.py — moved last, behaviour unchanged
+  controls/                      NEW: balanced_pool.py, disjoint_classes.py, shuffled_labels.py
+training/support_classifier/     keeps train.py, curriculum, sampling, collate, objectives, neighbors.py
+                                 (neighbors.py stays: model/ imports it; it is shared train/eval code)
+results/tools/                   reporting only — tables, plots, provenance readers
+```
+
+Rules that make "which version is which" unambiguous:
+
+1. **Every artifact declares its regime and method.** `evaluation/provenance.py` holds a registry
+   (`REGIME ∈ {1, 2, 3}`, `METHOD` enum, `READOUT_VERSION` string such as `discovery-v1`,
+   `ncurve-v1`). An artifact cannot be written without them, and they sit in `run_provenance.json`
+   beside the checkpoint and manifest fingerprints — the code analogue of RESULTS.md's "which run is
+   which" index.
+2. **Readout versions bump when the procedure changes**, exactly as `sealed-manifest-v2` and
+   `deployment-scenarios-v5` do today, so an old artifact is never mistaken for a new protocol.
+3. **Classifier names are unchanged**: v4 / T-numbers per RESULTS.md. Regimes 1 and 2 use no learned
+   head, so they name the encoder checkpoint, not a classifier.
+4. **The transductive method lives in one file** (`evaluation/regime2_unlabeled/transductive.py`)
+   and is imported by both the evaluator and the trainer's unrolled loop. One implementation, so the
+   method unrolled in training is provably the one applied to the baselines at test.
+5. **Order of migration:** extract the shared modules first (regimes 1 and 2 need them; each
+   extraction is `git mv` + import shim + a bit-exact diff of `results.json` on one cached sealed cell);
+   build regimes 1 and 2 on them; move regime 3's runners last, and only once the extraction is proven.
+   Entry points in `pyproject.toml` are re-pointed at the same time; `halo-sealed-eval` keeps its name.
+6. **Case studies and other experiments** are drivers under the regime they read from, never new
+   top-level trees. A case study that reads regime-3 caches is `evaluation/regime3_labeled/case_*.py`.
