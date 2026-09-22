@@ -24,17 +24,19 @@ acceleration. **No clinical or health framing.** A foundation model is not a sub
 collecting disease-specific data and the paper does not argue otherwise; InclusiveHAR is a
 robustness row only.
 
-## The claim, in three regimes
+## The claim, in four rungs
 
-The paper is organised from the least to the most information a deployment can provide. The same
-six encoders — HALO v4 and five released baselines — are scored in every regime, through the same
-inference procedure, so that every difference is attributable to the encoder.
+The paper is organised as a ladder from the least to the most a deployment can provide, hardest
+rung first. The same six encoders — HALO and five released baselines — are scored on every rung
+through the same inference procedure, so that every difference is attributable to the encoder and
+how it was trained.
 
-| regime | the deployment provides | the question | what "better" is measured against |
+| rung | the deployment provides | the question | what "better" is measured against |
 |---|---|---|---|
 | **1 — discovery** | unlabelled recordings; roster and K unknown | does the encoder's geometry recover the activities, and does it mirror how their names relate in language? | the baselines' geometry |
 | **2 — unlabelled adaptation** | the roster, plus a growing pool of unlabelled recordings | does accuracy rise with unlabelled data, with no label ever provided? | a flat curve, which is exactly per-window zero-shot |
-| **3 — labelled adaptation** | k labelled examples per class | with labels and fine-tuning switched on for every model, does HALO still lead, and reach the honest closed-set bar? | ~77–80 % — the fully supervised multi-subject, multi-device, multi-dataset ceiling |
+| **3 — labelled, parameters frozen** | k labelled examples per class; the model may not change | does the encoder beat the baselines under an identical parameter-free readout at every k? | done — the existing sealed and scenario tables; the case study |
+| **4 — labelled, fine-tuning allowed** | k labelled examples per class; every model may fine-tune | with the same treatment for everyone, does HALO still lead at every k, and where does it cross a specialist trained from scratch on the same k? | every baseline fine-tuned; the crossover; ~77–80 % as context |
 
 The contribution is **not** any single mechanism. Every inference-time procedure is an established
 one, applied identically to all six encoders. The contribution is that HALO is **trained through

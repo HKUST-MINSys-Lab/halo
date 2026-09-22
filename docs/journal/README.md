@@ -77,5 +77,6 @@ entries preserve what was believed at the time; current behavior is defined only
 | 2026-09-21 | [2026-09-21-classifier-t8-grounded-primitives.md](2026-09-21-classifier-t8-grounded-primitives.md) | T8: the primitive path with a grounded label side |
 | 2026-09-21 | [2026-09-21-v4-promotion-and-primitive-path-postmortem.md](2026-09-21-v4-promotion-and-primitive-path-postmortem.md) | v4 promoted (the T6 recipe), and why the primitive semantic path failed on foreign vocabulary |
 | 2026-09-22 | [2026-09-22-baseline-corpus-matched-arms.md](2026-09-22-baseline-corpus-matched-arms.md) | Giving the baselines our corpus: what we run, and why each choice is defensible |
+| 2026-09-22 | [2026-09-22-four-rungs-and-rung2-head-correction.md](2026-09-22-four-rungs-and-rung2-head-correction.md) | Addendum: four rungs, and rung 2 does not use the v4 head |
 | 2026-09-22 | [2026-09-22-pivot-unsupervised-then-finetune-and-framing.md](2026-09-22-pivot-unsupervised-then-finetune-and-framing.md) | The pivot: unsupervised first, fine-tuning second — and how the paper is framed |
 | 2026-09-22 | [2026-09-22-three-regimes-and-unsupervised-adaptation-decisions.md](2026-09-22-three-regimes-and-unsupervised-adaptation-decisions.md) | The three-regime plan, and how the unsupervised tier was redesigned twice in one day |
