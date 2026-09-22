@@ -71,18 +71,72 @@ demonstration" — that IMWUT reviewers accept without a clinical justification.
 for HALO v4 and all five baselines already cover every sealed stream, so this is CPU work on
 existing artifacts.
 
-* U0 — cluster with known K (= candidate roster): spherical k-means, 10 seeds; NMI, ARI,
-  Hungarian accuracy; agglomerative as a second algorithm so nothing is a k-means artefact.
+* U-0a — kNN purity / R@k: do a window's nearest neighbours share its activity? No algorithm, no
+  K, no seed, no labels at query time. Added 2026-09-22 so the headline geometry claim does not
+  rest on a clustering algorithm's assumptions.
+* U-0b — cluster with **known K** (= candidate roster): spherical k-means, 10 seeds; **AMI, ARI and
+  Hungarian/clustering accuracy** (see metric note); agglomerative as a second algorithm so nothing
+  is a k-means artefact.
+* U-0c — cluster with **estimated K** (silhouette / eigengap). The deployment-realistic case, and
+  where the AMI-vs-NMI choice actually bites, since K then varies between models.
 * U1 — name the clusters: centroid → the model's text bridge → argmax over the roster.
   Cluster-naming accuracy and end-to-end unsupervised accuracy. Open-vocabulary variant over the
   155 training labels + roster is the harder, more honest version. Disclose that HARNet and
   LiMU-BERT-X are named through *our* ConSE bridge.
 * U2 — refine as labels arrive: seed with the k windows the manifests already enrol,
-  k ∈ {0,1,2,4,8,16,32}; seeded k-means, label propagation, and HALO's parameter-free vote.
+  k ∈ {0,1,2,4,8,16,32}; **seeded k-means (not constrained k-means — see below)**, label
+  propagation over the kNN graph, and HALO's parameter-free vote.
 
-Registered caveats: known K is generous (also report estimated K); clustering metrics are
-imbalance-sensitive (report per dataset); this measures the representation, not the classifier,
-which is the right object here.
+### Design review against the literature (2026-09-22) — three corrections
+
+**1. Declare subject-independent clustering explicitly; it is the dominant design choice.**
+Mahon & Lukasiewicz (*Efficient Deep Clustering of Human Activities and How to Improve Evaluation*,
+arXiv:2209.08335) identify this as the central ambiguity in the field — whether each subject's data
+is clustered separately (subject-dependent) or all subjects together (subject-independent) — and
+show the *same model* swings enormously between them: WISDM-watch ACC 78.40 → 25.58, ARI 72.22 →
+12.60; REALDISP ACC 89.60 → 51.37; PAMAP 66.28 → 48.30. Their Table 1 shows almost every prior HAR
+clustering paper is ambiguous about which it used. **We cluster subject-independently** — harder, and
+the only setting consistent with the deployment framing. Stated here so it can never be ambiguous.
+They also test window-wise vs point-wise labelling and find "essentially no diﬀerence", so our
+window-level evaluation needs no further justification beyond being declared.
+
+**2. NMI is a biased metric; use AMI and ARI.** Jerdee et al. (*Nature Communications*,
+10.1038/s41467-025-66150-8) and Mahmoudi et al. (*Scientific Reports*,
+10.1038/s41598-024-59073-9) both show NMI is biased with respect to the number of clusters — the
+latter proving it formally and calling NMI "unsuitable ... for evaluating clustering". Jerdee et al.
+show the bias changes *which algorithm looks best*. Romano et al. (*JMLR* 2015) give the operational
+rule: **ARI when the reference clustering has large equal-sized clusters, AMI when it is unbalanced
+with small clusters.** Our sealed rosters are imbalanced, so AMI is the right primary, with ARI
+alongside. NMI may be reported for comparability with the HAR clustering literature (which uses it
+almost universally) but never as the deciding number, and always with the bias disclosed.
+
+**3. Expected absolute numbers are far lower than the sealed table would suggest.** In the
+subject-independent setting, Mahon & Lukasiewicz's *trained deep clustering model* reaches ACC
+25.6–51.4, NMI 28.4–71.8, ARI 12.6–43.9 across six datasets. We are running k-means over frozen
+embeddings with no training at all, on held-out datasets. Low absolute numbers are the norm here,
+not a failure signal — the claim is *relative* (does HALO's geometry cluster better than the
+baselines'), and the registered success criterion is a margin, not a threshold.
+
+**Why seeded k-means and not constrained k-means for U2.** Zhong (*Machine Learning* 2006,
+10.1007/s10994-006-6540-7) compares seeded, constrained and feedback-based variants and finds "the
+constrained approach is the best when available labels are complete whereas the feedback-based
+approach excels when available labels are incomplete." Our partial-coverage regime has *incomplete*
+label sets by construction — some roster entries are enrolled, others deliberately are not — so
+constrained k-means is the wrong tool: it would force every seeded point to stay in its seed's
+cluster and leave no mechanism for an unenrolled activity to form its own. Seeded k-means uses the
+labelled windows only to initialise centroids and then lets assignment proceed freely, which is
+what an open-set setting requires. Basu, Banerjee & Mooney (2002) is the canonical reference;
+González-Almagro et al. (*Artificial Intelligence Review* 2025, 10.1007/s10462-024-11103-8) is the
+315-method taxonomy with a pitfalls section to check against before implementing.
+
+**U2 is the missing left end of a curve we have already published.** At k=0 it is U-0b; at k≥1 with
+HALO's own parameter-free vote it should reproduce our published sealed k-curve exactly. That makes
+it both a new result and a self-consistency check on the existing table.
+
+Registered caveats: known K is generous (hence U-0c); clustering metrics are imbalance-sensitive
+(report per dataset); this measures the representation, not the classifier, which is the right
+object here; feature dimensionality varies 72-d to 4608-d across models, so report raw plus a
+PCA-to-64-d robustness check.
 
 **Stage F — fine-tuning on, same k-window budgets, every treatment applied to HALO too.**
 Linear probe on frozen features (closed form; NormWear's own protocol; TransfHAR's mechanism —
@@ -147,10 +201,22 @@ absence of any adaptation or unsupervised row is the gap Stages U and F fill.
 
 ### Everything else worth carrying
 
-* **Nobody in this sweep evaluates foundation-model embeddings by unsupervised clustering for
-  HAR**, and **nobody reports an enrollment-versus-fine-tuning crossover at matched label
-  budgets.** Both stages are novel, not just useful. (The scite digest of the few-shot literature
-  is pending and may qualify the second claim.)
+* ~~**Nobody in this sweep evaluates foundation-model embeddings by unsupervised clustering for
+  HAR**~~ — **corrected 2026-09-22, this was wrong.** A targeted search found an established HAR
+  deep-clustering line: Abedin et al. (ISWC 2020), Ahmed et al. (ISWC 2022, adapting SCAN to HAR),
+  Mahon & Lukasiewicz (2022), Sheng et al. (2023), Amrani et al. (ICCE-Berlin 2022), and a 2020
+  *Sensors* review (10.3390/s20092702). Most damagingly for the original claim, **Takatsu et al.**
+  (*IEEE Access* 2025, 10.1109/access.2025.3562897) run cross-dataset pretrained representations →
+  unsupervised deep clustering → fine-tuning with 50 samples, i.e. essentially our U-0 → U-2
+  pipeline, reporting F1 0.441–0.781 clustering and 0.66–0.88 after 50 labels. What remains
+  defensible as novel is narrower and should be stated that way: a *head-to-head comparison of
+  released foundation models as frozen feature extractors* on held-out datasets (rather than
+  proposing another clustering method), and the text-bridge **naming** step (U1), for which no
+  counterpart was found.
+* **Nobody reports an enrollment-versus-fine-tuning crossover at matched label budgets.** This
+  claim survived the scite digest — FSID (Sci Rep 2025) has the matched design but only at a fixed
+  5-sample budget on spectrogram/gait data, and HARLLM gives a fine-tuning curve with no
+  enrollment arm.
 * *Are they ready for prime-time?* (arXiv 2608.13316; fetched directly — the ceilings sweep did not
   surface it, so it is absent from that table) — three modes (linear, frozen+attention
   head, fine-tune); **UniMTS is "the best frozen feature extractor overall"**; NormWear and UniMTS
