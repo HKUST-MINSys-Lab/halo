@@ -122,13 +122,13 @@ automatically learn to balance from exposure to imbalanced training tasks".
 
 ### Comparison structure
 
-Three baseline tiers, two of which need no new baseline training, and a four-step HALO ladder in
-which each step changes one thing.
+Three baseline tiers and a four-step HALO ladder in which each step changes one thing. Tier 1
+needs no training; tier 2 needs the matched arms trained (≈ 15.5 GPU-h, a separate go).
 
 | tier | baselines | isolates | new training |
 |---|---|---|---|
 | 1 | frozen released checkpoints + the transductive method | off-the-shelf reality | none |
-| 2 | the corpus-matched arms (built 2026-09-22; trained with differentiable neighbours on our corpus) + the transductive method | "you just saw our corpus" | none — existing checkpoints, new readout |
+| 2 | the corpus-matched arms (built 2026-09-22, trained with differentiable neighbours on our corpus) + the transductive method | "you just saw our corpus" | no new *design*; the arms are built but **unlaunched** — HARNet 32 min, LiMU-BERT ~40 min, UniMTS 13.6 h, NormWear ~40 min ≈ 15.5 GPU-h |
 | 3 | HALO trained through the unrolled method | the claim | HALO only |
 
 HALO ladder, all from random initialisation on our corpus: (1) plain cross-entropy → (2) +
@@ -235,8 +235,10 @@ never fine-tune.
 ## Sequencing and gates
 
 1. **This document and the journal entries** — done 2026-09-22.
-2. **Build rung 1 and the rung-2 established arm** on cached features. Build + tests + smoke;
-   nothing runs without explicit go. Includes the shared-module extraction in the code plan below.
+2. **Build rung 1 and the rung-2 established arm** on cached features, per the
+   [implementation plan](../journal/2026-09-22-rung1-rung2-implementation-plan.md): shared-module
+   extraction first (bit-exact), then the provenance registry, then the two rungs. Build + tests +
+   smoke; nothing runs without explicit go.
 3. **Run rungs 1 and 2 (established)** on go. CPU, ~hours.
 4. **Gate:** build the HALO unrolled arm only if prediction 2's curve rises for at least one encoder.
 5. **Rung 4** fine-tune paths. The expensive build; last in sequence, not least in weight.
