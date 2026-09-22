@@ -16,7 +16,15 @@ Two honest answers, in order of strength:
    frequently random splits over overlapping windows (our own audit found this in `uci_har`,
    `sp_sw_har`, `unimib`). Cross-subject closed-set on real benchmarks is typically 80–92%. Our
    sealed 72.7 is cross-subject, manifest-controlled, six unseen datasets. Different protocol.
-   The literature ceilings are being tabulated separately (`related_works_ceilings.md`, pending).
+   The literature ceilings are tabulated with citations in
+   [`docs/related_work/2026-09-22-published-ceilings-by-regime.md`](../related_work/2026-09-22-published-ceilings-by-regime.md).
+   Headline: the 99% UCI-HAR figure is 10-fold CV over 50%-overlapping windows (Mekruksavanich &
+   Jitpattanakul 2021, Table 8); the same model under LOSO is 96.7 / 93.9 and the dataset's own
+   subject-disjoint baseline is 96 (Anguita 2013). Honest cross-subject ceilings: UCI-HAR ~93 mF1,
+   MotionSense ~89, RealWorld ~85, PAMAP2 ~85–86, USC-HAD ~61, Opportunity 45–69, WISDM-19 ~32;
+   two 2026 multi-dataset benchmarks plateau at 61–68 mean mF1. Placement/device shift costs
+   more than subject shift. The genuine unseen-dataset zero-shot ceiling is UniMTS 34.3 mF1 ≈
+   AnyMo 29.5; every higher number relaxes an "unseen" axis.
 2. **What HALO replaces is not the specialist, it is the pipeline that produces specialists.**
    Enrollment at k=8 is a minute of "show me walking" by the end user; a specialist needs
    hundreds of windows per class across subjects plus an engineer and a training loop, and
@@ -109,6 +117,8 @@ Watch app. Details that matter:
 * **Compares to no foundation model** — not UniMTS, HARNet, LiMU-BERT, or NormWear. Only
   task-specific supervised baselines and architecture-matched from-scratch/fine-tuned ViTs.
 * Stated limitation: window-based, no long temporal structure; untested across body types.
+* Venue: UIST 2026 (per secondary listings). **No code or weights located** as of 2026-09-22; the one
+  GitHub link a search surfaced is a 404.
 
 What this means for us. It validates the on-demand framing from outside. It is also the cleanest
 possible Stage-F "linear probe" treatment to adopt verbatim. Our differentiators against it are
@@ -126,7 +136,10 @@ does.
   WISDM, DSADS, PAMAP2, UCI-HAR, UTD-MHAD, Opportunity: AnyMo 35.7 Acc / 29.5 F1 / 57.5 R@2
   against UniMTS 31.9 / 26.4 / 46.9, NormWear 8.0 / 2.2 / 16.6, ImageBind 13.4 / 8.8, IMU2CLIP
   18.0 / 13.0, HARGPT 10.2 / 5.5, Gemma-4-26B ~19 / 11.
-* **No few-shot, fine-tuning, linear-probe or clustering evaluation.** Weights not stated.
+* **No few-shot, fine-tuning, linear-probe or clustering evaluation.** Code is released
+  (`github.com/Breezelled/AnyMo`, MIT) with an AnyMo-Bench dataset on HuggingFace, but **no
+  pretrained checkpoints** and no standalone inference entry point — verified 2026-09-22. Reproducing
+  its zero-shot row means retraining from its synthetic pipeline.
 
 What this means. It beats UniMTS zero-shot, it evaluates on our embodied and occupational targets,
 and it is from a neighbouring lab. It should be a zero-shot baseline if weights are public. And its
@@ -138,7 +151,8 @@ absence of any adaptation or unsupervised row is the gap Stages U and F fill.
   HAR**, and **nobody reports an enrollment-versus-fine-tuning crossover at matched label
   budgets.** Both stages are novel, not just useful. (The scite digest of the few-shot literature
   is pending and may qualify the second claim.)
-* *Are they ready for prime-time?* (arXiv 2608.13316) — three modes (linear, frozen+attention
+* *Are they ready for prime-time?* (arXiv 2608.13316; fetched directly — the ceilings sweep did not
+  surface it, so it is absent from that table) — three modes (linear, frozen+attention
   head, fine-tune); **UniMTS is "the best frozen feature extractor overall"**; NormWear and UniMTS
   are "evaluated below their modality-native potential" on triaxial input. Same caveat applies to us.
 * **Inertia-1** (Xu … Yang — JHU / UCLA / Duke; arXiv 2607.06617; `yang-ai-lab/Inertia-1`): ten
