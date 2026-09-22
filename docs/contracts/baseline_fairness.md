@@ -29,6 +29,35 @@ released encoder, attaches the identical HALO learnable classifier, trains only 
 and evaluates it under both the aggregate and scenario manifests. Label these rows `HALO classifier
 with frozen <encoder>` and disclose trainable parameters, steps, runtime, and seeds.
 
+## Corpus-matched baseline arms (added 2026-09-22)
+
+The headline tables above evaluate every encoder frozen, because the claim under test is enrollment
+**without parameter updates**. That is the experimental condition, not an approximation of any
+author's downstream recipe. Three of the four retained baselines are fine-tuned rather than frozen
+by their own authors, so the frozen tables likely understate them; that is accepted, disclosed, and
+does not change the deployment claim.
+
+Two further arms answer the separate question of whether HALO's lead reflects its training corpus
+sitting closer to the test distribution than the baselines' pretraining corpora do. They are
+reported separately and never merged into a deployment row.
+
+1. **Corpus-matched from scratch (M2).** The baseline's architecture, randomly initialised, trained
+   on our training corpus under our sampler, episodes, objective and step budget. Precedented by
+   three of the four baselines' own papers, which each run the same random-init control. It
+   measures the architecture given our data, and it necessarily **discards the pretraining that is
+   the released model's contribution** — so the frozen released row must be reported beside it.
+2. **Frozen trunk with a corpus-fitted projection.** The released encoder is unchanged; its own
+   `window_features` produces the representation in both fitting and evaluation, and a projection
+   fitted with the differentiable-neighbour objective is applied before the readout. This is the
+   only arm offered for an encoder whose authors never fine-tune it, or whose training cost is
+   prohibitive; both reasons must be stated, protocol first.
+
+Rules for both: no released preprocessing may be reimplemented where the adapter can be called, and
+any reimplementation must be pinned against the released artifact by a test. Disclose trainable
+versus total parameters, steps, runtime, seed, and the measured cost of any arm declined. Report
+encoder-only readouts (1-NN) for the encoder comparison, so no classifier enters it. An arm that
+scores below its own frozen released row is reported as such.
+
 All model-selection decisions are fixed a priori or use the internal subject-held-out fold of the
 supervised training sources; there is no separate development-source roster. Test results are per
 dataset with subject-level uncertainty, checkpoint provenance, upstream data-overlap disclosure,

@@ -41,8 +41,17 @@ GYRO_SLICE = slice(3, 6)
 #: Input contracts, from each model's own published preprocessing. ``channels`` is how many of the
 #: canonical ``CHANNELS`` order the trunk consumes; ``clip`` is the sample count it was trained on.
 BACKBONE_CONTRACTS = {
-    # LiMU-BERT: 20 Hz, 6-axis, one-second clips (20 samples), acceleration in g.
-    "limubert": {"rate_hz": 20.0, "clip": 20, "channels": 6, "dim": 72, "crop": "clip"},
+    # LiMU-BERT-X: 10 Hz, 6-axis, two-second clips (20 samples), acceleration in g.
+    #
+    # The rate was 20.0 here until 2026-09-22, which fed the trunk one-second clips and silently
+    # halved the physical time each positional embedding covers. Three sources agree on 10 Hz:
+    # the released checkpoint's positional-embedding table is (20, 72), so the contract is 20
+    # positions; the MobiCom'25 deployment paper states "we reduced the IMU data sampling rate
+    # from 20 Hz to 10 Hz"; and the released adapter encodes at TARGET_HZ = 10.0 with
+    # native_window_sec = 2.0. The stale "20" in the literature is the mask width (20 of 120
+    # samples) and the original SenSys classifier's slice length, neither of which is the input
+    # window. `tests/test_matched_encoder_fidelity.py` now pins this against the adapter itself.
+    "limubert": {"rate_hz": 10.0, "clip": 20, "channels": 6, "dim": 72, "crop": "clip"},
     # harnet5: 30 Hz, accelerometer triad, 5 s (150 samples).
     # ``min_clip`` is the shortest input the trunk tolerates. harnet5's ResNet pads circularly and
     # raises on a signal shorter than its 5 s contract, so it never shortens; UniMTS's ST-GCN is

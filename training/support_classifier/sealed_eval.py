@@ -60,6 +60,7 @@ from model.support.factory import (
     LEGACY_CONTEXTUAL_READOUTS, LEARNED_CLASSIFIER_ARCHITECTURES,
     RESIDUAL_ARCHITECTURES, build_classifier_from_blob,
 )
+from training.support_classifier import frozen_baseline_adaptation
 from training.support_classifier.train import make_label_text
 from training.support_classifier.neighbors import differentiable_neighbor_logits
 from training.support_classifier.representation_diagnostics import write_embedding_diagnostics
@@ -1713,6 +1714,13 @@ def main() -> None:
               "always emitted and the primary baseline readout remains equal-weight normalized fusion"),
     )
     parser.add_argument(
+        "--baseline-projection", action="append", default=[], metavar="NAME=PATH",
+        help="frozen-trunk adaptation: apply a projection fitted by "
+             "training.support_classifier.frozen_baseline_adaptation to that baseline's frozen "
+             "features before every readout. The released encoder is never modified. Report the "
+             "resulting rows as a project method, not as a native baseline result.",
+    )
+    parser.add_argument(
         "--classifier-isolation", action="store_true",
         help="add HALO-only component and support-label-binding diagnostics",
     )
@@ -1730,6 +1738,14 @@ def main() -> None:
     if len(set(args.models)) != len(args.models):
         parser.error("--models must not repeat a provider")
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
+    # Frozen-trunk adaptations, loaded once. Empty unless --baseline-projection was passed, so
+    # the default protocol is byte-identical to a run without this feature.
+    baseline_projections = frozen_baseline_adaptation.parse_projection_arguments(
+        args.baseline_projection, device=device)
+    for _name, (_module, _blob, _source) in baseline_projections.items():
+        print(f"[sealed-eval] {_name}: frozen trunk + projection from {_source} "
+              f"({_blob['trainable_parameters']:,} trainable, {_blob['steps']} steps, "
+              f"seed {_blob['seed']})", flush=True)
     halo_state: tuple[torch.nn.Module, str] | None = None
     halo_has_classifier = False
     halo_architecture = None
@@ -1855,6 +1871,21 @@ def main() -> None:
                         baseline_state=persistent_states.get(name),
                         halo_state=halo_state, memory_cache=feature_memory_cache,
                     )
+                    if name in baseline_projections:
+                        # A frozen-trunk arm: the released encoder is unchanged and its cached
+                        # features are reused, then mapped through a projection fitted on our
+                        # training corpus. Applied after the cache so the frozen features stay
+                        # shared with the unadapted run, and folded into the fingerprint so a
+                        # projected row can never be mistaken for a native baseline row.
+                        module, blob, source = baseline_projections[name]
+                        raw, fingerprint = features_by_model[name]
+                        features_by_model[name] = (
+                            frozen_baseline_adaptation.apply_projection(
+                                module, blob, raw,
+                                frozen_baseline_adaptation.stream_channel_mask(stream),
+                                device=device),
+                            f"{fingerprint}+proj:{_file_hash(Path(source))[:16]}",
+                        )
                     if args.embedding_diagnostics:
                         features, _ = features_by_model[name]
                         write_embedding_diagnostics(

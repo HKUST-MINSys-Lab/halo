@@ -213,12 +213,27 @@ def test_checkpoint_round_trip(arch):
 
 
 def test_contracts_match_each_models_published_preprocessing():
-    assert BACKBONE_CONTRACTS["limubert"]["rate_hz"] == 20.0
-    assert BACKBONE_CONTRACTS["limubert"]["clip"] == 20      # 1 s positional-embedding contract
+    """Pinned against the released adapters, never against a literal copied from this file.
+
+    This test previously asserted ``limubert rate_hz == 20.0``, which is what the contract said
+    and what the released checkpoint does not do. Restating a value cannot detect that the value
+    is wrong; only comparing it to the artifact can. The rate and clip therefore come from the
+    adapters themselves here, and `tests/test_matched_encoder_fidelity.py` additionally checks
+    LiMU-BERT's clip against the checkpoint's positional-embedding table.
+    """
+    from baselines.harnet import adapter as harnet
+    from baselines.limubert_x import adapter as limubert
+
+    assert BACKBONE_CONTRACTS["limubert"]["rate_hz"] == limubert.TARGET_HZ
+    assert BACKBONE_CONTRACTS["limubert"]["clip"] == limubert.SEQ_LEN
     assert BACKBONE_CONTRACTS["limubert"]["channels"] == 6
-    assert BACKBONE_CONTRACTS["harnet"]["rate_hz"] == 30.0
-    assert BACKBONE_CONTRACTS["harnet"]["clip"] == 150       # 5 s
-    assert BACKBONE_CONTRACTS["harnet"]["channels"] == 3     # accelerometer only
+    # 20 samples at 10 Hz is the released two-second clip.
+    assert (BACKBONE_CONTRACTS["limubert"]["clip"]
+            / BACKBONE_CONTRACTS["limubert"]["rate_hz"]) == 2.0
+
+    assert BACKBONE_CONTRACTS["harnet"]["rate_hz"] == harnet.TARGET_HZ
+    assert BACKBONE_CONTRACTS["harnet"]["clip"] == harnet.TARGET_LEN     # 5 s at 30 Hz
+    assert BACKBONE_CONTRACTS["harnet"]["channels"] == 3                 # accelerometer only
 
 
 # --------------------------------------------------- UniMTS: native skeleton fusion
