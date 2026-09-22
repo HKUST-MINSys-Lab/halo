@@ -168,7 +168,11 @@ absence of any adaptation or unsupervised row is the gap Stages U and F fill.
   demonstration" query returned robotics PbD, not the HCI canon. The lineage to cite is uWave
   (Liu et al., PerCom 2009 — "allows users to define their own personal gestures" from a single
   training sample), Exemplar (Hartmann, CHI 2007), MAGIC (Ashbrook & Starner, CHI 2010), the
-  $1-family recognisers, and IMWUT "interactive machine teaching" work. Not yet pulled.
+  $1-family recognisers, and IMWUT "interactive machine teaching" work. Confirmed citable via
+  scite (same day): uWave — Liu, Wang, Zhong, PerCom 2009, 10.1109/percom.2009.4912759, 562
+  citing publications; MAGIC — Ashbrook & Starner, CHI 2010, 10.1145/1753326.1753653; Exemplar —
+  Hartmann et al., CHI 2007, 10.1145/1240624.1240646 ("authoring sensor-based interactions by
+  demonstration"). Full texts are closed-access; cite from metadata.
 * **Nobody reports a samples-per-class crossover between enrollment/prototypes and
   fine-tuning.** FSID (Belal et al., Sci Rep 2025, 10.1038/s41598-025-04323-7) has the matched
   design — frozen self-supervised transformer + weight-imprinted prototypes vs fine-tuning at 5
