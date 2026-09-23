@@ -194,3 +194,16 @@ def test_disjoint_class_split_separates_scored_and_pool_classes():
     new, kept, held = disjoint_class_split(split, truth_ids, 4, holdout_fraction=0.5, seed_parts=("d",))
     assert len(kept) == 2 and len(held) == 2 and not set(kept) & set(held)
     assert set(truth_ids[new.scored]) <= set(kept) and set(truth_ids[new.pool]) <= set(held)
+
+
+def test_row_mask_excludes_padded_rows_exactly():
+    z, y = _dirichlet_mixture(n_per=20)
+    zt = torch.as_tensor(z)[None]
+    padded = torch.cat([zt, torch.full((1, 7, 3), 1.0 / 3)], dim=1)
+    row_mask = torch.tensor([[True] * len(z) + [False] * 7])
+    with torch.no_grad():
+        ref = transduce(zt, n_iter=4, n_iter_mm=30)
+        out = transduce(padded, row_mask=row_mask, n_iter=4, n_iter_mm=30)
+    assert torch.all(out.u[0, len(z):] == 0)
+    assert torch.allclose(out.u[0, :len(z)], ref.u[0], atol=1e-4)
+    assert torch.allclose(out.alpha, ref.alpha, atol=1e-3) and float(out.lam[0]) == float(ref.lam[0])

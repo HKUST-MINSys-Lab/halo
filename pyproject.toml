@@ -30,6 +30,9 @@ halo-sealed-eval = "training.support_classifier.sealed_eval:main"
 halo-scenarios = "training.support_classifier.run_scenarios:main"
 halo-audit-curriculum = "training.support_classifier.curriculum_audit:main"
 halo-dev-panel = "training.support_classifier.development_panel:main"
+halo-rung1 = "evaluation.rung1_discovery.run:main"
+halo-rung2 = "evaluation.rung2_unlabeled.run:main"
+halo-rung4 = "evaluation.rung4_finetune.run:main"
 
 [tool.setuptools.packages.find]
 include = ["halo*", "baselines*", "data*", "model*", "training*"]

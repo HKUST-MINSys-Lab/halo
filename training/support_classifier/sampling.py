@@ -324,6 +324,13 @@ class Episode:
     counterfactual_view: str = "independent"
     counterfactual_axis: str = "independent"
     counterfactual_intervention: tuple[tuple[str, str], ...] = ()
+    # Unlabelled deployment pool (rung-2 training arm, 2026-09-23). Pool rows are encoded with the
+    # episode and reach the loss only through the transductive readout
+    # (``train.pooled_episode_logits``); an empty pool leaves every existing path untouched.
+    pool: tuple[int, ...] = ()
+    pool_regime: str = "none"
+    pool_marginal: tuple[float, ...] = ()       # realised per-candidate share of the pool
+    pool_distractors: int = 0
 
     @property
     def is_zero_shot(self) -> bool:
@@ -753,6 +760,90 @@ def _additional_queries(
         if not progressed:
             break
     return output
+
+
+def attach_pool(
+    corpus: SupportCorpus,
+    rng: np.random.Generator,
+    episode: Episode,
+    *,
+    pool_size: int,
+    pool_regime: SamplingMode,
+    concentration: float = 1.0,
+    distractor_fraction: float = 0.0,
+    coverage: tuple[float, float] = (0.5, 1.0),
+) -> Episode:
+    """Attach an unlabelled pool that looks like a deployment pool (rung 2, roadmap):
+
+    * drawn from ``pool_regime`` relative to the query's acquisition — ``compatible`` (same key),
+      ``cross_placement`` or ``cross_dataset`` — never from the query's own execution and never
+      reusing an enrolled support row;
+    * a **partial** roster: a uniform draw in ``coverage`` decides what fraction of the episode's
+      candidates are present at all;
+    * a **Dirichlet-imbalanced** class marginal over the present candidates (``concentration``;
+      1.0 is uniform over the simplex — Veilleux et al. 2022's realistic sampling);
+    * ``distractor_fraction`` of the pool from labels outside the roster.
+
+    Availability caps every count; the realised marginal is recorded on the episode. An episode
+    whose regime has no usable rows is returned unchanged with ``pool_regime="unavailable"``.
+    """
+    if pool_size <= 0:
+        return episode
+    if not 0.0 <= distractor_fraction < 1.0:
+        raise ValueError("distractor_fraction must lie in [0, 1)")
+    low, high = coverage
+    if not 0.0 < low <= high <= 1.0:
+        raise ValueError("coverage must satisfy 0 < low <= high <= 1")
+    if concentration <= 0:
+        raise ValueError("concentration must be positive")
+    corpus.ensure_indexes()
+    query = corpus.recordings[episode.query]
+    keys = _keys_for(corpus, corpus.key_of(query), pool_regime)
+    if not keys:
+        return replace(episode, pool_regime="unavailable")
+    units = _available_units(
+        corpus, keys, query, "cross_subject", different_dataset=(pool_regime == "cross_dataset"),
+    )
+    excluded = {episode.query, *episode.support,
+                *(index for group in episode.support_window_groups for index in group)}
+    rows_by_label = {
+        label: [row for unit_rows in by_unit.values() for row in unit_rows if row not in excluded]
+        for label, by_unit in units.items()
+    }
+    rows_by_label = {label: rows for label, rows in rows_by_label.items() if rows}
+    if not rows_by_label:
+        return replace(episode, pool_regime="unavailable")
+
+    candidates = list(episode.candidates)
+    n_distractor = int(round(distractor_fraction * pool_size))
+    n_in_roster = pool_size - n_distractor
+    n_present = max(1, int(round(float(rng.uniform(low, high)) * len(candidates))))
+    present = sorted(rng.choice(len(candidates), size=min(n_present, len(candidates)), replace=False).tolist())
+    weights = rng.dirichlet([float(concentration)] * len(present))
+    counts = rng.multinomial(n_in_roster, weights) if n_in_roster > 0 else np.zeros(len(present), dtype=int)
+
+    pool: list[int] = []
+    realised = [0] * len(candidates)
+    for slot, count in zip(present, counts.tolist()):
+        available = rows_by_label.get(candidates[slot], [])
+        take = min(int(count), len(available))
+        if take > 0:
+            picked = rng.choice(len(available), size=take, replace=False)
+            pool.extend(int(available[i]) for i in picked)
+            realised[slot] = take
+    distractor_rows = [row for label, rows in rows_by_label.items() if label not in candidates for row in rows]
+    n_distractor_actual = min(n_distractor, len(distractor_rows))
+    if n_distractor_actual > 0:
+        picked = rng.choice(len(distractor_rows), size=n_distractor_actual, replace=False)
+        pool.extend(int(distractor_rows[i]) for i in picked)
+    if not pool:
+        return replace(episode, pool_regime="unavailable")
+    total_in_roster = max(1, sum(realised))
+    return replace(
+        episode, pool=tuple(pool), pool_regime=str(pool_regime),
+        pool_marginal=tuple(count / total_in_roster for count in realised),
+        pool_distractors=int(n_distractor_actual),
+    )
 
 
 def draw_episode(
@@ -1225,6 +1316,11 @@ def draw_batch(
     variable_support_probability: float = DEFAULT_VARIABLE_SUPPORT_PROBABILITY,
     counterfactual_enrollment_probability: float = 0.0,
     require_query_support: bool = False,
+    pool_size: int = 0,
+    pool_regime_mix: Sequence[float] | None = None,
+    pool_concentration: float = 1.0,
+    pool_distractor_fraction: float = 0.0,
+    pool_coverage: tuple[float, float] = (0.5, 1.0),
     **kwargs,
 ) -> tuple[list[Episode], dict[str, float]]:
     """Draw ``batch_size`` episodes plus auditable curriculum telemetry.
@@ -1235,6 +1331,14 @@ def draw_batch(
     """
     if not 0.0 <= counterfactual_enrollment_probability <= 1.0:
         raise ValueError("counterfactual_enrollment_probability must be in [0, 1]")
+    if pool_size < 0:
+        raise ValueError("pool_size must be non-negative")
+    pool_regimes: tuple[SamplingMode, ...] = ("compatible", "cross_placement", "cross_dataset")
+    pool_probability = (np.ones(3, dtype=np.float64) / 3 if pool_regime_mix is None
+                        else np.asarray(pool_regime_mix, dtype=np.float64))
+    if pool_probability.shape != (3,) or (pool_probability < 0).any() or pool_probability.sum() <= 0:
+        raise ValueError("pool_regime_mix must be three non-negative weights")
+    pool_probability = pool_probability / pool_probability.sum()
     if require_query_support and counterfactual_enrollment_probability:
         raise ValueError(
             "counterfactual enrollment includes a zero-support view and is incompatible with "
@@ -1462,6 +1566,19 @@ def draw_batch(
             )
         regime_episodes = episodes
         support_set_episodes = episodes
+    if pool_size > 0:
+        # One independent pool per query: each pooled episode is its own transductive task. Drawn
+        # after the support sets so pools can never claim an enrolled row, and before the
+        # counterfactual expansion so every view of an episode shares its pool.
+        episodes = [
+            attach_pool(
+                corpus, rng, episode, pool_size=pool_size,
+                pool_regime=pool_regimes[int(rng.choice(3, p=pool_probability))],
+                concentration=pool_concentration, distractor_fraction=pool_distractor_fraction,
+                coverage=pool_coverage,
+            )
+            for episode in episodes
+        ]
     counterfactual_groups = 0
     if counterfactual_enrollment_probability and rng.random() < counterfactual_enrollment_probability:
         eligible_complete = [index for index, episode in enumerate(episodes)
@@ -1515,6 +1632,19 @@ def draw_batch(
         "sampler/shrunk_episode_fraction": sum(e.shrunk for e in episodes) / len(episodes),
         "sampler/mean_support_size": float(np.mean([len(e.support) for e in episodes])),
         "sampler/mean_candidate_count": float(np.mean([len(e.candidates) for e in episodes])),
+        "sampler/pool_mean_size": float(np.mean([len(e.pool) for e in episodes])),
+        "sampler/pool_attached_fraction": float(np.mean([bool(e.pool) for e in episodes])),
+        "sampler/pool_unavailable_fraction": float(np.mean([e.pool_regime == "unavailable" for e in episodes])),
+        "sampler/pool_mean_coverage": (float(np.mean([
+            sum(1 for share in e.pool_marginal if share > 0) / max(1, len(e.candidates))
+            for e in episodes if e.pool]))
+            if any(e.pool for e in episodes) else 0.0),
+        "sampler/pool_distractor_fraction": (float(np.mean([
+            e.pool_distractors / max(1, len(e.pool)) for e in episodes if e.pool]))
+            if any(e.pool for e in episodes) else 0.0),
+        "sampler/pool_gt_present_fraction": (float(np.mean([
+            e.pool_marginal[e.gt_slot] > 0 if e.pool_marginal else False for e in episodes if e.pool]))
+            if any(e.pool for e in episodes) else 0.0),
         "sampler/candidate_roster_shrink_fraction": float(np.mean([
             episode.requested_candidates > len(episode.candidates)
             for episode in regime_episodes if episode.requested_candidates

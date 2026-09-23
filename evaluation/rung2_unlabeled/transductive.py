@@ -45,7 +45,7 @@ INFERENCE_DEFAULTS = {"n_iter": 20, "n_iter_mm": 1000, "early_stop": True}
 UNROLL_DEFAULTS = {"n_iter": 5, "n_iter_mm": 20, "early_stop": False}
 
 
-def paper_lambda(n_classes: torch.Tensor | int, n_query: int, *, k_eff: int | None = None) -> torch.Tensor:
+def paper_lambda(n_classes: torch.Tensor | int, n_query: torch.Tensor | int, *, k_eff: int | None = None) -> torch.Tensor:
     """The released code's rule: zero-shot ``int(C/5) * N``; few-shot ``int(C/k_eff) * N``.
 
     Note the integer division: for a roster of fewer than five classes the zero-shot rule gives
@@ -53,7 +53,7 @@ def paper_lambda(n_classes: torch.Tensor | int, n_query: int, *, k_eff: int | No
     """
     c = torch.as_tensor(n_classes, dtype=torch.float32)
     divisor = 5 if k_eff is None else int(k_eff)
-    return torch.floor(c / divisor) * float(n_query)
+    return torch.floor(c / divisor) * torch.as_tensor(n_query, dtype=torch.float32, device=c.device)
 
 
 def _curvature(alpha: torch.Tensor, log_gamma_1: torch.Tensor, zero_value: torch.Tensor):
@@ -109,6 +109,7 @@ def transduce(
     z: torch.Tensor,
     *,
     candidate_mask: torch.Tensor | None = None,
+    row_mask: torch.Tensor | None = None,
     support_z: torch.Tensor | None = None,
     support_onehot: torch.Tensor | None = None,
     n_iter: int = 20,
@@ -134,6 +135,12 @@ def transduce(
     if mask.shape != (B, C):
         raise ValueError("candidate_mask must be (B, C)")
     dim_mask = mask.to(z.dtype)[:, None, :]                                     # (B, 1, C)
+    rows_valid = (torch.ones((B, N), dtype=torch.bool, device=z.device) if row_mask is None
+                  else row_mask.to(device=z.device, dtype=torch.bool))
+    if rows_valid.shape != (B, N):
+        raise ValueError("row_mask must be (B, N)")
+    row_w = rows_valid.to(z.dtype)[..., None]                                   # (B, N, 1)
+    n_valid = rows_valid.sum(dim=1).clamp_min(1).to(z.dtype)                     # (B,)
     log_z = torch.log(z.clamp_min(0) + EPS) * dim_mask                          # padded dims → 0
     few_shot = support_z is not None
     if few_shot:
@@ -142,13 +149,13 @@ def transduce(
         log_s = torch.log(support_z.clamp_min(0) + EPS) * dim_mask
         y_s_sum = support_onehot.sum(dim=1)                                     # (B, C)
     if lam is None:
-        lam_t = paper_lambda(mask.sum(-1), N, k_eff=k_eff).to(device=z.device, dtype=z.dtype)
+        lam_t = paper_lambda(mask.sum(-1), n_valid, k_eff=k_eff).to(device=z.device, dtype=z.dtype)
     else:
         lam_t = torch.as_tensor(lam, dtype=z.dtype, device=z.device).expand(B).clone()
     neg_inf = torch.finfo(z.dtype).min
 
     v = torch.zeros((B, C), dtype=z.dtype, device=z.device)
-    u = z * dim_mask                                                            # init: features
+    u = z * dim_mask * row_w                                                    # init: features
     alpha = torch.ones((B, C, C), dtype=z.dtype, device=z.device)
     logits = torch.log(u + EPS)
     for _ in range(int(n_iter)):
@@ -164,10 +171,11 @@ def transduce(
             y_cst = torch.where(nonzero, y_cst, torch.full_like(y_cst, -10.0))
             alpha_new = update_alpha(alpha, y_cst, dim_mask, n_iter_mm=n_iter_mm, early_stop=early_stop)
             alpha = torch.where(nonzero, alpha_new, alpha)                      # empty clusters keep alpha
-        v = torch.log(u_sum / N + EPS) + 1
-        logits = dirichlet_log_density(log_z, alpha, dim_mask) + lam_t[:, None, None] * v[:, None, :] / N
+        v = torch.log(u_sum / n_valid[:, None] + EPS) + 1
+        logits = dirichlet_log_density(log_z, alpha, dim_mask) \
+            + lam_t[:, None, None] * v[:, None, :] / n_valid[:, None, None]
         logits = logits.masked_fill(~mask[:, None, :], neg_inf)
-        u = torch.softmax(logits, dim=-1)
+        u = torch.softmax(logits, dim=-1) * row_w
     return Transduction(u=u, logits=logits, alpha=alpha, v=v, lam=lam_t)
 
 

@@ -136,6 +136,10 @@ class Method(str, Enum):
     LORA = "lora"
     FULL_FINETUNE = "full_finetune"
     SCRATCH_SPECIALIST = "scratch_specialist"
+    # The rung-3 parameter-free readout re-run on rung 4's own support draw and scored set, so the
+    # enrollment-vs-fine-tuning crossover is measured on identical windows. Named distinctly so it
+    # is never confused with the sealed table's per-query-manifest rows.
+    ENROLLMENT_FROZEN = "enrollment_frozen"
 
 
 METHODS_BY_RUNG: dict[Rung, frozenset[Method]] = {
@@ -143,7 +147,8 @@ METHODS_BY_RUNG: dict[Rung, frozenset[Method]] = {
     Rung.UNLABELED: frozenset({Method.INDUCTIVE, Method.TRANSDUCTIVE_CLIP_V1}),
     Rung.FROZEN: frozenset({Method.NEIGHBOURS, Method.CLASSIFIER_V4}),
     Rung.FINETUNE: frozenset({Method.LINEAR_PROBE, Method.SMALL_CLASSIFIER, Method.LORA,
-                              Method.FULL_FINETUNE, Method.SCRATCH_SPECIALIST}),
+                              Method.FULL_FINETUNE, Method.SCRATCH_SPECIALIST,
+                              Method.ENROLLMENT_FROZEN}),
 }
 
 # Bump when the procedure changes, as sealed-manifest-v2 / deployment-scenarios-v5 do today.

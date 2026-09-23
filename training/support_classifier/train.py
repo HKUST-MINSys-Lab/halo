@@ -431,7 +431,7 @@ def episode_recording_indices(episodes: list[Episode]) -> list[int]:
     seen: set[int] = set()
     for episode in episodes:
         groups = episode.support_window_groups or tuple((index,) for index in episode.support)
-        for index in (episode.query, *(value for group in groups for value in group)):
+        for index in (episode.query, *(value for group in groups for value in group), *episode.pool):
             if index not in seen:
                 seen.add(index)
                 recording_indices.append(index)
@@ -514,6 +514,101 @@ def split_encoded(
         "support_acquisition": group_acquisition[support_index] * keep.to(acquisition.dtype),
         "support_mask": support_mask,
     }
+
+
+def split_pool(pooled: torch.Tensor, episodes: list[Episode]) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(B, P, D)`` unlabelled-pool features and ``(B, P)`` mask from the batch's encoded rows."""
+    device = pooled.device
+    encoded_row = {recording: row for row, recording in enumerate(episode_recording_indices(episodes))}
+    B = len(episodes)
+    P = max((len(episode.pool) for episode in episodes), default=0)
+    if P == 0:
+        return pooled.new_zeros((B, 0, pooled.shape[-1])), torch.zeros((B, 0), dtype=torch.bool, device=device)
+    position = np.zeros((B, P), dtype=np.int64)
+    valid = np.zeros((B, P), dtype=bool)
+    for row, episode in enumerate(episodes):
+        position[row, :len(episode.pool)] = [encoded_row[index] for index in episode.pool]
+        valid[row, :len(episode.pool)] = True
+    mask = torch.from_numpy(valid).to(device)
+    feature = pooled[torch.from_numpy(position).to(device)] * mask.unsqueeze(-1).to(pooled.dtype)
+    return feature, mask
+
+
+def probability_features_torch(features: torch.Tensor, p_text: torch.nn.Module, candidate_text: torch.Tensor,
+                               candidate_mask: torch.Tensor, temperature: float) -> torch.Tensor:
+    """``softmax(T * cos(p_text(f), text))`` over valid candidates for ``features (B, M, D)``: the
+    trainer's twin of ``evaluation.zero_shot.probability_features(kind="cosine")``."""
+    projected = F.normalize(p_text(features.float()), dim=-1)
+    text = F.normalize(candidate_text.float(), dim=-1)
+    cosine = torch.einsum("bmd,bcd->bmc", projected, text)
+    logits = (temperature * cosine).masked_fill(~candidate_mask[:, None, :], torch.finfo(cosine.dtype).min)
+    return torch.softmax(logits, dim=-1)
+
+
+def pooled_episode_logits(
+    *,
+    mode: str,
+    query: torch.Tensor,
+    support_feature: torch.Tensor,
+    support_mask: torch.Tensor,
+    support_bound: torch.Tensor,
+    pool_feature: torch.Tensor,
+    pool_mask: torch.Tensor,
+    candidate_text: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    p_text: torch.nn.Module,
+    temperature: float,
+    unroll: dict,
+) -> torch.Tensor:
+    """``(B, C)`` query logits that use the unlabelled pool.
+
+    ``transductive`` — EM-Dirichlet unrolled on query ∪ pool (∪ labelled supports at k > 0),
+    imported from ``evaluation.rung2_unlabeled.transductive``: the same file the evaluator scores
+    every encoder with, so what HALO is trained through is provably what the baselines get at test.
+    Gradients flow through the unrolled iterations into ``p_text`` and the encoder.
+
+    ``soft_kmeans`` — ladder step 3 (Ren et al. 2018): one E-step under the differentiable-
+    neighbour vote. Pool rows are soft-labelled against the supports, appended as supports weighted
+    by those soft labels, and the query is scored by the same centred vote. No unrolling.
+    """
+    from evaluation.rung2_unlabeled.transductive import transduce
+
+    B, C = candidate_mask.shape
+    if mode == "transductive":
+        rows = torch.cat([query.unsqueeze(1), pool_feature], dim=1)                     # (B, 1 + P, D)
+        row_mask = torch.cat([torch.ones((B, 1), dtype=torch.bool, device=query.device), pool_mask], dim=1)
+        z = probability_features_torch(rows, p_text, candidate_text, candidate_mask, temperature)
+        support_z = support_onehot = None
+        if bool(support_mask.any()):
+            support_z = probability_features_torch(support_feature, p_text, candidate_text, candidate_mask, temperature)
+            support_onehot = F.one_hot(support_bound.clamp_min(0), C).to(z.dtype) \
+                * support_mask.unsqueeze(-1).to(z.dtype)
+        result = transduce(z, candidate_mask=candidate_mask, row_mask=row_mask,
+                           support_z=support_z, support_onehot=support_onehot, **unroll)
+        return result.logits[:, 0, :]
+    if mode == "soft_kmeans":
+        if not bool(support_mask.any()):
+            raise ValueError("soft_kmeans needs enrolled supports")
+        keep = support_mask.unsqueeze(-1).to(support_feature.dtype)
+        centre = (support_feature * keep).sum(1) / support_mask.sum(1, keepdim=True).clamp_min(1).to(keep.dtype)
+        q = F.normalize(query - centre, dim=-1)
+        s = F.normalize(support_feature - centre.unsqueeze(1), dim=-1)
+        p = F.normalize(pool_feature - centre.unsqueeze(1), dim=-1)
+        onehot_s = F.one_hot(support_bound.clamp_min(0), C).to(q.dtype) * keep                # (B, K, C)
+        # E-step: soft label of every pool row from the supports (the neighbour vote, per row).
+        sim_ps = torch.einsum("bpd,bkd->bpk", p, s) / TAU_SUPPORT
+        sim_ps = sim_ps.masked_fill(~support_mask[:, None, :], float("-inf"))
+        pool_prob = torch.einsum("bpk,bkc->bpc", torch.softmax(sim_ps, dim=-1), onehot_s)   # (B, P, C)
+        # M-step + query vote: supports and soft-labelled pool rows share one softmax over similarity.
+        sim_qs = torch.einsum("bd,bkd->bk", q, s) / TAU_SUPPORT
+        sim_qp = torch.einsum("bd,bpd->bp", q, p) / TAU_SUPPORT
+        sims = torch.cat([sim_qs.masked_fill(~support_mask, float("-inf")),
+                          sim_qp.masked_fill(~pool_mask, float("-inf"))], dim=1)
+        weight = torch.softmax(sims, dim=1)
+        K = support_feature.shape[1]
+        vote = torch.einsum("bk,bkc->bc", weight[:, :K], onehot_s) + torch.einsum("bp,bpc->bc", weight[:, K:], pool_prob)
+        return vote.clamp_min(1e-12).log().masked_fill(~candidate_mask, -1e30)
+    raise ValueError(f"unknown pool mode {mode!r}")
 
 
 def episode_text(
@@ -845,6 +940,12 @@ def build_dataset(index: CorpusIndex, args) -> PretrainDataset:
     )
 
 
+def _pool_unroll(args) -> dict:
+    """Fixed, short, early-stop-free iteration counts for the unrolled transductive readout."""
+    return {"n_iter": int(args.pool_unroll_iters), "n_iter_mm": int(args.pool_unroll_mm_iters),
+            "early_stop": False}
+
+
 def draw_kwargs_from_args(args) -> dict:
     """Single source of truth for the deployment-shaped episode curriculum."""
     counterfactual_probability = float(args.counterfactual_enrollment_probability)
@@ -863,6 +964,11 @@ def draw_kwargs_from_args(args) -> dict:
         "enrollment_mix": (tuple(args.enrollment_mix)
                            if args.enrollment_mix is not None else None),
         "partial_coverage": tuple(args.partial_coverage),
+        "pool_size": int(args.pool_size),
+        "pool_regime_mix": tuple(args.pool_regime_mix),
+        "pool_concentration": float(args.pool_concentration),
+        "pool_distractor_fraction": float(args.pool_distractor_fraction),
+        "pool_coverage": tuple(args.pool_coverage),
         "variable_support_probability": args.variable_support_probability,
         "counterfactual_enrollment_probability": counterfactual_probability,
         "require_query_support": args.classifier == "neighbors",
@@ -962,6 +1068,9 @@ def run_step(
     executor: ThreadPoolExecutor | None = None,
     batch: dict | None = None,
     device_set_plans: list[DeviceSetPlan] | None = None,
+    pool_mode: str = "none",
+    pool_temperature: float = 30.0,
+    pool_unroll: dict | None = None,
 ) -> dict:
     """``batch`` lets a prefetching loader hand over an already-collated batch for these episodes;
     otherwise the windows are loaded and collated here, on the calling thread."""
@@ -1080,6 +1189,32 @@ def run_step(
         )
     else:
         raise ValueError(f"unknown classifier mode {classifier_mode!r}")
+    if pool_mode != "none" and any(episode.pool for episode in episodes):
+        # Rung-2 training arm: pooled episodes are scored by the transductive readout instead of
+        # the head; every other episode keeps the head's logits, so a batch without pools is
+        # bit-identical to the existing recipe.
+        if classifier is None or not hasattr(classifier, "p_text"):
+            raise ValueError("pool readouts need a classifier with a text projection (p_text)")
+        from evaluation.rung2_unlabeled.transductive import UNROLL_DEFAULTS
+
+        pool_feature, pool_mask = split_pool(pooled, episodes)
+        has_pool = torch.tensor([bool(episode.pool) for episode in episodes], dtype=torch.bool, device=device)
+        if pool_mode == "soft_kmeans":
+            has_pool = has_pool & rows["support_mask"].any(dim=1)
+        if bool(has_pool.any()):
+            pooled_logits = pooled_episode_logits(
+                mode=pool_mode, query=query, support_feature=rows["support_feature"],
+                support_mask=rows["support_mask"], support_bound=text["support_bound"],
+                pool_feature=pool_feature, pool_mask=pool_mask, candidate_text=text["candidate_text"],
+                candidate_mask=text["candidate_mask"], p_text=classifier.p_text,
+                temperature=pool_temperature, unroll={**UNROLL_DEFAULTS, **(pool_unroll or {})},
+            )
+            output["head_logits"] = output["logits"]
+            output["logits"] = torch.where(
+                has_pool[:, None], pooled_logits.to(output["logits"].dtype), output["logits"],
+            )
+        output["pool_rows"] = int(pool_mask.sum())
+        output["pooled_episodes"] = int(has_pool.sum())
     loss = episode_loss(
         output["logits"], episodes, text,
         counterfactual_grouping=isinstance(classifier, EvidenceAwareSupportClassifier),
@@ -1729,6 +1864,9 @@ def validate(
     executor: ThreadPoolExecutor | None,
     deployment_matched: bool = False,
     selection_policy: str = "legacy_enrolled",
+    pool_mode: str = "none",
+    pool_temperature: float = 30.0,
+    pool_unroll: dict | None = None,
 ) -> dict[str, float]:
     """Evaluate a fixed subject-held-out episode draw without consuming test datasets."""
     was_encoder_training = encoder.training
@@ -1787,6 +1925,7 @@ def validate(
             result = run_step(
                 episodes=group, corpus=corpus, dataset=dataset, collate=collate,
                 encoder=encoder, classifier=classifier, classifier_mode=classifier_mode,
+                pool_mode=pool_mode, pool_temperature=pool_temperature, pool_unroll=pool_unroll,
                 text_of=text_of, device=device, executor=executor,
                 # The collapse detector, reported beside every validation score.
                 corrupted_view_probe=isinstance(classifier, EvidenceGatedSupportClassifier),
@@ -1966,6 +2105,28 @@ def main() -> None:
     parser.add_argument("--partial-coverage", type=float, nargs=2,
                         default=list(DEFAULT_PARTIAL_COVERAGE), metavar=("LOW", "HIGH"),
                         help="range of enrolled-candidate fractions in partial episodes")
+    # Rung-2 training arm (2026-09-23): unlabelled deployment pools in training episodes, scored by
+    # the same transductive method the evaluator applies to every encoder. Off by default; with
+    # --pool-size 0 nothing in the recipe changes.
+    parser.add_argument("--pool-size", type=int, default=0,
+                        help="unlabelled deployment-pool windows drawn per episode; 0 = off")
+    parser.add_argument("--pool-mode", choices=("none", "soft_kmeans", "transductive"), default="none",
+                        help="how pooled episodes are scored: transductive = EM-Dirichlet unrolled "
+                             "(evaluation.rung2_unlabeled.transductive, the evaluator's method); "
+                             "soft_kmeans = one Ren-2018 E-step under the neighbour vote (ladder step 3)")
+    parser.add_argument("--pool-regime-mix", type=float, nargs=3, default=[0.5, 0.25, 0.25],
+                        metavar=("MATCH", "PLACE", "DATASET"),
+                        help="pool acquisition shares: the query's key, cross-placement, cross-dataset")
+    parser.add_argument("--pool-concentration", type=float, default=1.0,
+                        help="Dirichlet concentration of the pool's class marginal (1 = uniform on the simplex)")
+    parser.add_argument("--pool-distractor-fraction", type=float, default=0.25,
+                        help="share of pool windows from labels outside the episode's roster")
+    parser.add_argument("--pool-coverage", type=float, nargs=2, default=[0.5, 1.0], metavar=("LOW", "HIGH"),
+                        help="range of the fraction of roster classes present in the pool")
+    parser.add_argument("--pool-temperature", type=float, default=30.0,
+                        help="softmax temperature of the probability features (released config: T=30)")
+    parser.add_argument("--pool-unroll-iters", type=int, default=5, help="unrolled EM iterations")
+    parser.add_argument("--pool-unroll-mm-iters", type=int, default=20, help="unrolled MM-quadratic iterations")
     parser.add_argument("--variable-support-probability", type=float,
                         default=DEFAULT_VARIABLE_SUPPORT_PROBABILITY,
                         help="share of enrolled support sets with unequal per-candidate counts")
@@ -2327,6 +2488,18 @@ def main() -> None:
         parser.error("frontend-lr-scale and frontend-reg-weight must be nonnegative")
     if not args.enrollment_k or any(value < 1 for value in args.enrollment_k):
         parser.error("enrollment-k values must be positive")
+    if args.pool_size < 0:
+        parser.error("--pool-size must be non-negative")
+    if args.pool_size and args.pool_mode == "none":
+        parser.error("--pool-size > 0 needs --pool-mode; pools would be encoded and ignored")
+    if args.pool_mode != "none" and not args.pool_size:
+        parser.error("--pool-mode needs --pool-size > 0")
+    if args.pool_mode != "none" and args.classifier in ("neighbors", "token_mixer"):
+        parser.error("--pool-mode needs a classifier with a text projection (residual or evidence_gated)")
+    if not 0.0 <= args.pool_distractor_fraction < 1.0 or args.pool_concentration <= 0 \
+            or not (0.0 < args.pool_coverage[0] <= args.pool_coverage[1] <= 1.0) \
+            or args.pool_unroll_iters < 1 or args.pool_unroll_mm_iters < 1 or args.pool_temperature <= 0:
+        parser.error("pool options out of range")
     for option, values in (("acquisition-mix", args.acquisition_mix),
                            ("enrollment-mix", args.enrollment_mix)):
         if len(values) != 3 or any(not math.isfinite(value) or value < 0 for value in values) \
@@ -2423,6 +2596,12 @@ def main() -> None:
         saved.setdefault("acquisition_mix", None)
         saved.setdefault("enrollment_mix", None)
         saved.setdefault("partial_coverage", list(DEFAULT_PARTIAL_COVERAGE))
+        for pool_field, pool_default in (("pool_size", 0), ("pool_mode", "none"),
+                                         ("pool_regime_mix", [0.5, 0.25, 0.25]), ("pool_concentration", 1.0),
+                                         ("pool_distractor_fraction", 0.25), ("pool_coverage", [0.5, 1.0]),
+                                         ("pool_temperature", 30.0), ("pool_unroll_iters", 5),
+                                         ("pool_unroll_mm_iters", 20)):
+            saved.setdefault(pool_field, pool_default)
         saved.setdefault("variable_support_probability", 0.0)
         saved.setdefault("counterfactual_enrollment_probability", 0.0)
         saved.setdefault("open_vocabulary_holdout_fraction", 0.0)
@@ -2487,6 +2666,11 @@ def main() -> None:
             "support_size": "--support-size", "enrollment_k": "--enrollment-k",
             "acquisition_mix": "--acquisition-mix", "enrollment_mix": "--enrollment-mix",
             "partial_coverage": "--partial-coverage",
+            "pool_size": "--pool-size", "pool_mode": "--pool-mode",
+            "pool_regime_mix": "--pool-regime-mix", "pool_concentration": "--pool-concentration",
+            "pool_distractor_fraction": "--pool-distractor-fraction", "pool_coverage": "--pool-coverage",
+            "pool_temperature": "--pool-temperature", "pool_unroll_iters": "--pool-unroll-iters",
+            "pool_unroll_mm_iters": "--pool-unroll-mm-iters",
             "variable_support_probability": "--variable-support-probability",
             "counterfactual_enrollment_probability": "--counterfactual-enrollment-probability",
             "text_corruption_probability": "--text-corruption-probability",
@@ -2968,6 +3152,11 @@ def main() -> None:
                                if args.enrollment_mix is not None else None),
             "curriculum_sampler_schema": DEPLOYMENT_SAMPLER_SCHEMA,
             "partial_coverage": list(args.partial_coverage),
+            "pool_size": int(args.pool_size), "pool_mode": args.pool_mode,
+            "pool_regime_mix": list(args.pool_regime_mix), "pool_concentration": float(args.pool_concentration),
+            "pool_distractor_fraction": float(args.pool_distractor_fraction),
+            "pool_coverage": list(args.pool_coverage), "pool_temperature": float(args.pool_temperature),
+            "pool_unroll_iters": int(args.pool_unroll_iters), "pool_unroll_mm_iters": int(args.pool_unroll_mm_iters),
             "variable_support_probability": args.variable_support_probability,
             "counterfactual_enrollment_probability": args.counterfactual_enrollment_probability,
             "open_vocabulary_holdout_fraction": args.open_vocabulary_holdout_fraction,
@@ -3115,6 +3304,9 @@ def main() -> None:
             ("acquisition_mix", None),
             ("enrollment_mix", None),
             ("partial_coverage", list(DEFAULT_PARTIAL_COVERAGE)),
+            ("pool_size", 0), ("pool_mode", "none"), ("pool_regime_mix", [0.5, 0.25, 0.25]),
+            ("pool_concentration", 1.0), ("pool_distractor_fraction", 0.25), ("pool_coverage", [0.5, 1.0]),
+            ("pool_temperature", 30.0), ("pool_unroll_iters", 5), ("pool_unroll_mm_iters", 20),
             ("variable_support_probability", 0.0),
             ("counterfactual_enrollment_probability", 0.0),
             ("open_vocabulary_holdout_fraction", 0.0),
@@ -3289,6 +3481,7 @@ def main() -> None:
         nonlocal best_zero_f1, best_enrolled_f1, best_positive_regret
         latest_validation = validate(
             encoder=encoder, classifier=classifier, classifier_mode=args.classifier,
+            pool_mode=args.pool_mode, pool_temperature=args.pool_temperature, pool_unroll=_pool_unroll(args),
             corpus=val_corpus, dataset=val_dataset,
             collate=collate, text_of=text_of, device=device,
             episodes_count=args.val_episodes, episodes_per_step=args.episodes_per_step,
@@ -3305,6 +3498,7 @@ def main() -> None:
                 and open_vocab_val_corpus is not None):
             heldout = validate(
                 encoder=encoder, classifier=classifier, classifier_mode=args.classifier,
+                pool_mode=args.pool_mode, pool_temperature=args.pool_temperature, pool_unroll=_pool_unroll(args),
                 corpus=open_vocab_val_corpus, dataset=val_dataset,
                 collate=collate, text_of=text_of, device=device,
                 episodes_count=args.val_episodes, episodes_per_step=args.episodes_per_step,
@@ -3378,6 +3572,7 @@ def main() -> None:
             result = run_step(
                 episodes=episodes, corpus=corpus, dataset=dataset, collate=collate,
                 encoder=encoder, classifier=classifier, classifier_mode=args.classifier,
+                pool_mode=args.pool_mode, pool_temperature=args.pool_temperature, pool_unroll=_pool_unroll(args),
                 improvement_objective=improvement_objective,
                 evidence_objective=evidence_objective,
                 text_corruption_probability=args.text_corruption_probability,
