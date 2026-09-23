@@ -11,6 +11,10 @@ here.
 
 **Status: pre-registration. Nothing on rungs 1, 2 or 4 has been run.** Rungs 1 and 2 read sealed
 data, so this plan is written before any number is read, and it runs only on explicit go.
+**Built 2026-09-23** on `feat/evaluation-package-20260923` — rungs 1, 2, 4 and the pool training arm;
+unit-tested, not smoke-tested on real data; see the
+[implementation record](../journal/2026-09-23-rungs-implementation-record.md). `main` moves only
+after the bit-exact extraction gate and a debug sweep.
 
 ## The ladder
 
@@ -235,7 +239,7 @@ never fine-tune.
 ## Sequencing and gates
 
 1. **This document and the journal entries** — done 2026-09-22.
-2. **Build rung 1 and the rung-2 established arm** on cached features, per the
+2. **Build rung 1 and the rung-2 established arm** on cached features — **done 2026-09-23** (with rung 4 and the pool arm), per the
    [implementation plan](../journal/2026-09-22-rung1-rung2-implementation-plan.md): shared-module
    extraction first (bit-exact), then the provenance registry, then the two rungs. Build + tests +
    smoke; nothing runs without explicit go.
