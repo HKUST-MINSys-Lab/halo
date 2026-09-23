@@ -110,7 +110,8 @@ def _tensors(B=3, K=4, P=5, C=3, D=8, T=6, seed=0):
     support_mask = torch.ones(B, K, dtype=torch.bool)
     support_bound = torch.tensor([[0, 1, 2, 0]] * B)
     pool_mask = torch.ones(B, P, dtype=torch.bool)
-    pool_mask[1, 3:] = False                                     # one task with a short pool
+    if B > 1:
+        pool_mask[1, 3:] = False                                 # one task with a short pool
     candidate_text = torch.randn(B, C, T, generator=g)
     candidate_mask = torch.ones(B, C, dtype=torch.bool)
     p_text = nn.Linear(D, T)
