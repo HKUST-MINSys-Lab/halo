@@ -1,4 +1,4 @@
-"""The rung-4 treatments, every one fitted on the same k windows per class and scored on the same
+"""The rung-3 treatments, every one fitted on the same k windows per class and scored on the same
 scored set. Budgets are fixed a priori (steps, lr); nothing selects on the scored set.
 
 Cached-feature treatments (all six providers, NormWear included):
@@ -6,7 +6,7 @@ Cached-feature treatments (all six providers, NormWear included):
                           fitted by deterministic L-BFGS logistic regression.
 * ``small_classifier``  — the frozen-projection MLP from the corpus-matched work
                           (``FrozenBaselineProjection``) plus a linear head, fitted by SGD.
-* ``enrollment_frozen`` — the rung-3 parameter-free class-prototype readout on the same supports:
+* ``enrollment_frozen`` — the rung-2 parameter-free class-prototype readout on the same supports:
                           the enrollment side of the crossover, on identical windows.
 
 Raw-window treatments (HALO from its checkpoint; HARNet-5 / LiMU-BERT-X / UniMTS as released
@@ -31,8 +31,8 @@ import torch.nn.functional as F
 
 import baselines
 from evaluation.metrics import classification
-from evaluation.rung2_unlabeled.ncurve import CellSplit, inductive_predictions, shared_support_set
-from evaluation.rung4_finetune.lora import apply_lora, lora_parameters, trainable_parameter_count
+from evaluation.rung1_unlabeled.ncurve import CellSplit, inductive_predictions, shared_support_set
+from evaluation.rung3_finetune.lora import apply_lora, lora_parameters, trainable_parameter_count
 from evaluation.zero_shot import _normalise
 
 TREATMENTS = ("enrollment_frozen", "linear_probe", "small_classifier", "lora", "full_finetune",
@@ -240,8 +240,8 @@ def raw_window_predictions(name: str, treatment: str, stream, support_rows: np.n
 def run_cell(*, name: str, stream, features: np.ndarray | None, truth_ids: np.ndarray, classes: Sequence[str],
              split: CellSplit, ks: Sequence[int], treatments: Sequence[str], cfg: FineTuneConfig,
              device: torch.device, halo_checkpoint=None, seed_parts: Sequence[object] = ()) -> list[dict]:
-    """Every rung-4 row for one (provider, cell): treatments × k on the scored set, supports drawn
-    from the pool partition exactly as rung 2 draws them (same seed parts ⇒ same windows)."""
+    """Every rung-3 row for one (provider, cell): treatments × k on the scored set, supports drawn
+    from the pool partition exactly as rung 1 draws them (same seed parts ⇒ same windows)."""
     classes = list(classes)
     C = len(classes)
     names = np.asarray(classes, dtype=object)

@@ -563,7 +563,7 @@ def pooled_episode_logits(
     """``(B, C)`` query logits that use the unlabelled pool.
 
     ``transductive`` — EM-Dirichlet unrolled on query ∪ pool (∪ labelled supports at k > 0),
-    imported from ``evaluation.rung2_unlabeled.transductive``: the same file the evaluator scores
+    imported from ``evaluation.rung1_unlabeled.transductive``: the same file the evaluator scores
     every encoder with, so what HALO is trained through is provably what the baselines get at test.
     Gradients flow through the unrolled iterations into ``p_text`` and the encoder.
 
@@ -571,7 +571,7 @@ def pooled_episode_logits(
     neighbour vote. Pool rows are soft-labelled against the supports, appended as supports weighted
     by those soft labels, and the query is scored by the same centred vote. No unrolling.
     """
-    from evaluation.rung2_unlabeled.transductive import transduce
+    from evaluation.rung1_unlabeled.transductive import transduce
 
     B, C = candidate_mask.shape
     if mode == "transductive":
@@ -1190,12 +1190,12 @@ def run_step(
     else:
         raise ValueError(f"unknown classifier mode {classifier_mode!r}")
     if pool_mode != "none" and any(episode.pool for episode in episodes):
-        # Rung-2 training arm: pooled episodes are scored by the transductive readout instead of
+        # Rung-1 training arm: pooled episodes are scored by the transductive readout instead of
         # the head; every other episode keeps the head's logits, so a batch without pools is
         # bit-identical to the existing recipe.
         if classifier is None or not hasattr(classifier, "p_text"):
             raise ValueError("pool readouts need a classifier with a text projection (p_text)")
-        from evaluation.rung2_unlabeled.transductive import UNROLL_DEFAULTS
+        from evaluation.rung1_unlabeled.transductive import UNROLL_DEFAULTS
 
         pool_feature, pool_mask = split_pool(pooled, episodes)
         has_pool = torch.tensor([bool(episode.pool) for episode in episodes], dtype=torch.bool, device=device)
@@ -2105,14 +2105,14 @@ def main() -> None:
     parser.add_argument("--partial-coverage", type=float, nargs=2,
                         default=list(DEFAULT_PARTIAL_COVERAGE), metavar=("LOW", "HIGH"),
                         help="range of enrolled-candidate fractions in partial episodes")
-    # Rung-2 training arm (2026-09-23): unlabelled deployment pools in training episodes, scored by
+    # Rung-1 training arm (2026-09-23): unlabelled deployment pools in training episodes, scored by
     # the same transductive method the evaluator applies to every encoder. Off by default; with
     # --pool-size 0 nothing in the recipe changes.
     parser.add_argument("--pool-size", type=int, default=0,
                         help="unlabelled deployment-pool windows drawn per episode; 0 = off")
     parser.add_argument("--pool-mode", choices=("none", "soft_kmeans", "transductive"), default="none",
                         help="how pooled episodes are scored: transductive = EM-Dirichlet unrolled "
-                             "(evaluation.rung2_unlabeled.transductive, the evaluator's method); "
+                             "(evaluation.rung1_unlabeled.transductive, the evaluator's method); "
                              "soft_kmeans = one Ren-2018 E-step under the neighbour vote (ladder step 3)")
     parser.add_argument("--pool-regime-mix", type=float, nargs=3, default=[0.5, 0.25, 0.25],
                         metavar=("MATCH", "PLACE", "DATASET"),

@@ -1,32 +1,33 @@
-# Experiment roadmap: the four-rung plan
+# Experiment roadmap: the three-rung plan
 
-Last verified against code: 2026-09-22. This is the single forward-looking plan. It supersedes the
+Last verified against code: 2026-09-23. This is the single forward-looking plan. It supersedes the
 classifier-versus-neighbours roadmap, archived at
 [`docs/archive/roadmap-classifier-vs-neighbours-20260919.md`](../archive/roadmap-classifier-vs-neighbours-20260919.md).
 The reasoning, literature and retractions behind every choice here are in the
-[2026-09-22 decision record](../journal/2026-09-22-three-regimes-and-unsupervised-adaptation-decisions.md)
-and its [addendum](../journal/2026-09-22-four-rungs-and-rung2-head-correction.md); this file states
-only what is decided. The decision record calls these "three regimes"; its regime 3 is rungs 3 and 4
-here.
+[2026-09-22 decision record](../journal/2026-09-22-three-regimes-and-unsupervised-adaptation-decisions.md),
+its [addendum](../journal/2026-09-22-four-rungs-and-rung2-head-correction.md), and the
+[2026-09-23 renumbering](../journal/2026-09-23-three-rungs-discovery-dropped.md); this file states
+only what is decided. **Numbering:** the 09-22 entries say "three regimes" and then "four rungs";
+the discovery rung was dropped on 2026-09-23 and the remaining three were renumbered. This file and
+the Notion ⭐ Latest series are authoritative; older entries keep their own numbering.
 
-**Status: pre-registration. Nothing on rungs 1, 2 or 4 has been run.** Rungs 1 and 2 read sealed
+**Status: pre-registration. Nothing on rungs 1 or 3 has been run.** Rungs 1 and 3 read sealed
 data, so this plan is written before any number is read, and it runs only on explicit go.
-**Built 2026-09-23** on `feat/evaluation-package-20260923` — rungs 1, 2, 4 and the pool training arm;
+**Built 2026-09-23** on `feat/evaluation-package-20260923` — rungs 1 and 3 and the pool training arm;
 unit-tested, not smoke-tested on real data; see the
-[implementation record](../journal/2026-09-23-rungs-implementation-record.md). `main` moves only
-after the bit-exact extraction gate and a debug sweep.
+[implementation record](../journal/2026-09-23-rungs-implementation-record.md) (written under the
+old numbering). `main` moves only after the bit-exact extraction gate and a debug sweep.
 
 ## The ladder
 
-Four rungs, hardest first, ordered by how much a deployment provides. The same six encoders — HALO
+Three rungs, hardest first, ordered by how much a deployment provides. The same six encoders — HALO
 and five released baselines — are scored on every rung through the same inference procedure.
 
 | rung | the deployment provides | status |
 |---|---|---|
-| 1 | unlabelled recordings; roster and K unknown | to run |
-| 2 | the roster, and a growing pool of unlabelled recordings; no labels ever | to build, gated |
-| 3 | k labelled examples per class; parameters frozen | **done** — the case study |
-| 4 | k labelled examples per class; fine-tuning allowed | to build |
+| 1 | the roster, and a growing pool of unlabelled recordings; no labels ever | built, gated |
+| 2 | k labelled examples per class; parameters frozen | **done** — the case study |
+| 3 | k labelled examples per class; fine-tuning allowed | built |
 
 ## Standing rules
 
@@ -38,29 +39,7 @@ and five released baselines — are scored on every rung through the same infere
 - Report metrics uniformly: accuracy **and** macro-F1 wherever a label is available.
 - Declare subject-independent evaluation everywhere (all subjects pooled; the harder setting).
 
-## Rung 1 — discovery
-
-*Deployment provides unlabelled recordings. Roster and K are unknown. Tests the encoder, not a
-clustering algorithm. No new training: the encoder is scored as it exists today.*
-
-Protocol copied from Lowe et al., *An Empirical Study into Clustering of Unseen Datasets with
-Self-Supervised Encoders* (TMLR 2024, arXiv:2406.02465) — the same experiment in vision.
-
-| element | decision |
-|---|---|
-| algorithm | k-means++ with 10 restarts. Agglomerative (Ward) is a robustness check on the same result, not a second method. |
-| features | L2-normalised; report raw and PCA-to-64-d, because encoder dimensionality spans 72-d to 4608-d. |
-| K | estimated by silhouette and Davies–Bouldin over k ∈ [2, 30]. **|K̂ − K| is reported as a metric in its own right.** |
-| metric 1 — partition quality | AMI and ARI primary; Hungarian accuracy for comparability; NMI reported only with its cluster-count bias disclosed. |
-| metric 2 — semantic geometry | **Representational Similarity Analysis**: Spearman correlation between the K×K centroid-distance matrix and the K×K label-text-distance matrix (Kriegeskorte 2008; Dwivedi & Roig CVPR 2019). Projection-free, therefore fair to HARNet and LiMU-BERT, which have no text encoder. |
-| metric 2, secondary | cluster-naming accuracy: oracle-Hungarian (literature's number) vs model-Hungarian on the encoder's own cluster×name cosine matrix vs greedy argmax. The oracle − model gap **is the naming cost**. HARNet and LiMU-BERT are named through our ConSE bridge, disclosed. |
-| label-free proxy | silhouette in a UMAP-reduced space, which Lowe et al. find tracks clustering quality without labels — a signal a real deployment could use. |
-| data | existing sealed feature caches, all six encoders, CPU. |
-
-Registered caveat on RSA: alignment metrics can be driven by a small subset of dimensions (Bertram
-et al. 2026, arXiv:2605.05907); report a dimension-ablation check alongside.
-
-## Rung 2 — unlabelled adaptation: the N-curve
+## Rung 1 — unlabelled adaptation: the N-curve
 
 *Deployment provides the roster and a growing pool of unlabelled recordings. No label is ever
 provided. The load-bearing rung.*
@@ -79,11 +58,12 @@ class.
 **Transductive Zero-Shot and Few-Shot CLIP** (Martin et al., CVPR 2024,
 10.1109/cvpr52733.2024.02722) — provisional. The latest method designed for text-initialised
 prototypes at k=0, handling k=0 and k>0 in one framework; same lineage as PADDLE. Applied
-identically to all six encoders, with pool-mean centring (the existing `corpus_mean` knob).
+identically to all six encoders. Ported from the released repository
+(`evaluation/rung1_unlabeled/transductive.py`), not re-derived; unrollable — every step is a torch
+primitive and fixed iteration counts make it a finite differentiable graph.
 
-Two things are checked before the choice is final, in the build: that its block
-majorisation–minimisation update can be unrolled differentiably for training (see below); and how
-it behaves under imbalanced, partially-covered pools. **Fallback: PADDLE** (Martin et al. 2022,
+Checked in the build: unrollability holds; behaviour under imbalanced, partially-covered pools is
+a registered threat below, not assumed. **Fallback: PADDLE** (Martin et al. 2022,
 arXiv:2210.14545) — hyperparameter-free, built for query classes drawn from a larger set than the
 support set. Same first author; the swap costs nothing narratively.
 
@@ -108,18 +88,18 @@ enters inference — through the unrolled transductive iterations — not throug
 is trained is the encoder, the recording pool, and `p_text` (the projection that supplies HALO's k=0
 text prototypes; the analogue of CLIP's image–text alignment). **The v4 learned head — residual
 attention stack, gated text blend, corruption auxiliary, unenrolled calibration — is not used on
-rung 2**, at training or at inference; it remains the rung-3 case-study vehicle. An earlier draft of
-this section proposed a `ROLE_UNLABELED` token acting through v4's residual. That would give HALO a
-private inference path and break the identical-inference invariant, so it is withdrawn (recorded in
-the addendum).
+rung 1**, at training or at inference; it remains the rung-2 case-study vehicle. (An earlier draft
+proposed a `ROLE_UNLABELED` token acting through v4's residual; withdrawn — it would give HALO a
+private inference path.) Built as `halo-train --pool-size N --pool-mode transductive`;
+`--pool-mode soft_kmeans` is ladder step 3.
 
 Two N=0 checks, not one: (i) **architectural** — the same checkpoint with the pool removed must give
 a bit-identical forward pass; (ii) **inductive floor** — the retrained encoder's own N=0 k-curve must
 not fall below v4's encoder at any k. The sealed table remains the N=0 column for v4's encoder, not
 for the new arm.
 
-**End-to-end means unrolled.** The transductive method above runs inside the training forward pass
-on the episode's pool, and the loss backpropagates through it into the encoder — meta-learning the
+**End-to-end means unrolled.** The transductive method runs inside the training forward pass on the
+episode's pool, and the loss backpropagates through it into the encoder — meta-learning the
 deployment procedure (cf. Hu et al. 2020, arXiv:2004.12696). Exposure alone is not assumed to
 suffice: Ochal et al. (IEEE TAI, 10.1109/tai.2023.3298303) show many meta-learners "will not
 automatically learn to balance from exposure to imbalanced training tasks".
@@ -158,53 +138,56 @@ better" can be told apart. Optional tier 4: the unrolled loss dropped into the c
 
 ### What is dropped, and why
 
+- **The discovery rung** (roster and K unknown: cluster, RSA against label-text geometry, name the
+  clusters). Dropped 2026-09-23 as not interesting enough. The code is retained, retired, under
+  `evaluation/discovery/` (`halo-discovery`) and is not part of the paper.
 - **Class-prior correction (SLD).** Esuli, Molinari & Sebastiani (ACM TOIS 2020, 10.1145/3433164):
   helps only with ≤5 classes and a calibrated classifier; otherwise "negative rather than positive".
   Our rosters are 6–8 and text-cosine is uncalibrated.
 - **TENT.** Needs BatchNorm affines; not all six encoders have them — unfair by construction.
 - **LaplacianShot** as primary. Balanced-benchmark era; superseded for our regime.
 - **`ROLE_UNLABELED`.** A private HALO inference path; see above.
-- **"Clustering with known K" (the former U-0b).** With the roster known it is a worse version of
-  zero-shot; the only justification is transduction, which is what rung 2 now measures.
-- **Estimated-K as the deployment case (U-0c) and kNN purity as a headline (U-0a).** K is given by
-  the roster on rung 2; on rung 1 |K̂ − K| is one metric among several. kNN purity survives only as a
-  one-line diagnostic.
-- **Seeded k-means as U-2.** The unrolled transductive method subsumes it.
+- **"Clustering with known K".** With the roster known it is a worse version of zero-shot; the only
+  justification is transduction, which is what rung 1 measures.
+- **Seeded k-means as a refinement step.** The unrolled transductive method subsumes it.
 
-## Rung 3 — labelled, parameters frozen: the case study
+## Rung 2 — labels, parameters frozen: the case study
 
 *Deployment provides k labelled examples per class; the model may not change. This is the existing
-work: v4's 333 sealed cells and 737 deployment-scenario cells.*
+work: v4's 333 sealed cells and 737 deployment-scenario cells, the learned classifier, the k-curve,
+and the per-scenario results against the baselines under equal-weight normalised fusion.*
 
 It is demoted from headline to case study, and it is written as an **encoder** result with v4 as
 the vehicle, because that is what the numbers show (sealed aggregate, 8 s, dataset-balanced
-macro-F1, [RESULTS.md](../results/RESULTS.md#sealed-aggregate-dataset-balanced-macro-f1-single-device-cells)):
+macro-F1, [RESULTS.md](../results/RESULTS.md)):
 
 | readout | k=1 | k=8 | k=32 | k=128 |
 |---|---:|---:|---:|---:|
-| HALO encoder, plain 1-NN, no learned head | 60.3 | 70.6 | 74.0 | 76.0 |
+| HALO v4 learned classifier | 62.4 | 72.7 | 75.8 | 76.5 |
+| HALO v4 parameter-free support vote (the head's own floor) | 60.5 | 72.4 | 76.1 | 77.4 |
+| HALO v4 encoder, cosine 1-NN, no learned head | 60.8 | 71.7 | 74.8 | 76.3 |
 | best baseline (UniMTS), same 1-NN | 53.9 | 66.9 | 71.5 | 73.9 |
-| HALO learned head (v3) | 62.4 | 71.5 | 73.4 | 74.4 |
-| HALO parameter-free floor, same checkpoint | 60.1 | 73.3 | 77.0 | 78.0 |
 
 With no learned head, the HALO encoder beats every baseline under an identical parameter-free
 readout at every k. The learned head earns its keep at k ∈ {0, 1} — the text term is what makes
-k=0 work (51.7 vs 38.6 for the bank bridge) — and trails its own floor at k ≥ 8. So the rung-3
+k=0 work (50.2 vs 38.6 for the bank bridge) — and trails its own floor at k ≥ 32. So the rung-2
 claim is the encoder's; the head's design history (T1–T8) is a section on how the enrollment arm was
-built, not the claim. The frozen-enrollment arm at large k on rung 4's crossover is represented by
-the parameter-free vote.
+built, not the claim. The frozen-enrollment arm on rung 3's crossover is represented by the
+parameter-free vote.
 
-The scenario taxonomy (737 cells of acquisition mismatch) is reused as the axis along which rung 2
+The scenario taxonomy (737 cells of acquisition mismatch) is reused as the axis along which rung 1
 draws its unlabelled pools.
 
-## Rung 4 — labelled, fine-tuning allowed
+## Rung 3 — labels, fine-tuning allowed
 
 *Deployment provides k labelled examples per class; every model may fine-tune. The headline
 adaptation result, and where the "just retrain" objection is answered head-on.*
 
 Ladder by cost, every treatment applied to every model including HALO: linear probe on frozen
 features (closed form; TransfHAR's mechanism) → small classifier (the frozen-projection path built
-2026-09-22) → LoRA / full fine-tune.
+2026-09-22) → LoRA / full fine-tune → a specialist trained from scratch on the same k windows.
+Scored on rung 1's execution split, so the crossover is on identical windows. Built as
+`halo-rung3`.
 
 Priority, in order:
 
@@ -217,95 +200,76 @@ Priority, in order:
    scored by macro-F1, so an absolute target on it is not apples-to-apples; committing to one would
    manufacture a miss.
 
-Build cost: HALO's own-encoder fine-tune path does not exist yet; NormWear has none and its authors
-never fine-tune.
+Build cost: NormWear has no fine-tuning path (no trunk under the encoder contract; its authors never
+fine-tune) and is declared unsupported rather than approximated; HARNet-10 has no trunk under the
+contract and gets the cached-feature treatments only.
 
 ## Registered predictions
 
-1. **Rung 1:** HALO leads AMI/ARI on the sealed six by roughly its 1-NN margin; RSA is where the
-   gap opens; MM-Fit at k=0 is where we lose. Absolute clustering numbers will be low
-   (subject-independent HAR clustering runs ACC 26–51 even for trained deep models); the criterion
-   is a margin.
-2. **Rung 2, established method on all six:** modest gains (a few points), **negative on some cells
+1. **Rung 1, established method on all six:** modest gains (a few points), **negative on some cells
    for some encoders** — going negative is the norm in this literature (Burzer's baselines: −12.8
    pp). The curve rises steeply and plateaus within a few hundred windows per class.
-3. **Rung 2, HALO unrolled arm:** a reliably non-negative, steeper curve than any baseline under the
+2. **Rung 1, HALO unrolled arm:** a reliably non-negative, steeper curve than any baseline under the
    same procedure. If the established method is flat on all six, the arm has nothing to improve on
-   and is not built.
-4. **Rung 3:** no prediction — done.
-5. **Rung 4:** HALO's fine-tuned curve matches or exceeds every baseline's at every k; the crossover
+   and is not run.
+3. **Rung 2:** no prediction — done.
+4. **Rung 3:** HALO's fine-tuned curve matches or exceeds every baseline's at every k; the crossover
    sits at a k small enough to matter (registered qualitatively, not as a number).
 
 ## Sequencing and gates
 
-1. **This document and the journal entries** — done 2026-09-22.
-2. **Build rung 1 and the rung-2 established arm** on cached features — **done 2026-09-23** (with rung 4 and the pool arm), per the
-   [implementation plan](../journal/2026-09-22-rung1-rung2-implementation-plan.md): shared-module
-   extraction first (bit-exact), then the provenance registry, then the two rungs. Build + tests +
-   smoke; nothing runs without explicit go.
-3. **Run rungs 1 and 2 (established)** on go. CPU, ~hours.
-4. **Gate:** build the HALO unrolled arm only if prediction 2's curve rises for at least one encoder.
-5. **Rung 4** fine-tune paths. The expensive build; last in sequence, not least in weight.
+1. **This document and the journal entries** — done 2026-09-22/23.
+2. **Build rung 1 and rung 3** — **done 2026-09-23**, with the pool training arm, per the
+   [implementation plan](../journal/2026-09-22-rung1-rung2-implementation-plan.md) (old numbering).
+3. **Debug sweep** by a second agent; produce the extraction golden; smoke on one cached cell.
+4. **Run rung 1, tier 1** on go. CPU, ~hours. Tier 2 after the matched arms are trained (separate go).
+5. **Gate:** run the HALO unrolled arm only if prediction 1's curve rises for at least one encoder.
+6. **Rung 3** fine-tuning. The expensive part; last in sequence, not least in weight.
 
 ## Open decisions
 
-- Rungs 1 and 2 on the sealed six only, or MM-Fit as well.
-- Build the HALO unrolled arm now or after the gate in step 4 (recommendation: after).
+- Rung 1 on the sealed six only, or MM-Fit as well.
+- Pool-mean centring as a rung-1 option (the `corpus_mean` knob; not wired).
 - An embodied evaluation source (Ego-Exo4D IMU) so the headline framing can be scored.
+- Launching the corpus-matched arms (≈ 15.5 GPU-h) so tier 2 exists.
 
-## Code organisation plan
+## Code organisation
 
-*A plan. No code is moved by this document.* Rung 3 is the working pipeline that produced every
-published number, so the rule is **extract, don't rewrite**, and every move is verified bit-exact
-against an existing cached artifact before it lands.
+*Built 2026-09-23; the remaining planned move is rung 2's runners.* Rung 2 is the working pipeline
+that produced every published number, so the rule was **extract, don't rewrite**, verified byte-exact
+against the anchor tag.
 
-**Principle: separate by concern, not by rung.** All four rungs share the six encoders, the feature
+**Principle: separate by concern, not by rung.** All rungs share the six encoders, the feature
 caches, the sealed manifests, the metrics, and provenance. What differs is only the readout on top of
-cached features (rungs 1–3) or the treatment applied before it (rung 4). So rungs are thin drivers
-over shared modules, not parallel copies.
-
-Today
-[`training/support_classifier/sealed_eval.py`](../../training/support_classifier/sealed_eval.py)
-(2,382 lines) bundles feature caching, manifest construction, eight model-specific readouts, metrics,
-provenance and the CLI. Rungs 1 and 2 need the first two and the last two but none of the readouts.
-Copying them creates two versions; importing them makes rung 1 depend on rung 3's file.
-
-Target layout:
+cached features (rungs 1–2) or the treatment applied before it (rung 3).
 
 ```text
-evaluation/                      NEW package — consumes checkpoints + manifests, produces artifacts
-  encoders.py                    ← from sealed_eval: HALO + baseline feature extraction, _load_or_encode
-  manifests.py                   ← from sealed_eval: QueryPlan, *_cells, build_manifest, manifest_fingerprint
-  features.py                    ← from sealed_eval: FeatureMemoryCache, cache keys, file hashes
-  metrics.py                     ← from sealed_eval: _metric_row  +  NEW: ami, ari, hungarian_acc, rsa, naming_acc
-  provenance.py                  ← from sealed_eval: run provenance, atomic JSON  +  NEW: rung/method registry
-  rung1_discovery/               NEW: cluster.py, rsa.py, name.py, run.py
-  rung2_unlabeled/               NEW: transductive.py (the one method; also imported by the trainer), ncurve.py, run.py
-  rung3_frozen/                  sealed_eval.py, run_scenarios.py, run_partial_coverage.py — moved last, behaviour unchanged
-  rung4_finetune/                frozen_baseline_adaptation.py (the small classifier; exists) + NEW: probe.py, lora.py, crossover.py
-  controls/                      NEW: balanced_pool.py, disjoint_classes.py, shuffled_labels.py
-training/support_classifier/     keeps train.py, curriculum, sampling, collate, objectives, neighbors.py
-                                 (neighbors.py stays: model/ imports it; it is shared train/eval code)
-results/tools/                   reporting only — tables, plots, provenance readers
+evaluation/                      consumes checkpoints + manifests, produces artifacts
+  features.py                    ← from sealed_eval (verbatim): feature extraction and caches
+  manifests.py                   ← from sealed_eval (verbatim): rosters and episode manifests
+  zero_shot.py                   ← from sealed_eval (verbatim) + zero_shot_scores, probability_features, ProviderScorer
+  metrics.py                     one definition each; classification delegates to baselines.scoring
+  provenance.py                  ← from sealed_eval (verbatim) + the rung / method / readout-version registry
+  rung1_unlabeled/               transductive.py (the one method; also imported by the trainer), ncurve.py, run.py
+  rung2_frozen/                  PLANNED: sealed_eval.py, run_scenarios.py, run_partial_coverage.py move here last
+  rung3_finetune/                lora.py, finetune.py, run.py
+  controls/                      balanced_pool.py, disjoint_classes.py
+  discovery/                     RETIRED 2026-09-23 (was rung 1 of the four-rung plan); kept runnable, not part of the paper
+training/support_classifier/     train.py (+ the pool arm), sampling.py (+ attach_pool), neighbors.py stays (model/ imports it)
+results/tools/                   reporting only
 ```
 
 Rules that make "which version is which" unambiguous:
 
 1. **Every artifact declares its rung and method.** `evaluation/provenance.py` holds a registry
-   (`RUNG ∈ {1, 2, 3, 4}`, `METHOD` enum, `READOUT_VERSION` string such as `discovery-v1`,
-   `ncurve-v1`). An artifact cannot be written without them, and they sit in `run_provenance.json`
-   beside the checkpoint and manifest fingerprints — the code analogue of RESULTS.md's "which run is
-   which" index.
-2. **Readout versions bump when the procedure changes**, exactly as `sealed-manifest-v2` and
-   `deployment-scenarios-v5` do today, so an old artifact is never mistaken for a new protocol.
-3. **Classifier names are unchanged**: v4 / T-numbers per RESULTS.md. Rungs 1 and 2 use no learned
-   head, so they name the encoder checkpoint, not a classifier.
-4. **The transductive method lives in one file** (`evaluation/rung2_unlabeled/transductive.py`) and
-   is imported by both the evaluator and the trainer's unrolled loop. One implementation, so the
-   method unrolled in training is provably the one applied to the baselines at test.
-5. **Order of migration:** extract the shared modules first (rungs 1 and 2 need them; each extraction
-   is `git mv` + import shim + a bit-exact diff of `results.json` on one cached sealed cell); build
-   rungs 1 and 2 on them; move rung 3's runners last, and only once the extraction is proven. Entry
-   points in `pyproject.toml` are re-pointed at the same time; `halo-sealed-eval` keeps its name.
-6. **Case studies and other experiments** are drivers under the rung they read from, never new
-   top-level trees. A case study that reads rung-3 caches is `evaluation/rung3_frozen/case_*.py`.
+   (`RUNG ∈ {1, 2, 3}`; `DISCOVERY = 0` retired; `METHOD` enum; `READOUT_VERSION` such as `ncurve-v1`,
+   `finetune-v1`). An artifact cannot be written without them.
+2. **Readout versions bump when the procedure changes**, as `sealed-manifest-v2` and
+   `deployment-scenarios-v5` do today.
+3. **Classifier names are unchanged**: v4 / T-numbers per RESULTS.md. Rung 1 uses no learned head,
+   so it names the encoder checkpoint, not a classifier.
+4. **The transductive method lives in one file** and is imported by both the evaluator and the
+   trainer's unrolled loop, so the method unrolled in training is provably the one applied to the
+   baselines at test.
+5. **Case studies and other experiments** are drivers under the rung they read from, never new
+   top-level trees.

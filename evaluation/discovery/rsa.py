@@ -20,7 +20,7 @@ from scipy.spatial.distance import pdist
 from scipy.stats import spearmanr
 from sklearn.decomposition import PCA
 
-from evaluation.rung1_discovery.cluster import centroids_of, l2_normalise
+from evaluation.discovery.cluster import centroids_of, l2_normalise
 
 
 def rdm(vectors: np.ndarray, *, metric: str = "cosine") -> np.ndarray:

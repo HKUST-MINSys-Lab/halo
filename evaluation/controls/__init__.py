@@ -1,4 +1,4 @@
-"""Registered controls for rungs 1 and 2. Each is a pure function over row indices and labels so a
+"""Registered controls for rung 1 (the retired discovery readout also uses the shuffled null). Each is a pure function over row indices and labels so a
 control run differs from the main run in exactly one declared way (docs/overview/roadmap.md,
 "Registered threats and their matched controls")."""
 

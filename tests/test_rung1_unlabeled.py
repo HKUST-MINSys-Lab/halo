@@ -1,4 +1,4 @@
-"""Rung 2 unit tests: the EM-Dirichlet port, the pool protocol, and the controls — all synthetic."""
+"""Rung 1 unit tests: the EM-Dirichlet port, the pool protocol, and the controls — all synthetic."""
 
 from __future__ import annotations
 
@@ -8,10 +8,10 @@ import torch
 import torch.nn.functional as F
 
 from evaluation.controls import balanced_pool_filter, disjoint_class_split
-from evaluation.rung2_unlabeled.ncurve import (
+from evaluation.rung1_unlabeled.ncurve import (
     CellSplit, inductive_predictions, nested_pool_draws, run_cell, shared_support_set, split_scored_pool,
 )
-from evaluation.rung2_unlabeled.transductive import (
+from evaluation.rung1_unlabeled.transductive import (
     assign_clusters, paper_lambda, transduce, transduce_numpy,
 )
 from evaluation.zero_shot import probability_features

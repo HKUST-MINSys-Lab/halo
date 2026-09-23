@@ -82,3 +82,4 @@ entries preserve what was believed at the time; current behavior is defined only
 | 2026-09-22 | [2026-09-22-rung1-rung2-implementation-plan.md](2026-09-22-rung1-rung2-implementation-plan.md) | Rungs 1 and 2: implementation plan |
 | 2026-09-22 | [2026-09-22-three-regimes-and-unsupervised-adaptation-decisions.md](2026-09-22-three-regimes-and-unsupervised-adaptation-decisions.md) | The three-regime plan, and how the unsupervised tier was redesigned twice in one day |
 | 2026-09-23 | [2026-09-23-rungs-implementation-record.md](2026-09-23-rungs-implementation-record.md) | Rungs 1, 2 and 4 built; the unlabelled-pool training arm built — implementation record |
+| 2026-09-23 | [2026-09-23-three-rungs-discovery-dropped.md](2026-09-23-three-rungs-discovery-dropped.md) | Addendum: the discovery rung is dropped; three rungs, renumbered |

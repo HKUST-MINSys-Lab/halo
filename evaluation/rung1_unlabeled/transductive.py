@@ -3,7 +3,7 @@
 
 Ported from the released implementation, ``src/methods/{zero_shot,few_shot}/em_dirichlet.py`` at
 github.com/SegoleneMartin/transductive-CLIP (default branch ``master``, fetched 2026-09-23), not
-re-derived from the paper. This is the ONE implementation used by the rung-2 evaluator for every
+re-derived from the paper. This is the ONE implementation used by the rung-1 evaluator for every
 encoder and by the trainer's unrolled loop, so what HALO is trained through is provably what the
 baselines are scored with.
 

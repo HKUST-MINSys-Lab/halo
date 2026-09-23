@@ -26,7 +26,7 @@ from typing import Callable, Sequence
 import numpy as np
 
 from evaluation.metrics import classification
-from evaluation.rung2_unlabeled.transductive import INFERENCE_DEFAULTS, transduce_numpy
+from evaluation.rung1_unlabeled.transductive import INFERENCE_DEFAULTS, transduce_numpy
 from evaluation.zero_shot import _normalise, probability_features
 
 DEFAULT_POOL_SIZES: tuple[int | str, ...] = (0, 50, 100, 500, 2000, "all")
@@ -147,7 +147,7 @@ def run_cell(
     pool_filter: Callable[[np.ndarray], np.ndarray] | None = None,
     control: str = "none",
 ) -> list[dict]:
-    """Every rung-2 row for one (encoder, cell): the N × k grid on S, plus the all-windows
+    """Every rung-1 row for one (encoder, cell): the N × k grid on S, plus the all-windows
     reproduction row at N = 0, k = 0. ``pool_filter`` (a control) may resample each P_N."""
     classes = list(classes)
     C = len(classes)

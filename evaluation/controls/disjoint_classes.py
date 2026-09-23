@@ -9,7 +9,7 @@ import hashlib
 
 import numpy as np
 
-from evaluation.rung2_unlabeled.ncurve import CellSplit
+from evaluation.rung1_unlabeled.ncurve import CellSplit
 
 
 def disjoint_class_split(split: CellSplit, truth_ids: np.ndarray, n_classes: int, *,

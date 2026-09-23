@@ -1,10 +1,10 @@
-"""Rung 1 driver: cluster every sealed single-device cell for every encoder from cached features.
+"""Discovery driver (retired): cluster every sealed single-device cell for every encoder from cached features.
 
 ``evaluate_cell`` is the pure core (features + truth + roster + text vectors → rows) and is what
 the unit tests exercise; ``main`` only does I/O, mirroring the sealed evaluator's stream loading so
 the feature cache is hit rather than re-encoded. Nothing is run without an explicit invocation.
 
-Smoke: ``python -m evaluation.rung1_discovery.run --out /tmp/r1 --models halo --halo-checkpoint
+Smoke: ``python -m evaluation.discovery.run --out /tmp/r1 --models halo --halo-checkpoint
 <ckpt> --feature-cache <shared cache> --cells 1 --no-umap --null-draws 20 --k-range 2 6``.
 """
 
@@ -27,11 +27,11 @@ from evaluation.features import FeatureMemoryCache
 from evaluation.manifests import SEED, _aligned_labels, evaluation_cells
 from evaluation.metrics import ami, ari, davies_bouldin, hungarian_accuracy, nmi, silhouette
 from evaluation.provenance import ArtifactProvenance, Rung, _atomic_json, write_artifact
-from evaluation.rung1_discovery.cluster import (
+from evaluation.discovery.cluster import (
     ALGORITHMS, DEFAULT_K_RANGE, cluster_cell, estimate_k, prepare_features, umap_silhouette,
 )
-from evaluation.rung1_discovery.name import name_clusters, naming_outcomes, oracle_assignment
-from evaluation.rung1_discovery.rsa import (
+from evaluation.discovery.name import name_clusters, naming_outcomes, oracle_assignment
+from evaluation.discovery.rsa import (
     class_centroids, cluster_centroids_by_label, dimension_ablation, rsa, shuffled_null,
 )
 from evaluation.zero_shot import ProviderScorer, _normalise, zero_shot_feature_role
@@ -57,7 +57,7 @@ def evaluate_cell(
     umap_components: int = 5,
     null_draws: int = 200,
 ) -> list[dict]:
-    """All rung-1 rows for one (encoder, cell). Label-free quantities never see ``truth``."""
+    """All discovery rows for one (encoder, cell). Label-free quantities never see ``truth``."""
     classes = list(classes)
     truth = np.asarray(truth, dtype=object)
     index = {label: i for i, label in enumerate(classes)}
@@ -197,7 +197,7 @@ def main() -> None:
             rows.extend(cell_rows)
             fingerprints[name] = fingerprint
         elapsed = time.perf_counter() - started
-        print(f"[rung1] cells={cell_index}/{len(cells)} elapsed={elapsed / 60:.1f}m", flush=True)
+        print(f"[discovery] cells={cell_index}/{len(cells)} elapsed={elapsed / 60:.1f}m", flush=True)
         _atomic_json(args.out / "progress.json", {"completed_cells": cell_index, "total_cells": len(cells)})
     provenance = ArtifactProvenance(
         rung=Rung.DISCOVERY,
@@ -210,13 +210,13 @@ def main() -> None:
     path = write_artifact(args.out, rows, provenance, argv=sys.argv, device=device,
                           halo_checkpoint=args.halo_checkpoint)
     _write_summary(args.out / "RESULTS.md", rows)
-    print(f"[rung1] wrote {path} ({len(rows)} rows)")
+    print(f"[discovery] wrote {path} ({len(rows)} rows)")
 
 
 def _write_summary(path: Path, rows: Sequence[dict]) -> None:
     keys = ("ami", "ari", "hungarian_accuracy_pct", "rsa_class", "rsa_cluster",
             "naming_model_hungarian_pct", "naming_cost_pct", "k_abs_error_silhouette")
-    lines = ["# Rung 1 — discovery (means over cells; k_true, raw features, k-means++)", "",
+    lines = ["# Discovery readout (retired 2026-09-23; not a rung of the plan) (means over cells; k_true, raw features, k-means++)", "",
              "| encoder | " + " | ".join(keys) + " |", "|---|" + "---:|" * len(keys)]
     ok = [r for r in rows if r.get("status") == "ok" and r.get("k_setting") == "k_true"
           and r.get("pca_dim") == 0 and r.get("method") == "kmeans_pp_10"]

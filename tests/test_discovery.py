@@ -1,4 +1,4 @@
-"""Rung 1 unit tests: transparent synthetic geometry with known answers. No cached data needed."""
+"""discovery unit tests: transparent synthetic geometry with known answers. No cached data needed."""
 
 from __future__ import annotations
 
@@ -7,10 +7,10 @@ import pytest
 from sklearn.datasets import make_blobs
 
 from evaluation.metrics import ami, ari, hungarian_accuracy
-from evaluation.rung1_discovery.cluster import cluster_cell, estimate_k, prepare_features
-from evaluation.rung1_discovery.name import naming_outcomes
-from evaluation.rung1_discovery.rsa import class_centroids, rsa, shuffled_null
-from evaluation.rung1_discovery.run import evaluate_cell
+from evaluation.discovery.cluster import cluster_cell, estimate_k, prepare_features
+from evaluation.discovery.name import naming_outcomes
+from evaluation.discovery.rsa import class_centroids, rsa, shuffled_null
+from evaluation.discovery.run import evaluate_cell
 
 
 def _blobs(seed=0, k=3, n=60, dim=8):

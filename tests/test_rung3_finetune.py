@@ -1,4 +1,4 @@
-"""Rung 4 unit tests: the LoRA wrapper, every cached-feature treatment, the fixed-budget fit loop,
+"""Rung 3 unit tests: the LoRA wrapper, every cached-feature treatment, the fixed-budget fit loop,
 and run_cell on synthetic separable features. Raw-window treatments need real encoders and are
 exercised by the CLI smoke, not here."""
 
@@ -9,12 +9,12 @@ import torch
 import torch.nn as nn
 from sklearn.datasets import make_blobs
 
-from evaluation.rung2_unlabeled.ncurve import CellSplit
-from evaluation.rung4_finetune.finetune import (
+from evaluation.rung1_unlabeled.ncurve import CellSplit
+from evaluation.rung3_finetune.finetune import (
     FineTuneConfig, enrollment_frozen_predictions, fit_head, linear_probe_predictions, run_cell,
     small_classifier_predictions,
 )
-from evaluation.rung4_finetune.lora import LoRALinear, apply_lora, lora_parameters, trainable_parameter_count
+from evaluation.rung3_finetune.lora import LoRALinear, apply_lora, lora_parameters, trainable_parameter_count
 
 
 def test_lora_is_the_identity_at_init_and_trains_only_the_adapter():

@@ -18,7 +18,7 @@ from typing import Callable
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from evaluation.rung1_discovery.cluster import centroids_of
+from evaluation.discovery.cluster import centroids_of
 
 
 def confusion(cluster_labels: np.ndarray, truth_ids: np.ndarray, k: int, n_classes: int) -> np.ndarray:

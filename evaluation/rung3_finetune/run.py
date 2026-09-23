@@ -1,12 +1,12 @@
-"""Rung 4 driver: the fine-tuning ladder for every provider on every sealed single-device cell.
+"""Rung 3 driver: the fine-tuning ladder for every provider on every sealed single-device cell.
 
-The scored set and the k-per-class support draws are rung 2's (same seed parts), so a rung-4 row
-and a rung-2 row for the same (cell, k) are on identical windows and the enrollment-vs-fine-tuning
+The scored set and the k-per-class support draws are rung 1's (same seed parts), so a rung-3 row
+and a rung-1 row for the same (cell, k) are on identical windows and the enrollment-vs-fine-tuning
 crossover is a like-for-like comparison. Raw-window treatments re-instantiate an encoder per
 (cell, k, treatment) and train it for a fixed budget; that is the expensive part of the paper and
 is why ``--cells`` / ``--k`` / ``--steps`` exist for smoke runs.
 
-Smoke: ``python -m evaluation.rung4_finetune.run --out /tmp/r4 --models halo --halo-checkpoint
+Smoke: ``python -m evaluation.rung3_finetune.run --out /tmp/r4 --models halo --halo-checkpoint
 <ckpt> --feature-cache <shared cache> --cells 1 --k 1 --steps 5 --treatments enrollment_frozen
 linear_probe lora``.
 """
@@ -29,8 +29,8 @@ from baselines.data import load_eval_stream, source_slice_fingerprint
 from evaluation.features import FeatureMemoryCache
 from evaluation.manifests import SEED, _aligned_labels, evaluation_cells
 from evaluation.provenance import ArtifactProvenance, Rung, _atomic_json, write_artifact
-from evaluation.rung2_unlabeled.ncurve import split_scored_pool
-from evaluation.rung4_finetune.finetune import (
+from evaluation.rung1_unlabeled.ncurve import split_scored_pool
+from evaluation.rung3_finetune.finetune import (
     CACHED_FEATURE_TREATMENTS, TREATMENTS, FineTuneConfig, run_cell,
 )
 from evaluation.zero_shot import ProviderScorer
@@ -50,7 +50,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-read-dirs", type=Path, nargs="*", default=[])
     parser.add_argument("--feature-memory-cache-gib", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=SEED)
-    parser.add_argument("--scored-fraction", type=float, default=0.2, help="must match rung 2")
+    parser.add_argument("--scored-fraction", type=float, default=0.2, help="must match rung 1")
     parser.add_argument("--k", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32])
     parser.add_argument("--treatments", nargs="+", default=list(TREATMENTS), choices=TREATMENTS)
     parser.add_argument("--steps", type=int, default=FineTuneConfig.steps)
@@ -102,7 +102,7 @@ def main() -> None:
                 rows.append({**base, "model": name, "encoder": label_of[name], "status": "n/a",
                              "reason": "execution identity unavailable; cannot split scored and pool sets"})
             continue
-        # Identical to rung 2's split for this cell: same seed parts, same fraction.
+        # Identical to rung 1's split for this cell: same seed parts, same fraction.
         seed_parts = (args.seed, dataset, stream_id, float(window_seconds), args.scored_fraction)
         split = split_scored_pool(stream.execution_ids, valid_rows, fraction=args.scored_fraction,
                                   seed_parts=seed_parts)
@@ -128,7 +128,7 @@ def main() -> None:
             if fingerprint:
                 fingerprints[label_of[name]] = fingerprint
         elapsed = time.perf_counter() - started
-        print(f"[rung4] cells={cell_index}/{len(cells)} elapsed={elapsed / 60:.1f}m", flush=True)
+        print(f"[rung3] cells={cell_index}/{len(cells)} elapsed={elapsed / 60:.1f}m", flush=True)
         _atomic_json(args.out / "progress.json", {"completed_cells": cell_index, "total_cells": len(cells)})
     provenance = ArtifactProvenance(
         rung=Rung.FINETUNE,
@@ -142,12 +142,12 @@ def main() -> None:
     path = write_artifact(args.out, rows, provenance, argv=sys.argv, device=device,
                           halo_checkpoint=args.halo_checkpoint)
     _write_summary(args.out / "RESULTS.md", rows)
-    print(f"[rung4] wrote {path} ({len(rows)} rows)")
+    print(f"[rung3] wrote {path} ({len(rows)} rows)")
 
 
 def _write_summary(path: Path, rows: Sequence[dict]) -> None:
     ok = [r for r in rows if r.get("status") == "ok"]
-    lines = ["# Rung 4 — fine-tuning ladder: mean macro-F1 on the scored set", ""]
+    lines = ["# Rung 3 — fine-tuning ladder: mean macro-F1 on the scored set", ""]
     for treatment in TREATMENTS:
         sub = [r for r in ok if r["method"] == treatment]
         if not sub:

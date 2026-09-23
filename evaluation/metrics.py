@@ -1,4 +1,4 @@
-"""Metrics shared by rungs 1, 2 and 4 — one definition each.
+"""Metrics shared by rungs 1 and 3 (and the retired discovery readout) — one definition each.
 
 Classification metrics delegate to :func:`baselines.scoring.classification_metrics`, so every
 rung's accuracy and macro-F1 are the sealed table's definitions (macro-F1 over ground-truth ∪

@@ -1,7 +1,7 @@
 """Zero-target-enrollment scoring: the training-bank ConSE bridge and its reference bank.
 
 Extracted verbatim from training/support_classifier/sealed_eval.py on 2026-09-23 (Phase 0 of
-docs/journal/2026-09-22-rung1-rung2-implementation-plan.md). sealed_eval re-imports these names.
+docs/journal/2026-09-22-rung1-rung1-implementation-plan.md). sealed_eval re-imports these names.
 """
 
 from __future__ import annotations
@@ -225,7 +225,7 @@ def _build_training_reference_bank(
 
 
 # ---------------------------------------------------------------------------------------------
-# Added 2026-09-23: one zero-shot score matrix for every provider (rung 2's only model input).
+# Added 2026-09-23: one zero-shot score matrix for every provider (rung 1's only model input).
 # ---------------------------------------------------------------------------------------------
 
 import torch.nn.functional as F  # noqa: E402
@@ -251,7 +251,7 @@ def fit_halo_text_bridge(bank_features: np.ndarray, bank_label_ids: np.ndarray,
     """Closed-form ridge from HALO pooled features to frozen SBERT label vectors.
 
     The same map the v4 head initialises ``p_text`` with (``train.fit_text_projection``), fitted
-    here on the training reference bank so HALO enters rung 2 as encoder + bridge — symmetric with
+    here on the training reference bank so HALO enters rung 1 as encoder + bridge — symmetric with
     the ConSE bridge the representation-tier baselines get — and with no learned head.
     """
     from training.support_classifier.train import fit_text_projection

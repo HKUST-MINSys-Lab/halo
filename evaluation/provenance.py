@@ -1,7 +1,7 @@
 """Result-row validation, atomic JSON, and run provenance shared by every rung.
 
 Extracted verbatim from training/support_classifier/sealed_eval.py on 2026-09-23 (Phase 0 of
-docs/journal/2026-09-22-rung1-rung2-implementation-plan.md). sealed_eval re-imports these names.
+docs/journal/2026-09-22-rung1-rung1-implementation-plan.md). sealed_eval re-imports these names.
 """
 
 from __future__ import annotations
@@ -105,7 +105,7 @@ def _run_provenance(argv: list[str], *, device: torch.device, halo_checkpoint: P
 # ---------------------------------------------------------------------------------------------
 # Rung / method / readout-version registry (added 2026-09-23; docs/overview/roadmap.md, code plan
 # rule 1). An artifact cannot be written without declaring all three, so a results file can never
-# be mistaken for a different protocol. Rung 3 keeps its existing runner and adopts this at
+# be mistaken for a different protocol. Rung 2 keeps its existing runner and adopts this at
 # migration time.
 # ---------------------------------------------------------------------------------------------
 
@@ -114,29 +114,32 @@ from enum import Enum, IntEnum  # noqa: E402
 
 
 class Rung(IntEnum):
-    DISCOVERY = 1      # roster and K unknown
-    UNLABELED = 2      # roster known, unlabelled pool grows, no labels ever
-    FROZEN = 3         # k labels, parameters frozen (the existing sealed/scenario tables)
-    FINETUNE = 4       # k labels, fine-tuning allowed
+    # Numbering of 2026-09-23: the discovery readout (roster and K unknown) was dropped from the plan
+    # as not interesting enough; it keeps value 0 so the retired code still runs and can never be
+    # mistaken for a rung of the paper.
+    DISCOVERY = 0      # retired; roster and K unknown
+    UNLABELED = 1      # roster known, unlabelled pool grows, no labels ever
+    FROZEN = 2         # k labels, parameters frozen (the existing sealed/scenario tables)
+    FINETUNE = 3       # k labels, fine-tuning allowed
 
 
 class Method(str, Enum):
-    # rung 1
+    # discovery (retired)
     KMEANS_PP_10 = "kmeans_pp_10"
     WARD = "ward"
-    # rung 2
+    # rung 1
     INDUCTIVE = "inductive"                    # N=0: the published per-window readout
     TRANSDUCTIVE_CLIP_V1 = "transductive_clip_v1"
-    # rung 3
+    # rung 2
     NEIGHBOURS = "neighbours"
     CLASSIFIER_V4 = "classifier_v4"
-    # rung 4
+    # rung 3
     LINEAR_PROBE = "linear_probe"
     SMALL_CLASSIFIER = "small_classifier"
     LORA = "lora"
     FULL_FINETUNE = "full_finetune"
     SCRATCH_SPECIALIST = "scratch_specialist"
-    # The rung-3 parameter-free readout re-run on rung 4's own support draw and scored set, so the
+    # The rung-2 parameter-free readout re-run on rung 3's own support draw and scored set, so the
     # enrollment-vs-fine-tuning crossover is measured on identical windows. Named distinctly so it
     # is never confused with the sealed table's per-query-manifest rows.
     ENROLLMENT_FROZEN = "enrollment_frozen"
@@ -162,11 +165,11 @@ READOUT_VERSION: dict[Rung, str] = {
 
 @dataclass(frozen=True)
 class ArtifactProvenance:
-    """What every rung-1/2/4 artifact must declare before a row can be written.
+    """What every rung-1/3 (and retired discovery) artifact must declare before a row can be written.
 
     ``method`` and ``encoder`` may be fixed for the whole artifact or left ``None``, in which case
     every ``status == "ok"`` row must carry its own, and each is validated against the rung's
-    registered methods. Rung-1 artifacts hold six encoders x two algorithms, so they use the
+    registered methods. Discovery artifacts hold six encoders x two algorithms, so they use the
     per-row form; a single-arm artifact fixes both.
     """
 

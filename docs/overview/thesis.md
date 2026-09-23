@@ -1,9 +1,10 @@
 # Thesis and scope
 
-Last verified against code: 2026-09-22. Supersedes the classifier-era thesis, archived at
+Last verified against code: 2026-09-23. Supersedes the classifier-era thesis, archived at
 [`docs/archive/thesis-support-conditioned-classifier-era-20260918.md`](../archive/thesis-support-conditioned-classifier-era-20260918.md);
 the reasoning is in the
-[2026-09-22 decision record](../journal/2026-09-22-three-regimes-and-unsupervised-adaptation-decisions.md).
+[2026-09-22 decision record](../journal/2026-09-22-three-regimes-and-unsupervised-adaptation-decisions.md)
+and the [2026-09-23 renumbering](../journal/2026-09-23-three-rungs-discovery-dropped.md).
 
 HALO means **Heterogeneity-Adaptive, Lightweight, Open-vocabulary activity recognition**: a
 sub-million-parameter support-conditioned recogniser for wearable IMU whose deployment condition —
@@ -24,7 +25,7 @@ acceleration. **No clinical or health framing.** A foundation model is not a sub
 collecting disease-specific data and the paper does not argue otherwise; InclusiveHAR is a
 robustness row only.
 
-## The claim, in four rungs
+## The claim, in three rungs
 
 The paper is organised as a ladder from the least to the most a deployment can provide, hardest
 rung first. The same six encoders — HALO and five released baselines — are scored on every rung
@@ -33,10 +34,9 @@ how it was trained.
 
 | rung | the deployment provides | the question | what "better" is measured against |
 |---|---|---|---|
-| **1 — discovery** | unlabelled recordings; roster and K unknown | does the encoder's geometry recover the activities, and does it mirror how their names relate in language? | the baselines' geometry |
-| **2 — unlabelled adaptation** | the roster, plus a growing pool of unlabelled recordings | does accuracy rise with unlabelled data, with no label ever provided? | a flat curve, which is exactly per-window zero-shot |
-| **3 — labelled, parameters frozen** | k labelled examples per class; the model may not change | does the encoder beat the baselines under an identical parameter-free readout at every k? | done — the existing sealed and scenario tables; the case study |
-| **4 — labelled, fine-tuning allowed** | k labelled examples per class; every model may fine-tune | with the same treatment for everyone, does HALO still lead at every k, and where does it cross a specialist trained from scratch on the same k? | every baseline fine-tuned; the crossover; ~77–80 % as context |
+| **1 — unlabelled adaptation** | the roster, plus a growing pool of unlabelled recordings; no label ever | does accuracy rise with unlabelled data, with no label ever provided? | a flat curve, which is exactly per-window zero-shot |
+| **2 — labelled, parameters frozen** | k labelled examples per class; the model may not change | does the encoder beat the baselines under an identical parameter-free readout at every k? | done — the existing sealed and scenario tables; the case study |
+| **3 — labelled, fine-tuning allowed** | k labelled examples per class; every model may fine-tune | with the same treatment for everyone, does HALO still lead at every k, and where does it cross a specialist trained from scratch on the same k? | every baseline fine-tuned; the crossover; ~77–80 % as context |
 
 The contribution is **not** any single mechanism. Every inference-time procedure is an established
 one, applied identically to all six encoders. The contribution is that HALO is **trained through

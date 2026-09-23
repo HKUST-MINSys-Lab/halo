@@ -1,11 +1,11 @@
-"""Rung 2 driver: the N-curve for every encoder on every sealed single-device cell, from cached
+"""Rung 1 driver: the N-curve for every encoder on every sealed single-device cell, from cached
 features and the uniform zero-shot score matrix. ``ncurve.run_cell`` is the pure core.
 
 Tier 1: the released checkpoints (``--models``). Tier 2: a corpus-matched arm is scored as
 ``halo`` with ``--halo-checkpoint`` pointing at its checkpoint (``build_encoder`` rebuilds the
 matched trunk from the checkpoint's ``encoder_arch``); name it with ``--encoder-label``.
 
-Smoke: ``python -m evaluation.rung2_unlabeled.run --out /tmp/r2 --models halo --halo-checkpoint
+Smoke: ``python -m evaluation.rung1_unlabeled.run --out /tmp/r2 --models halo --halo-checkpoint
 <ckpt> --feature-cache <shared cache> --cells 1 --k 0 1 --pool-sizes 0 50 --n-iter 3 --n-iter-mm 10``.
 """
 
@@ -28,10 +28,10 @@ from evaluation.controls import CONTROLS, balanced_pool_filter, disjoint_class_s
 from evaluation.features import FeatureMemoryCache
 from evaluation.manifests import SEED, _aligned_labels, evaluation_cells
 from evaluation.provenance import ArtifactProvenance, Rung, _atomic_json, write_artifact
-from evaluation.rung2_unlabeled.ncurve import (
+from evaluation.rung1_unlabeled.ncurve import (
     DEFAULT_K, DEFAULT_POOL_SIZES, nested_pool_draws, run_cell, split_scored_pool,
 )
-from evaluation.rung2_unlabeled.transductive import INFERENCE_DEFAULTS
+from evaluation.rung1_unlabeled.transductive import INFERENCE_DEFAULTS
 from evaluation.zero_shot import ProviderScorer, zero_shot_feature_role
 
 RUNG_MODELS = ("halo", "harnet5", "harnet10", "limubert_x", "unimts", "normwear")
@@ -142,7 +142,7 @@ def main() -> None:
             rows.extend(cell_rows)
             fingerprints[label_of[name]] = fingerprint
         elapsed = time.perf_counter() - started
-        print(f"[rung2] cells={cell_index}/{len(cells)} elapsed={elapsed / 60:.1f}m", flush=True)
+        print(f"[rung1] cells={cell_index}/{len(cells)} elapsed={elapsed / 60:.1f}m", flush=True)
         _atomic_json(args.out / "progress.json", {"completed_cells": cell_index, "total_cells": len(cells)})
     provenance = ArtifactProvenance(
         rung=Rung.UNLABELED,
@@ -159,13 +159,13 @@ def main() -> None:
     path = write_artifact(args.out, rows, provenance, argv=sys.argv, device=device,
                           halo_checkpoint=args.halo_checkpoint)
     _write_summary(args.out / "RESULTS.md", rows)
-    print(f"[rung2] wrote {path} ({len(rows)} rows)")
+    print(f"[rung1] wrote {path} ({len(rows)} rows)")
 
 
 def _write_summary(path: Path, rows: Sequence[dict]) -> None:
     ok = [r for r in rows if r.get("status") == "ok" and r.get("scope") == "scored"
           and r.get("assignment", "identity") == "identity"]
-    lines = ["# Rung 2 — unlabelled adaptation: mean macro-F1 on the scored set vs pool size N", ""]
+    lines = ["# Rung 1 — unlabelled adaptation: mean macro-F1 on the scored set vs pool size N", ""]
     for k in sorted({r["k"] for r in ok}):
         sub = [r for r in ok if r["k"] == k]
         labels = ["0"] + sorted({r["N_label"] for r in sub if r["method"] != "inductive"},

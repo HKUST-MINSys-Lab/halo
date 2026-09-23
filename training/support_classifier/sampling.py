@@ -324,7 +324,7 @@ class Episode:
     counterfactual_view: str = "independent"
     counterfactual_axis: str = "independent"
     counterfactual_intervention: tuple[tuple[str, str], ...] = ()
-    # Unlabelled deployment pool (rung-2 training arm, 2026-09-23). Pool rows are encoded with the
+    # Unlabelled deployment pool (rung-1 training arm, 2026-09-23). Pool rows are encoded with the
     # episode and reach the loss only through the transductive readout
     # (``train.pooled_episode_logits``); an empty pool leaves every existing path untouched.
     pool: tuple[int, ...] = ()
@@ -773,7 +773,7 @@ def attach_pool(
     distractor_fraction: float = 0.0,
     coverage: tuple[float, float] = (0.5, 1.0),
 ) -> Episode:
-    """Attach an unlabelled pool that looks like a deployment pool (rung 2, roadmap):
+    """Attach an unlabelled pool that looks like a deployment pool (rung 1, roadmap):
 
     * drawn from ``pool_regime`` relative to the query's acquisition — ``compatible`` (same key),
       ``cross_placement`` or ``cross_dataset`` — never from the query's own execution and never
