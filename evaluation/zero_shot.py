@@ -329,3 +329,83 @@ def probability_features(scores: np.ndarray, kind: str, *, temperature: float = 
     z = z - z.max(axis=1, keepdims=True)
     p = np.exp(z)
     return (p / p.sum(axis=1, keepdims=True)).astype(np.float32), info
+
+
+class ProviderScorer:
+    """Feature loading and zero-shot score functions for every provider, sharing banks and bridges.
+
+    One object per run: it holds the released-adapter states (NormWear is instantiated once), the
+    HALO encoder, the per-duration training reference banks and HALO text bridges. Both rung
+    drivers use it so the six providers are scored by exactly one code path.
+    """
+
+    def __init__(self, *, models: Sequence[str], device: torch.device, cache_dir: Path,
+                 halo_checkpoint: Path | None, cache_read_dirs: Sequence[Path] = (),
+                 memory_cache: FeatureMemoryCache | None = None, sbert=None):
+        from training.tokenizer.eval_transfer import build_encoder
+
+        from evaluation.features import _file_hash
+
+        self.device = device
+        self.cache_dir = Path(cache_dir)
+        self.cache_read_dirs = tuple(Path(p) for p in cache_read_dirs)
+        self.memory_cache = memory_cache
+        self.halo_checkpoint = halo_checkpoint
+        self.halo_state = None
+        if "halo" in models:
+            if halo_checkpoint is None:
+                raise ValueError("--halo-checkpoint is required when the model list includes halo")
+            blob = torch.load(halo_checkpoint, map_location="cpu", weights_only=False)
+            self.halo_state = (build_encoder(blob, device).eval(), _file_hash(halo_checkpoint))
+        self.states = {name: baselines.REGISTRY[name].setup_features(device)
+                       for name in models if name != "halo"}
+        self.banks: dict[tuple[str, float], tuple] = {}
+        self.bridges: dict[float, np.ndarray] = {}
+        self._sbert = sbert
+
+    @property
+    def sbert(self):
+        if self._sbert is None:
+            self._sbert = scoring.get_sbert_encoder()
+        return self._sbert
+
+    def features(self, name: str, stream, *, role: str = "enrollment") -> tuple[np.ndarray, str]:
+        return _load_or_encode(
+            name=name, stream=stream, device=self.device, cache_dir=self.cache_dir,
+            halo_checkpoint=self.halo_checkpoint, baseline_state=self.states.get(name),
+            halo_state=self.halo_state, cache_read_dirs=self.cache_read_dirs,
+            memory_cache=self.memory_cache, feature_role=role,
+        )
+
+    def bank(self, name: str, window_seconds: float) -> tuple:
+        key = (name, float(window_seconds))
+        if key not in self.banks:
+            self.banks[key] = _build_training_reference_bank(
+                name=name, device=self.device, cache_dir=self.cache_dir,
+                halo_checkpoint=self.halo_checkpoint, halo_state=self.halo_state,
+                baseline_state=self.states.get(name), cache_read_dirs=self.cache_read_dirs,
+                memory_cache=self.memory_cache, window_seconds=float(window_seconds),
+            )
+        return self.banks[key]
+
+    def halo_bridge(self, window_seconds: float) -> np.ndarray:
+        key = float(window_seconds)
+        if key not in self.bridges:
+            bank = self.bank("halo", key)
+            self.bridges[key] = fit_halo_text_bridge(bank[0], bank[1], bank[2], sbert=self.sbert)[0]
+        return self.bridges[key]
+
+    def scores(self, name: str, features: np.ndarray, classes: Sequence[str],
+               window_seconds: float) -> tuple[np.ndarray, dict]:
+        if name == "halo":
+            return zero_shot_scores(name=name, features=features, candidates=classes, device=self.device,
+                                    halo_bridge=self.halo_bridge(window_seconds), sbert=self.sbert)
+        if name in TRAINING_BANK_ZERO_SHOT:
+            return zero_shot_scores(name=name, features=features, candidates=classes, device=self.device,
+                                    bank=self.bank(name, window_seconds))
+        return zero_shot_scores(name=name, features=features, candidates=classes, device=self.device,
+                                adapter_state=self.states[name])
+
+    def score_fn(self, name: str, classes: Sequence[str], window_seconds: float):
+        classes = list(classes)
+        return lambda features: self.scores(name, features, classes, window_seconds)[0]
