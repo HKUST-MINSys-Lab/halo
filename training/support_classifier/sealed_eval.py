@@ -76,7 +76,40 @@ from training.tokenizer.pretrain_data import (
     stream_channel_descriptions, stream_sensor_texts, structured_sensor_metadata,
 )
 
-SEED = 20260912
+# Shared evaluation modules, extracted 2026-09-23 (Phase 0 of the rung 1/2 implementation plan).
+# Re-exported so existing imports and test monkeypatches of ``sealed_eval.<name>`` keep working;
+# sealed_eval must never be imported by ``evaluation/`` (one-way dependency).
+from evaluation.features import (
+    FEATURE_CACHE_SCHEMA,
+    FeatureMemoryCache,
+    UNCHANGED_BASELINE_FEATURE_CACHE_SCHEMA,
+    _baseline_feature_state,
+    _cache_key,
+    _file_hash,
+    _file_hash_for_stat,
+    _halo_features,
+    _load_or_encode,
+    feature_cache_schema,
+)
+from evaluation.manifests import (
+    QueryPlan,
+    SEED,
+    _aligned_labels,
+    _stable_choice,
+    build_manifest,
+    duration_cells,
+    evaluation_cells,
+    manifest_fingerprint,
+    sealed_cells,
+)
+from evaluation.zero_shot import (
+    TRAINING_BANK_ZERO_SHOT,
+    _build_training_reference_bank,
+    _normalise,
+    _training_bank_conse_predictions,
+)
+from evaluation.provenance import _atomic_json, _run_provenance, validate_result_rows
+
 # Full enrollment curve. All six sealed sources have at least 128 execution-disjoint
 # support windows per candidate for every currently valid query (verified 2026-09-12).
 # ``build_manifest`` still fails closed per query if a future corpus revision no longer
@@ -102,78 +135,9 @@ _PARAMETER_BREAKDOWN_M = {
 _HALO_CLASSIFIER_PARAMETER_CACHE: dict[str, int] = {}
 _HALO_RESIDUAL_HEAD_CACHE: dict[tuple[str, str, bool, bool], torch.nn.Module] = {}
 _HALO_ACQUISITION_VECTOR_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
-TRAINING_BANK_ZERO_SHOT = frozenset({"halo", "harnet5", "harnet10", "limubert_x"})
-# Bump whenever feature extraction semantics, cache inputs, or pooling changes.  This avoids
-# treating an old embedding array as valid after a code-only correction.
-# v6 includes the acquisition-conditioning schema in the encoder reconstruction contract. v5
-# caches cannot distinguish historical combined sensor prose from v2 device/placement text.
-FEATURE_CACHE_SCHEMA = "sealed-feature-v6-20260918"
-UNCHANGED_BASELINE_FEATURE_CACHE_SCHEMA = "sealed-feature-v5-20260916"
 
 
-def feature_cache_schema(model_name: str) -> str:
-    """Invalidate HALO text-conditioned features without discarding unchanged baseline work."""
-    return (FEATURE_CACHE_SCHEMA if model_name == "halo"
-            else UNCHANGED_BASELINE_FEATURE_CACHE_SCHEMA)
 MAX_EXACT_RIDGE_SYSTEM = 512
-
-
-class FeatureMemoryCache:
-    """Bounded process-local cache for repeatedly referenced feature matrices.
-
-    Scenario cells intentionally reuse the same immutable stream under several perturbation and
-    support conditions.  Keeping recently used arrays avoids repeated ``np.load`` calls without
-    making evaluation memory grow with the complete experiment.
-    """
-
-    def __init__(self, max_bytes: int = 2 * 1024**3):
-        if max_bytes < 0:
-            raise ValueError("feature memory-cache size must be non-negative")
-        self.max_bytes = int(max_bytes)
-        self._bytes = 0
-        self._values: OrderedDict[str, np.ndarray] = OrderedDict()
-        self._stream_fingerprints: dict[int, tuple[weakref.ReferenceType, str]] = {}
-
-    def stream_fingerprint(self, stream) -> str:
-        identity = id(stream)
-        cached = self._stream_fingerprints.get(identity)
-        if cached is not None and cached[0]() is stream:
-            return cached[1]
-        value = source_slice_fingerprint(stream)
-        try:
-            reference = weakref.ref(
-                stream,
-                lambda ref, key=identity: self._drop_stream_fingerprint(key, ref),
-            )
-        except TypeError:
-            # Extension-owned stream wrappers need not support weak references. Recomputing their
-            # fingerprint is preferable to retaining an unbounded strong-reference side cache.
-            return value
-        self._stream_fingerprints[identity] = (reference, value)
-        return value
-
-    def _drop_stream_fingerprint(self, identity: int, reference: weakref.ReferenceType) -> None:
-        cached = self._stream_fingerprints.get(identity)
-        if cached is not None and cached[0] is reference:
-            del self._stream_fingerprints[identity]
-
-    def get(self, key: str) -> np.ndarray | None:
-        value = self._values.pop(key, None)
-        if value is not None:
-            self._values[key] = value
-        return value
-
-    def put(self, key: str, value: np.ndarray) -> None:
-        if self.max_bytes == 0 or value.nbytes > self.max_bytes:
-            return
-        previous = self._values.pop(key, None)
-        if previous is not None:
-            self._bytes -= previous.nbytes
-        self._values[key] = value
-        self._bytes += value.nbytes
-        while self._bytes > self.max_bytes:
-            _, evicted = self._values.popitem(last=False)
-            self._bytes -= evicted.nbytes
 
 
 def _native_capabilities(name: str) -> dict[str, bool]:
@@ -230,234 +194,6 @@ def _parameter_count_m(
             )
         count += _HALO_CLASSIFIER_PARAMETER_CACHE[cache_key]
     return count / 1_000_000.0
-
-
-@dataclass(frozen=True)
-class QueryPlan:
-    """One query and its execution-disjoint enrolled rows for every candidate."""
-
-    query: int
-    support: tuple[int, ...]
-    support_labels: tuple[str, ...]
-
-
-def sealed_cells(scope: str = "sealed") -> tuple[tuple[str, str], ...]:
-    """Resolve one declared evaluation scope without admitting caller-supplied datasets."""
-    if scope == "sealed":
-        datasets = SEALED_TEST_EVAL_DATASETS
-    elif scope == "prospective":
-        datasets = PROSPECTIVE_EVAL_DATASETS
-    else:
-        raise ValueError(f"unknown evaluation scope {scope!r}")
-    return tuple(
-        (dataset, spec.stream_id)
-        for dataset in datasets
-        for spec in stream_specs(dataset, "primary")
-    )
-
-
-def duration_cells(window_seconds: Sequence[float], *, scope: str = "sealed") -> tuple[tuple[float, str, str], ...]:
-    """Expand one declared roster over evidence budgets deterministically."""
-    return tuple(
-        (float(duration), dataset, stream)
-        for duration in sorted(set(window_seconds))
-        for dataset, stream in sealed_cells(scope)
-    )
-
-
-def evaluation_cells(
-    window_seconds: Sequence[float], *, scope: str = "sealed",
-) -> tuple[tuple[float, str, str, tuple[str, ...]], ...]:
-    """Single placements plus declared composites for the requested protocol scope."""
-    singles = [
-        (duration, dataset, stream, ())
-        for duration, dataset, stream in duration_cells(window_seconds, scope=scope)
-    ]
-    if scope != "sealed":
-        return tuple(singles)
-    composites = [
-        (float(duration), cell.dataset, cell.cell_id, tuple(cell.stream_ids))
-        for duration in sorted(set(window_seconds))
-        for cell in MULTI_DEVICE_EVAL_CELLS
-        if cell.dataset in SEALED_TEST_EVAL_DATASETS
-    ]
-    return tuple(singles + composites)
-
-
-def _aligned_labels(stream: EvalStream) -> np.ndarray:
-    return np.asarray(
-        scoring.align_ground_truth_labels(stream.gt, stream.eval_labels), dtype=object,
-    )
-
-
-def _stable_choice(values: np.ndarray, count: int, *, seed_parts: Sequence[object]) -> np.ndarray:
-    values = np.asarray(values, dtype=np.int64)
-    if count < 0 or count > len(values):
-        raise ValueError("choice count must lie within the available pool")
-    digest = hashlib.sha256("|".join(map(str, seed_parts)).encode()).digest()
-    rng = np.random.default_rng(int.from_bytes(digest[:8], "little"))
-    # The exact NumPy draw is frozen protocol behavior. Optimize manifest reuse, not the mapping
-    # from a public seed to episode rows.
-    return np.asarray(rng.choice(values, size=count, replace=False), dtype=np.int64)
-
-
-def build_manifest(
-    stream: EvalStream,
-    k: int,
-    *,
-    seed: int = SEED,
-    query_rows: Sequence[int] | None = None,
-    support_rows: Sequence[int] | None = None,
-) -> list[QueryPlan]:
-    """Create execution-disjoint target-dataset episodes without looking at representations.
-
-    Each target candidate receives exactly k labelled support *windows* from a different physical
-    execution than the query.  The candidate roster is always the frozen native vocabulary.  A
-    query is omitted when that honest episode cannot be formed; this is reported rather than
-    padded or silently relaxed.
-    """
-    if k < 0:
-        raise ValueError("k must be non-negative")
-    n_rows = stream.n_windows
-    query_allowed = (np.arange(n_rows, dtype=np.int64) if query_rows is None
-                     else np.asarray(query_rows, dtype=np.int64))
-    support_allowed = (np.arange(n_rows, dtype=np.int64) if support_rows is None
-                       else np.asarray(support_rows, dtype=np.int64))
-    for name, rows in (("query", query_allowed), ("support", support_allowed)):
-        if rows.ndim != 1 or np.any(rows < 0) or np.any(rows >= n_rows):
-            raise ValueError(f"{name}_rows are outside the stream")
-        if len(np.unique(rows)) != len(rows):
-            raise ValueError(f"{name}_rows contain duplicates")
-    if k == 0:
-        labels = _aligned_labels(stream)
-        return [QueryPlan(query=int(i), support=(), support_labels=())
-                for i in query_allowed if labels[i] in stream.eval_labels]
-    if not stream.execution_identity_known or stream.execution_ids is None:
-        raise ValueError(
-            f"{stream.dataset}/{stream.stream}: execution identity is unavailable; refusing "
-            "enrollment evaluation that could leak a recording into its own support set"
-        )
-    labels = _aligned_labels(stream)
-    valid = np.flatnonzero(labels != None)  # noqa: E711 - object-array comparison is intentional
-    query_valid = query_allowed[labels[query_allowed] != None]  # noqa: E711
-    plans: list[QueryPlan] = []
-    candidates = tuple(stream.eval_labels)
-    # Index once. The original direct expression scanned every valid row for every
-    # (query, candidate) pair, which turns the optional high-k curve into needless quadratic CPU
-    # work. A candidate-local index preserves exactly the same execution-disjoint rule.
-    label_rows = {
-        label: support_allowed[labels[support_allowed] == label]
-        for label in candidates
-    }
-    label_execution = {
-        label: np.asarray(stream.execution_ids[rows], dtype=object)
-        for label, rows in label_rows.items()
-    }
-    execution_pools: dict[tuple[str, object], np.ndarray] = {}
-    for query in query_valid.tolist():
-        q_execution = stream.execution_ids[query]
-        support: list[int] = []
-        support_labels: list[str] = []
-        possible = True
-        for label in candidates:
-            rows = label_rows[label]
-            pool_key = (label, q_execution)
-            pool = execution_pools.get(pool_key)
-            if pool is None:
-                pool = rows[label_execution[label] != q_execution]
-                execution_pools[pool_key] = pool
-            if len(pool) < k:
-                possible = False
-                break
-            picked = _stable_choice(
-                pool, k, seed_parts=(seed, stream.dataset, stream.stream, k, query, label),
-            )
-            support.extend(int(value) for value in picked)
-            support_labels.extend([label] * k)
-        if possible:
-            plans.append(QueryPlan(query=query, support=tuple(support),
-                                   support_labels=tuple(support_labels)))
-    return plans
-
-
-def manifest_fingerprint(plans: Iterable[QueryPlan]) -> str:
-    payload = [asdict(plan) for plan in plans]
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-
-
-def _normalise(rows: np.ndarray) -> np.ndarray:
-    rows = np.asarray(rows, dtype=np.float32)
-    return rows / np.maximum(np.linalg.norm(rows, axis=1, keepdims=True), np.float32(1e-12))
-
-
-@torch.no_grad()
-def _training_bank_conse_predictions(
-    query_features: np.ndarray,
-    reference_features: np.ndarray,
-    reference_label_ids: np.ndarray,
-    train_labels: Sequence[str],
-    target_labels: Sequence[str],
-    device: torch.device,
-    *,
-    query_batch_size: int = 1024,
-    reference_batch_size: int = 32768,
-    return_scores: bool = False,
-) -> tuple[list[str] | np.ndarray, dict]:
-    """Bridge a training-bank nearest neighbour onto an unseen candidate vocabulary.
-
-    ``k=0`` means zero *target-dataset enrollment*, not zero prior labelled evidence. The closest
-    training-corpus recording supplies a distribution over the fixed training vocabulary; ConSE
-    then maps that distribution to the target label strings. Chunking the exact matrix search
-    bounds VRAM without changing the selected neighbour.
-    """
-    query = _normalise(query_features).astype(np.float32, copy=False)
-    reference = _normalise(reference_features).astype(np.float32, copy=False)
-    label_ids = np.asarray(reference_label_ids, dtype=np.int64)
-    if reference.ndim != 2 or query.ndim != 2 or reference.shape[1] != query.shape[1]:
-        raise ValueError("query and training-bank features must be matching matrices")
-    if label_ids.shape != (len(reference),) or not len(reference):
-        raise ValueError("training-bank labels must align with a non-empty feature matrix")
-    if label_ids.min() < 0 or label_ids.max() >= len(train_labels):
-        raise ValueError("training-bank label id outside the declared training vocabulary")
-
-    nearest: list[np.ndarray] = []
-    reference_device = [
-        torch.as_tensor(reference[start:start + reference_batch_size], device=device)
-        for start in range(0, len(reference), reference_batch_size)
-    ]
-    for start in range(0, len(query), query_batch_size):
-        q = torch.as_tensor(query[start:start + query_batch_size], device=device)
-        best_score = torch.full((len(q),), -torch.inf, device=device)
-        best_row = torch.zeros((len(q),), dtype=torch.long, device=device)
-        offset = 0
-        for block in reference_device:
-            score, row = (q @ block.T).max(dim=1)
-            replace = score > best_score
-            best_score = torch.where(replace, score, best_score)
-            best_row = torch.where(replace, row + offset, best_row)
-            offset += len(block)
-        nearest.append(best_row.cpu().numpy())
-    nearest_rows = np.concatenate(nearest)
-    probs = np.zeros((len(query), len(train_labels)), dtype=np.float32)
-    probs[np.arange(len(query)), label_ids[nearest_rows]] = 1.0
-    if return_scores:
-        output: list[str] | np.ndarray = scoring.conse_score_matrix(
-            probs, train_labels, target_labels, top_T=1,
-        )
-        info = {"top_T": 1}
-    else:
-        output, info = scoring.conse_predict(probs, train_labels, target_labels, top_T=1)
-    info.update({
-        "zero_support_protocol": "training_bank_1nn_conse_v1",
-        "reference_rows": int(len(reference)),
-        "reference_labels": int(len(np.unique(label_ids))),
-    })
-    del reference_device
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-    return output, info
 
 
 def _readout_predictions(
@@ -704,69 +440,6 @@ def _metric_row(
         "source_slice_fingerprint": source_slice_fingerprint(stream),
     })
     return metrics
-
-
-def _cache_key(
-    name: str,
-    stream: EvalStream,
-    fingerprint: str,
-    *,
-    source_fingerprint: str | None = None,
-    feature_role: str = "enrollment",
-) -> str:
-    devices = tuple(getattr(stream, "device_ids", (stream.stream,)))
-    source_fingerprint = source_fingerprint or source_slice_fingerprint(stream)
-    text = (f"{feature_cache_schema(name)}|{feature_role}|{name}|{stream.dataset}|{stream.stream}|{stream.alignment}|"
-            f"{stream.window_seconds:g}|{devices}|{fingerprint}|{source_fingerprint}")
-    return hashlib.sha256(text.encode()).hexdigest()[:16]
-
-
-@lru_cache(maxsize=128)
-def _file_hash_for_stat(path_text: str, size: int, mtime_ns: int, ctime_ns: int) -> str:
-    del size, mtime_ns, ctime_ns  # Cache-key material; digest covers the complete file.
-    digest = hashlib.sha256()
-    with Path(path_text).open("rb") as handle:
-        for block in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _file_hash(path: Path) -> str:
-    path = Path(path).resolve()
-    stat = path.stat()
-    # ctime closes the practical stale-cache hole where a tool preserves mtime while replacing a
-    # same-sized checkpoint. It changes on inode metadata/content replacement on this platform.
-    return _file_hash_for_stat(str(path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
-
-
-def _halo_features(
-    stream: EvalStream,
-    checkpoint: Path,
-    device: torch.device,
-    state: tuple[torch.nn.Module, str] | None = None,
-) -> tuple[np.ndarray, str]:
-    if state is None:
-        blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
-        encoder = build_encoder(blob, device).eval()
-        fingerprint = _file_hash(checkpoint)
-    else:
-        encoder, fingerprint = state
-    if isinstance(stream, MultiDeviceEvalStream):
-        features = encode_multi_device_dataset(
-            encoder, stream.devices, device,
-            amp_dtype=torch.bfloat16 if device.type == "cuda" else None,
-        )
-    else:
-        features = encode_dataset(
-            encoder, stream.windows, stream_channel_descriptions(stream.dataset, stream.stream), device,
-            stream.rate_hz, _stream_gravity_state(stream.dataset, stream.stream),
-            channel_mask=stream.mask, dataset=stream.dataset, stream=stream.stream,
-            source_rate=(stream.effective_source_rate_hz
-                         if stream.effective_source_rate_hz is not None else None),
-            lengths=stream.lengths, amp_dtype=torch.bfloat16 if device.type == "cuda" else None,
-            batch_size=512 if device.type == "cuda" else 256,
-        )
-    return np.asarray(features.cpu(), dtype=np.float32), fingerprint
 
 
 @torch.no_grad()
@@ -1343,277 +1016,6 @@ def _halo_token_mixer_predictions(
     return output
 
 
-def _baseline_feature_state(
-    name: str,
-    stream: EvalStream,
-    device: torch.device,
-    state: dict | None = None,
-    feature_role: str = "enrollment",
-):
-    """Load a released feature provider and fingerprint it without encoding a stream."""
-    adapter = baselines.REGISTRY[name]
-    reason = adapter.incompatibility_for_stream(stream)
-    if reason is not None:
-        raise baselines.UnsupportedEvaluationCell(reason)
-    state = adapter.setup_features(device) if state is None else state
-    fingerprint_key = f"_feature_fingerprint_{feature_cache_schema(name)}_{feature_role}"
-    fingerprint = state.get(fingerprint_key)
-    if fingerprint is None:
-        artifacts = (adapter.native_feature_artifacts(state) if feature_role == "native_zero_shot"
-                     else adapter.feature_artifacts(state))
-        config = (adapter.native_feature_config(state) if feature_role == "native_zero_shot"
-                  else adapter.feature_config(state))
-        fingerprint = hashlib.sha256(json.dumps({
-            "artifacts": {key: _file_hash(Path(path)) for key, path in artifacts.items()},
-            "config": config,
-        }, sort_keys=True, default=str).encode()).hexdigest()
-        state[fingerprint_key] = fingerprint
-    return adapter, state, fingerprint
-
-
-def _load_or_encode(
-    *, name: str, stream: EvalStream, device: torch.device, cache_dir: Path,
-    halo_checkpoint: Path | None, baseline_state: dict | None = None,
-    halo_state: tuple[torch.nn.Module, str] | None = None,
-    cache_read_dirs: Sequence[Path] = (),
-    memory_cache: FeatureMemoryCache | None = None,
-    feature_role: str = "enrollment",
-) -> tuple[np.ndarray, str]:
-    if name == "halo":
-        if halo_checkpoint is None:
-            raise ValueError("--halo-checkpoint is required when model list includes halo")
-        probe = _file_hash(halo_checkpoint)
-    else:
-        # Feature artifacts can be verified only after adapter setup. Do not reuse a baseline
-        # cache under a guessed key; a changed released checkpoint must force re-extraction.
-        adapter, state, probe = _baseline_feature_state(
-            name, stream, device, state=baseline_state, feature_role=feature_role,
-        )
-    source_fingerprint = (memory_cache.stream_fingerprint(stream) if memory_cache is not None
-                          else source_slice_fingerprint(stream))
-    key = _cache_key(name, stream, probe, source_fingerprint=source_fingerprint,
-                     feature_role=feature_role)
-    cache_schema = feature_cache_schema(name)
-    filename = f"{stream.dataset}__{stream.stream}__{name}__{key}.npy"
-    memory_key = f"{name}:{key}"
-    if memory_cache is not None:
-        cached = memory_cache.get(memory_key)
-        if cached is not None:
-            return cached, probe
-
-    roots = (Path(cache_dir), *(Path(root) for root in cache_read_dirs if Path(root) != Path(cache_dir)))
-    for root in roots:
-        candidate = root / filename
-        candidate_meta = candidate.with_suffix(".json")
-        if not candidate.exists() or not candidate_meta.exists():
-            continue
-        meta = json.loads(candidate_meta.read_text())
-        if (meta.get("cache_schema") != cache_schema or meta.get("cache_key") != key
-                or meta.get("n_windows") != stream.n_windows
-                or meta.get("source_slice_fingerprint") != source_fingerprint):
-            continue
-        cached = np.load(candidate)
-        if cached.ndim == 2 and cached.shape[0] == stream.n_windows and np.isfinite(cached).all():
-            if memory_cache is not None:
-                memory_cache.put(memory_key, cached)
-            return cached, str(meta["artifact_fingerprint"])
-    if name == "halo":
-        values, fingerprint = _halo_features(
-            stream, halo_checkpoint, device, state=halo_state,
-        )
-    else:
-        extractor = (adapter.native_zero_shot_features_for_stream
-                     if feature_role == "native_zero_shot" else adapter.features_for_stream)
-        values = np.asarray(extractor(stream, state, device), dtype=np.float32)
-        fingerprint = probe
-    if values.shape[0] != stream.n_windows or values.ndim != 2 or not np.isfinite(values).all():
-        raise ValueError(f"{name}: invalid feature matrix {values.shape} for {stream.dataset}/{stream.stream}")
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    array_path = cache_dir / filename
-    meta_path = array_path.with_suffix(".json")
-    np.save(array_path, values)
-    meta_path.write_text(json.dumps({"cache_schema": cache_schema, "cache_key": key, "n_windows": stream.n_windows,
-                                     "artifact_fingerprint": fingerprint,
-                                     "source_slice_fingerprint": source_fingerprint},
-                                    indent=2) + "\n")
-    if memory_cache is not None:
-        memory_cache.put(memory_key, values)
-    return values, fingerprint
-
-
-def _build_training_reference_bank(
-    *,
-    name: str,
-    device: torch.device,
-    cache_dir: Path,
-    halo_checkpoint: Path | None,
-    halo_state: tuple[torch.nn.Module, str] | None = None,
-    baseline_state: dict | None = None,
-    cache_read_dirs: Sequence[Path] = (),
-    memory_cache: FeatureMemoryCache | None = None,
-    window_seconds: float = 6.0,
-) -> tuple[np.ndarray, np.ndarray, list[str], str]:
-    """Encode the active labelled training roster for zero-target-enrollment scoring."""
-    assert_no_retired_sources(SUPERVISED_HEAD_TRAIN_DATASETS)
-    train_labels = load_global_labels()
-    label_to_id = {label: index for index, label in enumerate(train_labels)}
-    feature_parts: list[np.ndarray] = []
-    label_parts: list[np.ndarray] = []
-    provenance: list[dict] = []
-    excluded: list[dict] = []
-    for dataset in SUPERVISED_HEAD_TRAIN_DATASETS:
-        streams = list_streams(dataset, alignment="native", window_seconds=window_seconds)
-        if not streams:
-            raise FileNotFoundError(f"zero-shot training bank has no native grid for {dataset}")
-        for stream_id in streams:
-            stream = load_eval_stream(
-                dataset, stream_id, alignment="native", apply_quality_screen=True,
-                candidate_labels=train_labels, window_seconds=window_seconds,
-            )
-            if stream.quality_screen != "applied":
-                raise RuntimeError(
-                    f"{dataset}/{stream_id}: quality screen unavailable ({stream.quality_screen})"
-                )
-            aligned = np.asarray(
-                scoring.align_ground_truth_labels(stream.gt, train_labels), dtype=object,
-            )
-            lengths = (
-                np.asarray(stream.lengths, dtype=np.int64)
-                if stream.lengths is not None
-                else np.full(stream.n_windows, stream.windows.shape[1], dtype=np.int64)
-            )
-            eligible_duration = lengths / float(stream.rate_hz) >= MIN_RECORDING_SECONDS
-            keep = np.flatnonzero((aligned != None) & eligible_duration)  # noqa: E711
-            if not len(keep):
-                continue
-            bank_stream = replace(
-                stream,
-                windows=stream.windows[keep],
-                gt=[stream.gt[row] for row in keep],
-                subjects=np.asarray(stream.subjects)[keep],
-                event_ids=(np.asarray(stream.event_ids)[keep] if stream.event_ids is not None else None),
-                execution_ids=(
-                    np.asarray(stream.execution_ids)[keep]
-                    if stream.execution_ids is not None else None
-                ),
-                block_ids=(np.asarray(stream.block_ids)[keep] if stream.block_ids is not None else None),
-                lengths=lengths[keep],
-                perturbation=f"training-bank-min-{MIN_RECORDING_SECONDS:g}s",
-            )
-            if name == "limubert_x":
-                required = ("acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z")
-                channel_index = {channel: index for index, channel in enumerate(bank_stream.channels)}
-                missing = [channel for channel in required if channel not in channel_index]
-                masked = [
-                    channel for channel in required
-                    if channel in channel_index and not bool(bank_stream.mask[channel_index[channel]])
-                ]
-                if missing or masked:
-                    excluded.append({
-                        "dataset": dataset,
-                        "stream": stream_id,
-                        "reason": f"LiMU-BERT-X requires measured six-axis IMU; "
-                                  f"missing={missing}, masked={masked}",
-                    })
-                    continue
-            try:
-                features, fingerprint = _load_or_encode(
-                    name=name,
-                    stream=bank_stream,
-                    device=device,
-                    cache_dir=cache_dir,
-                    halo_checkpoint=halo_checkpoint,
-                    halo_state=halo_state,
-                    baseline_state=baseline_state,
-                    cache_read_dirs=cache_read_dirs,
-                    memory_cache=memory_cache,
-                )
-            except baselines.UnsupportedEvaluationCell as error:
-                excluded.append({"dataset": dataset, "stream": stream_id, "reason": str(error)})
-                continue
-            feature_parts.append(np.asarray(features, dtype=np.float32))
-            label_parts.append(np.asarray([label_to_id[str(aligned[row])] for row in keep], dtype=np.int64))
-            provenance.append({
-                "dataset": dataset,
-                "stream": stream_id,
-                "rows": int(len(keep)),
-                "feature_fingerprint": fingerprint,
-                "quality_excluded": int(stream.n_quality_excluded),
-            })
-    if not feature_parts:
-        raise RuntimeError(f"no valid labelled training references for {name}")
-    features = np.concatenate(feature_parts)
-    labels = np.concatenate(label_parts)
-    fingerprint = hashlib.sha256(json.dumps({
-        "provider": name,
-        "roster": list(SUPERVISED_HEAD_TRAIN_DATASETS),
-        "vocabulary": train_labels,
-        "parts": provenance,
-        "excluded": excluded,
-        "protocol": "training_bank_1nn_conse_v1",
-        "window_seconds": float(window_seconds),
-    }, sort_keys=True).encode()).hexdigest()
-    manifest_dir = cache_dir / "bank_manifests"
-    manifest_dir.mkdir(parents=True, exist_ok=True)
-    duration_token = f"{float(window_seconds):g}".replace(".", "p")
-    (manifest_dir / f"{name}__w{duration_token}.json").write_text(json.dumps({
-        "provider": name,
-        "window_seconds": float(window_seconds),
-        "fingerprint": fingerprint,
-        "vocabulary": train_labels,
-        "included": provenance,
-        "excluded": excluded,
-        "n_rows": int(len(labels)),
-    }, indent=2) + "\n")
-    return features, labels, train_labels, fingerprint
-
-
-def validate_result_rows(
-    rows: Sequence[dict],
-    *,
-    expected_cells: Sequence[tuple[float, str, str]],
-    models: Sequence[str],
-    k_values: Sequence[int],
-) -> None:
-    """Reject incomplete or internally inconsistent result artifacts before publication."""
-    if not rows:
-        raise RuntimeError("sealed evaluation produced no rows")
-    required = {
-        "model", "readout", "window_seconds", "k", "dataset", "stream", "status",
-        "parameters_m", "native_open_set_labels", "native_support_conditioning",
-        "published_few_label_finetuning", "padded", "padded_fraction",
-    }
-    coverage: set[tuple[float, str, str, str, int]] = set()
-    for index, row in enumerate(rows):
-        missing = sorted(required - set(row))
-        if missing:
-            raise RuntimeError(f"result row {index} is missing fields: {missing}")
-        if row["model"] == "harnet":
-            raise RuntimeError("ambiguous model identity 'harnet'; use harnet5 or harnet10")
-        if row["status"] not in {"ok", "n/a"}:
-            raise RuntimeError(f"result row {index} has non-publishable status {row['status']!r}")
-        if not np.isfinite(float(row["padded_fraction"])) or float(row["padded_fraction"]) < 0:
-            raise RuntimeError(f"result row {index} has invalid padding accounting")
-        if row["status"] == "ok":
-            for metric in ("accuracy", "balanced_accuracy", "f1_macro"):
-                if metric in row and not np.isfinite(float(row[metric])):
-                    raise RuntimeError(f"result row {index} has non-finite {metric}")
-        coverage.add((float(row["window_seconds"]), str(row["dataset"]), str(row["stream"]),
-                      str(row["model"]), int(row["k"])))
-    expected = {
-        (float(duration), dataset, stream, model, int(k))
-        for duration, dataset, stream in expected_cells
-        for model in models for k in k_values
-    }
-    missing_cells = sorted(expected - coverage)
-    if missing_cells:
-        preview = missing_cells[:5]
-        raise RuntimeError(
-            f"sealed evaluation is partial: {len(missing_cells)} model/cell/k combinations missing; "
-            f"first={preview}"
-        )
-
-
 def _write_markdown(rows: Sequence[dict], path: Path) -> None:
     columns = ("model", "readout", "window_seconds", "k", "dataset", "stream", "n_devices",
                "multi_device_mode", "padded", "padded_fraction", "f1_macro", "balanced_accuracy",
@@ -1631,44 +1033,6 @@ def _write_markdown(rows: Sequence[dict], path: Path) -> None:
             continue
         lines.append("| " + " | ".join(str(row.get(column, "")) for column in columns) + " |")
     path.write_text("\n".join(lines) + "\n")
-
-
-def _atomic_json(path: Path, value: object) -> None:
-    """Write evaluator state without exposing a partial JSON document to monitors."""
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2, sort_keys=True, default=str) + "\n")
-    os.replace(temporary, path)
-
-
-def _run_provenance(argv: list[str], *, device: torch.device, halo_checkpoint: Path | None) -> dict:
-    """Persist the evaluator revision and model identity beside every sealed result."""
-    try:
-        revision = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL,
-        ).strip()
-        status = subprocess.check_output(
-            ["git", "status", "--porcelain=v1"], text=True, stderr=subprocess.DEVNULL,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        revision, status = None, None
-    checkpoint = halo_checkpoint.resolve() if halo_checkpoint is not None else None
-    return {
-        "protocol": "sealed-support-conditioned-v3-20260920",
-        "argv": argv,
-        "git_revision": revision,
-        "dirty_worktree": bool(status) if status is not None else None,
-        "python": platform.python_version(),
-        "numpy": np.__version__,
-        "torch": torch.__version__,
-        "device": str(device),
-        "halo_checkpoint": str(checkpoint) if checkpoint else None,
-        "halo_checkpoint_sha256": _file_hash(checkpoint) if checkpoint else None,
-        "baseline_adapters": {
-            name: type(baselines.REGISTRY[name]).__qualname__
-            for name in sorted(baselines.REGISTRY)
-        },
-        "feature_cache_schema": FEATURE_CACHE_SCHEMA,
-    }
 
 
 def main() -> None:

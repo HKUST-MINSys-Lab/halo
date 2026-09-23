@@ -38,3 +38,6 @@ namespaces = false
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = [
+    "slow: needs cached sealed artifacts, a golden, or a training run; run explicitly",
+]
