@@ -52,7 +52,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--k", type=int, nargs="+", default=list(DEFAULT_K))
     parser.add_argument("--pool-sizes", nargs="+", default=[str(s) for s in DEFAULT_POOL_SIZES],
-                        help="pool sizes N (integers and/or 'all'); 0 is the inductive anchor")
+                        help="pool sizes N (integers and/or 'all'); N=0 is transduction over the "
+                             "scored set alone, the null of the curve (the inductive anchor is always emitted)")
     parser.add_argument("--scored-fraction", type=float, default=0.2)
     parser.add_argument("--temperature", type=float, default=30.0, help="released config: T 30")
     parser.add_argument("--n-iter", type=int, default=INFERENCE_DEFAULTS["n_iter"])
@@ -78,7 +79,6 @@ def main() -> None:
         memory_cache=FeatureMemoryCache(int(args.feature_memory_cache_gib * 1024**3)),
     )
     pool_sizes: list[int | str] = [s if s == "all" else int(s) for s in args.pool_sizes]
-    pool_sizes = [s for s in pool_sizes if s != 0]                      # 0 is the inductive row
     transduce_kwargs = {"n_iter": args.n_iter, "n_iter_mm": args.n_iter_mm,
                         "early_stop": args.n_iter_mm >= 100, "lam": args.lam}
     cells = [cell for cell in evaluation_cells(args.window_seconds, scope="sealed") if not cell[3]]
@@ -162,25 +162,35 @@ def main() -> None:
     print(f"[rung1] wrote {path} ({len(rows)} rows)")
 
 
+def _dataset_balanced(rows: Sequence[dict]) -> float | None:
+    """Mean over datasets of the per-dataset mean: the sealed table's aggregation."""
+    by_dataset: dict[str, list[float]] = {}
+    for row in rows:
+        by_dataset.setdefault(row["dataset"], []).append(float(row["f1_macro"]))
+    return float(np.mean([np.mean(v) for v in by_dataset.values()])) if by_dataset else None
+
+
 def _write_summary(path: Path, rows: Sequence[dict]) -> None:
     ok = [r for r in rows if r.get("status") == "ok" and r.get("scope") == "scored"
           and r.get("assignment", "identity") == "identity"]
-    lines = ["# Rung 1 — unlabelled adaptation: mean macro-F1 on the scored set vs pool size N", ""]
+    lines = ["# Rung 1 — unlabelled adaptation: dataset-balanced macro-F1 on the scored set vs pool size N",
+             "",
+             "`inductive` is the anchor (zero-shot arg-max at k = 0, embedding prototypes at k > 0) and "
+             "reads a different feature space; the curve's null is `N=0`, the same transductive method "
+             "over the scored set alone.", ""]
     for k in sorted({r["k"] for r in ok}):
         sub = [r for r in ok if r["k"] == k]
-        labels = ["0"] + sorted({r["N_label"] for r in sub if r["method"] != "inductive"},
-                                key=lambda s: (s == "all", int(s) if s != "all" else 0))
-        lines += [f"## k = {k}", "", "| encoder | " + " | ".join(f"N={l}" for l in labels) + " |",
-                  "|---|" + "---:|" * len(labels)]
+        labels = sorted({r["N_label"] for r in sub if r["method"] != "inductive"},
+                        key=lambda s: (s == "all", int(s) if s != "all" else 0))
+        header = ["inductive"] + [f"N={label}" for label in labels]
+        lines += [f"## k = {k}", "", "| encoder | " + " | ".join(header) + " |",
+                  "|---|" + "---:|" * len(header)]
         for encoder in sorted({r["encoder"] for r in sub}):
-            cells = []
-            for label in labels:
-                if label == "0":
-                    values = [r["f1_macro"] for r in sub if r["encoder"] == encoder and r["method"] == "inductive"]
-                else:
-                    values = [r["f1_macro"] for r in sub if r["encoder"] == encoder and r.get("N_label") == label]
-                cells.append(f"{np.mean(values):.1f}" if values else "-")
-            lines.append(f"| {encoder} | " + " | ".join(cells) + " |")
+            mine = [r for r in sub if r["encoder"] == encoder]
+            groups = [[r for r in mine if r["method"] == "inductive"]] \
+                + [[r for r in mine if r.get("N_label") == label] for label in labels]
+            values = [_dataset_balanced(group) for group in groups]
+            lines.append(f"| {encoder} | " + " | ".join("-" if v is None else f"{v:.1f}" for v in values) + " |")
         lines.append("")
     path.write_text("\n".join(lines))
 

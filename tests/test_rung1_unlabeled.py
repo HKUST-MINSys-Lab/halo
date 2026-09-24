@@ -34,6 +34,30 @@ def test_paper_lambda_follows_the_released_integer_division_rule():
     assert float(paper_lambda(6, 50, k_eff=6)) == 50.0   # few-shot: int(C/k_eff)*N
 
 
+@pytest.mark.parametrize("n_classes", [3, 4, 7, 12])
+def test_transduce_defaults_to_lambda_equal_to_n_for_every_roster_size(n_classes):
+    # k_eff defaults to the roster size, so the partition term neither vanishes below five classes
+    # nor doubles at ten; padded roster slots do not count towards the roster.
+    torch.manual_seed(0)
+    z = torch.softmax(torch.randn(2, 9, n_classes + 2), dim=-1)
+    mask = torch.zeros(2, n_classes + 2, dtype=torch.bool)
+    mask[:, :n_classes] = True
+    rows = torch.ones(2, 9, dtype=torch.bool)
+    rows[1, 6:] = False
+    result = transduce(z, candidate_mask=mask, row_mask=rows, n_iter=1, n_iter_mm=2, early_stop=False)
+    assert result.lam.tolist() == [9.0, 6.0]
+
+
+def test_transduce_ignores_an_enclosing_bf16_autocast():
+    torch.manual_seed(0)
+    z = torch.softmax(3 * torch.randn(1, 40, 5), dim=-1)
+    reference = transduce(z, n_iter=3, n_iter_mm=10, early_stop=False)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        autocast_result = transduce(z, n_iter=3, n_iter_mm=10, early_stop=False)
+    assert autocast_result.logits.dtype == torch.float32
+    assert torch.equal(autocast_result.logits, reference.logits)
+
+
 def test_zero_shot_recovers_a_dirichlet_mixture_and_matchings_agree():
     z, y = _dirichlet_mixture()
     preds, u, info = transduce_numpy(z, n_iter=10, n_iter_mm=200, assignment="identity")

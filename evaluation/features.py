@@ -1,7 +1,7 @@
 """Feature extraction and on-disk/in-memory feature caches shared by every rung.
 
 Extracted verbatim from training/support_classifier/sealed_eval.py on 2026-09-23 (Phase 0 of
-docs/journal/2026-09-22-rung1-rung1-implementation-plan.md). sealed_eval re-imports these names.
+docs/journal/2026-09-22-rung1-rung2-implementation-plan.md). sealed_eval re-imports these names.
 """
 
 from __future__ import annotations

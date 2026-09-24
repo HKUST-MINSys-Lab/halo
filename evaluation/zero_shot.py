@@ -1,7 +1,7 @@
 """Zero-target-enrollment scoring: the training-bank ConSE bridge and its reference bank.
 
 Extracted verbatim from training/support_classifier/sealed_eval.py on 2026-09-23 (Phase 0 of
-docs/journal/2026-09-22-rung1-rung1-implementation-plan.md). sealed_eval re-imports these names.
+docs/journal/2026-09-22-rung1-rung2-implementation-plan.md). sealed_eval re-imports these names.
 """
 
 from __future__ import annotations
@@ -251,8 +251,10 @@ def fit_halo_text_bridge(bank_features: np.ndarray, bank_label_ids: np.ndarray,
     """Closed-form ridge from HALO pooled features to frozen SBERT label vectors.
 
     The same map the v4 head initialises ``p_text`` with (``train.fit_text_projection``), fitted
-    here on the training reference bank so HALO enters rung 1 as encoder + bridge — symmetric with
-    the ConSE bridge the representation-tier baselines get — and with no learned head.
+    here on the training reference bank. Since 2026-09-23 it is the **fallback** for HALO-slot
+    checkpoints with no learned text projection (e.g. the neighbours control, corpus-matched arms);
+    a checkpoint that has ``p_text`` is scored through it (:func:`checkpoint_text_projection`),
+    because that is the head the rung-1 training arm is trained through. Rows record which route.
     """
     from training.support_classifier.train import fit_text_projection
 
@@ -266,27 +268,58 @@ def fit_halo_text_bridge(bank_features: np.ndarray, bank_label_ids: np.ndarray,
 
 
 def halo_text_scores(features: np.ndarray, bridge: np.ndarray, candidates: Sequence[str], *,
-                     sbert=None) -> np.ndarray:
+                     sbert=None, bias: np.ndarray | None = None) -> np.ndarray:
+    """Cosine between projected HALO features and SBERT label vectors. ``bridge`` is ``(D, T)``: the
+    ridge map, or the transposed weight of a checkpoint's ``p_text`` (then with its ``bias``)."""
     sbert = sbert or scoring.get_sbert_encoder()
     text = _normalise(np.asarray(sbert(list(candidates)), dtype=np.float32))
-    projected = _normalise(np.asarray(features, dtype=np.float32) @ bridge)
-    return projected @ text.T
+    projected = np.asarray(features, dtype=np.float32) @ bridge
+    if bias is not None:
+        projected = projected + bias
+    return _normalise(projected) @ text.T
+
+
+def checkpoint_text_projection(blob: dict) -> tuple[np.ndarray, np.ndarray] | None:
+    """``(W^T, b)`` of the checkpoint's learned ``p_text``, or ``None`` if it has no learned head.
+
+    ``p_text`` is what HALO's own text path applies to the pooled feature, and it is exactly what the
+    rung-1 training arm optimises through the unrolled transduction
+    (``train.probability_features_torch``). Scoring a checkpoint through a separately refitted ridge
+    bridge instead would evaluate a different head from the one that was trained.
+    """
+    from model.support.factory import build_classifier_from_blob
+
+    if blob.get("classifier") is None:
+        return None
+    head, _ = build_classifier_from_blob(blob, device=torch.device("cpu"))
+    p_text = getattr(head, "p_text", None)
+    if p_text is None:
+        return None
+    weight = p_text.weight.detach().float().numpy().T.copy()
+    bias = None if p_text.bias is None else p_text.bias.detach().float().numpy().copy()
+    return weight, bias
 
 
 def zero_shot_scores(*, name: str, features: np.ndarray, candidates: Sequence[str],
                      device: torch.device, adapter_state: dict | None = None,
                      bank: tuple | None = None, halo_bridge: np.ndarray | None = None,
+                     halo_p_text: tuple[np.ndarray, np.ndarray | None] | None = None,
                      sbert=None) -> tuple[np.ndarray, dict]:
     """(N, C) zero-target-enrollment scores over ``candidates``, higher is better, any provider.
 
     ``features`` must be the representation named by :func:`zero_shot_feature_role`. ``bank`` is
-    the ``_build_training_reference_bank`` tuple for bank-bridge providers; ``halo_bridge`` is the
-    matrix from :func:`fit_halo_text_bridge`.
+    the ``_build_training_reference_bank`` tuple for bank-bridge providers. HALO is scored through its
+    checkpoint's own ``p_text`` (``halo_p_text``, from :func:`checkpoint_text_projection`) when it has
+    one, and otherwise through ``halo_bridge``, the matrix from :func:`fit_halo_text_bridge`.
     """
     candidates = list(candidates)
     if name == "halo":
+        if halo_p_text is not None:
+            weight, bias = halo_p_text
+            return halo_text_scores(features, weight, candidates, sbert=sbert, bias=bias), \
+                {"route": "halo_p_text", "kind": "cosine"}
         if halo_bridge is None:
-            raise ValueError("halo zero-shot scores need a fitted text bridge (fit_halo_text_bridge)")
+            raise ValueError("halo zero-shot scores need p_text or a fitted text bridge (fit_halo_text_bridge)")
         return halo_text_scores(features, halo_bridge, candidates, sbert=sbert), \
             {"route": "halo_text_bridge", "kind": "cosine"}
     if name in TRAINING_BANK_ZERO_SHOT:
@@ -352,11 +385,13 @@ class ProviderScorer:
         self.memory_cache = memory_cache
         self.halo_checkpoint = halo_checkpoint
         self.halo_state = None
+        self.halo_p_text = None
         if "halo" in models:
             if halo_checkpoint is None:
                 raise ValueError("--halo-checkpoint is required when the model list includes halo")
             blob = torch.load(halo_checkpoint, map_location="cpu", weights_only=False)
             self.halo_state = (build_encoder(blob, device).eval(), _file_hash(halo_checkpoint))
+            self.halo_p_text = checkpoint_text_projection(blob)
         self.states = {name: baselines.REGISTRY[name].setup_features(device)
                        for name in models if name != "halo"}
         self.banks: dict[tuple[str, float], tuple] = {}
@@ -398,6 +433,9 @@ class ProviderScorer:
     def scores(self, name: str, features: np.ndarray, classes: Sequence[str],
                window_seconds: float) -> tuple[np.ndarray, dict]:
         if name == "halo":
+            if self.halo_p_text is not None:
+                return zero_shot_scores(name=name, features=features, candidates=classes, device=self.device,
+                                        halo_p_text=self.halo_p_text, sbert=self.sbert)
             return zero_shot_scores(name=name, features=features, candidates=classes, device=self.device,
                                     halo_bridge=self.halo_bridge(window_seconds), sbert=self.sbert)
         if name in TRAINING_BANK_ZERO_SHOT:

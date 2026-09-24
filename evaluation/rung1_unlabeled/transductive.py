@@ -22,7 +22,17 @@ Batched over tasks ``(B, N, C)``; padded roster slots are excluded exactly throu
 autograd, so with ``early_stop=False`` and fixed iteration counts the whole procedure is a finite
 differentiable graph — that is what Phase 4 unrolls.
 
-Disclosed deviation: at zero-shot, the reference initialises ``u`` from the probability features
+Disclosed deviation (partition weight, 2026-09-23): the reference sets ``lambda = int(C / k_eff) * N``
+at few-shot and ``int(C / 5) * N`` at zero-shot, where ``C`` is the label space the probabilities range
+over (1,000 for ImageNet) and ``k_eff`` the number of classes actually present in a task (3-10 in its
+sampler; the zero-shot 5 is a fixed guess of it). Our label space *is* the declared roster, and the
+rung-1 regime is "roster known, all of it deployed", so the non-oracle value of ``k_eff`` is the roster
+size and ``lambda = N`` at every k. Porting the integer-division rule verbatim instead would switch the
+partition term off for rosters under five classes and double it at ten or more — a dependence on
+roster size that nothing in the method motivates. ``paper_lambda`` still implements the reference
+rule for any explicit ``k_eff``.
+
+Disclosed deviation (cluster assignment): at zero-shot, the reference initialises ``u`` from the probability features
 (component k starts as class k) and *still* re-assigns clusters to classes afterwards by graph
 matching on cluster prototypes (paper §4.3). Here ``assign_clusters(mode="identity")`` keeps the
 initial identity (differentiable, needed for training) and ``mode="graph"`` / ``"basic"`` port the
@@ -45,14 +55,14 @@ INFERENCE_DEFAULTS = {"n_iter": 20, "n_iter_mm": 1000, "early_stop": True}
 UNROLL_DEFAULTS = {"n_iter": 5, "n_iter_mm": 20, "early_stop": False}
 
 
-def paper_lambda(n_classes: torch.Tensor | int, n_query: torch.Tensor | int, *, k_eff: int | None = None) -> torch.Tensor:
-    """The released code's rule: zero-shot ``int(C/5) * N``; few-shot ``int(C/k_eff) * N``.
-
-    Note the integer division: for a roster of fewer than five classes the zero-shot rule gives
-    ``lambda = 0`` and the partition term vanishes. Recorded in provenance rather than "fixed".
-    """
+def paper_lambda(n_classes: torch.Tensor | int, n_query: torch.Tensor | int, *,
+                 k_eff: torch.Tensor | int | None = None) -> torch.Tensor:
+    """The released code's rule ``int(C / k_eff) * N``, with ``k_eff = 5`` when omitted (its
+    zero-shot constant). :func:`transduce` passes ``k_eff = C`` (see the module docstring), so the
+    rule as used here is ``lambda = N``; an explicit ``k_eff`` reproduces the reference exactly,
+    including its integer division (``C < k_eff`` gives ``lambda = 0``)."""
     c = torch.as_tensor(n_classes, dtype=torch.float32)
-    divisor = 5 if k_eff is None else int(k_eff)
+    divisor = torch.as_tensor(5 if k_eff is None else k_eff, dtype=torch.float32, device=c.device)
     return torch.floor(c / divisor) * torch.as_tensor(n_query, dtype=torch.float32, device=c.device)
 
 
@@ -116,15 +126,32 @@ def transduce(
     n_iter_mm: int = 1000,
     early_stop: bool = True,
     lam: torch.Tensor | float | None = None,
-    k_eff: int | None = None,
+    k_eff: torch.Tensor | int | None = None,
 ) -> Transduction:
     """Run EM-Dirichlet over a batch of tasks.
 
     ``z``: ``(B, N, C)`` probability features of the unlabelled pool (rows sum to 1 over valid
     slots). ``candidate_mask``: ``(B, C)`` bool, valid roster slots (default all). ``support_z`` /
     ``support_onehot``: ``(B, S, C)`` labelled supports for the few-shot variant, or ``None`` for
-    zero-shot. ``lam``: partition weight; ``None`` applies :func:`paper_lambda`.
+    zero-shot. ``lam``: partition weight; ``None`` applies :func:`paper_lambda` with ``k_eff``, which
+    defaults to each task's roster size (``lambda = N``; see the module docstring).
+
+    Always computed in float32 with autocast disabled: the reference runs in float32, and the
+    log-gamma / digamma terms and the log-density einsums lose the assignment signal in bf16.
     """
+    if torch.is_autocast_enabled(z.device.type):
+        with torch.autocast(device_type=z.device.type, enabled=False):
+            return transduce(
+                z.float(), candidate_mask=candidate_mask, row_mask=row_mask,
+                support_z=None if support_z is None else support_z.float(),
+                support_onehot=None if support_onehot is None else support_onehot.float(),
+                n_iter=n_iter, n_iter_mm=n_iter_mm, early_stop=early_stop, lam=lam, k_eff=k_eff,
+            )
+    z = z.float()
+    if support_z is not None:
+        support_z = support_z.float()
+    if support_onehot is not None:
+        support_onehot = support_onehot.float()
     if z.ndim != 3:
         raise ValueError("z must be (B, N, C)")
     B, N, C = z.shape
@@ -149,7 +176,9 @@ def transduce(
         log_s = torch.log(support_z.clamp_min(0) + EPS) * dim_mask
         y_s_sum = support_onehot.sum(dim=1)                                     # (B, C)
     if lam is None:
-        lam_t = paper_lambda(mask.sum(-1), n_valid, k_eff=k_eff).to(device=z.device, dtype=z.dtype)
+        roster = mask.sum(-1)
+        lam_t = paper_lambda(roster, n_valid, k_eff=roster if k_eff is None else k_eff) \
+            .to(device=z.device, dtype=z.dtype)
     else:
         lam_t = torch.as_tensor(lam, dtype=z.dtype, device=z.device).expand(B).clone()
     neg_inf = torch.finfo(z.dtype).min

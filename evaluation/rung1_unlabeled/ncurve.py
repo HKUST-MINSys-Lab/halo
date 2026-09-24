@@ -6,7 +6,8 @@ drawn. So per cell the queries are split **by physical execution** into a scored
 a pool P (80 %); nested subsets P_50 ⊂ P_100 ⊂ … ⊂ P are drawn once from a seeded permutation;
 transduction runs over S ∪ P_N; every metric is computed on S only.
 
-* N = 0 is **inductive** — no transduction at all — and at k = 0 must reproduce the published
+* The **inductive anchor** (``method="inductive"``, recorded with N = 0) involves no transduction at
+  all, and at k = 0 must reproduce the published
   sealed zero-shot rule on the same windows (the arg-max of the zero-shot scores). That is the
   self-consistency check, also emitted over *all* windows so it can be compared row for row with
   the sealed results file.
@@ -15,6 +16,12 @@ transduction runs over S ∪ P_N; every metric is computed on S only.
   the sealed manifest's per-query support sets. The inductive k > 0 readout at N = 0 is the
   normalised class-prototype rule the sealed table calls ``prototype``, on that shared set; it is
   the same readout, not the same draw, and is labelled as such.
+* The inductive row is an **anchor**, not the null of the curve. It reads a different space (the
+  zero-shot arg-max, or embedding prototypes at k > 0) from every transductive row (simplex
+  probability features), so "gain over inductive" mixes a change of feature space with the effect
+  of the pool. The curve's null is the transductive row at **N = 0**: EM-Dirichlet over S alone
+  (plus the k supports), same method, same features, no pool. Pass ``0`` in ``pool_draws`` to get
+  it; "does accuracy rise with unlabelled data" is read against that row.
 """
 
 from __future__ import annotations
@@ -184,8 +191,7 @@ def run_cell(
                      **metrics_on(split.scored, inductive), "n_scored": int(len(split.scored)),
                      "n_support": int(len(support_rows)), "score_kind": score_kind, **feature_info})
         for label, drawn in pool_draws.items():
-            pool_n = np.asarray([r for r in drawn if r in set(pool_available.tolist())], dtype=np.int64) \
-                if len(support_rows) else drawn
+            pool_n = drawn[np.isin(drawn, pool_available)] if len(support_rows) else drawn
             if pool_filter is not None:
                 pool_n = pool_filter(pool_n)
             task_rows = np.concatenate([split.scored, pool_n])

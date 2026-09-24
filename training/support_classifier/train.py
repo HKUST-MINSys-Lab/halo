@@ -574,6 +574,9 @@ def pooled_episode_logits(
     from evaluation.rung1_unlabeled.transductive import transduce
 
     B, C = candidate_mask.shape
+    # A support whose label is off the roster (bound -1) has no class to vote for; clamping its
+    # bound would silently relabel it as candidate 0.
+    support_mask = support_mask & (support_bound >= 0)
     if mode == "transductive":
         rows = torch.cat([query.unsqueeze(1), pool_feature], dim=1)                     # (B, 1 + P, D)
         row_mask = torch.cat([torch.ones((B, 1), dtype=torch.bool, device=query.device), pool_mask], dim=1)
