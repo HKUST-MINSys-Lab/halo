@@ -22,7 +22,7 @@ import torch
 from baselines import scoring
 from baselines.data import load_eval_stream, load_multi_device_stream, source_slice_fingerprint
 from halo.paths import CACHE_DIR
-from training.support_classifier.sealed_eval import (
+from evaluation.rung2_frozen.sealed_eval import (
     SEED, _aligned_labels, _differentiable_neighbor_predictions, _readout_predictions,
     _neighbor_prototype_predictions_batched, _normalise, build_manifest, evaluation_cells,
 )

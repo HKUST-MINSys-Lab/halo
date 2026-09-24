@@ -14,8 +14,8 @@ from sklearn.metrics import accuracy_score, f1_score, recall_score
 from baselines.data import EvalStream, source_slice_fingerprint
 from baselines.scoring import paired_subject_bootstrap_difference
 from training.support_classifier.partial_coverage import zscore
-from training.support_classifier.run_scenarios import _PairedDeltaTracker, _paired_deltas
-from training.support_classifier.sealed_eval import (
+from evaluation.rung2_frozen.run_scenarios import _PairedDeltaTracker, _paired_deltas
+from evaluation.rung2_frozen.sealed_eval import (
     FEATURE_CACHE_SCHEMA,
     UNCHANGED_BASELINE_FEATURE_CACHE_SCHEMA,
     FeatureMemoryCache,

@@ -148,8 +148,8 @@ def test_checkpoint_factory_round_trip_is_exact():
 
 
 def test_sealed_scorer_requires_and_uses_aligned_acquisition_rows(tmp_path, monkeypatch):
-    from training.support_classifier import sealed_eval
-    from training.support_classifier.sealed_eval import QueryPlan
+    from evaluation.rung2_frozen import sealed_eval
+    from evaluation.rung2_frozen.sealed_eval import QueryPlan
 
     head = _head().eval()
     checkpoint = tmp_path / "contextual-residual.pt"

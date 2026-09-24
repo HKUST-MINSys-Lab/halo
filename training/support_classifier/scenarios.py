@@ -29,7 +29,7 @@ from scipy.signal import resample_poly
 from baselines.data import EvalStream
 from data.scripts.labels.canonical_labels import canonicalize
 
-from .sealed_eval import QueryPlan, _aligned_labels, _stable_choice
+from evaluation.manifests import QueryPlan, _aligned_labels, _stable_choice
 
 __all__ = [
     "GYRO_PREFIXES",

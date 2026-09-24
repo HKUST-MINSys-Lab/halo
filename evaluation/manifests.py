@@ -1,6 +1,6 @@
 """Sealed-cell rosters and execution-disjoint episode manifests shared by every rung.
 
-Extracted verbatim from training/support_classifier/sealed_eval.py on 2026-09-23 (Phase 0 of
+Extracted verbatim from evaluation/rung2_frozen/sealed_eval.py on 2026-09-23 (Phase 0 of
 docs/journal/2026-09-22-rung1-rung2-implementation-plan.md). sealed_eval re-imports these names.
 """
 

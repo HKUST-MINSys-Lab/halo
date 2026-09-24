@@ -213,8 +213,8 @@ def test_factory_round_trip_is_strict_and_rejects_residual_ablation_flags(tmp_pa
 
 def test_evaluator_gathers_off_roster_support_labels_without_candidate_binding(tmp_path):
     """Sealed/scenario readout must accept a support label outside the candidate roster."""
-    from training.support_classifier import sealed_eval
-    from training.support_classifier.sealed_eval import QueryPlan
+    from evaluation.rung2_frozen import sealed_eval
+    from evaluation.rung2_frozen.sealed_eval import QueryPlan
     try:
         table = sealed_eval.make_label_text(("walking", "sitting"), torch.device("cpu"))
     except Exception as error:  # pragma: no cover - text model unavailable in this environment

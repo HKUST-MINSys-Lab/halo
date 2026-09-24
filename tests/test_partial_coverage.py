@@ -16,7 +16,7 @@ from training.support_classifier.partial_coverage import (
     truth_split,
     zscore,
 )
-from training.support_classifier.sealed_eval import (
+from evaluation.rung2_frozen.sealed_eval import (
     PRIMARY_BASELINES,
     TRAINING_BANK_ZERO_SHOT,
     QueryPlan,
@@ -255,7 +255,7 @@ class _FakeStream:
 
 
 def _patch_labels(monkeypatch, truth):
-    import training.support_classifier.run_partial_coverage as runner
+    import evaluation.rung2_frozen.run_partial_coverage as runner
     monkeypatch.setattr(runner, "_aligned_labels",
                         lambda stream: np.asarray(stream.gt, dtype=object))
     return runner

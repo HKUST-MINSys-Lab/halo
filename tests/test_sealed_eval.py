@@ -11,7 +11,7 @@ from model.blocks import AttentionSpec
 from model.support.residual_classifier import ResidualClassifierConfig, ResidualSupportClassifier
 from model.support.token_mixer import SupportTokenMixer, TokenMixerConfig
 from training.support_classifier.neighbors import differentiable_neighbor_logits
-from training.support_classifier.sealed_eval import (
+from evaluation.rung2_frozen.sealed_eval import (
     DEFAULT_K,
     _halo_residual_diagnostic_predictions,
     _halo_token_mixer_predictions,
@@ -85,7 +85,7 @@ def _stream() -> EvalStream:
 def test_neighbor_checkpoint_zero_support_is_visible_in_results(tmp_path, monkeypatch):
     import json
     import sys
-    from training.support_classifier import sealed_eval as runner
+    from evaluation.rung2_frozen import sealed_eval as runner
 
     checkpoint = tmp_path / "neighbors.pt"
     torch.save({"config": {}, "classifier": None}, checkpoint)
@@ -196,7 +196,7 @@ def test_k_zero_uses_training_bank_neighbor_before_conse(monkeypatch):
         captured["top_T"] = top_T
         return [target_labels[index] for index in probs.argmax(axis=1)], {}
 
-    monkeypatch.setattr("training.support_classifier.sealed_eval.scoring.conse_predict", fake_conse)
+    monkeypatch.setattr("evaluation.rung2_frozen.sealed_eval.scoring.conse_predict", fake_conse)
     prediction, info = _training_bank_conse_predictions(
         np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32),
         np.asarray([[0.9, 0.1], [0.1, 0.9], [-1.0, 0.0]], dtype=np.float32),
@@ -226,7 +226,7 @@ def test_training_bank_can_return_the_same_pre_argmax_conse_scores(monkeypatch):
         return expected
 
     monkeypatch.setattr(
-        "training.support_classifier.sealed_eval.scoring.conse_score_matrix", fake_scores,
+        "evaluation.rung2_frozen.sealed_eval.scoring.conse_score_matrix", fake_scores,
     )
     scores, info = _training_bank_conse_predictions(
         np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32),
@@ -260,7 +260,7 @@ def test_halo_token_mixer_uses_the_same_enrolled_manifest(tmp_path, monkeypatch)
         def ids(labels):
             return [{"a": 0, "b": 1, "c": 2}[label] for label in labels]
 
-    monkeypatch.setattr("training.support_classifier.sealed_eval.make_label_text",
+    monkeypatch.setattr("evaluation.rung2_frozen.sealed_eval.make_label_text",
                         lambda labels, device: _Text())
     features = np.repeat(np.eye(3, 4, dtype=np.float32), 3, axis=0)
     predicted = _halo_token_mixer_predictions(features, stream, plans, checkpoint,
@@ -297,7 +297,7 @@ def test_v3_evaluator_dispatch_matches_centred_neighbor_floor(tmp_path, monkeypa
         def ids(labels):
             return [{"a": 0, "b": 1, "c": 2}[label] for label in labels]
 
-    monkeypatch.setattr("training.support_classifier.sealed_eval.make_label_text",
+    monkeypatch.setattr("evaluation.rung2_frozen.sealed_eval.make_label_text",
                         lambda labels, device: _Text())
     features = np.repeat(np.eye(3, 4, dtype=np.float32), 3, axis=0)
     predicted = _halo_token_mixer_predictions(

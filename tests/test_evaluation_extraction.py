@@ -17,7 +17,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 ANCHOR_TAG = "hist/v3-support-conditioned/pre-evaluation-package-20260923"
-SEALED_EVAL = "training/support_classifier/sealed_eval.py"
+SEALED_EVAL = "evaluation/rung2_frozen/sealed_eval.py"           # moved here 2026-09-24
+ANCHOR_SEALED_EVAL = "training/support_classifier/sealed_eval.py"  # its path inside the anchor tag
 MOVED = {
     "features": [
         "feature_cache_schema", "FeatureMemoryCache", "_cache_key", "_file_hash_for_stat",
@@ -51,7 +52,7 @@ def _definition_source(text: str, name: str) -> str:
 def _anchor_source() -> str | None:
     try:
         return subprocess.run(
-            ["git", "show", f"{ANCHOR_TAG}:{SEALED_EVAL}"], cwd=ROOT, check=True,
+            ["git", "show", f"{ANCHOR_TAG}:{ANCHOR_SEALED_EVAL}"], cwd=ROOT, check=True,
             capture_output=True, text=True,
         ).stdout
     except (subprocess.CalledProcessError, FileNotFoundError):
@@ -70,7 +71,7 @@ def test_every_moved_definition_is_byte_identical_to_the_anchor_tag():
 
 
 def test_sealed_eval_reexports_every_moved_name_from_the_new_module():
-    sealed = importlib.import_module("training.support_classifier.sealed_eval")
+    sealed = importlib.import_module("evaluation.rung2_frozen.sealed_eval")
     for module, names in MOVED.items():
         target = importlib.import_module(f"evaluation.{module}")
         for name in names:
@@ -83,7 +84,11 @@ def test_sealed_eval_reexports_every_moved_name_from_the_new_module():
 
 
 def test_evaluation_package_never_imports_the_sealed_runner():
+    # The shared modules and the other rungs must not depend on the rung-2 runner; the rung-2
+    # package itself (its runners import each other) is exempt.
     for path in (ROOT / "evaluation").rglob("*.py"):
+        if "rung2_frozen" in path.parts:
+            continue
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             module = getattr(node, "module", None) or ""
@@ -124,7 +129,7 @@ def test_sealed_results_on_a_cached_cell_are_bit_identical_to_the_anchor_golden(
         pytest.skip("set HALO_EXTRACTION_INVOCATION to the exact sealed_eval argument string used for the golden")
     out = tmp_path / "current"
     subprocess.run(
-        ["python", "-m", "training.support_classifier.sealed_eval", "--out", str(out), *invocation.split()],
+        ["python", "-m", "evaluation.rung2_frozen.sealed_eval", "--out", str(out), *invocation.split()],
         cwd=ROOT, check=True,
     )
     golden_rows = json.loads(Path(golden).read_text())

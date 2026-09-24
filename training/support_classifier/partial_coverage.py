@@ -6,7 +6,7 @@ ground truth is sometimes one of those.
 
 This module is deliberately *additive*.  It never mutates a sealed manifest in place, never changes
 the fingerprint of a fully covered manifest, and imports the immutable episode machinery from
-:mod:`training.support_classifier.sealed_eval` rather than duplicating it.
+:mod:`evaluation.rung2_frozen.sealed_eval` rather than duplicating it.
 
 Design notes
 ------------
@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Sequence
 import numpy as np
 
 if TYPE_CHECKING:
-    from .sealed_eval import QueryPlan
+    from evaluation.manifests import QueryPlan
 
 
 def _normalise(rows: np.ndarray) -> np.ndarray:
@@ -189,7 +189,7 @@ def support_only_predictions(
         # Hiding is cell-wide, so every surviving plan still carries the same k examples for each
         # supported class.  The sealed evaluator's batched implementation is therefore exactly the
         # same readout over a smaller candidate roster, including the same ridge system.
-        from .sealed_eval import _readout_predictions
+        from evaluation.rung2_frozen.sealed_eval import _readout_predictions
 
         requested = frozenset(("1nn", "prototype", "ridge")) if readouts is None else readouts
         delegated = requested - {"1nn"} if classwise_scores is not None else requested

@@ -26,8 +26,8 @@ baselines = ["halo[model]", "openai-clip==1.0.1", "timm>=1.0,<2", "setuptools>=6
 
 [project.scripts]
 halo-train = "training.support_classifier.train:main"
-halo-sealed-eval = "training.support_classifier.sealed_eval:main"
-halo-scenarios = "training.support_classifier.run_scenarios:main"
+halo-sealed-eval = "evaluation.rung2_frozen.sealed_eval:main"
+halo-scenarios = "evaluation.rung2_frozen.run_scenarios:main"
 halo-audit-curriculum = "training.support_classifier.curriculum_audit:main"
 halo-dev-panel = "training.support_classifier.development_panel:main"
 halo-rung1 = "evaluation.rung1_unlabeled.run:main"
@@ -35,7 +35,7 @@ halo-rung3 = "evaluation.rung3_finetune.run:main"
 halo-discovery = "evaluation.discovery.run:main"
 
 [tool.setuptools.packages.find]
-include = ["halo*", "baselines*", "data*", "model*", "training*"]
+include = ["halo*", "baselines*", "data*", "evaluation*", "model*", "training*"]
 namespaces = false
 
 [tool.pytest.ini_options]

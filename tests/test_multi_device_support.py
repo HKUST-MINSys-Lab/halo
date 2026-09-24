@@ -15,7 +15,7 @@ from data.scripts.scan_duplicates import cache_path as duplicate_cache_path
 from data.scripts.scan_implausible import cache_path as implausible_cache_path
 from data.scripts.build_grids import build_stream_specs
 from model.tokenizer.encoder import hierarchical_device_pool
-from training.support_classifier.sealed_eval import _cache_key, evaluation_cells
+from evaluation.rung2_frozen.sealed_eval import _cache_key, evaluation_cells
 from training.tokenizer.pretrain_data import MultiScaleCollate, merge_device_items
 
 

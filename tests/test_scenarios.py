@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from baselines.data import EvalStream, source_slice_fingerprint
-from training.support_classifier import run_scenarios as runner
+from evaluation.rung2_frozen import run_scenarios as runner
 from training.support_classifier.scenarios import (
     CrossEnrolment,
     build_cross_manifest,
@@ -14,7 +14,7 @@ from training.support_classifier.scenarios import (
     derive_resampled,
     shared_candidates,
 )
-from training.support_classifier.run_scenarios import (
+from evaluation.rung2_frozen.run_scenarios import (
     ACTIVE_SCENARIOS,
     Task,
     _matched_within_reference,
@@ -109,9 +109,9 @@ def test_zero_support_cross_stream_does_not_require_support_features():
 @pytest.mark.parametrize("coverage", [None, "partial"])
 def test_neighbor_encoder_zero_support_uses_training_bank_bridge(monkeypatch, tmp_path, coverage):
     import torch
-    from training.support_classifier import run_scenarios as runner
+    from evaluation.rung2_frozen import run_scenarios as runner
     from training.support_classifier.partial_coverage import CoverageCell
-    from training.support_classifier.sealed_eval import build_manifest
+    from evaluation.rung2_frozen.sealed_eval import build_manifest
 
     stream = make_stream()
     task = Task(
