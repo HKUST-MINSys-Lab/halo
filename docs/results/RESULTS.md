@@ -2,6 +2,12 @@
 
 Promoted results for the support-conditioned HAR design, newest first.
 
+**Where these sit in the paper (2026-09-22 onward):** every table below is **rung 2** of the
+three-rung plan — k labelled examples, parameters frozen — and is presented as a case study written
+as an *encoder* result, not as the headline. Rungs 1 (unlabelled adaptation) and 3 (fine-tuning for
+every model) are built and pre-registered but have no results yet; see
+[the roadmap](../overview/roadmap.md).
+
 **The one rule: never mix protocols.** A number is only comparable to another number produced by
 the same protocol on the same manifests. Every table below states its protocol, and superseded
 tables are not reproduced here: their numbers live in their immutable artifacts, linked in the index.

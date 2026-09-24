@@ -53,11 +53,12 @@ CLASSIFIER_ARCHITECTURE_STATUS = {
     # v2 completed its matched sealed + scenario evaluation on 2026-09-19 and did not beat the
     # v3 control (router collapsed onto label meaning); see docs/results/RESULTS.md.
     EVIDENCE_AWARE_ARCHITECTURE: "abandoned-negative-result",
-    # Promoted 2026-09-21 as "v4", in its T6 recipe (see PROMOTED_RECIPE). T7 remains an active
-    # experiment on the same architecture string.
+    # Promoted 2026-09-21 as "v4", in its T6 recipe (see PROMOTED_RECIPE). The T7 and T8 recipes
+    # share this architecture string and are recorded negative results.
     EVIDENCE_GATED_ARCHITECTURE: "promoted-control",
 }
-# Human-facing names, adopted 2026-09-20. `v3` is the promoted classifier; every experimental
+# Human-facing names, adopted 2026-09-20. `v4` (the T6 recipe) is the promoted classifier since
+# 2026-09-21 and `v3` is superseded; every experimental
 # replacement is T-numbered in the order it was trained ("T" for try). The architecture strings are
 # NOT numbered consistently with the tries -- `support_classifier_v4` is T4, not a successor to
 # `support_classifier_v3` -- which is why this mapping is explicit. Tries T4, T5 and T6 all share

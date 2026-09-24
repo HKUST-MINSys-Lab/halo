@@ -1,6 +1,6 @@
 # Thesis and scope
 
-Last verified against code: 2026-09-23. Supersedes the classifier-era thesis, archived at
+Last verified against code: 2026-09-24. Supersedes the classifier-era thesis, archived at
 [`docs/archive/thesis-support-conditioned-classifier-era-20260918.md`](../archive/thesis-support-conditioned-classifier-era-20260918.md);
 the reasoning is in the
 [2026-09-22 decision record](../journal/2026-09-22-three-regimes-and-unsupervised-adaptation-decisions.md)
@@ -45,6 +45,14 @@ it will meet — few or no labels, an unlabelled pool from a different acquisiti
 partially-covered rosters — so adaptation is a primary training objective rather than a property a
 strong encoder happens to have. The few-shot literature states this should be done and names it as
 open; nobody has done it on the acquisition axis.
+
+Two limits on that claim, both decided in advance. The adaptation procedure itself may gain only a
+handful of learnable constants, initialised at the published values and fitted for every baseline
+too — never a learned adapter that reads the pool, which the literature shows is unreliable on real
+shifts ([decision](../journal/2026-09-23-rung1-learnability-ceiling-and-fixes.md)). And rung 1's
+procedure lets each encoder's own embedding neighbourhoods vote alongside its text scores, so the
+rung measures how well an encoder groups the same activity together, not only how good its text
+head is ([roadmap](roadmap.md#the-one-established-method)).
 
 What the system does **not** claim: that language alone describes arbitrary motion; unknown-class
 rejection as a headline; or that a foundation model replaces domain data where domain data is cheap.

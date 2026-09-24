@@ -1,6 +1,6 @@
 # Current architecture
 
-Last verified against code: 2026-09-22.
+Last verified against code: 2026-09-24.
 
 HALO consumes native-rate accelerometer and optional gyroscope streams. Sampling rate, gravity
 availability, and modality presence are structured metadata; device role and placement are natural
@@ -26,12 +26,20 @@ The promoted head is
 (`support_classifier_v4`). It takes the parameter-free support vote as its floor, learns a bounded
 residual and a gated blend with the label-text term, and cannot emit unrestricted class logits. The
 differentiable-neighbour mode removes the learned classifier and remains the representation control.
-Regimes 1 and 2 of the [roadmap](roadmap.md) score the same encoder with no learned head at all.
+Rung 1 of the [roadmap](roadmap.md) scores the encoder with no learned head — only its text
+projection `p_text` feeds the transductive method — and rung 2's case study reports the
+parameter-free vote and plain 1-NN beside the head.
 
 Training draws complete, partial, and zero-enrollment episodes; compatible, cross-placement, and
 cross-dataset acquisition relationships; and optional rate, modality, and aligned multi-device
 perturbations. Checkpoint selection uses subject-held-out dataset-macro F1, with enrolled and
 zero-support panels reported separately.
+
+Code layout: the encoder is under `model/tokenizer/`, the heads under `model/support/`, training
+under `training/support_classifier/` (with shared data and encoder-building infrastructure in
+`training/tokenizer/`), and every evaluation rung under `evaluation/` — `rung1_unlabeled/`,
+`rung2_frozen/` (the sealed and scenario runners), `rung3_finetune/`, plus the shared feature,
+manifest, zero-shot and provenance modules.
 
 Future-JEPA, continuous/multispan kernels, the old token mixer, both v1 contextual heads, explicit
 admissibility gates, and hidden memory-bank retrieval are retired or abandoned. Their code and

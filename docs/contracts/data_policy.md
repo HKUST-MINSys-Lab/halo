@@ -1,6 +1,6 @@
 # Active Dataset Ledger
 
-**Status:** active protocol ledger. Last verified against code and local processed sessions: 2026-09-18.
+**Status:** active protocol ledger. Last verified against code: 2026-09-24 (local processed sessions last checked 2026-09-18).
 This is the single source for active data-role, conversion, and fairness disclosures. It covers the
 eight supervised-head sources, six sealed evaluation sources, and separately scoped prospective
 sources. The three label-free sources are retained below as a historical inventory only; JEPA

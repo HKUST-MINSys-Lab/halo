@@ -1,6 +1,6 @@
 # Baseline comparison policy
 
-Last verified against code: 2026-09-18.
+Last verified against code: 2026-09-24.
 
 The goal is a useful deployment comparison, not an attribution claim across unmatched upstream
 corpora. Each retained encoder keeps its author-released weights and published input preprocessing.
@@ -30,6 +30,9 @@ and evaluates it under both the aggregate and scenario manifests. Label these ro
 with frozen <encoder>` and disclose trainable parameters, steps, runtime, and seeds.
 
 ## Corpus-matched baseline arms (added 2026-09-22)
+
+**Status (2026-09-24): built, not trained** (≈ 15.5 GPU-h, a separate go). They are rung 1's
+tier 2 in the [roadmap](../overview/roadmap.md).
 
 The headline tables above evaluate every encoder frozen, because the claim under test is enrollment
 **without parameter updates**. That is the experimental condition, not an approximation of any

@@ -1,14 +1,23 @@
 # Evaluation protocol: support-conditioned HAR
 
-> Last verified against code: 2026-09-20. A score is reportable only when the run records the data split,
+> Last verified against code: 2026-09-24. A score is reportable only when the run records the data split,
 > encoder checkpoint, baseline adapter revision, episode manifest, and support/candidate settings.
 
-> **Operational status:** `training.support_classifier.sealed_eval` is the only sealed-test entry
-> point. It materializes deterministic execution-disjoint manifests, caches each representation
-> with a checkpoint/artifact fingerprint, and writes machine-readable and Markdown per-stream
-> tables. Internal validation from `training.support_classifier.train.py` is not a sealed result.
-> No result is reportable until this runner has been invoked once with a frozen checkpoint and the
-> generated manifest and artifact hashes have been retained beside the table.
+> **Operational status:** evaluation is organised by the three rungs of the
+> [roadmap](../overview/roadmap.md), all under `evaluation/`, sharing one feature-cache, manifest,
+> zero-shot and provenance implementation (`evaluation/{features,manifests,zero_shot,provenance,metrics}.py`):
+>
+> | rung | runner | entry point | status |
+> |---|---|---|---|
+> | 1 — unlabelled adaptation | `evaluation.rung1_unlabeled.run` | `halo-rung1` | built, not run |
+> | 2 — labels, frozen (this document's sealed and scenario protocol) | `evaluation.rung2_frozen.sealed_eval`, `.run_scenarios`, `.run_partial_coverage` | `halo-sealed-eval`, `halo-scenarios` | the promoted results |
+> | 3 — labels, fine-tuning | `evaluation.rung3_finetune.run` | `halo-rung3` | built, not run |
+>
+> Every rung writes artifacts through `evaluation.provenance.write_artifact`, which refuses a row
+> without a registered rung, method and readout version. The rung-2 sealed runner materializes
+> deterministic execution-disjoint manifests, caches each representation with a checkpoint/artifact
+> fingerprint, and writes machine-readable and Markdown per-stream tables. Internal validation from
+> `training.support_classifier.train` is not a sealed result.
 
 ## Data separation
 
@@ -148,6 +157,27 @@ HALO is shown with the same frozen-representation readouts and, for a support-cl
 its retrieve-mix-vote readout on the exact same manifest. This distinguishes representation
 quality from a task-specific training gain. Upstream training corpus, parameter count, inference
 time, peak memory, and known data overlap must be disclosed beside the score.
+
+## Rungs 1 and 3 (pre-registered; no result yet)
+
+Both reuse this document's data separation, the sealed single-device cells and the provider feature
+caches, and apply one procedure identically to all six encoders. Details and registered
+predictions are in the [roadmap](../overview/roadmap.md); the invariants a reader must know:
+
+- **Rung 1 (k = 0).** Per cell, queries are split by physical execution into a fixed scored set
+  (20 %) and a pool; nested pool draws N ∈ {0, 50, 100, 500, 2000, all}; metrics on the scored set
+  only. The procedure is EM-Dirichlet (Martin et al., CVPR 2024) over each encoder's zero-shot
+  probability vectors (softmax, T = 30), with λ = N and an embedding-affinity term (μ = 1, 10
+  neighbours in the encoder's own feature space). HALO's zero-shot scores come from its checkpoint's
+  `p_text`; HARNet and LiMU-BERT-X use the training-bank ConSE bridge; UniMTS and NormWear their native
+  text heads. The curve's null is N = 0 under the same procedure; the per-window inductive anchor
+  must reproduce the sealed k = 0 row. Rows report `neighbour_purity`. Readout version `ncurve-v2`.
+- **Rung 3.** Every treatment — linear probe, small classifier, LoRA, full fine-tune, and a
+  from-scratch specialist — is fitted on the same k windows per class and scored on rung 1's scored
+  set, beside the rung-2 parameter-free readout re-run on the same draw (`enrollment_frozen`).
+  Budgets are fixed a priori; nothing selects on the scored set. NormWear has no fine-tuning path
+  and is reported unsupported; HARNet-10 gets the cached-feature treatments only. Readout version
+  `finetune-v1`.
 
 ## Metrics and reporting
 

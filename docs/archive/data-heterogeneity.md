@@ -1,5 +1,9 @@
 # Heterogeneous IMU data contract
 
+> Archived on 2026-09-18. The living converter and metadata rules are in
+> [`../contracts/data_policy.md`](../contracts/data_policy.md) and
+> [`../contracts/acquisition_conditioning.md`](../contracts/acquisition_conditioning.md).
+
 HALO accepts heterogeneous IMU only when the difference is explicit in data and model inputs. This
 file is the live contract for converters, grid construction, encoder inputs, and support episodes.
 
@@ -40,6 +44,3 @@ Subject, recording, and session provenance must survive all preprocessing so spl
 windows and support episodes are constructed. Query/support pairs may only combine configurations
 allowed by the declared experiment. When a baseline cannot accept the real channel layout, mark the
 combination unsupported instead of replacing the input with an undocumented proxy.
-> Archived on 2026-09-18. The living converter and metadata rules are in
-> [`../contracts/data_policy.md`](../contracts/data_policy.md) and
-> [`../contracts/acquisition_conditioning.md`](../contracts/acquisition_conditioning.md).

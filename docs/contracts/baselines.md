@@ -1,8 +1,11 @@
 # Retained baseline encoders
 
-Last verified against code: 2026-09-18.
+Last verified against code: 2026-09-24.
 
-The primary comparison is deliberately small and uses only author-released checkpoints.
+The primary comparison is deliberately small and uses only author-released checkpoints. The same
+five also enter every rung of the [roadmap](../overview/roadmap.md) identically; the corpus-matched
+arms (each baseline's trunk trained on our corpus — built, not yet trained) are specified in
+[baseline_fairness.md](baseline_fairness.md#corpus-matched-baseline-arms-added-2026-09-22).
 
 | encoder | representation family | required input | role in comparison |
 |---|---|---|---|

@@ -1,5 +1,7 @@
 # Plan: add Mantis as a frozen (and briefly fine-tuned) encoder baseline
 
+> Archived on 2026-09-18. Mantis is not in the retained released-checkpoint baseline roster.
+
 **Written 2026-09-13.** Implementation brief for another agent. "Implement" here means
 **build + tests + short smoke**. Do **not** run sealed evaluation, and do not launch any long
 training run, without Alex's explicit go. See `docs/design/EVALUATION_PROTOCOL.md`.
@@ -193,4 +195,3 @@ vs our adapted arms** (does the gap survive supervised adaptation, the way JEPA'
   **`Mantis-8M`** — it is the one ZARA evaluated. Note the others in the docstring as future work.
 * If `mantis-tsfm` pulls a heavy or conflicting dependency set, vendor only the architecture module
   rather than taking the dependency; record which you did.
-> Archived on 2026-09-18. Mantis is not in the retained released-checkpoint baseline roster.

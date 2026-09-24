@@ -1,7 +1,10 @@
 # Design of record: support-conditioned heterogeneous HAR
 
-> Last verified against code: 2026-09-23 (support-classifier and training-boundary sections). This document supersedes the earlier language-alignment,
-> admissibility, evidence-engine, and movement-monitoring designs on `main`.
+> Last verified against code: 2026-09-24. This document is the design of the **system** (input
+> contract, encoder, classifier, training boundary). The **plan** — the three rungs, their methods
+> and what is claimed — is owned by [`../overview/roadmap.md`](../overview/roadmap.md) and
+> [`../overview/thesis.md`](../overview/thesis.md). It supersedes the earlier language-alignment,
+> admissibility, evidence-engine, and movement-monitoring designs.
 
 ## Objective
 
@@ -69,10 +72,14 @@ corruption view as a gate-only auxiliary and a label-blind calibration term for 
 support of their own. The head cannot emit unrestricted class logits.
 
 Superseded and negative heads remain loadable for reproduction only: v3 (`support_classifier_v3`,
-promoted 2026-09-18 to 2026-09-21), the evidence-aware v2 head (T3), and the two v1 contextual
-heads (T1, T2). The try-number index is in [RESULTS.md](../results/RESULTS.md), because
+promoted 2026-09-18 to 2026-09-21), the evidence-aware v2 head (T3), the two v1 contextual heads
+(T1, T2), and the primitive semantic path on the v4 architecture — T7 (best sealed aggregate,
+disqualified by a 15-point foreign-vocabulary regression) and T8 (built, never trained). The try-number index is in [RESULTS.md](../results/RESULTS.md), because
 architecture strings and try numbers do not line up; lifecycle strings in
 `model/support/factory.py` are authoritative.
+
+On rung 1 the head is not used at all: pooled episodes are scored by the transductive method
+through `p_text` alone (the unlabelled-pool arm in [curriculum.md](curriculum.md)).
 
 There is no top-k retrieval or hidden background bank. Every supplied support row participates in
 attention and receives a differentiable score. The `neighbors` control removes the learned classifier and
