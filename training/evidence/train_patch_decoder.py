@@ -1,10 +1,10 @@
-"""Train the Phase-B patch evidence predictor on answerable candidate episodes.
+"""Train the Phase-B predictor on clean, independently sampled memory episodes.
 
-The only objective is cross-entropy over the runtime candidate set. It reaches the retriever through
-the attention bias each evidence row's retrieval score applies, which is the sole differentiable path
-back to the projection — selection itself is a hard top-k over frozen memory vectors. True-label
-support, acquisition configuration, and candidate-set size vary as episode inputs. Confidence
-calibration is a parked, separate experiment and is not computed on this training path.
+Each episode samples a candidate count and one support count ``k``. Every candidate receives ``k``
+random eligible executions in memory. ``k=0`` uses coherent activity names for semantic prediction;
+positive-k episodes assign fresh arbitrary names so prediction requires support-to-name binding.
+Candidate cross-entropy is the only objective. Hard top-k retrieval remains entirely query-driven;
+support identity constructs memory and telemetry but never selects evidence.
 """
 
 from __future__ import annotations
@@ -57,7 +57,6 @@ from training.evidence.live_encoder import PatchViewSpec, SourcePatchEncoder
 from training.evidence.policy import (
     ACTIVE_REFRESH_STEPS,
     ACTIVE_WINDOWS_PER_LABEL,
-    ALIAS_PROBABILITY,
     CANDIDATE_COUNT_RANGE,
     EPISODES_PER_STEP,
     RETRIEVAL_VOTE_SCALE,
@@ -71,15 +70,13 @@ from training.evidence.policy import (
     RETRIEVAL_SUBSPACES,
     RETRIEVAL_TEMPERATURE,
     SUPPORT_COUNT_RANGE,
-    VALIDATION_CANDIDATE_COUNTS,
+    VALIDATION_CURVE_CANDIDATE_COUNT,
     VALIDATION_SUPPORT_COUNTS,
     TOKENIZER_EMA_DECAY,
     TOKENIZER_FINETUNE_WARMUP_STEPS,
     TOKENIZER_LR_SCALE,
-    ZERO_SUPPORT_GUARD_TOLERANCE,
     PhaseBPolicy,
 )
-from training.evidence.subject_style import sample_subject_style
 from training.evidence.telemetry import PhaseBTelemetry
 from training.tokenizer.eval_transfer import build_encoder
 
@@ -93,60 +90,50 @@ _PHASE_B_BEHAVIOR_PATHS = (
     "training/evidence/patch_episodes.py",
     "training/evidence/policy.py",
     "training/evidence/episode_labels.py",
-    "training/evidence/subject_style.py",
+    "training/evidence/labeltext.py",
     "training/evidence/live_encoder.py",
     "model/evidence/relational_decoder.py",
     "model/evidence/patch_retrieval.py",
-    "data/scripts/augmentations.py",
 )
 SEED = 20260725
 # Gradient decomposition retains the current episode graph, so sample it periodically rather than on
 # every optimizer update. The fixed cadence also prevents an end-of-step heartbeat from repeatedly
 # firing just before the following step has a chance to observe that telemetry is due.
 RETRIEVAL_DIAGNOSTIC_STEPS = 100
-QUERY_LOSS_GROUPS = (
-    "semantic_k0",
-    "partial_unenrolled",
-    "coherent_enrolled",
-    "alias_enrolled",
-)
-
-
 @dataclass(frozen=True)
 class AdaptationEpisodeSpec:
     episode_type: str
     support_count: int
     candidate_count: int
-    label_mode: str
-    physical_view_mode: str = "augmented"
-    # None  -> every candidate is enrolled with `support_count` (full enrollment).
-    # int n -> only n of the candidates are enrolled; the rest get zero support and keep their
-    #          concept erased from background memory, so they must be recognized from their name
-    #          and from semantically related background rows.
-    enrolled_candidate_count: int | None = None
-    # A paired zero/support episode reuses the exact query, candidates, candidate phrasing and
-    # physical-view seed. The ids are local to one optimizer step and carry no model input.
-    counterfactual_pair_id: int | None = None
-    counterfactual_role: str | None = None
-    distractor_hard_fraction: float = 0.5
-
-    @property
-    def partially_enrolled(self) -> bool:
-        return self.enrolled_candidate_count is not None
+    label_mode: str = "coherent"
+    physical_view_mode: str = "clean"
 
     @property
     def enrollment_shape(self) -> str:
         if self.support_count == 0:
             return "zero"
-        return "partial" if self.partially_enrolled else "full"
+        return "full"
 
     def __post_init__(self) -> None:
-        if self.counterfactual_role not in {None, "support", "zero"}:
-            raise ValueError("counterfactual_role must be None, 'support', or 'zero'")
-        if (self.counterfactual_pair_id is None) != (self.counterfactual_role is None):
-            raise ValueError("counterfactual pair id and role must be set together")
-        if not 0.0 <= self.distractor_hard_fraction <= 1.0:
-            raise ValueError("distractor_hard_fraction must be in [0, 1]")
+        if self.episode_type not in EPISODE_TYPES:
+            raise ValueError(f"unknown episode type {self.episode_type!r}")
+        if self.support_count < 0:
+            raise ValueError("support_count must be nonnegative")
+        if self.candidate_count < 2:
+            raise ValueError("candidate_count must be at least two")
+        expected_label_mode = "coherent" if self.support_count == 0 else "random_alias"
+        if self.label_mode != expected_label_mode:
+            raise ValueError(
+                f"support_count={self.support_count} requires label_mode="
+                f"{expected_label_mode!r}"
+            )
+        if self.physical_view_mode != "clean":
+            raise ValueError("minimal Phase-B episodes require clean views")
+        expected = "semantic_zero_support" if self.support_count == 0 else "ordinary_few_support"
+        if self.episode_type != expected:
+            raise ValueError(
+                f"support_count={self.support_count} requires episode_type={expected!r}"
+            )
 
 
 def validation_canary_cases(recipes, fold_pools):
@@ -162,143 +149,30 @@ def validation_canary_cases(recipes, fold_pools):
     ]
 
 
-def _partial_enrollment_plan(
-    spec: "AdaptationEpisodeSpec", n_candidates: int, rng: np.random.Generator
-) -> int | list[int]:
-    """Per-candidate support counts for one episode.
-
-    Returns the plain integer (every candidate enrolled) unless the spec asks for partial
-    enrollment, in which case a random subset of size `enrolled_candidate_count` keeps the support
-    and the remainder drop to zero.
-    """
-    enrolled = spec.enrolled_candidate_count
-    if enrolled is None or spec.support_count == 0 or n_candidates < 2:
-        return spec.support_count
-    enrolled = max(1, min(int(enrolled), n_candidates - 1))
-    plan = [0] * n_candidates
-    for position in rng.choice(n_candidates, size=enrolled, replace=False):
-        plan[int(position)] = spec.support_count
-    return plan
-
-
-class EpisodeCurriculum:
-    """Sample adaptation episodes with one controlled counterfactual pair.
-
-    One support/zero counterfactual pair and one alias episode anchor each normal optimizer step.
-    Remaining episodes are independent draws, and all physical views, support counts, candidate
-    identities, and enrollment subsets remain stochastic. Candidate count and distractor hardness
-    increase with training progress; the realized mix is reported in telemetry.
-    """
+class EpisodeSampler:
+    """Draw independent, fixed-policy episodes without a curriculum."""
 
     def __init__(self, rng: np.random.Generator):
         self.rng = rng
 
-    def sample_batch(
-        self, count: int, *, step: int = 1, total_steps: int = 1
-    ) -> list[AdaptationEpisodeSpec]:
+    def sample_batch(self, count: int) -> list[AdaptationEpisodeSpec]:
         if count < 1:
             raise ValueError("episodes_per_step must be positive")
-        if step < 1 or total_steps < 1:
-            raise ValueError("step and total_steps must be positive")
-        if count == 1:
-            return [self._sample_episode(step, total_steps)]
-
-        # One exact counterfactual pair per multi-episode step. The supported half is deliberately
-        # coherent and partial, so the pair also guarantees both enrolled and unenrolled query rows;
-        # the zero half differs only in the memory overlay. This makes support use identifiable
-        # without replacing the independently sampled remainder of the batch.
-        candidate_count, hard_fraction = self._difficulty(step, total_steps)
-        physical_view_mode = str(self.rng.choice(PHYSICAL_VIEW_MODES))
-        supported = AdaptationEpisodeSpec(
-            episode_type=str(self.rng.choice([
-                name for name in EPISODE_TYPES if name != "semantic_zero_support"
-            ])),
-            support_count=int(self.rng.integers(
-                SUPPORT_COUNT_RANGE[0], SUPPORT_COUNT_RANGE[1] + 1
-            )),
-            candidate_count=candidate_count,
-            label_mode="coherent",
-            physical_view_mode=physical_view_mode,
-            enrolled_candidate_count=int(self.rng.integers(1, candidate_count)),
-            counterfactual_pair_id=0,
-            counterfactual_role="support",
-            distractor_hard_fraction=hard_fraction,
-        )
-        zero = AdaptationEpisodeSpec(
-            episode_type="semantic_zero_support",
-            support_count=0,
-            candidate_count=candidate_count,
-            label_mode="coherent",
-            physical_view_mode=physical_view_mode,
-            counterfactual_pair_id=0,
-            counterfactual_role="zero",
-            distractor_hard_fraction=hard_fraction,
-        )
-        result = [supported, zero]
-        if count >= 3:
-            # Ensure the fourth loss group is represented in every normal step as well. Random-alias
-            # candidates are necessarily fully enrolled because their names carry no semantics.
-            alias_count, alias_hard_fraction = self._difficulty(step, total_steps)
+        support_low, support_high = SUPPORT_COUNT_RANGE
+        candidate_low, candidate_high = CANDIDATE_COUNT_RANGE
+        result = []
+        for _ in range(count):
+            support_count = int(self.rng.integers(support_low, support_high + 1))
             result.append(AdaptationEpisodeSpec(
-                episode_type=str(self.rng.choice([
-                    name for name in EPISODE_TYPES if name != "semantic_zero_support"
-                ])),
-                support_count=int(self.rng.integers(
-                    SUPPORT_COUNT_RANGE[0], SUPPORT_COUNT_RANGE[1] + 1
-                )),
-                candidate_count=alias_count,
-                label_mode="random_alias",
-                physical_view_mode=str(self.rng.choice(PHYSICAL_VIEW_MODES)),
-                distractor_hard_fraction=alias_hard_fraction,
+                episode_type=(
+                    "semantic_zero_support" if support_count == 0
+                    else "ordinary_few_support"
+                ),
+                support_count=support_count,
+                candidate_count=int(self.rng.integers(candidate_low, candidate_high + 1)),
+                label_mode=("coherent" if support_count == 0 else "random_alias"),
             ))
-        result.extend(
-            self._sample_episode(step, total_steps) for _ in range(count - len(result))
-        )
         return result
-
-    def _difficulty(self, step: int, total_steps: int) -> tuple[int, float]:
-        progress = min(1.0, max(0.0, (step - 1) / max(1, total_steps - 1)))
-        if progress < 0.20:
-            low, high, hard_fraction = 2, 4, 0.25
-        elif progress < 0.60:
-            low, high, hard_fraction = 4, 8, 0.50
-        else:
-            low, high, hard_fraction = CANDIDATE_COUNT_RANGE[0], CANDIDATE_COUNT_RANGE[1], 0.75
-        return int(self.rng.integers(low, high + 1)), hard_fraction
-
-    def _sample_episode(self, step: int, total_steps: int) -> AdaptationEpisodeSpec:
-        episode_type = str(self.rng.choice(EPISODE_TYPES))
-        physical_view_mode = str(self.rng.choice(PHYSICAL_VIEW_MODES))
-        candidate_count, hard_fraction = self._difficulty(step, total_steps)
-        if episode_type == "semantic_zero_support":
-            return AdaptationEpisodeSpec(
-                episode_type=episode_type,
-                support_count=0,
-                candidate_count=candidate_count,
-                label_mode="coherent",
-                physical_view_mode=physical_view_mode,
-                distractor_hard_fraction=hard_fraction,
-            )
-
-        alias = bool(self.rng.random() < ALIAS_PROBABILITY)
-        # An aliased candidate's name carries no information, so every candidate in an alias episode
-        # must be enrolled or it is unanswerable. Otherwise how many are enrolled is a single
-        # uniform draw over 1..candidate_count, and drawing all of them *is* full enrollment — so
-        # partial and full fall out of one sample instead of being separately named strata.
-        enrolled = candidate_count if alias else int(
-            self.rng.integers(1, candidate_count + 1)
-        )
-        return AdaptationEpisodeSpec(
-            episode_type=episode_type,
-            support_count=int(self.rng.integers(
-                SUPPORT_COUNT_RANGE[0], SUPPORT_COUNT_RANGE[1] + 1
-            )),
-            candidate_count=candidate_count,
-            label_mode="random_alias" if alias else "coherent",
-            physical_view_mode=physical_view_mode,
-            enrolled_candidate_count=None if enrolled >= candidate_count else enrolled,
-            distractor_hard_fraction=hard_fraction,
-        )
 
 
 
@@ -379,13 +253,101 @@ def balanced_accuracy(pred: np.ndarray, true: np.ndarray) -> float:
 
 
 def checkpoint_is_better(metrics: dict, best: dict) -> bool:
-    """Only guard-eligible trained checkpoints may replace the current fallback/best state."""
-    if not bool(metrics.get("zero_support_guard_pass", False)):
+    """Rank only checkpoints that demonstrate learned use of the enrolled evidence."""
+    if not bool(metrics.get("checkpoint_eligible", False)):
         return False
-    if not bool(best.get("zero_support_guard_pass", False)):
+    if not bool(best.get("checkpoint_eligible", False)):
         return True
     return float(metrics["adaptation_selection_score"]) > float(
         best["adaptation_selection_score"]
+    )
+
+
+def checkpoint_eligibility(metrics: dict) -> tuple[bool, dict[str, bool]]:
+    """Predeclared mechanism checks for a deployable learned decoder checkpoint."""
+    checks = {
+        "matches_closed_form_low_k_control": (
+            np.isfinite(metrics.get("selection_low_k_adaptation_gain", float("nan")))
+            and metrics["selection_low_k_adaptation_gain"] >= 0.0
+        ),
+        "benefits_from_support_presence": (
+            np.isfinite(metrics.get("support_removal_true_probability_drop", float("nan")))
+            and metrics["support_removal_true_probability_drop"] > 0.0
+        ),
+        "uses_support_label_binding": (
+            np.isfinite(
+                metrics.get("support_label_shuffle_true_probability_drop", float("nan"))
+            )
+            and metrics["support_label_shuffle_true_probability_drop"] > 0.0
+        ),
+    }
+    return all(checks.values()), checks
+
+
+def deranged_support_view(view: EpisodeMemoryView, *, shift: int = 1) -> EpisodeMemoryView:
+    """Keep every memory row fixed while assigning support to the wrong candidate."""
+    n_candidates = len(view.candidate_ids)
+    if n_candidates < 2:
+        raise ValueError("support-label derangement needs at least two candidates")
+    shift = int(shift) % n_candidates
+    if shift == 0:
+        raise ValueError("support-label derangement cannot use a zero shift")
+    binding = view.support_candidate.clone()
+    binding[view.support_mask] = (binding[view.support_mask] + shift) % n_candidates
+    return replace(view, support_candidate=binding)
+
+
+def nested_support_view(
+    view: EpisodeMemoryView,
+    patch: dict,
+    index_rows: torch.Tensor,
+    support_count: int,
+) -> EpisodeMemoryView:
+    """Derive a nested k-shot view from one maximum-support canary."""
+    if support_count < 0:
+        raise ValueError("support_count must be nonnegative")
+    support_units = torch.where(
+        torch.as_tensor(patch["event_verified"])[index_rows.detach().cpu()].bool().to(
+            view.support_mask.device
+        ),
+        torch.as_tensor(patch["event"])[index_rows.detach().cpu()].long().to(
+            view.support_mask.device
+        ) + int(torch.as_tensor(patch["window"]).max()) + 1,
+        torch.as_tensor(patch["window"])[index_rows.detach().cpu()].long().to(
+            view.support_mask.device
+        ),
+    )
+    keep = torch.zeros_like(view.support_mask)
+    realized = torch.zeros_like(view.support_units_per_candidate)
+    for candidate_position in range(len(view.candidate_ids)):
+        members = (
+            view.support_mask & view.support_candidate.eq(candidate_position)
+        )
+        units = torch.unique(support_units[members], sorted=True)
+        chosen = units[:support_count]
+        if len(chosen):
+            keep |= members & torch.isin(support_units, chosen)
+        realized[candidate_position] = len(chosen)
+    originally_enrolled = view.support_units_per_candidate.gt(0)
+    if support_count > 0 and bool(
+        (realized[originally_enrolled] < support_count).any()
+    ):
+        raise ValueError("maximum-support canary cannot realize the requested nested k")
+    allowed = view.allowed & (
+        ~view.support_mask.view(1, 1, -1) | keep.view(1, 1, -1)
+    )
+    binding = torch.where(
+        keep, view.support_candidate, torch.full_like(view.support_candidate, -1)
+    )
+    return replace(
+        view,
+        allowed=allowed,
+        support_mask=keep,
+        support_candidate=binding,
+        support_units_per_candidate=realized,
+        episode_type=(
+            "semantic_zero_support" if support_count == 0 else view.episode_type
+        ),
     )
 
 
@@ -393,30 +355,6 @@ def label_index(candidates: torch.Tensor, n_vocab: int, device) -> torch.Tensor:
     position = torch.full((n_vocab,), -1, device=device, dtype=torch.long)
     position[candidates] = torch.arange(len(candidates), device=device)
     return position
-
-
-def query_loss_group_ids(
-    spec: AdaptationEpisodeSpec,
-    realized_true_support: torch.Tensor,
-) -> torch.Tensor:
-    """Classify every query row into one of the four balanced Phase-B loss conditions."""
-    support = realized_true_support.long()
-    if support.ndim != 1:
-        raise ValueError("realized_true_support must be one-dimensional")
-    if spec.label_mode == "random_alias":
-        if bool((support <= 0).any()):
-            raise ValueError("random-alias query rows must all carry enrolled support")
-        return torch.full_like(support, QUERY_LOSS_GROUPS.index("alias_enrolled"))
-    if spec.support_count == 0:
-        if bool((support != 0).any()):
-            raise ValueError("zero-support query rows unexpectedly carry support")
-        return torch.full_like(support, QUERY_LOSS_GROUPS.index("semantic_k0"))
-    return torch.where(
-        support > 0,
-        torch.full_like(support, QUERY_LOSS_GROUPS.index("coherent_enrolled")),
-        torch.full_like(support, QUERY_LOSS_GROUPS.index("partial_unenrolled")),
-    )
-
 
 def sample_text_tables(variants: torch.Tensor, generator: torch.Generator):
     """Independently sample evidence and candidate phrasings for every vocabulary label."""
@@ -434,6 +372,99 @@ def parameter_gradient_norm(parameters, device) -> torch.Tensor:
         if parameter.grad is not None:
             total = total + parameter.grad.detach().float().square().sum()
     return total.sqrt()
+
+
+def parameter_gradient_statistics(parameters, device) -> dict[str, torch.Tensor]:
+    """Size-normalized gradient health for a trainable parameter collection.
+
+    Raw L2 norms grow with module size. RMS permits comparisons between paths, while coverage
+    distinguishes a disconnected parameter from a connected parameter whose derivative is zero in
+    the current batch. These reductions run only on the telemetry cadence.
+    """
+    parameters = tuple(parameter for parameter in parameters if parameter.requires_grad)
+    total_elements = sum(parameter.numel() for parameter in parameters)
+    squared = torch.zeros((), dtype=torch.float32, device=device)
+    covered_elements = 0
+    nonzero_elements = torch.zeros((), dtype=torch.float32, device=device)
+    for parameter in parameters:
+        if parameter.grad is None:
+            continue
+        gradient = parameter.grad.detach().float()
+        squared = squared + gradient.square().sum()
+        covered_elements += parameter.numel()
+        nonzero_elements = nonzero_elements + gradient.count_nonzero().float()
+    denominator = max(total_elements, 1)
+    return {
+        "norm": squared.sqrt(),
+        "rms": (squared / denominator).sqrt(),
+        "coverage": torch.tensor(
+            covered_elements / denominator, dtype=torch.float32, device=device
+        ),
+        "nonzero_fraction": nonzero_elements / denominator,
+    }
+
+
+def decoder_gradient_components(decoder) -> dict[str, tuple[torch.nn.Parameter, ...]]:
+    """Return disjoint, exhaustive groups for Phase-B decoder gradient telemetry."""
+    components = {
+        "relational_attention": tuple(decoder.blocks.parameters()),
+        "candidate_readout": tuple(decoder.readout.parameters()),
+        "input_layer_norm": tuple(decoder.in_ln.parameters()),
+        "output_layer_norm": tuple(decoder.final_ln.parameters()),
+        "role_embeddings": tuple(decoder.role_emb.parameters()),
+        "coreference_slot_embeddings": tuple(decoder.slot_emb.parameters()),
+        "window_group_embeddings": tuple(decoder.group_emb.parameters()),
+        "acquisition_relation_embeddings": tuple(
+            parameter
+            for module in (
+                decoder.same_config_emb,
+                decoder.same_subject_emb,
+                decoder.same_sensor_emb,
+            )
+            for parameter in module.parameters()
+        ),
+        "query_projection": tuple(decoder.proj_query.parameters()),
+        "evidence_projection": tuple(decoder.proj_evidence.parameters()),
+        "text_projection": tuple(decoder.proj_text.parameters()),
+        "time_projection": tuple(decoder.proj_time.parameters()),
+        "component_scales": tuple(decoder.component_log_scale.parameters()),
+    }
+    grouped = [id(parameter) for parameters in components.values() for parameter in parameters]
+    expected = [id(parameter) for parameter in decoder.parameters() if parameter.requires_grad]
+    if len(grouped) != len(set(grouped)) or set(grouped) != set(expected):
+        raise RuntimeError("decoder gradient telemetry groups must partition trainable parameters")
+    return components
+
+
+def tokenizer_gradient_components(encoder) -> dict[str, tuple[torch.nn.Parameter, ...]]:
+    """Partition the inference-path parameters used by optional Phase-B fine-tuning."""
+    duration_projection = getattr(encoder, "duration_proj", None)
+    duration_parameters = tuple(duration_projection.parameters()) \
+        if duration_projection is not None else ()
+    duration_gate = getattr(encoder, "duration_gate_logit", None)
+    if duration_gate is not None and duration_gate.requires_grad:
+        duration_parameters += (duration_gate,)
+    components = {
+        "filterbank": tuple(
+            parameter for parameter in encoder.filterbank.parameters()
+            if parameter.requires_grad
+        ),
+        "channel_conditioning": tuple(
+            parameter for parameter in encoder.fusion.parameters()
+            if parameter.requires_grad
+        ),
+        "duration_conditioning": duration_parameters,
+        "context_transformer": tuple(
+            parameter for parameter in encoder.transformer.parameters()
+            if parameter.requires_grad
+        ),
+    }
+    components = {name: parameters for name, parameters in components.items() if parameters}
+    grouped = [id(parameter) for parameters in components.values() for parameter in parameters]
+    expected = [id(parameter) for parameter in encoder.parameters() if parameter.requires_grad]
+    if len(grouped) != len(set(grouped)) or set(grouped) != set(expected):
+        raise RuntimeError("tokenizer gradient telemetry groups must partition trainable parameters")
+    return components
 
 
 @torch.no_grad()
@@ -538,8 +569,9 @@ def choose_candidates(
 ) -> torch.Tensor:
     """Candidate set mixing nearest confusable labels with random distractors.
 
-    Distractor difficulty is derived from curriculum progress rather than exposed as a CLI knob.
-    All-random distractors make most episodes
+    The active minimal trainer passes ``hard_fraction=0`` and samples all distractors uniformly.
+    The optional hard branch remains available to the parked confidence experiment. All-random
+    distractors make most episodes
     trivial — the full vocabulary rarely lands two similar activities in the same set by chance —
     while all-near distractors drop the easy cases the model also has to get right. Nearness averages
     label-text cosine with physical-centroid cosine
@@ -569,15 +601,18 @@ def choose_candidates(
     if n_distractors > len(pool):
         n_distractors = len(pool)
 
-    score = 0.5 * (
-        F.normalize(text_table[pool], dim=-1)
-        @ F.normalize(text_table[truth], dim=-1).t()
-    ).max(dim=1).values + 0.5 * (
-        F.normalize(physical_centroids[pool], dim=-1)
-        @ F.normalize(physical_centroids[truth], dim=-1).t()
-    ).max(dim=1).values
     hard_count = min(int(round(n_distractors * hard_fraction)), len(pool))
-    near = pool[score.topk(hard_count).indices] if hard_count else pool[:0]
+    if hard_count:
+        score = 0.5 * (
+            F.normalize(text_table[pool], dim=-1)
+            @ F.normalize(text_table[truth], dim=-1).t()
+        ).max(dim=1).values + 0.5 * (
+            F.normalize(physical_centroids[pool], dim=-1)
+            @ F.normalize(physical_centroids[truth], dim=-1).t()
+        ).max(dim=1).values
+        near = pool[score.topk(hard_count).indices]
+    else:
+        near = pool[:0]
     remainder_pool = pool[~torch.isin(pool, near)]
     random_count = n_distractors - len(near)
     if random_count:
@@ -1223,39 +1258,14 @@ def _episode_view_specs(
     *,
     physical_view_mode: str,
 ) -> tuple[list[PatchViewSpec], list[PatchViewSpec]]:
-    """Build either exact source views or the full subject/acquisition simulation."""
-    if physical_view_mode not in PHYSICAL_VIEW_MODES:
-        raise ValueError(
-            f"physical_view_mode must be one of {PHYSICAL_VIEW_MODES}, "
-            f"got {physical_view_mode!r}"
-        )
+    """Build exact source views for the minimal clean-embedding recipe."""
+    if physical_view_mode != "clean":
+        raise ValueError("minimal Phase-B training supports only clean physical views")
     support_global = index_rows.detach().cpu()[view.support_rows.detach().cpu()]
-    if physical_view_mode == "clean":
-        return (
-            [PatchViewSpec() for _ in range(query.Z.shape[0])],
-            [PatchViewSpec() for _ in range(len(support_global))],
-        )
-
-    support_style = query_style = None
-    if view.episode_type == "same_subject_enrollment":
-        support_style = query_style = sample_subject_style(rng)
-    elif view.episode_type == "cross_subject_few_support":
-        support_style = sample_subject_style(rng)
-        query_style = sample_subject_style(rng)
-    query_specs = [
-        PatchViewSpec(query_style, int(rng.integers(1, 2**31 - 1)))
-        for _ in range(query.Z.shape[0])
-    ]
-    parent = torch.as_tensor(patch["window"])[support_global].long()
-    seed_by_window = {
-        int(window): int(rng.integers(1, 2**31 - 1))
-        for window in torch.unique(parent).tolist()
-    }
-    support_specs = [
-        PatchViewSpec(support_style, seed_by_window[int(window)])
-        for window in parent.tolist()
-    ]
-    return query_specs, support_specs
+    return (
+        [PatchViewSpec() for _ in range(query.Z.shape[0])],
+        [PatchViewSpec() for _ in range(len(support_global))],
+    )
 
 
 def prepare_adaptation_views(
@@ -1272,7 +1282,7 @@ def prepare_adaptation_views(
     selector_encoder=None,
     online_encoder=None,
     online_requires_grad: bool = False,
-    physical_view_mode: str = "augmented",
+    physical_view_mode: str = "clean",
     reuse_stored_clean: bool = False,
     view_specs: tuple[list[PatchViewSpec], list[PatchViewSpec]] | None = None,
     encoded_query: torch.Tensor | None = None,
@@ -1340,12 +1350,12 @@ def encode_frozen_adaptation_views_batch(
     live_source: SourcePatchEncoder,
     selector_encoder,
 ) -> list[tuple[torch.Tensor, torch.Tensor] | None]:
-    """Encode every augmented frozen-tokenizer view in one stream-grouped pass.
+    """Encode requested live frozen-tokenizer views in one stream-grouped pass.
 
     Episode semantics remain independent. This only flattens the raw query/support occurrences
     before ``SourcePatchEncoder`` groups them by acquisition stream, which turns dozens of tiny GPU
-    encoder launches into one useful batch per represented stream. Exact counterfactual-pair views
-    have identical ``(source window, PatchViewSpec)`` keys and are therefore encoded once.
+    encoder launches into one useful batch per represented stream. Identical
+    ``(source window, PatchViewSpec)`` keys are encoded once.
     """
     flat_rows: list[torch.Tensor] = []
     flat_specs: list[PatchViewSpec] = []
@@ -1416,7 +1426,7 @@ def prepare_frozen_adaptation_views_batch(
             continue
         encoded = encoded_views[episode_index]
         if encoded is None:
-            raise ValueError("augmented episode is missing its frozen view embeddings")
+            raise ValueError("live episode view is missing its frozen embeddings")
         encoded_query, encoded_support = encoded
         result[episode_index] = prepare_adaptation_views(
             query, view, bank, index_rows, selector_z, memory_index, retriever,
@@ -1452,7 +1462,7 @@ def decode_adaptation_episode(
     selector_encoder=None,
     online_encoder=None,
     online_requires_grad: bool = False,
-    physical_view_mode: str = "augmented",
+    physical_view_mode: str = "clean",
     evidence_budget: int | None = None,
     score_temperature: float | None = None,
     view_specs: tuple[list[PatchViewSpec], list[PatchViewSpec]] | None = None,
@@ -1477,7 +1487,12 @@ def decode_adaptation_episode(
     selector_query.Z = F.normalize(selector_query.Z, dim=-1)
     online_query.Z = F.normalize(online_query.Z, dim=-1)
     memory_online = F.normalize(memory_online, dim=-1)
-    topk = policy.topk_per_subspace(int(query.mask.sum(1).max()))
+    effective_evidence_budget = (
+        policy.evidence_budget if evidence_budget is None else int(evidence_budget)
+    )
+    topk = policy.topk_per_subspace(
+        int(query.mask.sum(1).max()), evidence_budget=effective_evidence_budget
+    )
     retrieval = retriever.retrieve(
         selector_query.Z, selector_episode_index, view.allowed, topk,
         query_mask=query.mask,
@@ -1487,7 +1502,7 @@ def decode_adaptation_episode(
     )
     evidence = assemble_evidence(
         retrieval, online_score, index_rows,
-        max_evidence=policy.evidence_budget if evidence_budget is None else evidence_budget,
+        max_evidence=effective_evidence_budget,
         tau=RETRIEVAL_TEMPERATURE if score_temperature is None else score_temperature,
     )
     if evidence.local_index is None:
@@ -1502,8 +1517,8 @@ def decode_adaptation_episode(
             ),
             dim=-1,
         )
-        # Provided support keeps its episode-specific augmented view; selected background rows
-        # use a fresh live forward so future tokenizer fine-tuning receives the hard-path gradient.
+        # Provided support keeps its episode-specific clean view; selected background rows use a
+        # fresh live forward so optional tokenizer fine-tuning receives the hard-path gradient.
         ev_Z = torch.where(ev_support.unsqueeze(-1), ev_Z, live_selected)
 
     def ev_field(name, dtype=None):
@@ -1570,7 +1585,7 @@ def decode_adaptation_episode(
             label_index(view.candidate_ids, int(canonical_text.shape[0]), device)[view.query_label]
         ],
         "retrieval_topk": topk,
-        "evidence_budget": policy.evidence_budget if evidence_budget is None else evidence_budget,
+        "evidence_budget": effective_evidence_budget,
         "score_temperature": (
             dec.cfg.score_temperature if score_temperature is None else score_temperature
         ),
@@ -1594,19 +1609,15 @@ def training_episode_telemetry(
     detailed: bool,
     retrieval_score_gradient: torch.Tensor | None = None,
 ) -> tuple[dict, dict, dict]:
-    """Detach one independent episode into scalar telemetry and curriculum categories."""
+    """Detach one independent episode into scalar telemetry and sampling categories."""
     categories = {
         "episode_type": spec.episode_type,
         "label_mode": spec.label_mode,
         "physical_view_mode": spec.physical_view_mode,
         "enrollment_shape": spec.enrollment_shape,
         "support_count": str(spec.support_count),
-        "enrolled_candidate_count": str(spec.enrolled_candidate_count),
         "candidate_count": str(len(candidates)),
-        "counterfactual_role": spec.counterfactual_role or "independent",
-        "distractor_hard_fraction": str(spec.distractor_hard_fraction),
         "target_position": target.detach().cpu().tolist(),
-        "synthetic_persona": composition["synthetic_persona"],
     }
     strata = {key: categories[key] for key in (
         "episode_type", "label_mode", "physical_view_mode", "enrollment_shape",
@@ -1614,7 +1625,7 @@ def training_episode_telemetry(
     )}
     if not detailed:
         # Full evidence/attention telemetry is published on the minute cadence. In between, one
-        # compact transfer preserves continuous objective and curriculum health without copying
+        # compact transfer preserves continuous objective and episode health without copying
         # several evidence tensors to the host eight times per optimizer step.
         chance = 1.0 / len(candidates)
         compact = torch.stack([
@@ -1817,15 +1828,25 @@ def main() -> None:
     ap.add_argument("--heads", type=int, default=4)
     ap.add_argument("--evidence-budget", type=int, default=64,
                     help="sole retrieval-capacity knob; K and contribution caps are derived")
+    ap.add_argument(
+        "--retriever-init-predictor", type=Path, default=None,
+        help="diagnostic arm: initialize retrieval from an existing predictor artifact",
+    )
+    ap.add_argument(
+        "--freeze-retriever", action="store_true",
+        help="diagnostic arm: train only the decoder while keeping retrieval projections fixed",
+    )
     ap.add_argument("--tokenizer-mode", choices=("frozen", "ema_finetune"), default="frozen")
     ap.add_argument("--val-families", type=int, default=2,
                     help="complete canonical activity families excluded from every training role")
     ap.add_argument("--val-frac-cfg", type=float, default=0.2)
     ap.add_argument("--val-every", type=int, default=200)
-    ap.add_argument("--val-episodes", type=int, default=48,
-                    help="fixed canaries (48 is the full 16-recipe x 3-transfer-fold grid)")
+    ap.add_argument("--val-episodes", type=int, default=15,
+                    help="fixed clean C=8 canaries: coherent k=0 plus alias k=1/2/4/8, "
+                         "across three transfer folds")
     ap.add_argument("--val-queries", type=int, default=32)
-    ap.add_argument("--label-variants", type=int, default=16)
+    ap.add_argument("--label-variants", type=int, default=0,
+                    help="optional label-text augmentation; disabled in the minimal recipe")
     ap.add_argument("--telemetry-seconds", type=float, default=60.0)
     ap.add_argument("--telemetry-dir", type=Path, default=None)
     ap.add_argument("--save-every", type=int, default=200,
@@ -1874,15 +1895,22 @@ def main() -> None:
             Path("/tmp/halo_phase_b_predictor_real_smoke.pt")
             if args.out == _DEFAULT_OUT else args.out
         )
-    if args.steps < 1 or args.queries_per_episode < 1 \
-            or args.val_every < 1 or args.save_every < 1:
-        ap.error("steps, queries-per-episode, val-every, and save-every must be positive")
+    if args.steps < 1 or args.queries_per_episode < 1 or args.val_episodes < 1 \
+            or args.val_queries < 1 or args.val_every < 1 or args.save_every < 1:
+        ap.error(
+            "steps, queries-per-episode, validation sizes, val-every, and save-every "
+            "must be positive"
+        )
     if args.episodes_per_step < 1:
         ap.error("episodes-per-step must be positive")
+    if args.val_episodes > 15:
+        ap.error("val-episodes cannot exceed the declared 15-point canary grid")
     if args.warmup_steps < 0 or args.grad_clip <= 0:
         ap.error("warmup-steps must be nonnegative and grad-clip must be positive")
     if args.telemetry_seconds <= 0:
         ap.error("telemetry-seconds must be positive")
+    if args.freeze_retriever and args.retriever_init_predictor is None:
+        ap.error("--freeze-retriever requires --retriever-init-predictor")
     if args.tokenizer_mode == "ema_finetune" \
             and args.steps <= TOKENIZER_FINETUNE_WARMUP_STEPS:
         ap.error(
@@ -1912,11 +1940,11 @@ def main() -> None:
 
     sbert = get_sbert_encoder()
     text = ensemble_text(vocab, sbert, 8, train_only=True).to(device)
+    alias_embeddings = encode_neutral_aliases(sbert, device)
     variants = (
         build_label_variants(vocab, sbert, args.label_variants, train_only=True).to(device)
         if args.label_variants > 0 else None
     )
-    alias_embeddings = encode_neutral_aliases(sbert, device)
     text_gen = torch.Generator(device=device).manual_seed(args.seed)
 
     # Training occupies the non-held-subject/non-held-configuration quadrant. Held-family
@@ -1959,13 +1987,36 @@ def main() -> None:
     retriever = PatchSubspaceRetriever(
         d, RETRIEVAL_SUBSPACES, RETRIEVAL_SUBSPACE_DIM, RETRIEVAL_PROJECTION_EMA
     ).to(device)
+    retriever_init = None
+    if args.retriever_init_predictor is not None:
+        retriever_init = torch.load(
+            args.retriever_init_predictor, map_location="cpu", weights_only=True
+        )
+        expected_bank_fp = bank.get("bank_fp") or bank_fingerprint(bank)
+        if retriever_init.get("bank_fp") != expected_bank_fp:
+            raise SystemExit("retriever initializer was built against a different memory bank")
+        initializer_cfg = retriever_init.get("cfg", {})
+        expected_shape = (d, RETRIEVAL_SUBSPACES, RETRIEVAL_SUBSPACE_DIM)
+        actual_shape = (
+            int(initializer_cfg.get("d_model", -1)),
+            int(initializer_cfg.get("n_subspaces", -1)),
+            int(initializer_cfg.get("subspace_dim", -1)),
+        )
+        if actual_shape != expected_shape:
+            raise SystemExit(
+                f"retriever initializer shape {actual_shape} != required {expected_shape}"
+            )
+        retriever.load_state_dict(retriever_init["retriever"])
+    if args.freeze_retriever:
+        for parameter in retriever.parameters():
+            parameter.requires_grad_(False)
     decoder_cfg = {
         "d_model": d, "n_layers": args.layers, "n_heads": args.heads,
     }
     dec = build_decoder(decoder_cfg).to(device)
-    params = dec.param_groups(args.weight_decay) + [
-        {"params": retriever.parameters(), "weight_decay": args.weight_decay},
-    ]
+    params = dec.param_groups(args.weight_decay)
+    if not args.freeze_retriever:
+        params.append({"params": retriever.parameters(), "weight_decay": args.weight_decay})
     live_source = online_encoder = ema_encoder = None
     checkpoint = None
     if not args.smoke:
@@ -1993,6 +2044,10 @@ def main() -> None:
             online_encoder = build_encoder(checkpoint, device, training=True)
             # The frozen LM is lazy/non-stateful. Reuse the instance/cache warmed by the probes.
             online_encoder.text_encoder = ema_encoder.text_encoder
+            # Phase B encodes complete patches and never executes the Phase-A masked-token path.
+            # Exclude its learned mask vector from AdamW rather than silently decaying a parameter
+            # that cannot receive a task gradient.
+            online_encoder.mask_token.requires_grad_(False)
             params.append({
                 "params": [p for p in online_encoder.parameters() if p.requires_grad],
                 "weight_decay": args.weight_decay,
@@ -2021,7 +2076,7 @@ def main() -> None:
         torch.as_tensor(bank["patch"]["Z"])[index_rows].float().to(device), dim=-1
     )
     memory_index = retriever.build_index(selector_z)
-    curriculum = EpisodeCurriculum(rng)
+    episode_sampler = EpisodeSampler(rng)
 
     def build_selector_index(rows, *, encoder=None):
         if encoder is None:
@@ -2077,7 +2132,7 @@ def main() -> None:
             truth_present=True,
             rng=local_rng,
             allowed_vocab=allowed_vocab,
-            hard_fraction=spec.distractor_hard_fraction,
+            hard_fraction=0.0,
         )
         # choose_candidates may have fewer rows when the represented pool is tiny.
         candidates = candidates[torch.isin(candidates, allowed_vocab)]
@@ -2094,19 +2149,9 @@ def main() -> None:
             raise ValueError(
                 "no eligible support-feasible labels for an adaptation episode"
             )
-        support_plan = _partial_enrollment_plan(spec, len(candidates), local_rng)
-        required_query_labels = None
-        if isinstance(support_plan, list):
-            enrolled_positions = np.flatnonzero(np.asarray(support_plan) > 0)
-            unenrolled_positions = np.flatnonzero(np.asarray(support_plan) == 0)
-            required_query_labels = candidates[torch.tensor([
-                int(local_rng.choice(enrolled_positions)),
-                int(local_rng.choice(unenrolled_positions)),
-            ], device=device)]
         qi = sample_queries_covering_labels(
             episode_query_pool, candidates, y, count, local_rng,
             config_ids=cfg, subject_ids=subj,
-            required_labels=required_query_labels,
         )
         episode_window_mask = memory_window_mask
         if validation:
@@ -2118,61 +2163,30 @@ def main() -> None:
             expand_verified_events=True,
             allowed_window_mask=episode_window_mask,
         )
-        # Candidate selection above already guarantees every candidate can supply
-        # `spec.support_count` units, so zeroing a subset is always feasible and never changes which
-        # labels are in play — only which of them arrive enrolled.
+        # Candidate selection guarantees every candidate can supply k independent support units.
+        # The view samples those units uniformly. Retrieval receives only the resulting allowed-row
+        # mask; it is never told which rows are support and never has support appended to its top-k.
         view = build_episode_memory_view(
             bank["patch"], rows, query, y[qi], candidates,
-            support_count=support_plan,
+            support_count=spec.support_count,
             episode_type=spec.episode_type,
             label_mode=spec.label_mode,
             rng=local_rng,
         )
         return qi, query, view
 
-    # Fixed canaries cover the full support curriculum. The held-out set is the checkpoint-selection
-    # target; a smaller matched training set provides an interpretable generalization gap.
-    supported_episode_types = [
-        name for name in EPISODE_TYPES if name != "semantic_zero_support"
-    ]
-    supported_validation_modes = (
-        ("coherent", True),
-        ("coherent", False),
-        ("random_alias", False),
+    # Fixed canaries hold query rows, candidate identities and text fixed within each curve. The
+    # held-family curves select checkpoints, while matched training-family curves expose the gap.
+    canary_support_counts = (1, 2) if args.smoke else VALIDATION_SUPPORT_COUNTS
+    canary_candidate_count = 4 if args.smoke else VALIDATION_CURVE_CANDIDATE_COUNT
+    # Five points per fold match the information available during training: coherent k=0 and
+    # arbitrary-name k=1/2/4/8. The positive-k aliases are fixed within a curve so only support
+    # count changes along that curve.
+    validation_curves = (
+        ("coherent_zero", "semantic_zero_support", "coherent", (0,)),
+        ("alias_full", "ordinary_few_support", "random_alias", canary_support_counts),
     )
-    def canary_recipes(episode_types):
-        # k=0 must span the candidate-set sizes used at deployment; the historical single C=2
-        # canary was much easier than training and could not guard zero-shot behavior at scale.
-        recipes = []
-        for support_index, support in enumerate(VALIDATION_SUPPORT_COUNTS):
-            recipes.append((
-                "semantic_zero_support", 0, "coherent", False,
-                (2, 4, 8, 16)[support_index],
-            ))
-            for mode_index, (label_mode, partial) in enumerate(supported_validation_modes):
-                candidate_count = VALIDATION_CANDIDATE_COUNTS[
-                    (support_index * len(supported_validation_modes) + mode_index)
-                    % len(VALIDATION_CANDIDATE_COUNTS)
-                ]
-                recipes.append((
-                    episode_types[
-                        (support_index * len(supported_validation_modes) + mode_index)
-                        % len(episode_types)
-                    ],
-                    support,
-                    label_mode,
-                    partial,
-                    candidate_count,
-                ))
-        return recipes
-
-    # A held-subject validation query cannot, by definition, obtain real same-subject support from
-    # the subject-disjoint validation memory. Keep that condition in matched training canaries and
-    # the external enrollment evaluator rather than silently substituting a synthetic identity.
-    validation_recipes = canary_recipes([
-        "ordinary_few_support", "cross_subject_few_support",
-    ])
-    training_recipes = canary_recipes(supported_episode_types)
+    training_curves = validation_curves
     val_selector_z = F.normalize(
         torch.as_tensor(bank["patch"]["Z"])[val_index_rows].float().to(device), dim=-1
     )
@@ -2187,85 +2201,94 @@ def main() -> None:
             )
         validation_query_pools.append((fold_name, relation_pool))
 
-    def build_fixed_canaries(pool, rows, *, recipes, count, validation, seed_offset):
+    def build_fixed_canaries(pool, rows, *, curves, count, validation, seed_offset):
         canaries = []
-        local_rng = np.random.default_rng(args.seed + seed_offset)
         cases = (
-            validation_canary_cases(recipes, validation_query_pools)
+            validation_canary_cases(curves, validation_query_pools)
             if validation else
-            [(None, pool, recipe_index, recipe) for recipe_index, recipe in enumerate(recipes)]
+            [(None, pool, curve_index, curve) for curve_index, curve in enumerate(curves)]
         )
-        for i in range(count):
-            fold_relation, episode_pool, recipe_index, recipe = cases[i % len(cases)]
-            episode_type, requested_support, label_mode, partial, candidate_count = recipe
-            episode_seed = args.seed + seed_offset * 1000 + i
-            support_attempts = [requested_support]
-            if requested_support:
-                support_attempts += [
-                    value for value in reversed(VALIDATION_SUPPORT_COUNTS)
-                    if value < requested_support
-                ]
+        base_canaries = []
+        for case_index, (fold_relation, episode_pool, curve_index, curve) in enumerate(cases):
+            curve_name, episode_type, label_mode, support_values = curve
+            episode_seed = args.seed + seed_offset * 1000 + case_index
+            local_rng = np.random.default_rng(episode_seed)
+            max_support = max(support_values)
             built = None
-            for support in support_attempts:
-                canary_spec = AdaptationEpisodeSpec(
-                    episode_type=episode_type,
-                    support_count=support,
-                    candidate_count=candidate_count,
-                    label_mode=label_mode,
-                    enrolled_candidate_count=(
-                        max(1, candidate_count // 2)
-                        if partial and support > 0 else None
-                    ),
-                )
-                for _attempt in range(50):
-                    try:
-                        qi, query, view = make_adaptation_episode(
-                            episode_pool, rows, canary_spec,
-                            count=args.val_queries, local_rng=local_rng,
-                            validation=validation,
-                        )
-                        label_set = episode_label_set(
-                            view.candidate_ids, text, mode=label_mode,
-                            rng=local_rng, alias_embeddings=alias_embeddings,
-                            canonical_names=vocab,
-                        )
-                        built = (
-                            canary_spec, qi, query, view, label_set
-                        )
-                        break
-                    except ValueError:
-                        continue
-                if built is not None:
+            max_spec = AdaptationEpisodeSpec(
+                episode_type=episode_type,
+                support_count=max_support,
+                candidate_count=canary_candidate_count,
+                label_mode=label_mode,
+            )
+            for _attempt in range(50):
+                try:
+                    qi, query, max_view = make_adaptation_episode(
+                        episode_pool, rows, max_spec,
+                        count=args.val_queries, local_rng=local_rng,
+                        validation=validation,
+                    )
+                    if len(max_view.candidate_ids) != canary_candidate_count:
+                        raise ValueError("fixed validation curve did not realize all candidates")
+                    label_set = episode_label_set(
+                        max_view.candidate_ids, text, mode=label_mode,
+                        rng=local_rng,
+                        alias_embeddings=alias_embeddings,
+                        canonical_names=vocab,
+                    )
+                    built = qi, query, max_view, label_set
                     break
+                except ValueError:
+                    continue
             if built is None:
                 split = "validation" if validation else "training"
                 raise RuntimeError(
-                    f"could not construct {split} adaptation canary requested_support="
-                    f"{requested_support}"
+                    f"could not construct {split} nested adaptation curve {curve_name!r} "
+                    f"with C={canary_candidate_count}, k={max_support}"
                 )
-            canary_spec, qi, query, view, label_set = built
-            for physical_view_mode in PHYSICAL_VIEW_MODES:
-                canaries.append({
-                    "spec": replace(canary_spec, physical_view_mode=physical_view_mode),
+            qi, query, max_view, label_set = built
+            for support in support_values:
+                view = nested_support_view(max_view, bank["patch"], rows, support)
+                spec = replace(
+                    max_spec,
+                    episode_type=(
+                        "semantic_zero_support" if support == 0 else max_spec.episode_type
+                    ),
+                    support_count=support,
+                )
+                base_canaries.append({
+                    "spec": spec,
                     "qi": qi,
                     "query": query,
                     "view": view,
                     "candidate_text": label_set.embeddings,
                     "candidate_phrases": label_set.phrases,
                     "seed": episode_seed,
-                    "requested_support": requested_support,
+                    "requested_support": support,
                     "fold_relation": fold_relation,
+                    "curve": curve_name,
+                })
+        if count > len(base_canaries):
+            raise ValueError(
+                f"requested {count} fixed canaries but the declared grid contains "
+                f"{len(base_canaries)}"
+            )
+        for base in base_canaries[:count]:
+            for physical_view_mode in PHYSICAL_VIEW_MODES:
+                canaries.append({
+                    **base,
+                    "spec": replace(base["spec"], physical_view_mode=physical_view_mode),
                 })
         return canaries
 
     val_specs = build_fixed_canaries(
-        val_pool, val_index_rows, recipes=validation_recipes, count=args.val_episodes,
+        val_pool, val_index_rows, curves=validation_curves, count=args.val_episodes,
         validation=True, seed_offset=1,
     )
     train_canary_specs = build_fixed_canaries(
         train_pool, train_canary_index_rows,
-        recipes=training_recipes,
-        count=min(args.val_episodes, len(training_recipes)),
+        curves=training_curves,
+        count=min(args.val_episodes, 1 + len(canary_support_counts)),
         validation=False, seed_offset=2,
     )
     for canaries, rows in (
@@ -2312,26 +2335,21 @@ def main() -> None:
     previous_validation_rosters = None
     initial_validation_retriever = None
     previous_validation_retriever = None
-    k0_reference_floor = None
 
     @torch.no_grad()
     def evaluate():
         nonlocal initial_validation_rosters, previous_validation_rosters
         nonlocal initial_validation_retriever, previous_validation_retriever
-        nonlocal k0_reference_floor
         dec.eval(); retriever.eval()
         if ema_encoder is not None:
             ema_encoder.eval()
         all_pred, all_identity_pred, all_true = [], [], []
         per_cell, identity_per_cell, true_mass, positive_support_recall = [], [], [], []
         cell_records = []
-        random_scores = []
         support_removal_drop = []
         support_label_shuffle_drop = []
-        label_renaming_agreement = []
         support_removal_by_view = {mode: [] for mode in PHYSICAL_VIEW_MODES}
         support_label_shuffle_by_view = {mode: [] for mode in PHYSICAL_VIEW_MODES}
-        label_renaming_by_view = {mode: [] for mode in PHYSICAL_VIEW_MODES}
         current_validation_rosters = []
         fold_predictions = {
             name: {"pred": [], "true": []}
@@ -2401,12 +2419,11 @@ def main() -> None:
                 "episode_type": spec.episode_type,
                 "label_mode": spec.label_mode,
                 "enrollment_shape": spec.enrollment_shape,
+                "curve": canary["curve"],
                 "ba": cell_ba,
                 "identity_ba": identity_cell_ba,
                 "loss_over_random": normalized_ce,
             })
-            if spec.label_mode == "random_alias":
-                random_scores.append(cell_ba)
             for batch_index in range(len(aux["evidence_index"])):
                 row = aux["evidence_mask"][batch_index]
                 current_validation_rosters.append(frozenset(
@@ -2501,28 +2518,6 @@ def main() -> None:
                 support_label_shuffle_drop.extend(shuffle_values)
                 support_label_shuffle_by_view[spec.physical_view_mode].extend(shuffle_values)
 
-                if spec.label_mode == "random_alias":
-                    # Rename every candidate and its enrolled support consistently. This measures
-                    # naming stability; it is not treated as evidence that support is used.
-                    permutation = torch.roll(
-                        torch.arange(len(view.candidate_ids), device=device), shifts=1
-                    )
-                    permuted_logits, _ = decode_adaptation_episode(
-                        dec, retriever, bank, val_index_rows, eval_selector_z,
-                        val_memory_index, canary["query"], view, text,
-                        canary["candidate_text"][permutation], policy=policy,
-                        rng=np.random.default_rng(canary["seed"]),
-                        live_source=live_source,
-                        selector_encoder=ema_encoder, online_requires_grad=False,
-                        physical_view_mode=spec.physical_view_mode,
-                        view_specs=canary["view_specs"],
-                        prepared_views=prepared_views,
-                    )
-                    agreement_values = (
-                        permuted_logits.argmax(1).eq(logits.argmax(1)).float().cpu().tolist()
-                    )
-                    label_renaming_agreement.extend(agreement_values)
-                    label_renaming_by_view[spec.physical_view_mode].extend(agreement_values)
         zero = [score for support, _, score in per_cell if support == 0]
         low = [score for support, _, score in per_cell if support != 0]
         macro_cell_ba = float(np.mean([score for _, _, score in per_cell]))
@@ -2542,7 +2537,6 @@ def main() -> None:
             ])),
             "zero_support_ba": float(np.mean(zero)) if zero else float("nan"),
             "positive_support_ba": float(np.mean(low)) if low else float("nan"),
-            "random_alias_ba": float(np.mean(random_scores)) if random_scores else float("nan"),
             "positive_support_recall_at_k": (
                 float(np.mean(positive_support_recall))
                 if positive_support_recall else float("nan")
@@ -2554,10 +2548,6 @@ def main() -> None:
             "support_label_shuffle_true_probability_drop": (
                 float(np.mean(support_label_shuffle_drop))
                 if support_label_shuffle_drop else float("nan")
-            ),
-            "label_renaming_prediction_agreement": (
-                float(np.mean(label_renaming_agreement))
-                if label_renaming_agreement else float("nan")
             ),
             "support_fallback_fraction": float(np.mean([
                 record["support"] != record["requested_support"] for record in cell_records
@@ -2620,7 +2610,7 @@ def main() -> None:
                     metrics[f"support_k{support}_true_support_recall_at_k"] = float(
                         np.mean(recalls)
                     )
-        for candidate_count in (2, 4, 8, 16):
+        for candidate_count in (VALIDATION_CURVE_CANDIDATE_COUNT,):
             selected_records = [
                 record for record in cell_records
                 if record["support"] == 0 and record["candidate_count"] == candidate_count
@@ -2654,7 +2644,7 @@ def main() -> None:
                 metrics[f"label_mode/{label_mode}_macro_cell_ba"] = float(np.mean([
                     record["ba"] for record in selected_records
                 ]))
-        for enrollment_shape in ("zero", "partial", "full"):
+        for enrollment_shape in ("zero", "full"):
             selected_records = [
                 record for record in cell_records
                 if record["enrollment_shape"] == enrollment_shape
@@ -2686,10 +2676,6 @@ def main() -> None:
                 float(np.mean(support_label_shuffle_by_view[physical_view_mode]))
                 if support_label_shuffle_by_view[physical_view_mode] else float("nan")
             )
-            metrics[f"{physical_view_mode}_label_renaming_prediction_agreement"] = (
-                float(np.mean(label_renaming_by_view[physical_view_mode]))
-                if label_renaming_by_view[physical_view_mode] else float("nan")
-            )
 
         low_support_records = [
             record for record in cell_records if record["support"] in {1, 2}
@@ -2705,27 +2691,24 @@ def main() -> None:
         selection_low_k_gain = selection_low_k_ba - selection_low_k_identity_ba
         zero_support_ba = metrics["support_k0_macro_cell_ba"]
         zero_support_identity_ba = metrics["support_k0_identity_macro_cell_ba"]
-        if k0_reference_floor is None:
-            k0_reference_floor = max(zero_support_ba, zero_support_identity_ba)
-        zero_support_guard_floor = max(k0_reference_floor, zero_support_identity_ba)
-        zero_support_guard_pass = (
-            zero_support_ba + ZERO_SUPPORT_GUARD_TOLERANCE >= zero_support_guard_floor
-        )
-        # Absolute low-k quality is primary; a smaller identity-gain term ensures the selected
-        # checkpoint demonstrates learned evidence use rather than merely tracking its control. A
-        # checkpoint that destroys the deterministic k=0 floor is ineligible regardless of its k=1/2
-        # gain; the step-0 predictor remains a valid fallback in that case.
-        adaptation_score = selection_low_k_ba + 0.5 * selection_low_k_gain
+        # Absolute low-k quality ranks checkpoints only after the mechanism checks establish that
+        # the learned arm matches its closed-form control and reacts correctly to both interventions.
+        adaptation_score = selection_low_k_ba
         metrics.update({
             "selection_low_k_ba": selection_low_k_ba,
             "selection_low_k_identity_ba": selection_low_k_identity_ba,
             "selection_low_k_adaptation_gain": selection_low_k_gain,
-            "zero_support_guard_reference": k0_reference_floor,
-            "zero_support_guard_floor": zero_support_guard_floor,
-            "zero_support_guard_tolerance": ZERO_SUPPORT_GUARD_TOLERANCE,
-            "zero_support_guard_pass": zero_support_guard_pass,
+            "zero_support_identity_delta": zero_support_ba - zero_support_identity_ba,
             "adaptation_selection_score": adaptation_score,
             "checkpoint_selection_score": adaptation_score,
+        })
+        eligible, eligibility_checks = checkpoint_eligibility(metrics)
+        metrics.update({
+            "checkpoint_eligible": eligible,
+            **{
+                f"checkpoint_eligibility/{name}": passed
+                for name, passed in eligibility_checks.items()
+            },
         })
 
         # Matched fixed training canaries use the same episode recipe and metrics. Their purpose is
@@ -2803,9 +2786,12 @@ def main() -> None:
         )
         return metrics
 
-    best = {"checkpoint_selection_score": -float("inf")}
+    best = {"checkpoint_selection_score": -float("inf"), "checkpoint_eligible": False}
     best_step = 0
     best_state = None
+    best_control = {"selection_low_k_identity_ba": -float("inf")}
+    best_control_step = 0
+    best_control_state = None
     t0 = time.time()
     active_refreshes = 0
     state_path = args.out.with_name(f"{args.out.stem}.last{args.out.suffix}")
@@ -2822,6 +2808,10 @@ def main() -> None:
         "heads": args.heads,
         "evidence_budget": args.evidence_budget,
         "tokenizer_mode": args.tokenizer_mode,
+        "retriever_init_predictor": (
+            str(args.retriever_init_predictor) if args.retriever_init_predictor else None
+        ),
+        "freeze_retriever": bool(args.freeze_retriever),
         "val_families": args.val_families,
         "val_frac_cfg": args.val_frac_cfg,
         "val_episodes": args.val_episodes,
@@ -2862,19 +2852,19 @@ def main() -> None:
             "candidate_count_range": list(CANDIDATE_COUNT_RANGE),
             "support_count_range": list(SUPPORT_COUNT_RANGE),
             "physical_view_modes": list(PHYSICAL_VIEW_MODES),
-            "clean_physical_view_share": 0.5,  # expected, not exact per batch
+            "clean_physical_view_share": 1.0,
             "label_text_modes": list(LABEL_TEXT_MODES),
-            "mixture": "one_counterfactual_pair_and_one_alias_anchor_plus_independent_draws",
-            "batch_structure": "independent_episodes_except_exact_support_zero_pair",
+            "mixture": "independent_uniform_candidate_and_support_count_draws",
+            "batch_structure": "independent_episodes",
             "episodes_per_step": args.episodes_per_step,
             "queries_per_episode": args.queries_per_episode,
-            "alias_probability": ALIAS_PROBABILITY,
             "query_balance": "hierarchical",
             "query_subject_alpha": 0.5,
-            "candidate_support_policy": "episode_local_zero_partial_or_equal_full",
-            "physical_views": "sampled_clean_or_subject_style_then_phase_b_generic",
-            "counterfactual_pairing": "one_exact_support_vs_zero_pair_per_multi_episode_step",
-            "candidate_difficulty": "2_to_4_then_4_to_8_then_2_to_16_with_hard_fraction_anneal",
+            "candidate_support_policy": "same_uniformly_sampled_k_for_every_candidate",
+            "support_source_policy": "uniform_eligible_real_execution_excluding_query_execution",
+            "physical_views": "clean_stored_patch_embeddings_only",
+            "candidate_difficulty": "uniform_random_labels_no_hard_distractor_mining",
+            "retrieval_selection": "learned_query_driven_topk_without_support_insertion",
         },
         "retrieval_cfg": {**policy.as_dict(), "index_seed": args.seed + 2},
         "phase_b_policy": policy.as_dict(),
@@ -2924,10 +2914,19 @@ def main() -> None:
         "objective_cfg": {
             "candidate_gradient_loss": "raw_cross_entropy",
             "candidate_diagnostic_normalization": "divide_by_log_candidate_count",
-            "query_groups": list(QUERY_LOSS_GROUPS),
-            "reduction": "equal_mean_across_present_query_groups",
+            "reduction": "mean_queries_then_equal_mean_across_episodes",
         },
-        "phase_b_schema_version": 6,
+        "diagnostic_arm": {
+            "freeze_retriever": bool(args.freeze_retriever),
+            "retriever_initializer": (
+                str(args.retriever_init_predictor)
+                if args.retriever_init_predictor is not None else None
+            ),
+            "retriever_initializer_step": (
+                retriever_init.get("checkpoint_step") if retriever_init is not None else None
+            ),
+        },
+        "phase_b_schema_version": 8,
         "training_regime": PHASE_B_TRAINING_REGIME,
         "training_source_fp": current_source_fp,
         "validation_canary_fp": current_canary_fp,
@@ -2960,7 +2959,10 @@ def main() -> None:
         checkpoint_step: int,
         checkpoint_metrics: dict,
         selection: str,
+        predictor_mode: str = "relational_decoder",
     ) -> dict:
+        if predictor_mode not in {"relational_decoder", "closed_form_retrieval_vote"}:
+            raise ValueError(f"unknown predictor mode {predictor_mode!r}")
         return {
             **model_state,
             **predictor_metadata,
@@ -2970,11 +2972,12 @@ def main() -> None:
             "best_step": checkpoint_step,
             "best_metrics": dict(checkpoint_metrics),
             "checkpoint_selection": selection,
+            "predictor_mode": predictor_mode,
         }
 
     def save_trainer_state(step: int) -> None:
         state = {
-            "kind": "phase_b_patch_decoder_trainer_state_v4",
+            "kind": "phase_b_patch_decoder_trainer_state_v5",
             "step": step,
             "elapsed_seconds": time.time() - t0,
             "run_config": run_config,
@@ -2995,7 +2998,9 @@ def main() -> None:
             "best": best,
             "best_step": best_step,
             "best_state": best_state,
-            "k0_reference_floor": k0_reference_floor,
+            "best_control": best_control,
+            "best_control_step": best_control_step,
+            "best_control_state": best_control_state,
             "index_rows": index_rows.detach().cpu(),
             "selector_z": selector_z.detach().cpu(),
             "active_refreshes": active_refreshes,
@@ -3011,7 +3016,7 @@ def main() -> None:
     start_step = 0
     if args.resume is not None:
         resume = torch.load(args.resume, map_location="cpu", weights_only=False)
-        if resume.get("kind") != "phase_b_patch_decoder_trainer_state_v4":
+        if resume.get("kind") != "phase_b_patch_decoder_trainer_state_v5":
             raise SystemExit(
                 "--resume is not a protocol-bound Phase-B trainer state; "
                 "legacy states cannot safely restore checkpoint selection"
@@ -3047,9 +3052,9 @@ def main() -> None:
         best = dict(resume["best"])
         best_step = int(resume["best_step"])
         best_state = resume.get("best_state")
-        if resume.get("k0_reference_floor") is None:
-            raise SystemExit("resume state lacks the zero-support checkpoint guard reference")
-        k0_reference_floor = float(resume["k0_reference_floor"])
+        best_control = dict(resume["best_control"])
+        best_control_step = int(resume["best_control_step"])
+        best_control_state = resume.get("best_control_state")
         index_rows = resume["index_rows"].long().cpu()
         selector_z = resume["selector_z"].float().to(device)
         memory_index = retriever.build_index(selector_z)
@@ -3086,26 +3091,31 @@ def main() -> None:
                 "patch_embeddings": "l2_normalized",
                 "retrieval_attention_prior": "log_softmax_over_valid_plus_log_count",
                 "token_inputs": "unit_direction_components_with_learned_positive_scales_then_ln",
-                "candidate_loss": "raw_cross_entropy_equal_mean_across_present_query_groups",
+                "candidate_loss": "raw_cross_entropy_equal_mean_across_episodes",
             },
         },
     )
 
     if args.resume is None:
-        # Establish the semantic-transfer floor before any optimizer update. Step zero is retained as
-        # the fallback checkpoint, so a run that improves enrollment by destroying zero-support
-        # behavior cannot silently become the published predictor.
+        # Score both the learned arm and its deterministic closed-form control before any update.
+        # An ineligible learned run ships the strongest measured control state rather than arbitrary
+        # decoder initialization.
         initial_metrics = evaluate()
         telemetry.set_validation(initial_metrics)
-        best = dict(initial_metrics)
-        best_step = 0
-        best_state = snapshot_predictor_state()
+        initial_state = snapshot_predictor_state()
+        if checkpoint_is_better(initial_metrics, best):
+            best = dict(initial_metrics)
+            best_step = 0
+            best_state = initial_state
+        best_control = dict(initial_metrics)
+        best_control_step = 0
+        best_control_state = initial_state
         atomic_torch_save(
             make_predictor_payload(
-                best_state,
+                initial_state,
                 checkpoint_step=0,
                 checkpoint_metrics=initial_metrics,
-                selection="step0_zero_support_guard_reference",
+                selection="step0_untrained_reference",
             ),
             milestone_checkpoint_path(args.out, 0),
         )
@@ -3116,7 +3126,11 @@ def main() -> None:
         dec.train(); retriever.train()
         if online_encoder is not None:
             online_encoder.train()
-        tokenizer_active = online_encoder is not None and step > TOKENIZER_FINETUNE_WARMUP_STEPS
+        retriever.proj.requires_grad_(not args.freeze_retriever)
+        tokenizer_active = (
+            online_encoder is not None
+            and step > TOKENIZER_FINETUNE_WARMUP_STEPS
+        )
         if step > 1 and (step - 1) % ACTIVE_REFRESH_STEPS == 0:
             index_rows = table.sample_index_rows(
                 memory_window_mask,
@@ -3140,45 +3154,31 @@ def main() -> None:
             or step % RETRIEVAL_DIAGNOSTIC_STEPS == 0
             or step % args.val_every == 0
         )
-        specs = curriculum.sample_batch(
-            args.episodes_per_step, step=step, total_steps=args.steps
-        )
+        specs = episode_sampler.sample_batch(args.episodes_per_step)
         if args.smoke:
             specs = [
-                replace(spec, support_count=min(spec.support_count, 1)) for spec in specs
+                AdaptationEpisodeSpec(
+                    episode_type=(
+                        "semantic_zero_support" if spec.support_count == 0
+                        else "ordinary_few_support"
+                    ),
+                    support_count=min(spec.support_count, 1),
+                    candidate_count=spec.candidate_count,
+                    label_mode=(
+                        "coherent" if min(spec.support_count, 1) == 0 else "random_alias"
+                    ),
+                )
+                for spec in specs
             ]
-        training_evidence_budget, training_score_temperature = policy.training_retrieval(
-            step, args.steps
-        )
+        training_evidence_budget = policy.evidence_budget
+        training_score_temperature = RETRIEVAL_TEMPERATURE
         episode_records = []
         step_loss = 0.0
         hard_grad_sum = torch.zeros_like(retriever.proj) if telemetry_due else None
 
-        # Prepare all episode metadata before any forward pass. This makes the four query-condition
-        # denominators known up front, so each episode can backward immediately instead of retaining
-        # every episode graph merely to compute an exact group-balanced mean.
+        # Prepare all independent episode metadata before any forward pass.
         prepared = []
-        paired_support = {}
         for episode_number, spec in enumerate(specs):
-            if spec.counterfactual_role == "zero":
-                source = paired_support.get(spec.counterfactual_pair_id)
-                if source is None:
-                    raise RuntimeError("counterfactual zero episode precedes its support episode")
-                qi, query = source["qi"], source["query"]
-                view = build_episode_memory_view(
-                    bank["patch"], index_rows, query, y[qi], source["view"].candidate_ids,
-                    support_count=0,
-                    episode_type="semantic_zero_support",
-                    label_mode="coherent",
-                    rng=rng,
-                )
-                prepared.append({
-                    **source,
-                    "spec": spec,
-                    "view": view,
-                    "attempt": 1,
-                })
-                continue
             episode_error = None
             for attempt in range(20):
                 t_ev, t_cand = (
@@ -3221,26 +3221,15 @@ def main() -> None:
                 "attempt": attempt + 1,
             }
             prepared.append(item)
-            if spec.counterfactual_role == "support":
-                paired_support[spec.counterfactual_pair_id] = item
 
         if live_source is not None:
-            paired_query_specs = {}
             for item in prepared:
                 spec = item["spec"]
-                if spec.counterfactual_role == "zero":
-                    query_specs = paired_query_specs.get(spec.counterfactual_pair_id)
-                    if query_specs is None:
-                        raise RuntimeError("paired query-view specification is unavailable")
-                    item["view_specs"] = (query_specs, [])
-                    continue
                 item["view_specs"] = _episode_view_specs(
                     item["query"], item["view"], index_rows, bank["patch"],
                     np.random.default_rng(item["decode_seed"]),
                     physical_view_mode=spec.physical_view_mode,
                 )
-                if spec.counterfactual_role == "support":
-                    paired_query_specs[spec.counterfactual_pair_id] = item["view_specs"][0]
 
         if live_source is not None and policy.tokenizer_mode == "frozen":
             batched_views = prepare_frozen_adaptation_views_batch(
@@ -3257,34 +3246,23 @@ def main() -> None:
             for item, prepared_views in zip(prepared, batched_views, strict=True):
                 item["prepared_views"] = prepared_views
 
-        group_counts = torch.zeros(len(QUERY_LOSS_GROUPS), dtype=torch.long, device=device)
         for item in prepared:
             candidates = item["view"].candidate_ids
             true_label = y[item["qi"]]
             target = label_index(candidates, n_vocab, device)[true_label]
             if bool((target < 0).any()):
                 raise RuntimeError("answerable episode omitted a query label from candidates")
-            realized_support = item["view"].support_units_per_candidate[target]
-            group_id = query_loss_group_ids(item["spec"], realized_support)
-            group_counts += torch.bincount(group_id, minlength=len(QUERY_LOSS_GROUPS))
             item.update({
                 "true_label": true_label,
                 "target": target,
-                "loss_group_id": group_id,
             })
-        active_loss_groups = int(group_counts.gt(0).sum())
-        if active_loss_groups < 1:
-            raise RuntimeError("training step contains no Phase-B query-loss groups")
-        group_loss_sums = torch.zeros(len(QUERY_LOSS_GROUPS), device=device)
 
-        for episode_number, item in enumerate(prepared):
+        def forward_item(item, *, attention=None):
             spec = item["spec"]
-            qi, query, view = item["qi"], item["query"], item["view"]
-            candidates = view.candidate_ids
-            true_label, target = item["true_label"], item["target"]
-            logits, aux = decode_adaptation_episode(
+            return decode_adaptation_episode(
                 dec, retriever, bank, index_rows, selector_z, memory_index,
-                query, view, item["evidence_text"], item["candidate_text"],
+                item["query"], item["view"],
+                item["evidence_text"], item["candidate_text"],
                 policy=policy,
                 rng=np.random.default_rng(item["decode_seed"]),
                 live_source=live_source,
@@ -3296,56 +3274,51 @@ def main() -> None:
                 score_temperature=training_score_temperature,
                 view_specs=item.get("view_specs"),
                 prepared_views=item.get("prepared_views"),
-                return_attention=telemetry_due,
+                return_attention=telemetry_due if attention is None else attention,
             )
-            per_query_loss = F.cross_entropy(logits, target, reduction="none")
-            candidate_loss = per_query_loss.mean()
+
+        def diagnostic_gradients(objective, aux_values):
+            score_inputs = [
+                aux["retrieval_scores"] for aux in aux_values
+                if aux["retrieval_scores"].requires_grad
+            ]
+            inputs = ([retriever.proj] if retriever.proj.requires_grad else []) + score_inputs
+            if not telemetry_due or not inputs:
+                return None, [None] * len(aux_values)
+            gradients = torch.autograd.grad(
+                objective, inputs, retain_graph=True, allow_unused=True,
+            )
+            cursor = 0
+            hard_gradient = None
+            if retriever.proj.requires_grad:
+                hard_gradient = gradients[0]
+                cursor = 1
+            score_gradients = []
+            for aux in aux_values:
+                if aux["retrieval_scores"].requires_grad:
+                    score_gradients.append(gradients[cursor])
+                    cursor += 1
+                else:
+                    score_gradients.append(None)
+            return hard_gradient, score_gradients
+
+        def record_item(item, logits, aux, candidate_loss, retrieval_score_gradient):
+            spec = item["spec"]
+            view = item["view"]
             normalized_candidate_loss = candidate_loss / max(
-                np.log(len(candidates)), 1e-8
+                np.log(len(view.candidate_ids)), 1e-8
             )
-            episode_objective = per_query_loss.new_zeros(())
-            for group_id in range(len(QUERY_LOSS_GROUPS)):
-                member = item["loss_group_id"].eq(group_id)
-                if bool(member.any()):
-                    group_sum = per_query_loss[member].sum()
-                    episode_objective = episode_objective + (
-                        group_sum / group_counts[group_id] / active_loss_groups
-                    )
-                    group_loss_sums[group_id] += group_sum.detach()
-            if not bool(torch.isfinite(episode_objective)):
-                raise FloatingPointError(
-                    f"non-finite Phase-B loss at step {step}, episode {episode_number + 1}"
-                )
-
-            retrieval_score_gradient = None
-            if telemetry_due:
-                hard_grad, retrieval_score_gradient = torch.autograd.grad(
-                    episode_objective, (retriever.proj, aux["retrieval_scores"]),
-                    retain_graph=True, allow_unused=True,
-                )
-                if hard_grad is not None:
-                    hard_grad_sum.add_(hard_grad.detach())
-            episode_objective.backward()
-            step_loss += float(episode_objective.detach())
-
             composition = (
                 describe_episode_composition(
-                    bank["patch"], index_rows, query, view, simultaneous_pairs
+                    bank["patch"], index_rows, item["query"], view, simultaneous_pairs
                 )
-                if telemetry_due else {
-                    "synthetic_persona": {
-                        "same_subject_enrollment":
-                            "one persona shared by the query and its support",
-                        "cross_subject_few_support":
-                            "a different persona for the query and its support",
-                    }.get(view.episode_type, "none applied")
-                }
+                if telemetry_due else {}
             )
             episode_metrics, categories, strata = training_episode_telemetry(
                 spec=spec,
-                candidates=candidates,
-                target=target,
-                true_label=true_label,
+                candidates=view.candidate_ids,
+                target=item["target"],
+                true_label=item["true_label"],
                 aux=aux,
                 candidate_loss=candidate_loss.detach(),
                 normalized_candidate_loss=normalized_candidate_loss.detach(),
@@ -3368,36 +3341,59 @@ def main() -> None:
                 "score_temperature": float(aux["score_temperature"]),
             })
 
-        dec_grad = parameter_gradient_norm(dec.parameters(), device)
-        retrieval_grad = parameter_gradient_norm(retriever.parameters(), device)
-        tokenizer_grad = torch.tensor(0.0, device=device)
+        for episode_number, item in enumerate(prepared):
+            logits, aux = forward_item(item)
+            candidate_loss = F.cross_entropy(logits, item["target"])
+            objective = candidate_loss / len(prepared)
+            if not bool(torch.isfinite(objective)):
+                raise FloatingPointError(
+                    f"non-finite Phase-B loss at step {step}, episode {episode_number + 1}"
+                )
+            hard_grad, score_grads = diagnostic_gradients(objective, [aux])
+            if hard_grad is not None:
+                hard_grad_sum.add_(hard_grad.detach())
+            objective.backward()
+            step_loss += float(objective.detach())
+            record_item(item, logits, aux, candidate_loss, score_grads[0])
+
+        dec_gradient_stats = parameter_gradient_statistics(dec.parameters(), device)
+        retriever_gradient_stats = parameter_gradient_statistics(retriever.parameters(), device)
+        dec_grad = dec_gradient_stats["norm"]
+        retrieval_grad = retriever_gradient_stats["norm"]
+        tokenizer_gradient_stats = {
+            name: torch.tensor(0.0, device=device)
+            for name in ("norm", "rms", "coverage", "nonzero_fraction")
+        }
         if online_encoder is not None:
-            tokenizer_grad = parameter_gradient_norm(online_encoder.parameters(), device)
+            tokenizer_gradient_stats = parameter_gradient_statistics(
+                online_encoder.parameters(), device
+            )
+        tokenizer_grad = tokenizer_gradient_stats["norm"]
         component_gradients = {}
         if telemetry_due:
-            components = {
-                "relational_attention": dec.blocks,
-                "candidate_readout": dec.readout,
-                "role_embeddings": dec.role_emb,
-                "coreference_slot_embeddings": dec.slot_emb,
-                "window_group_embeddings": dec.group_emb,
-                "query_projection": dec.proj_query,
-                "evidence_projection": dec.proj_evidence,
-                "text_projection": dec.proj_text,
-                "component_scales": dec.component_log_scale,
-            }
-            for name, module in components.items():
-                if module is not None:
-                    component_gradients[f"component_grad_norm/{name}"] = float(
-                        parameter_gradient_norm(module.parameters(), device)
-                    )
-        trainable_params = list(dec.parameters()) + list(retriever.parameters())
+            for name, parameters in decoder_gradient_components(dec).items():
+                statistics = parameter_gradient_statistics(parameters, device)
+                for statistic, value in statistics.items():
+                    component_gradients[f"component_grad_{statistic}/{name}"] = float(value)
+            if online_encoder is not None:
+                for name, parameters in tokenizer_gradient_components(online_encoder).items():
+                    statistics = parameter_gradient_statistics(parameters, device)
+                    for statistic, value in statistics.items():
+                        component_gradients[
+                            f"tokenizer_component_grad_{statistic}/{name}"
+                        ] = float(value)
+        trainable_params = [
+            parameter for parameter in [*dec.parameters(), *retriever.parameters()]
+            if parameter.requires_grad
+        ]
         if online_encoder is not None:
             trainable_params += [p for p in online_encoder.parameters() if p.requires_grad]
         preclip_grad = torch.nn.utils.clip_grad_norm_(
             trainable_params, args.grad_clip, error_if_nonfinite=True,
         )
-        opt.step(); sched.step(); retriever.update_ema()
+        opt.step(); sched.step()
+        if not args.freeze_retriever:
+            retriever.update_ema()
         if tokenizer_active:
             update_tokenizer_ema(ema_encoder, online_encoder)
         task_objective = float(np.mean([
@@ -3407,11 +3403,30 @@ def main() -> None:
             "loss": step_loss,
             "task_objective": task_objective,
             "decoder_grad_norm": float(dec_grad),
+            "decoder_grad_rms": float(dec_gradient_stats["rms"]),
+            "decoder_grad_coverage": float(dec_gradient_stats["coverage"]),
+            "decoder_grad_nonzero_fraction": float(
+                dec_gradient_stats["nonzero_fraction"]
+            ),
             "retriever_grad_norm": float(retrieval_grad),
+            "retriever_grad_rms": float(retriever_gradient_stats["rms"]),
+            "retriever_grad_coverage": float(retriever_gradient_stats["coverage"]),
+            "retriever_grad_nonzero_fraction": float(
+                retriever_gradient_stats["nonzero_fraction"]
+            ),
             "retriever_to_decoder_grad_ratio": float(
                 retrieval_grad / dec_grad.clamp_min(1e-12)
             ),
+            "retriever_to_decoder_grad_rms_ratio": float(
+                retriever_gradient_stats["rms"]
+                / dec_gradient_stats["rms"].clamp_min(1e-12)
+            ),
             "tokenizer_grad_norm": float(tokenizer_grad),
+            "tokenizer_grad_rms": float(tokenizer_gradient_stats["rms"]),
+            "tokenizer_grad_coverage": float(tokenizer_gradient_stats["coverage"]),
+            "tokenizer_grad_nonzero_fraction": float(
+                tokenizer_gradient_stats["nonzero_fraction"]
+            ),
             "preclip_grad_norm": float(preclip_grad),
             "gradient_clipped_fraction": float(float(preclip_grad) > args.grad_clip),
             "learning_rate": float(opt.param_groups[0]["lr"]),
@@ -3419,24 +3434,10 @@ def main() -> None:
             "queries_per_step": float(len(specs) * args.queries_per_episode),
             "training_evidence_budget": float(training_evidence_budget),
             "training_retrieval_temperature": float(training_score_temperature),
-            "paired_episode_fraction": float(np.mean([
-                spec.counterfactual_pair_id is not None for spec in specs
-            ])),
-            "distractor_hard_fraction": float(np.mean([
-                spec.distractor_hard_fraction for spec in specs
-            ])),
+            "retriever_trainable": float(not args.freeze_retriever),
+            "tokenizer_active": float(tokenizer_active),
             "step_seconds": float(time.perf_counter() - step_started),
         }
-        total_group_queries = int(group_counts.sum())
-        for group_id, name in enumerate(QUERY_LOSS_GROUPS):
-            count = int(group_counts[group_id])
-            optimizer_metrics[f"query_group_fraction/{name}"] = (
-                count / total_group_queries if total_group_queries else 0.0
-            )
-            if count:
-                optimizer_metrics[f"query_group_loss/{name}"] = float(
-                    group_loss_sums[group_id] / count
-                )
         if device.type == "cuda":
             optimizer_metrics.update({
                 "gpu_allocated_gib": torch.cuda.memory_allocated(device) / 2**30,
@@ -3468,6 +3469,12 @@ def main() -> None:
             if better:
                 best, best_step = dict(metrics), step
                 best_state = milestone_state
+            if metrics["selection_low_k_identity_ba"] > best_control[
+                "selection_low_k_identity_ba"
+            ]:
+                best_control = dict(metrics)
+                best_control_step = step
+                best_control_state = milestone_state
             milestone_path = milestone_checkpoint_path(args.out, step)
             atomic_torch_save(
                 make_predictor_payload(
@@ -3548,7 +3555,7 @@ def main() -> None:
                 **{key: round(value, 4) for key, value in metrics.items()},
                 "best_checkpoint_selection_score": round(
                     best["checkpoint_selection_score"], 4
-                ),
+                ) if np.isfinite(best["checkpoint_selection_score"]) else None,
                 "elapsed_s": round(time.time() - t0, 1),
             }), flush=True)
         # Emit only after a step that collected the expensive diagnostics. If the wall-clock
@@ -3570,23 +3577,34 @@ def main() -> None:
         if step % args.save_every == 0 or step == args.steps:
             save_trainer_state(step)
 
-    if best_state is None:
-        raise RuntimeError("training completed without a valid checkpoint")
+    learned_checkpoint = best_state is not None
+    selected_state = best_state if learned_checkpoint else best_control_state
+    selected_metrics = best if learned_checkpoint else best_control
+    selected_step = best_step if learned_checkpoint else best_control_step
+    if selected_state is None:
+        raise RuntimeError("training completed without a learned or control checkpoint")
     payload = make_predictor_payload(
-        best_state,
-        checkpoint_step=best_step,
-        checkpoint_metrics=best,
+        selected_state,
+        checkpoint_step=selected_step,
+        checkpoint_metrics=selected_metrics,
         selection=(
-            "step0_fallback_no_trained_checkpoint_passed_zero_support_guard"
-            if best_step == 0 else
-            "held_family_adaptation_with_zero_support_nonregression_guard"
+            "held_family_low_k_eligible_relational_decoder"
+            if learned_checkpoint else
+            "closed_form_retrieval_vote_fallback_no_eligible_learned_checkpoint"
+        ),
+        predictor_mode=(
+            "relational_decoder" if learned_checkpoint else "closed_form_retrieval_vote"
         ),
     )
     atomic_torch_save(payload, args.out)
     telemetry.emit(
         step=args.steps, elapsed_seconds=time.time() - t0, force=True, final=True
     )
-    print(f"[patch-dec] best step {best_step}: {best} -> {args.out}", flush=True)
+    print(
+        f"[patch-dec] selected {payload['predictor_mode']} step {selected_step}: "
+        f"{selected_metrics} -> {args.out}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

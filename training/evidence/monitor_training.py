@@ -82,36 +82,61 @@ def assess(telemetry_dir: Path, stale_seconds: float = 150.0) -> dict:
     if stage == "predictor" and (snapshot.get("metrics") or snapshot.get("validation")):
         warmup = int(metadata.get("warmup_steps", 0))
         mix = snapshot.get("mix", {})
-        enrollment_mix = mix.get("enrollment_shape", {})
-        if enrollment_mix and int(enrollment_mix.get("partial", 0)) == 0:
+        label_modes = mix.get("label_mode", {})
+        expected_label_modes = {"coherent", "random_alias"}
+        if label_modes and not set(label_modes).issubset(expected_label_modes):
             alert(
-                "critical", "missing_partial_enrollment",
-                "The latest training window contains no partial-enrollment episodes.",
+                "critical", "unexpected_label_mode",
+                f"Phase-B training emitted unexpected label modes: {label_modes}.",
             )
-        # Anchor episodes guarantee the core loss conditions, while the remaining regimes are
-        # sampled stochastically, so counts need not be exactly equal. What still indicates a broken
-        # sampler is a regime that never appears at all, or one so starved that the telemetry window
-        # carries almost no signal for it.
-        episode_mix = mix.get("episode_type", {})
-        episode_counts = [int(value) for value in episode_mix.values()]
-        if episode_counts and sum(episode_counts) >= 32:
-            expected = sum(episode_counts) / 4
-            if len(episode_counts) < 4 or min(episode_counts) < 0.25 * expected:
+        physical_modes = mix.get("physical_view_mode", {})
+        if physical_modes and set(physical_modes) != {"clean"}:
+            alert(
+                "critical", "unexpected_physical_view",
+                f"Minimal Phase-B training emitted non-clean views: {physical_modes}.",
+            )
+        support_mix = mix.get("support_count", {})
+        support_total = sum(int(value) for value in support_mix.values())
+        if support_total >= 32:
+            zero = int(support_mix.get("0", 0))
+            coherent = int(label_modes.get("coherent", 0))
+            aliases = int(label_modes.get("random_alias", 0))
+            if coherent != zero or aliases != support_total - zero:
                 alert(
-                    "warning", "starved_episode_regime",
-                    f"Recent episode-regime counts are {episode_mix}; one regime is far below the "
-                    f"rough four-regime reference count of {expected:.0f}.",
+                    "critical", "label_support_contract_broken",
+                    "Phase-B requires coherent names exactly for k=0 and arbitrary names exactly "
+                    f"for k>0; observed support={support_mix}, labels={label_modes}.",
+                )
+            if zero == 0:
+                alert(
+                    "warning", "missing_zero_support_draws",
+                    f"No k=0 episode occurred in {support_total} recent independent draws.",
+                )
+            if zero == support_total:
+                alert(
+                    "critical", "missing_supported_draws",
+                    f"All {support_total} recent episodes used k=0.",
                 )
         if step > warmup:
-            for name in ("decoder_grad_norm", "retriever_grad_norm"):
+            for name in ("decoder_grad_norm",):
                 maximum = _metric(snapshot, name, "max")
                 if math.isfinite(maximum) and maximum == 0.0:
                     alert("critical", "dead_gradient", f"{name} remained zero in the latest window.")
-            grad_ratio = _metric(snapshot, "retriever_to_decoder_grad_ratio")
+        if step > warmup:
+            maximum = _metric(snapshot, "retriever_grad_norm", "max")
+            if math.isfinite(maximum) and maximum == 0.0:
+                alert(
+                    "critical", "dead_gradient",
+                    "retriever_grad_norm remained zero after optimizer warm-up.",
+                )
+            grad_ratio = _metric(snapshot, "retriever_to_decoder_grad_rms_ratio")
+            if not math.isfinite(grad_ratio):
+                # Compatibility with telemetry emitted before size-normalized gradients existed.
+                grad_ratio = _metric(snapshot, "retriever_to_decoder_grad_ratio")
             if math.isfinite(grad_ratio) and grad_ratio < 1e-4:
                 alert(
                     "warning", "weak_retriever_gradient",
-                    f"Retriever/decoder gradient ratio is only {grad_ratio:.2e} in the latest "
+                    f"Retriever/decoder gradient RMS ratio is only {grad_ratio:.2e} in the latest "
                     "window; retrieval may be learning too slowly to change the roster.",
                 )
         clipped = _metric(snapshot, "gradient_clipped_fraction")
@@ -189,6 +214,45 @@ def assess(telemetry_dir: Path, stale_seconds: float = 150.0) -> dict:
             alert("warning", "dead_components",
                   "Zero gradient in three consecutive probes: "
                   + ", ".join(dead_components) + ".")
+        incomplete_components = []
+        for key in sorted(
+            key for key in snapshot.get("metrics", {})
+            if key.startswith("component_grad_coverage/")
+        ):
+            coverage = _metric(snapshot, key, "min")
+            if math.isfinite(coverage) and coverage < 0.999:
+                incomplete_components.append(
+                    f"{key.removeprefix('component_grad_coverage/')}={coverage:.1%}"
+                )
+        if step > warmup and incomplete_components:
+            alert(
+                "warning",
+                "incomplete_component_gradient_coverage",
+                "Some trainable parameters were absent from the latest backward graph: "
+                + ", ".join(incomplete_components) + ".",
+            )
+        tokenizer_active = _metric(snapshot, "tokenizer_active", "max") > 0.5
+        if tokenizer_active:
+            dead_tokenizer_components = []
+            for key in sorted(
+                key for row in history[-6:] for key in row.get("metrics", {})
+                if key.startswith("tokenizer_component_grad_norm/")
+            ):
+                samples = [
+                    float(row["metrics"][key].get("max", 0.0))
+                    for row in history[-6:] if key in row.get("metrics", {})
+                ]
+                if len(samples) >= 3 and all(value == 0.0 for value in samples[-3:]):
+                    dead_tokenizer_components.append(
+                        key.removeprefix("tokenizer_component_grad_norm/")
+                    )
+            if dead_tokenizer_components:
+                alert(
+                    "warning",
+                    "dead_tokenizer_components",
+                    "Zero gradient in three active tokenizer probes: "
+                    + ", ".join(dead_tokenizer_components) + ".",
+                )
         component_scales = {
             key.removeprefix("component_scale/"): _metric(snapshot, key)
             for key in snapshot.get("metrics", {}) if key.startswith("component_scale/")
@@ -217,7 +281,8 @@ def assess(telemetry_dir: Path, stale_seconds: float = 150.0) -> dict:
         validation = snapshot.get("validation", {})
         retriever_drift = validation.get("retriever_ema_relative_drift_from_initial")
         val_every = int(metadata.get("val_every", 0))
-        if retriever_drift is not None and val_every and step >= warmup + 3 * val_every \
+        if retriever_drift is not None and val_every \
+                and step >= warmup + 3 * val_every \
                 and float(retriever_drift) < 1e-5:
             alert(
                 "warning", "retriever_not_moving",
@@ -229,21 +294,12 @@ def assess(telemetry_dir: Path, stale_seconds: float = 150.0) -> dict:
                   f"Held-out adaptation score is {float(gain):.3f} below identity control.")
         k0_score = validation.get("support_k0_macro_cell_ba")
         k0_identity = validation.get("support_k0_identity_macro_cell_ba")
-        k0_floor = validation.get("zero_support_guard_floor")
-        k0_tolerance = float(validation.get("zero_support_guard_tolerance", 0.0))
         if k0_score is not None and k0_identity is not None \
                 and float(k0_score) < float(k0_identity) - 0.05:
             alert(
                 "warning", "zero_support_below_identity",
                 f"Held-out k=0 BA {float(k0_score):.3f} is below the identity retrieval control "
                 f"{float(k0_identity):.3f}.",
-            )
-        if k0_score is not None and k0_floor is not None \
-                and float(k0_score) + k0_tolerance < float(k0_floor):
-            alert(
-                "critical", "zero_support_guard_failed",
-                f"Held-out k=0 BA {float(k0_score):.3f} is below the checkpoint floor "
-                f"{float(k0_floor):.3f}; this checkpoint is ineligible for selection.",
             )
         support_drop = validation.get("support_removal_true_probability_drop")
         if support_drop is not None and step > warmup and float(support_drop) <= 0.01:
@@ -258,6 +314,13 @@ def assess(telemetry_dir: Path, stale_seconds: float = 150.0) -> dict:
                 "warning", "support_labels_inert",
                 f"Shuffling enrollment labels changes true-label probability by only "
                 f"{float(shuffle_drop):.3f}.",
+            )
+        eligible = validation.get("checkpoint_eligible")
+        if eligible is False and step > warmup:
+            alert(
+                "warning", "checkpoint_mechanism_ineligible",
+                "The latest checkpoint does not yet match the retrieval-vote control and respond "
+                "positively to both support interventions.",
             )
         gap = validation.get("train_validation_macro_cell_ba_gap")
         gap_points = []

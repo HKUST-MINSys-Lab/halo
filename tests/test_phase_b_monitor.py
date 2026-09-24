@@ -112,7 +112,8 @@ def test_predictor_monitor_detects_role_attention_starvation_and_weak_credit(tmp
     telemetry.update({
         "decoder_grad_norm": 1.0,
         "retriever_grad_norm": 1e-6,
-        "retriever_to_decoder_grad_ratio": 1e-6,
+        "retriever_to_decoder_grad_ratio": 1.0,
+        "retriever_to_decoder_grad_rms_ratio": 1e-6,
         "candidate_to_evidence_attention_mass": 0.99,
         "candidate_to_query_attention_mass": 0.003,
         "candidate_to_candidate_attention_mass": 0.004,
@@ -130,20 +131,60 @@ def test_predictor_monitor_detects_role_attention_starvation_and_weak_credit(tmp
     } <= codes
 
 
-def test_predictor_monitor_detects_missing_partial_enrollment(tmp_path):
+def test_predictor_monitor_detects_incomplete_component_gradient_coverage(tmp_path):
+    telemetry = PhaseBTelemetry(tmp_path, interval_seconds=60, run_id="gradient-coverage")
+    telemetry.start(
+        step=0,
+        elapsed_seconds=0,
+        metadata={"planned_steps": 1000, "warmup_steps": 10},
+    )
+    telemetry.update({
+        "decoder_grad_norm": 1.0,
+        "component_grad_norm/time_projection": 0.1,
+        "component_grad_coverage/time_projection": 0.5,
+    })
+    telemetry.emit(step=100, elapsed_seconds=10, force=True)
+    codes = {item["code"] for item in assess(tmp_path)["alerts"]}
+    assert "incomplete_component_gradient_coverage" in codes
+
+
+def test_predictor_monitor_checks_minimal_episode_contract(tmp_path):
     telemetry = PhaseBTelemetry(tmp_path, interval_seconds=60, run_id="episodes")
     telemetry.start(step=0, elapsed_seconds=0, metadata={"planned_steps": 100})
-    for episode_type in (
-        "semantic_zero_support", "ordinary_few_support",
-        "cross_subject_few_support", "same_subject_enrollment",
-    ):
+    for _ in range(32):
         telemetry.update(
             {"loss": 1.0},
-            categories={"episode_type": episode_type, "enrollment_shape": "full"},
+            categories={
+                "episode_type": "ordinary_few_support",
+                "support_count": "2",
+                "label_mode": "random_alias",
+                "physical_view_mode": "clean",
+            },
         )
     telemetry.emit(step=1, elapsed_seconds=1, force=True)
     codes = {item["code"] for item in assess(tmp_path)["alerts"]}
-    assert "missing_partial_enrollment" in codes
+    assert "missing_zero_support_draws" in codes
+    assert "unexpected_label_mode" not in codes
+    assert "unexpected_physical_view" not in codes
+    assert "label_support_contract_broken" not in codes
+
+
+def test_predictor_monitor_detects_label_support_contract_break(tmp_path):
+    telemetry = PhaseBTelemetry(tmp_path, interval_seconds=60, run_id="label-contract")
+    telemetry.start(step=0, elapsed_seconds=0, metadata={"planned_steps": 100})
+    for _ in range(32):
+        telemetry.update(
+            {"loss": 1.0},
+            categories={
+                "episode_type": "ordinary_few_support",
+                "support_count": "2",
+                "label_mode": "coherent",
+                "physical_view_mode": "clean",
+            },
+        )
+    telemetry.emit(step=1, elapsed_seconds=1, force=True)
+    codes = {item["code"] for item in assess(tmp_path)["alerts"]}
+    assert "label_support_contract_broken" in codes
 
 
 def test_predictor_monitor_detects_token_component_scale_imbalance(tmp_path):
@@ -173,12 +214,12 @@ def test_predictor_monitor_detects_zero_support_checkpoint_regression(tmp_path):
     telemetry.set_validation({
         "support_k0_macro_cell_ba": 0.20,
         "support_k0_identity_macro_cell_ba": 0.30,
-        "zero_support_guard_floor": 0.32,
-        "zero_support_guard_tolerance": 0.01,
     })
     telemetry.emit(step=100, elapsed_seconds=10, force=True)
     codes = {item["code"] for item in assess(tmp_path)["alerts"]}
-    assert {"zero_support_below_identity", "zero_support_guard_failed"} <= codes
+    # Reported separately from the current support-use eligibility checks.
+    assert "zero_support_below_identity" in codes
+    assert "zero_support_guard_failed" not in codes
 
 
 def test_external_development_and_test_rosters_are_complete_and_disjoint():

@@ -21,7 +21,7 @@ Usage:
     python -m training.evidence.build_comparison_table \
         --arm step0 out/enroll_step0_coherent.json out/enroll_step0_aliases.json \
         --arm step1000 out/enroll_step1000_coherent.json out/enroll_step1000_aliases.json \
-        --out-prefix training/evidence/outputs/stage1_step0_control/comparison
+        --out-prefix training/evidence/outputs/diagnostics/phase_b_20260808/stage1_step0_control/comparison
 """
 
 from __future__ import annotations
@@ -63,6 +63,7 @@ def load_arm(paths: list[Path]) -> dict:
                 raise SystemExit(f"duplicate cell {cell} across {paths}")
             cells[cell] = result
         for field in ("predictor", "predictor_fp", "predictor_step", "predictor_selection",
+                      "predictor_mode",
                       "untrained_control", "training_regime", "bank_fp", "checkpoint_fp", "seed",
                       "evaluation_regime", "evaluation_source_fp", "evaluation_protocol_fp"):
             value = payload.get(field)

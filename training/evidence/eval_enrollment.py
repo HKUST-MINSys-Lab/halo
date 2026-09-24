@@ -6,7 +6,8 @@ import argparse
 import hashlib
 import json
 import os
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -418,6 +419,52 @@ def _few_shot_baselines(
     return prototype, ridge
 
 
+def predictor_logits(logits: torch.Tensor, aux: dict, predictor_mode: str) -> torch.Tensor:
+    """Select the artifact-declared prediction path without changing the episode protocol."""
+    if predictor_mode == "relational_decoder":
+        return logits
+    if predictor_mode == "closed_form_retrieval_vote":
+        return aux["identity_logits"]
+    raise ValueError(f"unknown predictor mode {predictor_mode!r}")
+
+
+@contextmanager
+def _zero_module_output(module):
+    """Temporarily remove one decoder information source without changing retrieval."""
+    handle = module.register_forward_hook(
+        lambda _module, _inputs, output: torch.zeros_like(output)
+    )
+    try:
+        yield
+    finally:
+        handle.remove()
+
+
+def _restricted_view(view, row_mask: torch.Tensor):
+    """Return the same episode with retrieval restricted to selected active-memory rows."""
+    if row_mask.dim() == 1:
+        row_mask = row_mask.view(1, 1, -1)
+    allowed = view.allowed & row_mask
+    if not bool((allowed.any(-1) | ~view.allowed.any(-1)).all()):
+        raise ValueError("diagnostic retrieval restriction left a valid query without evidence")
+    return replace(view, allowed=allowed)
+
+
+def _prediction_contingency(learned: torch.Tensor, identity: torch.Tensor,
+                            target: torch.Tensor) -> dict[str, int]:
+    """Paired account of whether decoder changes help or harm the retrieval-only decision."""
+    learned_correct = learned.eq(target)
+    identity_correct = identity.eq(target)
+    return {
+        "both_correct": int((learned_correct & identity_correct).sum()),
+        "decoder_only_correct": int((learned_correct & ~identity_correct).sum()),
+        "identity_only_correct": int((~learned_correct & identity_correct).sum()),
+        "both_wrong": int((~learned_correct & ~identity_correct).sum()),
+        "prediction_changed": int(learned.ne(identity).sum()),
+        "queries": int(target.numel()),
+    }
+
+
 @torch.no_grad()
 def score_enrollment_cell(
     encoded,
@@ -445,12 +492,33 @@ def score_enrollment_cell(
     enrolled_candidate_count: int | None = None,
     phase_b_seen_labels: set[str] | None = None,
     same_configuration: bool = True,
+    predictor_mode: str = "relational_decoder",
+    decoder_diagnostics: bool = False,
 ):
     all_true, all_pred, all_identity_pred = [], [], []
     all_removed_pred, all_shuffled_pred = [], []
     all_prototype_pred, all_ridge_pred = [], []
     all_enrolled_query = []
     subject_results = {}
+    diagnostic_true = []
+    diagnostic_predictions = {
+        name: [] for name in (
+            "support_only_learned", "support_only_identity",
+            "background_only_learned", "background_only_identity",
+            "true_support_oracle_learned", "true_support_oracle_identity",
+            "without_query_signal", "without_evidence_signal",
+            "without_text", "without_coreference",
+        )
+    }
+    diagnostic_probability = {name: [] for name in diagnostic_predictions}
+    diagnostic_margin = {name: [] for name in diagnostic_predictions}
+    contingency = {
+        "both_correct": 0, "decoder_only_correct": 0,
+        "identity_only_correct": 0, "both_wrong": 0,
+        "prediction_changed": 0, "queries": 0,
+    }
+    attention_sum = {}
+    attention_queries = 0
     support_encoded = encoded if support_encoded is None else support_encoded
     support_subjects = subjects if support_subjects is None else support_subjects
     phase_b_seen_labels = phase_b_seen_labels or set()
@@ -553,32 +621,179 @@ def score_enrollment_cell(
                 enrollment.canonical_text, enrollment.candidate_text,
                 policy=policy,
                 rng=np.random.default_rng(seed + subject_index),
+                return_attention=decoder_diagnostics,
             )
+            logits = predictor_logits(logits, aux, predictor_mode)
             removed_view = removed.episode_view(
                 query, target_position, label_mode=label_mode
             )
-            removed_logits, _ = decode_adaptation_episode(
+            removed_logits, removed_aux = decode_adaptation_episode(
                 decoder, retriever, removed.bank, removed.index_rows,
                 removed.selector_z, removed_index, query, removed_view,
                 removed.canonical_text, removed.candidate_text,
                 policy=policy,
                 rng=np.random.default_rng(seed + subject_index),
             )
+            removed_logits = predictor_logits(removed_logits, removed_aux, predictor_mode)
             shuffled_logits = None
             if shuffled is not None:
                 shuffled_memory, shuffled_index = shuffled
                 shuffled_view = shuffled_memory.episode_view(
                     query, target_position, label_mode=label_mode
                 )
-                shuffled_logits, _ = decode_adaptation_episode(
+                shuffled_logits, shuffled_aux = decode_adaptation_episode(
                     decoder, retriever, shuffled_memory.bank, shuffled_memory.index_rows,
                     shuffled_memory.selector_z, shuffled_index, query, shuffled_view,
                     shuffled_memory.canonical_text, shuffled_memory.candidate_text,
                     policy=policy,
                     rng=np.random.default_rng(seed + subject_index),
                 )
+                shuffled_logits = predictor_logits(
+                    shuffled_logits, shuffled_aux, predictor_mode
+                )
             prediction = logits.argmax(1).cpu().tolist()
             identity_prediction = aux["identity_logits"].argmax(1).cpu().tolist()
+
+            if decoder_diagnostics and support_count > 0:
+                if predictor_mode != "relational_decoder":
+                    raise ValueError("decoder diagnostics require a relational-decoder predictor")
+
+                def run_diagnostic_arm(name, arm_view, module=None):
+                    if module is None:
+                        arm_logits, arm_aux = decode_adaptation_episode(
+                            decoder, retriever, enrollment.bank, enrollment.index_rows,
+                            enrollment.selector_z, memory_index, query, arm_view,
+                            enrollment.canonical_text, enrollment.candidate_text,
+                            policy=policy,
+                            rng=np.random.default_rng(seed + subject_index),
+                        )
+                    else:
+                        with _zero_module_output(module):
+                            arm_logits, arm_aux = decode_adaptation_episode(
+                                decoder, retriever, enrollment.bank, enrollment.index_rows,
+                                enrollment.selector_z, memory_index, query, arm_view,
+                                enrollment.canonical_text, enrollment.candidate_text,
+                                policy=policy,
+                                rng=np.random.default_rng(seed + subject_index),
+                            )
+                    arm_prediction = arm_logits.argmax(1)
+                    diagnostic_predictions[name].extend(
+                        candidate_names[index] for index in arm_prediction.cpu().tolist()
+                    )
+                    arm_probability = torch.softmax(arm_logits, dim=1)
+                    diagnostic_probability[name].extend(
+                        arm_probability.gather(1, target_position[:, None]).squeeze(1).cpu().tolist()
+                    )
+                    true_logit = arm_logits.gather(1, target_position[:, None]).squeeze(1)
+                    other_logit = arm_logits.masked_fill(
+                        F.one_hot(target_position, len(candidate_names)).bool(), float("-inf")
+                    ).max(1).values
+                    diagnostic_margin[name].extend((true_logit - other_logit).cpu().tolist())
+                    return arm_logits, arm_aux
+
+                learned_position = logits.argmax(1)
+                identity_position = aux["identity_logits"].argmax(1)
+                for key, value in _prediction_contingency(
+                    learned_position, identity_position, target_position
+                ).items():
+                    contingency[key] += value
+                diagnostic_true.extend(
+                    str(labels[int(row)]) for row in rows.tolist()
+                )
+
+                support_view = _restricted_view(view, view.support_mask)
+                support_logits, support_aux = run_diagnostic_arm(
+                    "support_only_learned", support_view
+                )
+                support_identity = support_aux["identity_logits"]
+                support_identity_position = support_identity.argmax(1)
+                diagnostic_predictions["support_only_identity"].extend(
+                    candidate_names[index] for index in support_identity_position.cpu().tolist()
+                )
+                support_probability = torch.softmax(support_identity, dim=1)
+                diagnostic_probability["support_only_identity"].extend(
+                    support_probability.gather(1, target_position[:, None]).squeeze(1).cpu().tolist()
+                )
+                support_true_logit = support_identity.gather(
+                    1, target_position[:, None]
+                ).squeeze(1)
+                support_other_logit = support_identity.masked_fill(
+                    F.one_hot(target_position, len(candidate_names)).bool(), float("-inf")
+                ).max(1).values
+                diagnostic_margin["support_only_identity"].extend(
+                    (support_true_logit - support_other_logit).cpu().tolist()
+                )
+
+                background_view = _restricted_view(view, ~view.support_mask)
+                background_logits, background_aux = run_diagnostic_arm(
+                    "background_only_learned", background_view
+                )
+                background_identity = background_aux["identity_logits"]
+                background_identity_position = background_identity.argmax(1)
+                diagnostic_predictions["background_only_identity"].extend(
+                    candidate_names[index]
+                    for index in background_identity_position.cpu().tolist()
+                )
+                background_probability = torch.softmax(background_identity, dim=1)
+                diagnostic_probability["background_only_identity"].extend(
+                    background_probability.gather(
+                        1, target_position[:, None]
+                    ).squeeze(1).cpu().tolist()
+                )
+                background_true_logit = background_identity.gather(
+                    1, target_position[:, None]
+                ).squeeze(1)
+                background_other_logit = background_identity.masked_fill(
+                    F.one_hot(target_position, len(candidate_names)).bool(), float("-inf")
+                ).max(1).values
+                diagnostic_margin["background_only_identity"].extend(
+                    (background_true_logit - background_other_logit).cpu().tolist()
+                )
+
+                true_support_rows = view.support_candidate.view(1, 1, -1).eq(
+                    target_position.view(-1, 1, 1)
+                )
+                true_support_view = _restricted_view(view, true_support_rows)
+                true_support_logits, true_support_aux = run_diagnostic_arm(
+                    "true_support_oracle_learned", true_support_view
+                )
+                true_support_identity = true_support_aux["identity_logits"]
+                true_support_identity_position = true_support_identity.argmax(1)
+                diagnostic_predictions["true_support_oracle_identity"].extend(
+                    candidate_names[index]
+                    for index in true_support_identity_position.cpu().tolist()
+                )
+                true_support_probability = torch.softmax(true_support_identity, dim=1)
+                diagnostic_probability["true_support_oracle_identity"].extend(
+                    true_support_probability.gather(
+                        1, target_position[:, None]
+                    ).squeeze(1).cpu().tolist()
+                )
+                true_support_true_logit = true_support_identity.gather(
+                    1, target_position[:, None]
+                ).squeeze(1)
+                true_support_other_logit = true_support_identity.masked_fill(
+                    F.one_hot(target_position, len(candidate_names)).bool(), float("-inf")
+                ).max(1).values
+                diagnostic_margin["true_support_oracle_identity"].extend(
+                    (true_support_true_logit - true_support_other_logit).cpu().tolist()
+                )
+
+                run_diagnostic_arm("without_query_signal", view, decoder.proj_query)
+                run_diagnostic_arm("without_evidence_signal", view, decoder.proj_evidence)
+                run_diagnostic_arm("without_text", view, decoder.proj_text)
+                run_diagnostic_arm("without_coreference", view, decoder.slot_emb)
+
+                batch_queries = int(target_position.numel())
+                attention_queries += batch_queries
+                for key in (
+                    "candidate_attention_normalized_entropy",
+                    "candidate_to_candidate_attention_mass",
+                    "candidate_to_label_attention_mass",
+                    "candidate_to_query_attention_mass",
+                    "candidate_to_evidence_attention_mass",
+                ):
+                    attention_sum[key] = attention_sum.get(key, 0.0) + float(aux[key]) * batch_queries
             removed_prediction = removed_logits.argmax(1).cpu().tolist()
             shuffled_prediction = (
                 shuffled_logits.argmax(1).cpu().tolist()
@@ -657,7 +872,7 @@ def score_enrollment_cell(
             np.asarray(prediction, dtype=object)[mask].tolist(),
         )["f1_macro"]) if bool(mask.any()) else float("nan")
 
-    return {
+    result = {
         "f1_macro": float(metrics["f1_macro"]),
         "identity_f1_macro": float(identity_metrics["f1_macro"]),
         "adaptation_f1_gain": float(metrics["f1_macro"] - identity_metrics["f1_macro"]),
@@ -704,6 +919,38 @@ def score_enrollment_cell(
             subject_results, seed=seed + 700_001 + support_count
         ),
     }
+    if decoder_diagnostics and diagnostic_true:
+        arm_results = {}
+        for name, prediction in diagnostic_predictions.items():
+            scores = classification_metrics(diagnostic_true, prediction)
+            arm_results[name] = {
+                "f1_macro": float(scores["f1_macro"]),
+                "accuracy": float(
+                    np.mean(np.asarray(diagnostic_true) == np.asarray(prediction)) * 100.0
+                ),
+                "mean_true_probability": float(np.mean(diagnostic_probability[name])),
+                "mean_true_logit_margin": float(np.mean(diagnostic_margin[name])),
+            }
+        result["decoder_diagnostics"] = {
+            "arms": arm_results,
+            "matched_decoder_vs_identity": contingency,
+            "attention": {
+                key: value / attention_queries for key, value in attention_sum.items()
+            },
+            "queries": len(diagnostic_true),
+            "protocol": {
+                "support_only": "learned top-k restricted to all enrolled rows",
+                "background_only": "same episode with all enrolled rows excluded",
+                "true_support_oracle": (
+                    "target-leaking diagnostic restricted to support bound to the true candidate"
+                ),
+                "module_interventions": (
+                    "same learned retrieval and evidence roster; named decoder projection output "
+                    "is set to zero"
+                ),
+            },
+        }
+    return result
 
 
 def main() -> None:
@@ -731,6 +978,10 @@ def main() -> None:
         help="positive-support protocols; partial enrolls half of each candidate set",
     )
     parser.add_argument("--random-aliases", action="store_true")
+    parser.add_argument(
+        "--decoder-diagnostics", action="store_true",
+        help="run paired support/background/oracle and decoder-input interventions on positive-k cells",
+    )
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--seed", type=int, default=20260808)
     parser.add_argument("--out", type=Path, default=None,
@@ -767,6 +1018,9 @@ def main() -> None:
     assert_artifact_matches_bank(
         predictor, bank, context="eval_enrollment", artifact_name="patch evidence predictor"
     )
+    predictor_mode = predictor.get("predictor_mode", "relational_decoder")
+    if predictor_mode not in {"relational_decoder", "closed_form_retrieval_vote"}:
+        raise SystemExit(f"unsupported predictor mode {predictor_mode!r}")
     recorded_regime = predictor.get("training_regime")
     accepted = {PHASE_B_TRAINING_REGIME}
     if args.accept_training_regime:
@@ -970,6 +1224,8 @@ def main() -> None:
                                 same_configuration=(
                                     configuration_relation == "same_configuration"
                                 ),
+                                predictor_mode=predictor_mode,
+                                decoder_diagnostics=args.decoder_diagnostics,
                             )
                             result["paired_protocol"] = coverage
                         result.update({
@@ -1038,6 +1294,8 @@ def main() -> None:
         "datasets": args.datasets,
         "seed": args.seed,
         "batch_size": args.batch,
+        "decoder_diagnostics": bool(args.decoder_diagnostics),
+        "predictor_mode": predictor_mode,
         "protocol": protocol,
         "evaluation_regime": PHASE_B_EVALUATION_REGIME,
         "evaluation_source_fp": evaluation_source_fp,

@@ -89,7 +89,7 @@ learning-rate discontinuity. Set the final budget upfront.
 CUDA_VISIBLE_DEVICES=0 /home/alex/code/HALO/legacy_code/.venv/bin/python \
   -m training.tokenizer.pretrain --device cuda --steps <FINAL_BUDGET> \
   --out training/tokenizer/outputs/pretrain_native
-# resume a killed run:  --resume training/tokenizer/outputs/pretrain_native/last.pt
+# Historical resume state was removed after completion; `best.pt` remains for reproduction.
 ```
 
 ## Profiling + config (2026-07-19, RTX 4090)

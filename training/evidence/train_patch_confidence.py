@@ -128,8 +128,12 @@ def main() -> None:
             predictor, bank, context="train_patch_confidence",
             artifact_name="patch evidence predictor",
         )
-    if predictor.get("objective") != "candidate_cross_entropy":
-        raise SystemExit("confidence calibration requires the consolidated CE predictor artifact")
+    if predictor.get("objective") != (
+        "candidate_cross_entropy_plus_matched_support_counterfactuals"
+    ):
+        raise SystemExit(
+            "confidence calibration requires the current counterfactual Phase-B predictor artifact"
+        )
     if predictor.get("training_regime") != PHASE_B_TRAINING_REGIME:
         raise SystemExit(
             "confidence calibration requires a predictor trained with the current adaptation regime"

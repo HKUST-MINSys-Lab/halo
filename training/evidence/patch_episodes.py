@@ -220,56 +220,12 @@ class PatchTable:
             if len(candidates) <= windows_per_label:
                 selected_windows.append(candidates)
                 continue
-            # Hoisted out of the loops below: each was re-indexing the same rows once per subject
-            # or per configuration.
-            candidate_subj = self.window_subj[candidates]
-            # Reserve half the active budget as distinct executions from one subject. Without this,
-            # round-robin subject balancing retained only one window per person and made the
-            # same-subject k=2..8 curriculum impossible despite ample repeated executions in the
-            # archive. The anchor is redrawn on every active-view refresh.
-            reserve_target = min(8, windows_per_label // 2)
-            candidate_unit = torch.where(
-                self.window_event_verified[candidates],
-                self.window_event[candidates] + self.n_windows,
-                candidates,
-            )
-            # Distinct units per subject, counted in one pass. The per-subject
-            # `unique(candidate_unit[subject_mask])` loop this replaces ran once for every
-            # (label, subject) pair — 13k tensor comparisons and 5k uniques per refresh. Subjects
-            # stay in ascending order, so the anchor tie-break sees the same list as before and the
-            # RNG is consumed identically.
-            subjects = candidate_subj.unique()
-            # (subject, unit) packed into one integer; both are non-negative ids so the packing is
-            # injective. `torch.unique(..., dim=0)` would express this directly but sorts row-wise
-            # and measured slower than the loop it replaces.
-            unit_stride = int(candidate_unit.max()) + 1
-            distinct = torch.unique(candidate_subj * unit_stride + candidate_unit)
-            distinct_subject = torch.div(distinct, unit_stride, rounding_mode="floor")
-            units_per_subject = torch.bincount(
-                torch.searchsorted(subjects, distinct_subject.contiguous()),
-                minlength=len(subjects),
-            )
-            max_units = int(units_per_subject.max())
-            anchor_positions = torch.nonzero(
-                units_per_subject.eq(max_units), as_tuple=True
-            )[0]
-            anchor_subject = int(
-                subjects[anchor_positions[int(rng.integers(len(anchor_positions)))]]
-            )
-            anchor_member = candidate_subj.eq(anchor_subject)
-            anchor_units = torch.unique(candidate_unit[anchor_member]).numpy()
-            chosen_units = rng.choice(
-                anchor_units, size=min(reserve_target, len(anchor_units)), replace=False
-            )
-            reserved = []
-            for unit in chosen_units.tolist():
-                members = candidates[candidate_unit.eq(int(unit))]
-                reserved.append(int(rng.choice(members.numpy())))
-            picked = list(reserved)
-            remaining_candidates = candidates[~torch.isin(
-                candidate_unit, torch.as_tensor(chosen_units, dtype=torch.long)
-            )]
-            remaining_budget = windows_per_label - len(picked)
+            # Balance the retrievable corpus across configurations and subjects, but do not reserve
+            # any rows from a chosen subject or otherwise shape it for enrollment. Episode support
+            # is sampled later from this active view without subject constraints.
+            picked = []
+            remaining_candidates = candidates
+            remaining_budget = windows_per_label
             remaining_cfg = self.window_cfg[remaining_candidates]
             configs = sorted(remaining_cfg.unique().tolist())
             # When a label occurs in more configurations than the active-window budget, assigning

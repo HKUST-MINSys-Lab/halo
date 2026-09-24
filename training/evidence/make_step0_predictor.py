@@ -168,6 +168,9 @@ def main() -> None:
         "checkpoint_metrics": {},
         "best_metrics": {},
         "checkpoint_selection": "untrained_step0_control",
+        # A reference artifact may itself have selected the closed-form fallback. This script exists
+        # to measure the architecture-matched untrained decoder, so never inherit that choice.
+        "predictor_mode": "relational_decoder",
     }
     if reference.get("cfg", {}).get("tokenizer_mode") == "ema_finetune":
         raise SystemExit(

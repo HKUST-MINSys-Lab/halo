@@ -6,8 +6,8 @@
     6
   ],
   "loss": {
-    "jepa": 1.0587775707244873,
-    "vicreg": 23.812597274780273
+    "jepa": 1.0624516010284424,
+    "vicreg": 23.817296981811523
   },
   "activation_rms": {
     "sensor_tokens": 0.48773,
@@ -20,12 +20,12 @@
   },
   "fusion_delta_ratio": 0.07268,
   "gradient_norms": {
-    "encoder": 4.32301664352417,
-    "jepa_predictor": 1.9501465559005737,
-    "vicreg_projector": 1.9258683919906616,
+    "encoder": 4.325377464294434,
+    "jepa_predictor": 1.9716347455978394,
+    "vicreg_projector": 1.9228239059448242,
     "transformer_layers": [
-      2.2923102378845215,
-      1.6577950716018677
+      2.3075969219207764,
+      1.6580591201782227
     ]
   },
   "dead_parameters": [],

@@ -2,10 +2,10 @@
 
 Building the active memory bank used to rescan all windows once per label, which was the entire
 ~300 ms cost of an active-index refresh. The grouping is now precomputed per memory mask. This is
-only a legitimate optimisation if the chosen windows are identical — and the function consumes the
-shared episode RNG in a data-dependent order (anchor subject, reserved units, config permutation,
-per-subject shuffles, top-up), so a changed grouping order would silently reshuffle every later
-draw. `_reference_candidates` reproduces the original per-label scan as the oracle.
+only a legitimate optimisation if the chosen windows are identical. The function consumes its RNG
+through configuration permutation, per-subject shuffles, and top-up, so a changed grouping order
+would silently reshuffle later draws. `_reference_candidates` reproduces the original per-label scan
+as the oracle.
 """
 
 from __future__ import annotations

@@ -76,6 +76,8 @@ def render(telemetry_dir: Path, output: Path | None = None) -> Path:
         axes[0, 1].set_yscale("symlog", linthresh=1e-4); axes[0, 1].set_title("Gradient norms")
         for key, label in (
             ("provided_support_recall_at_k", "provided-support recall"),
+            ("provided_support_pool_mass", "support pool mass"),
+            ("true_label_pool_mass", "true-label pool mass"),
             ("true_support_task_promoted_fraction", "task promotes support"),
             ("background_task_promoted_fraction", "task promotes background"),
         ):
@@ -98,10 +100,12 @@ def render(telemetry_dir: Path, output: Path | None = None) -> Path:
         for key, label in (
             ("macro_cell_ba", "held-out"), ("identity_macro_cell_ba", "identity"),
             ("train_macro_cell_ba", "matched train"),
-            ("random_alias_ba", "random alias"),
             ("support_k0_macro_cell_ba", "k=0"),
+            ("support_k1_macro_cell_ba", "k=1"),
+            ("support_k2_macro_cell_ba", "k=2"),
+            ("support_k4_macro_cell_ba", "k=4"),
+            ("support_k8_macro_cell_ba", "k=8"),
             ("support_k0_identity_macro_cell_ba", "k=0 identity"),
-            ("zero_support_guard_floor", "k=0 guard"),
         ):
             _line(axes[1, 1], _validation_series(rows, key), label, marker="o")
         axes[1, 1].set_title("Fixed canaries")
@@ -109,15 +113,17 @@ def render(telemetry_dir: Path, output: Path | None = None) -> Path:
             _line(axes[0, 3], _series(rows, f"component_scale/{name}"), name)
         axes[0, 3].set_title("Token component scales")
         for key, label in (
-            ("component_grad_norm/query_projection", "query"),
-            ("component_grad_norm/evidence_projection", "evidence"),
-            ("component_grad_norm/text_projection", "text"),
-            ("component_grad_norm/coreference_slot_embeddings", "slot"),
-            ("component_grad_norm/component_scales", "scale gates"),
+            ("component_grad_rms/query_projection", "query"),
+            ("component_grad_rms/evidence_projection", "evidence"),
+            ("component_grad_rms/text_projection", "text"),
+            ("component_grad_rms/time_projection", "time"),
+            ("component_grad_rms/acquisition_relation_embeddings", "relations"),
+            ("component_grad_rms/coreference_slot_embeddings", "slot"),
+            ("component_grad_rms/component_scales", "scale gates"),
         ):
             _line(axes[1, 3], _series(rows, key), label)
         axes[1, 3].set_yscale("symlog", linthresh=1e-5)
-        axes[1, 3].set_title("Input-path gradients")
+        axes[1, 3].set_title("Input-path gradient RMS")
     else:
         _line(axes[0, 0], _series(rows, "loss"), "train BCE")
         _line(axes[0, 0], _validation_series(rows, "bce"), "validation BCE", marker="o")
