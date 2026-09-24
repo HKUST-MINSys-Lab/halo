@@ -565,7 +565,8 @@ def pooled_episode_logits(
     ``transductive`` — EM-Dirichlet unrolled on query ∪ pool (∪ labelled supports at k > 0),
     imported from ``evaluation.rung1_unlabeled.transductive``: the same file the evaluator scores
     every encoder with, so what HALO is trained through is provably what the baselines get at test.
-    Gradients flow through the unrolled iterations into ``p_text`` and the encoder.
+    With ``unroll["mu"] > 0`` the embedding-affinity term uses the pooled features themselves, so
+    gradients reach the encoder both through ``p_text`` and through its neighbourhood geometry.
 
     ``soft_kmeans`` — ladder step 3 (Ren et al. 2018): one E-step under the differentiable-
     neighbour vote. Pool rows are soft-labelled against the supports, appended as supports weighted
@@ -587,7 +588,7 @@ def pooled_episode_logits(
             support_onehot = F.one_hot(support_bound.clamp_min(0), C).to(z.dtype) \
                 * support_mask.unsqueeze(-1).to(z.dtype)
         result = transduce(z, candidate_mask=candidate_mask, row_mask=row_mask,
-                           support_z=support_z, support_onehot=support_onehot, **unroll)
+                           support_z=support_z, support_onehot=support_onehot, embeddings=rows, **unroll)
         return result.logits[:, 0, :]
     if mode == "soft_kmeans":
         if not bool(support_mask.any()):
@@ -946,7 +947,7 @@ def build_dataset(index: CorpusIndex, args) -> PretrainDataset:
 def _pool_unroll(args) -> dict:
     """Fixed, short, early-stop-free iteration counts for the unrolled transductive readout."""
     return {"n_iter": int(args.pool_unroll_iters), "n_iter_mm": int(args.pool_unroll_mm_iters),
-            "early_stop": False}
+            "early_stop": False, "mu": float(args.pool_affinity_mu), "knn": int(args.pool_affinity_knn)}
 
 
 def draw_kwargs_from_args(args) -> dict:
@@ -2130,6 +2131,10 @@ def main() -> None:
                         help="softmax temperature of the probability features (released config: T=30)")
     parser.add_argument("--pool-unroll-iters", type=int, default=5, help="unrolled EM iterations")
     parser.add_argument("--pool-unroll-mm-iters", type=int, default=20, help="unrolled MM-quadratic iterations")
+    parser.add_argument("--pool-affinity-mu", type=float, default=1.0,
+                        help="weight of the embedding-affinity term in the unrolled readout (0 = published EM-Dirichlet)")
+    parser.add_argument("--pool-affinity-knn", type=int, default=10,
+                        help="neighbours per row for the embedding-affinity term")
     parser.add_argument("--variable-support-probability", type=float,
                         default=DEFAULT_VARIABLE_SUPPORT_PROBABILITY,
                         help="share of enrolled support sets with unequal per-candidate counts")
@@ -2501,7 +2506,8 @@ def main() -> None:
         parser.error("--pool-mode needs a classifier with a text projection (residual or evidence_gated)")
     if not 0.0 <= args.pool_distractor_fraction < 1.0 or args.pool_concentration <= 0 \
             or not (0.0 < args.pool_coverage[0] <= args.pool_coverage[1] <= 1.0) \
-            or args.pool_unroll_iters < 1 or args.pool_unroll_mm_iters < 1 or args.pool_temperature <= 0:
+            or args.pool_unroll_iters < 1 or args.pool_unroll_mm_iters < 1 or args.pool_temperature <= 0 \
+            or args.pool_affinity_mu < 0 or args.pool_affinity_knn < 1:
         parser.error("pool options out of range")
     for option, values in (("acquisition-mix", args.acquisition_mix),
                            ("enrollment-mix", args.enrollment_mix)):
@@ -2603,7 +2609,8 @@ def main() -> None:
                                          ("pool_regime_mix", [0.5, 0.25, 0.25]), ("pool_concentration", 1.0),
                                          ("pool_distractor_fraction", 0.25), ("pool_coverage", [0.5, 1.0]),
                                          ("pool_temperature", 30.0), ("pool_unroll_iters", 5),
-                                         ("pool_unroll_mm_iters", 20)):
+                                         ("pool_unroll_mm_iters", 20), ("pool_affinity_mu", 0.0),
+                                         ("pool_affinity_knn", 10)):
             saved.setdefault(pool_field, pool_default)
         saved.setdefault("variable_support_probability", 0.0)
         saved.setdefault("counterfactual_enrollment_probability", 0.0)
@@ -2674,6 +2681,7 @@ def main() -> None:
             "pool_distractor_fraction": "--pool-distractor-fraction", "pool_coverage": "--pool-coverage",
             "pool_temperature": "--pool-temperature", "pool_unroll_iters": "--pool-unroll-iters",
             "pool_unroll_mm_iters": "--pool-unroll-mm-iters",
+            "pool_affinity_mu": "--pool-affinity-mu", "pool_affinity_knn": "--pool-affinity-knn",
             "variable_support_probability": "--variable-support-probability",
             "counterfactual_enrollment_probability": "--counterfactual-enrollment-probability",
             "text_corruption_probability": "--text-corruption-probability",
@@ -3160,6 +3168,7 @@ def main() -> None:
             "pool_distractor_fraction": float(args.pool_distractor_fraction),
             "pool_coverage": list(args.pool_coverage), "pool_temperature": float(args.pool_temperature),
             "pool_unroll_iters": int(args.pool_unroll_iters), "pool_unroll_mm_iters": int(args.pool_unroll_mm_iters),
+            "pool_affinity_mu": float(args.pool_affinity_mu), "pool_affinity_knn": int(args.pool_affinity_knn),
             "variable_support_probability": args.variable_support_probability,
             "counterfactual_enrollment_probability": args.counterfactual_enrollment_probability,
             "open_vocabulary_holdout_fraction": args.open_vocabulary_holdout_fraction,
@@ -3310,6 +3319,7 @@ def main() -> None:
             ("pool_size", 0), ("pool_mode", "none"), ("pool_regime_mix", [0.5, 0.25, 0.25]),
             ("pool_concentration", 1.0), ("pool_distractor_fraction", 0.25), ("pool_coverage", [0.5, 1.0]),
             ("pool_temperature", 30.0), ("pool_unroll_iters", 5), ("pool_unroll_mm_iters", 20),
+            ("pool_affinity_mu", 0.0), ("pool_affinity_knn", 10),
             ("variable_support_probability", 0.0),
             ("counterfactual_enrollment_probability", 0.0),
             ("open_vocabulary_holdout_fraction", 0.0),

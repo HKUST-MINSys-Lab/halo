@@ -157,7 +157,7 @@ METHODS_BY_RUNG: dict[Rung, frozenset[Method]] = {
 # Bump when the procedure changes, as sealed-manifest-v2 / deployment-scenarios-v5 do today.
 READOUT_VERSION: dict[Rung, str] = {
     Rung.DISCOVERY: "discovery-v1",
-    Rung.UNLABELED: "ncurve-v1",
+    Rung.UNLABELED: "ncurve-v2",   # v2 (2026-09-24): lambda = N, transductive N=0 null, embedding affinity, k = 0
     Rung.FROZEN: "sealed-manifest-v2",
     Rung.FINETUNE: "finetune-v1",
 }

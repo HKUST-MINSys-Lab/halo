@@ -58,7 +58,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature", type=float, default=30.0, help="released config: T 30")
     parser.add_argument("--n-iter", type=int, default=INFERENCE_DEFAULTS["n_iter"])
     parser.add_argument("--n-iter-mm", type=int, default=INFERENCE_DEFAULTS["n_iter_mm"])
-    parser.add_argument("--lam", type=float, default=None, help="override the paper's lambda rule")
+    parser.add_argument("--lam", type=float, default=None, help="override lambda (default: N)")
+    parser.add_argument("--affinity-mu", type=float, default=INFERENCE_DEFAULTS["mu"],
+                        help="weight of the embedding-affinity term; 0 = the published EM-Dirichlet")
+    parser.add_argument("--affinity-knn", type=int, default=INFERENCE_DEFAULTS["knn"],
+                        help="neighbours per window in each encoder's embedding space")
     parser.add_argument("--assignments", nargs="+", default=["identity", "graph"])
     parser.add_argument("--control", choices=CONTROLS, default="none")
     parser.add_argument("--holdout-fraction", type=float, default=0.5, help="disjoint_classes control")
@@ -80,7 +84,8 @@ def main() -> None:
     )
     pool_sizes: list[int | str] = [s if s == "all" else int(s) for s in args.pool_sizes]
     transduce_kwargs = {"n_iter": args.n_iter, "n_iter_mm": args.n_iter_mm,
-                        "early_stop": args.n_iter_mm >= 100, "lam": args.lam}
+                        "early_stop": args.n_iter_mm >= 100, "lam": args.lam,
+                        "mu": args.affinity_mu, "knn": args.affinity_knn}
     cells = [cell for cell in evaluation_cells(args.window_seconds, scope="sealed") if not cell[3]]
     if args.cells is not None:
         cells = cells[:args.cells]
@@ -129,7 +134,7 @@ def main() -> None:
                 classes=classes, split=split, pool_draws=pool_draws, ks=args.k,
                 temperature=args.temperature, transduce_kwargs=transduce_kwargs,
                 assignments=args.assignments, seed_parts=(*seed_parts, name),
-                pool_filter=pool_filter, control=args.control,
+                pool_filter=pool_filter, control=args.control, device=device,
             )
             for row in cell_rows:
                 row.update({**base, "model": name, "encoder": label_of[name],

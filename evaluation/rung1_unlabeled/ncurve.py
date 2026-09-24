@@ -37,7 +37,10 @@ from evaluation.rung1_unlabeled.transductive import INFERENCE_DEFAULTS, transduc
 from evaluation.zero_shot import _normalise, probability_features
 
 DEFAULT_POOL_SIZES: tuple[int | str, ...] = (0, 50, 100, 500, 2000, "all")
-DEFAULT_K: tuple[int, ...] = (0, 1, 2, 4, 8)
+# Rung 1 is k = 0: the roster is known by name and no labelled example is ever provided. k > 0
+# (labels plus an unlabelled pool) remains computable for a separately named semi-supervised
+# condition, but it is not rung 1 and is not in the default grid.
+DEFAULT_K: tuple[int, ...] = (0,)
 
 
 def _rng(*parts: object) -> np.random.Generator:
@@ -128,6 +131,21 @@ def inductive_predictions(*, scores: np.ndarray, features: np.ndarray | None, su
     return np.asarray((z[rows] @ _normalise(prototypes).T).argmax(axis=1), dtype=np.int64)
 
 
+def neighbour_purity(truth: np.ndarray, neighbours: np.ndarray | None) -> float | None:
+    """Share of embedding-space neighbours with the same true class (in-roster rows only).
+
+    The affinity term's registered risk is an encoder that groups windows by subject or device
+    rather than by activity, in which case the neighbour vote spreads errors. This measures that
+    directly, per encoder and cell; it uses labels and is a diagnostic, never an input."""
+    if neighbours is None or neighbours.size == 0:
+        return None
+    truth = np.asarray(truth)
+    own = truth[:, None]
+    other = truth[neighbours]
+    counted = (own >= 0) & (other >= 0)
+    return float(((own == other) & counted).sum() / max(int(counted.sum()), 1))
+
+
 def pool_marginal(truth_ids: np.ndarray, rows: np.ndarray, n_classes: int) -> dict:
     counts = np.bincount(truth_ids[rows], minlength=n_classes).astype(np.float64)
     p = counts / max(counts.sum(), 1.0)
@@ -153,6 +171,7 @@ def run_cell(
     seed_parts: Sequence[object] = (),
     pool_filter: Callable[[np.ndarray], np.ndarray] | None = None,
     control: str = "none",
+    device=None,
 ) -> list[dict]:
     """Every rung-1 row for one (encoder, cell): the N × k grid on S, plus the all-windows
     reproduction row at N = 0, k = 0. ``pool_filter`` (a control) may resample each P_N."""
@@ -197,13 +216,15 @@ def run_cell(
             task_rows = np.concatenate([split.scored, pool_n])
             z = z_all[task_rows]
             support_z = z_all[support_rows] if k else None
+            embeddings = None if features_all is None else features_all[task_rows]
             for assignment in assignments:
                 if k and assignment != "identity":
                     continue           # few-shot components are pinned by supports; no matching
                 preds, u, info = transduce_numpy(
                     z, support_z=support_z, support_labels=support_labels if k else None,
-                    assignment=assignment, **kwargs,
+                    assignment=assignment, embeddings=embeddings, device=device, **kwargs,
                 )
+                neighbours = info.pop("neighbours")
                 scored_preds = preds[:len(split.scored)]
                 rows.append({
                     "method": "transductive_clip_v1", "k": k, "N": int(len(pool_n)), "N_label": label,
@@ -213,6 +234,8 @@ def run_cell(
                     "n_scored": int(len(split.scored)), "n_support": int(len(support_rows)),
                     "n_transduced": int(len(task_rows)),
                     "lam": info["lam"], "n_iter": info["n_iter"], "n_iter_mm": info["n_iter_mm"],
+                    "affinity_mu": info["mu"], "affinity_knn": info["knn"],
+                    "neighbour_purity": neighbour_purity(truth_ids[task_rows], neighbours),
                     "cluster_sizes": info["cluster_sizes"],
                     "collapsed_components": int(sum(1 for s in info["cluster_sizes"] if s < 0.5)),
                     "score_kind": score_kind, **feature_info,

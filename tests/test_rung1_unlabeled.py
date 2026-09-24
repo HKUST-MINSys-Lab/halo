@@ -231,3 +231,74 @@ def test_row_mask_excludes_padded_rows_exactly():
     assert torch.all(out.u[0, len(z):] == 0)
     assert torch.allclose(out.u[0, :len(z)], ref.u[0], atol=1e-4)
     assert torch.allclose(out.alpha, ref.alpha, atol=1e-3) and float(out.lam[0]) == float(ref.lam[0])
+
+
+# ---------------------------------------------------------------- embedding affinity (2026-09-24)
+from evaluation.rung1_unlabeled.ncurve import neighbour_purity  # noqa: E402
+from evaluation.rung1_unlabeled.transductive import knn_affinity  # noqa: E402
+
+
+def _noisy_text(seed=0, n_per=150, n_classes=6, dims=32, geometry="clean"):
+    """A noisy text head (softmax at T = 30 of weak class evidence plus per-window noise) over
+    embeddings that are either clean class clusters or grouped by an unrelated 'subject'."""
+    rng = np.random.default_rng(seed)
+    y = np.repeat(np.arange(n_classes), n_per)
+    s = np.eye(n_classes)[y] * 0.25 + 0.105 * rng.standard_normal((len(y), n_classes))
+    z = np.exp(30 * s)
+    z /= z.sum(1, keepdims=True)
+    if geometry == "clean":
+        emb = rng.standard_normal((n_classes, dims))[y] + 0.6 * rng.standard_normal((len(y), dims))
+    else:
+        subject = rng.integers(0, n_classes, len(y))
+        emb = rng.standard_normal((n_classes, dims))[subject] + 0.3 * rng.standard_normal((len(y), dims))
+    return z.astype(np.float32), emb.astype(np.float32), y
+
+
+def test_mu_zero_or_no_embeddings_is_the_published_method_exactly():
+    z, emb, _ = _noisy_text()
+    zt, et = torch.from_numpy(z)[None], torch.from_numpy(emb)[None]
+    plain = transduce(zt, n_iter=4, n_iter_mm=20, early_stop=False)
+    with_zero = transduce(zt, embeddings=et, mu=0.0, n_iter=4, n_iter_mm=20, early_stop=False)
+    assert torch.equal(plain.logits, with_zero.logits) and with_zero.neighbours is None
+
+
+def test_affinity_lets_clean_geometry_correct_a_noisy_text_head():
+    z, emb, y = _noisy_text(geometry="clean")
+    kwargs = {"n_iter": 20, "n_iter_mm": 200, "early_stop": False}
+    plain, _, _ = transduce_numpy(z, **kwargs)
+    affine, _, info = transduce_numpy(z, embeddings=emb, mu=1.0, knn=10, **kwargs)
+    assert (affine == y).mean() > (plain == y).mean() + 0.03
+    assert info["mu"] == 1.0 and info["knn"] == 10 and info["neighbours"].shape == (len(y), 10)
+    assert neighbour_purity(y, info["neighbours"]) > 0.8
+
+
+def test_affinity_does_not_collapse_when_neighbours_are_uninformative():
+    # Neighbours grouped by subject, not class: the vote must be roughly neutral, never the
+    # one-class collapse that voting on the current assignments produced.
+    z, emb, y = _noisy_text(geometry="subject")
+    kwargs = {"n_iter": 20, "n_iter_mm": 200, "early_stop": False}
+    plain, _, _ = transduce_numpy(z, **kwargs)
+    affine, _, info = transduce_numpy(z, embeddings=emb, mu=1.0, knn=10, **kwargs)
+    assert neighbour_purity(y, info["neighbours"]) < 0.3
+    assert (affine == y).mean() > (plain == y).mean() - 0.03
+    assert len(np.unique(affine)) == len(np.unique(y))
+
+
+def test_knn_affinity_skips_self_and_padded_rows_and_carries_gradient():
+    emb = torch.randn(1, 6, 4, requires_grad=True)
+    rows = torch.tensor([[True, True, True, True, False, False]])
+    idx, weight = knn_affinity(emb, rows, knn=10)
+    assert idx.shape == (1, 6, 5)
+    for i in range(4):
+        chosen = idx[0, i][weight[0, i] > 0].tolist()
+        assert i not in chosen and not ({4, 5} & set(chosen))
+    assert float(weight[0, 4:].abs().sum()) == 0.0              # padded rows have no neighbours
+    weight.sum().backward()
+    assert emb.grad is not None and torch.isfinite(emb.grad).all()
+
+
+def test_neighbour_purity_ignores_out_of_roster_rows():
+    truth = np.array([0, 0, 1, -1])
+    neighbours = np.array([[1, 3], [0, 2], [0, 1], [0, 1]])
+    # counted pairs: (0,1)=same, (1,0)=same, (1,2)=diff, (2,0)=diff, (2,1)=diff -> 2/5
+    assert neighbour_purity(truth, neighbours) == pytest.approx(0.4)

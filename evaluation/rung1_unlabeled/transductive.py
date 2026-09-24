@@ -32,6 +32,25 @@ partition term off for rosters under five classes and double it at ten or more �
 roster size that nothing in the method motivates. ``paper_lambda`` still implements the reference
 rule for any explicit ``k_eff``.
 
+Added term (embedding affinity, 2026-09-24): EM-Dirichlet sees each window only through its
+C-dimensional probability vector, so two windows the encoder places side by side are treated
+independently. In the spirit of the Laplacian term of LaplacianShot (Ziko et al., ICML 2020), each
+window's assignment update also receives ``mu * log(neighbour vote)``, where the vote is the
+cosine-weighted mean of the **text probability vectors** of its ``knn`` nearest neighbours **in the
+encoder's own embedding space**. It enters exactly like the partition term: a log prior, local
+instead of global, with ``mu = 1`` giving the two equal standing. ``mu = 0`` (or no embeddings) is
+the published method bit for bit. This is what makes rung 1 read the encoder's geometry rather
+than only its text head.
+
+The vote uses the neighbours' fixed text evidence, not their current assignments. A synthetic
+check (2026-09-24; six classes, noisy text head) showed why: voting on the current assignments
+gains on clean clusters but, when neighbourhoods are uninformative (random, or grouped by subject),
+feeds errors back each iteration and collapses every window onto one class (0.84 -> 0.17, chance),
+which would punish an encoder for its geometry far beyond what its geometry deserves. Voting on the
+fixed evidence gains +4 to +6 points on clean clusters at ``mu = 1`` and is neutral (-0.1 to +0.4)
+on uninformative ones; ``mu = 2`` already costs up to 15 points there, which is why the a-priori
+default is 1.
+
 Disclosed deviation (cluster assignment): at zero-shot, the reference initialises ``u`` from the probability features
 (component k starts as class k) and *still* re-assigns clusters to classes afterwards by graph
 matching on cluster prototypes (paper §4.3). Here ``assign_clusters(mode="identity")`` keeps the
@@ -51,8 +70,8 @@ from scipy.optimize import linear_sum_assignment
 EPS = 1e-15
 # config/methods_config/em_dirichlet.yaml: iter 20, iter_mm 1000 (early stop on a 1e-11 relative
 # criterion checked every 50 inner steps). Training-time unrolling uses fixed, short counts.
-INFERENCE_DEFAULTS = {"n_iter": 20, "n_iter_mm": 1000, "early_stop": True}
-UNROLL_DEFAULTS = {"n_iter": 5, "n_iter_mm": 20, "early_stop": False}
+INFERENCE_DEFAULTS = {"n_iter": 20, "n_iter_mm": 1000, "early_stop": True, "mu": 1.0, "knn": 10}
+UNROLL_DEFAULTS = {"n_iter": 5, "n_iter_mm": 20, "early_stop": False, "mu": 1.0, "knn": 10}
 
 
 def paper_lambda(n_classes: torch.Tensor | int, n_query: torch.Tensor | int, *,
@@ -106,6 +125,48 @@ def dirichlet_log_density(log_z: torch.Tensor, alpha: torch.Tensor, dim_mask: to
     return l1[:, None, :] + l2[:, None, :] + l3
 
 
+def knn_affinity(embeddings: torch.Tensor, row_mask: torch.Tensor, knn: int, *,
+                 chunk: int = 2048) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(B, N, k)`` neighbour indices and non-negative cosine weights among the valid rows.
+
+    A window is never its own neighbour; padded rows are never neighbours and have no neighbours.
+    Weights are ``max(cos, 0)`` so dissimilar rows cannot vote; the selection is by cosine rank,
+    and gradients reach the embeddings through the weights. Rows are processed in chunks so a
+    16k-window cell never materialises an N x N matrix.
+    """
+    B, N, _ = embeddings.shape
+    k = min(int(knn), N - 1)
+    if k < 1:
+        empty = torch.zeros((B, N, 0), device=embeddings.device)
+        return empty.long(), empty
+    unit = F.normalize(embeddings.float(), dim=-1)
+    valid = row_mask.to(device=embeddings.device, dtype=torch.bool)
+    idx_parts, weight_parts = [], []
+    for start in range(0, N, chunk):
+        stop = min(start + chunk, N)
+        cos = torch.einsum("bqd,bnd->bqn", unit[:, start:stop], unit)             # (B, q, N)
+        blocked = ~valid[:, None, :].expand_as(cos).clone()
+        rows = torch.arange(start, stop, device=cos.device)
+        blocked[:, rows - start, rows] = True                                     # no self-loops
+        cos = cos.masked_fill(blocked, float("-inf"))
+        top, idx = cos.topk(k, dim=-1)
+        weight = torch.where(torch.isfinite(top), top.clamp_min(0.0), torch.zeros_like(top))
+        weight = weight * valid[:, start:stop, None].to(weight.dtype)
+        idx_parts.append(idx)
+        weight_parts.append(weight)
+    return torch.cat(idx_parts, dim=1), torch.cat(weight_parts, dim=1)
+
+
+def neighbour_vote(u: torch.Tensor, idx: torch.Tensor, weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cosine-weighted mean of the neighbours' assignments, ``(B, N, C)``, and a ``(B, N)`` mask of
+    rows that have any positive-weight neighbour."""
+    B, N, C = u.shape
+    gathered = torch.gather(u, 1, idx.reshape(B, -1, 1).expand(-1, -1, C)).reshape(B, N, idx.shape[-1], C)
+    total = weight.sum(-1)
+    vote = (weight.unsqueeze(-1) * gathered).sum(2) / total.clamp_min(EPS).unsqueeze(-1)
+    return vote, total > 0
+
+
 @dataclass
 class Transduction:
     u: torch.Tensor          # (B, N, C) soft assignments after the last update
@@ -113,6 +174,7 @@ class Transduction:
     alpha: torch.Tensor      # (B, C, C) Dirichlet parameters per component
     v: torch.Tensor          # (B, C) log class proportions (+1)
     lam: torch.Tensor        # (B,) the partition-term weight actually used
+    neighbours: torch.Tensor | None = None   # (B, N, knn) embedding-affinity indices, if used
 
 
 def transduce(
@@ -127,6 +189,9 @@ def transduce(
     early_stop: bool = True,
     lam: torch.Tensor | float | None = None,
     k_eff: torch.Tensor | int | None = None,
+    embeddings: torch.Tensor | None = None,
+    mu: torch.Tensor | float = 0.0,
+    knn: int = 10,
 ) -> Transduction:
     """Run EM-Dirichlet over a batch of tasks.
 
@@ -134,7 +199,11 @@ def transduce(
     slots). ``candidate_mask``: ``(B, C)`` bool, valid roster slots (default all). ``support_z`` /
     ``support_onehot``: ``(B, S, C)`` labelled supports for the few-shot variant, or ``None`` for
     zero-shot. ``lam``: partition weight; ``None`` applies :func:`paper_lambda` with ``k_eff``, which
-    defaults to each task's roster size (``lambda = N``; see the module docstring).
+    defaults to each task's roster size (``lambda = N``; see the module docstring). ``embeddings``:
+    ``(B, N, D)`` encoder features of the same rows; with ``mu != 0`` they add the embedding-affinity
+    term over each row's ``knn`` nearest neighbours. The function-level default ``mu = 0`` is the
+    published method; the evaluator and trainer defaults (``INFERENCE_DEFAULTS`` /
+    ``UNROLL_DEFAULTS``) switch the term on.
 
     Always computed in float32 with autocast disabled: the reference runs in float32, and the
     log-gamma / digamma terms and the log-density einsums lose the assignment signal in bf16.
@@ -146,6 +215,7 @@ def transduce(
                 support_z=None if support_z is None else support_z.float(),
                 support_onehot=None if support_onehot is None else support_onehot.float(),
                 n_iter=n_iter, n_iter_mm=n_iter_mm, early_stop=early_stop, lam=lam, k_eff=k_eff,
+                embeddings=embeddings, mu=mu, knn=knn,
             )
     z = z.float()
     if support_z is not None:
@@ -182,6 +252,18 @@ def transduce(
     else:
         lam_t = torch.as_tensor(lam, dtype=z.dtype, device=z.device).expand(B).clone()
     neg_inf = torch.finfo(z.dtype).min
+    affinity = None
+    use_affinity = embeddings is not None and not (isinstance(mu, (int, float)) and float(mu) == 0.0)
+    if use_affinity:
+        if embeddings.shape[:2] != (B, N):
+            raise ValueError("embeddings must be (B, N, D) and aligned with z")
+        affinity = knn_affinity(embeddings, rows_valid, knn)
+        mu_t = torch.as_tensor(mu, dtype=z.dtype, device=z.device)
+        # The neighbours vote with their *text evidence* z, computed once, not with the current
+        # assignments u: a vote on u feeds each iteration's errors back into the next and, when the
+        # neighbourhoods are uninformative, collapses every row onto one class.
+        vote, has_neighbours = neighbour_vote(z * dim_mask * row_w, *affinity)
+        local_prior = torch.log(vote + EPS) * has_neighbours.unsqueeze(-1).to(z.dtype)
 
     v = torch.zeros((B, C), dtype=z.dtype, device=z.device)
     u = z * dim_mask * row_w                                                    # init: features
@@ -203,9 +285,12 @@ def transduce(
         v = torch.log(u_sum / n_valid[:, None] + EPS) + 1
         logits = dirichlet_log_density(log_z, alpha, dim_mask) \
             + lam_t[:, None, None] * v[:, None, :] / n_valid[:, None, None]
+        if affinity is not None:
+            logits = logits + mu_t * local_prior
         logits = logits.masked_fill(~mask[:, None, :], neg_inf)
         u = torch.softmax(logits, dim=-1) * row_w
-    return Transduction(u=u, logits=logits, alpha=alpha, v=v, lam=lam_t)
+    return Transduction(u=u, logits=logits, alpha=alpha, v=v, lam=lam_t,
+                        neighbours=None if affinity is None else affinity[0])
 
 
 def assign_clusters(u: torch.Tensor, z: torch.Tensor, *, mode: str = "identity",
@@ -242,10 +327,15 @@ def assign_clusters(u: torch.Tensor, z: torch.Tensor, *, mode: str = "identity",
 
 def transduce_numpy(z: np.ndarray, *, support_z: np.ndarray | None = None,
                     support_labels: np.ndarray | None = None, assignment: str = "identity",
+                    embeddings: np.ndarray | None = None,
                     device: torch.device | None = None, **kwargs) -> tuple[np.ndarray, np.ndarray, dict]:
-    """Single-task convenience for the evaluator: ``z (N, C)`` → (predicted ids, soft u, info)."""
+    """Single-task convenience for the evaluator: ``z (N, C)`` → (predicted ids, soft u, info).
+    ``embeddings (N, D)`` enable the affinity term when ``mu != 0``; ``info["neighbours"]`` then
+    holds the ``(N, knn)`` neighbour indices (for the neighbour-purity diagnostic)."""
     device = device or torch.device("cpu")
     zt = torch.as_tensor(np.asarray(z, dtype=np.float32), device=device)[None]
+    if embeddings is not None:
+        kwargs["embeddings"] = torch.as_tensor(np.asarray(embeddings, dtype=np.float32), device=device)[None]
     support_zt = support_onehot = None
     if support_z is not None:
         support_zt = torch.as_tensor(np.asarray(support_z, dtype=np.float32), device=device)[None]
@@ -258,5 +348,8 @@ def transduce_numpy(z: np.ndarray, *, support_z: np.ndarray | None = None,
     info = {"lam": float(result.lam[0]), "assignment": assignment,
             "n_iter": int(kwargs.get("n_iter", 20)), "n_iter_mm": int(kwargs.get("n_iter_mm", 1000)),
             "few_shot": support_z is not None,
+            "mu": float(kwargs.get("mu", 0.0)) if result.neighbours is not None else 0.0,
+            "knn": int(result.neighbours.shape[-1]) if result.neighbours is not None else 0,
+            "neighbours": None if result.neighbours is None else result.neighbours[0].cpu().numpy(),
             "cluster_sizes": result.u[0].sum(0).cpu().numpy().round(3).tolist()}
     return preds[0].cpu().numpy(), result.u[0].cpu().numpy(), info
