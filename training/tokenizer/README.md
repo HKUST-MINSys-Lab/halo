@@ -1,46 +1,40 @@
-# Retired encoder pretraining
+# `training/tokenizer/`: shared encoder infrastructure, plus the retired JEPA pretraining
 
-`training.tokenizer.pretrain` is retained solely to reproduce the retired label-free future-JEPA
-experiments. It requires `--allow-retired-jepa` and is not an active HALO training entry point.
+Last verified against code: 2026-09-24.
 
-## Historical Future-JEPA
+The directory name is historical. It holds two different things, and the difference matters:
 
-The student receives only a physical-time prefix of an eight-second source window. An EMA teacher
-encodes the clean window. Target-query tokens request later intervals without exposing their signal.
-The predictor forecasts the change from a past-only, same-sensor/same-resolution EMA reference to
-the normalized teacher state of a later patch. It receives relative time-to-boundary metadata on
-every observed context token, but no target absolute position. Adding the predicted residual back to
-that reference yields the future state passed to a small decoder for frozen, standardized physical
-measurements. The predictor and decoder are removed after pretraining.
+## Active shared infrastructure (used by training and every evaluation rung)
 
-The implementation accepts any frontend that returns the common token-grid contract: token values,
-physical start/center/end times, durations or resolution IDs, sensor metadata, and validity masks.
-The retained arms are fixed one-second filterbank, fixed multiresolution filterbank at
-0.5/1.0/2.0 seconds, and revision-3 continuous multispan kernels at 0.5/1.0/2.0 seconds.
-The loader reconstructs historical revision-2 0.5/1.0/1.5-second checkpoints from their saved
-configuration; those checkpoints do not silently inherit current frontend math.
+- `pretrain_data.py` — corpus indexing, the multiresolution collate and the stream/channel
+  description helpers. Imported by the support-classifier trainer, `evaluation/`, the baselines and
+  the data scripts.
+- `eval_transfer.py` — `build_encoder` (rebuilds any HALO or corpus-matched encoder from a
+  checkpoint) and the dataset encoders the feature caches use.
+- `pretrain.py` — besides the retired entry point below, it provides the provenance and corpus
+  fingerprint helpers (`capture_runtime_provenance`, `capture_source_provenance`,
+  `corpus_fingerprint`) and constants (`DFT_SIZE`, `TRAIN_DATASETS`) that the support-classifier
+  trainer imports.
 
-## Historical commands
+## Retired: label-free Future-JEPA pretraining
+
+`python -m training.tokenizer.pretrain` is retained solely to reproduce the retired label-free
+Future-JEPA experiments. It requires `--allow-retired-jepa` and is not an active HALO training
+entry point. Its objective modules are `future_jepa.py`, `losses_repr.py` and `ablation_subset.py`.
+Why it was retired: [the retired-JEPA record](../../docs/journal/2026-09-13-retired-jepa-promoted-results.md)
+and [the measured value of JEPA](../../docs/journal/2026-09-13-jepa-value-measured.md).
+
+The student receives only a physical-time prefix of an eight-second source window; an EMA teacher
+encodes the clean window; the predictor forecasts the change from a past-only EMA reference to the
+teacher state of a later patch, and a small decoder maps it to frozen physical measurements. The
+predictor and decoder are removed after pretraining. Historical revision-2 checkpoints are rebuilt
+from their saved configuration and do not inherit current frontend math.
 
 ```bash
-PY=/home/alex/code/HALO/legacy_code/.venv/bin/python
-$PY -m training.tokenizer.pretrain --allow-retired-jepa --help
-$PY -m training.tokenizer.objective_health --allow-retired-jepa --frontend fixed --corpus label_free --out /tmp/halo_health.json
+.venv/bin/python -m training.tokenizer.pretrain --allow-retired-jepa --help
 ```
 
-These commands are historical reproducibility utilities only. The corpus and timing record live in
-[PRETRAINING_CORPUS.md](../../docs/data/PRETRAINING_CORPUS.md).
-
-## Retained historical utilities
-
-- `pretrain.py`: configuration, training, validation, checkpointing, and telemetry;
-- `pretrain_data.py`: corpus indexing, balanced sampling, and collate contract;
-- `future_jepa.py`: future-target construction and objective modules;
-- `losses_repr.py`: shared numerical utilities and the explicit legacy masked control;
-- `objective_health.py`, `grad_check.py`, `monitor_training.py`, `plot_training.py`: targeted
-  readiness and health diagnostics; and
-- `eval_transfer.py`, `eval_quality.py`: encoder reconstruction and controlled representation
-  probes.
-
-The removed fleet launchers, contrastive experiment, and old Phase-A diagnostic scripts are
-available through Git history rather than as competing live entry points.
+The JEPA health and monitoring scripts (`objective_health.py`, `grad_check.py`,
+`monitor_training.py`, `plot_training.py`, `eval_quality.py`) and the frontend probes under
+`diagnostics/frontend/` were removed from `main` on 2026-09-24; they are preserved at the tag
+`hist/v3-support-conditioned/pre-cleanup-20260924`.
