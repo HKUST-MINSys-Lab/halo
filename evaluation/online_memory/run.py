@@ -29,7 +29,7 @@ from baselines.data import load_eval_stream, source_slice_fingerprint
 from evaluation.features import FeatureMemoryCache, _file_hash
 from evaluation.manifests import SEED, _aligned_labels, evaluation_cells
 from evaluation.online_memory.stream import run_stream, summarise
-from evaluation.provenance import _atomic_json, _run_provenance
+from evaluation.provenance import _atomic_json, _resource_usage, _run_provenance
 from evaluation.rung1_unlabeled.ncurve import shared_support_set, split_scored_pool
 from evaluation.zero_shot import ProviderScorer
 
@@ -62,7 +62,7 @@ def main() -> None:
     from model.support.factory import build_classifier_from_blob
     from model.support.memory_classifier import ARCHITECTURE_VERSION
     from training.support_classifier.train import label_text_matrix
-    from evaluation.rung2_frozen.sealed_eval import halo_acquisition_rows
+    from evaluation.acquisition import halo_acquisition_rows
 
     blob = torch.load(args.v5_checkpoint, map_location="cpu", weights_only=False)
     if blob.get("architecture_version") != ARCHITECTURE_VERSION:
@@ -128,6 +128,7 @@ def main() -> None:
         "argv": sys.argv, "v5_checkpoint": str(args.v5_checkpoint), "v5_sha256": _file_hash(args.v5_checkpoint),
         "feature_checkpoint": str(feature_checkpoint),
         "provenance": _run_provenance(sys.argv, device=device, halo_checkpoint=feature_checkpoint),
+        "resources": _resource_usage(device),
         "protocol": "online-memory-v1", "fingerprint": hashlib.sha256(json.dumps(
             [list(c[:3]) for c in cells]).encode()).hexdigest()})
     _write_summary(args.out / "RESULTS.md", rows)

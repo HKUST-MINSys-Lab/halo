@@ -30,6 +30,7 @@ MOVED = {
     ],
     "zero_shot": ["_normalise", "_training_bank_conse_predictions", "_build_training_reference_bank"],
     "provenance": ["validate_result_rows", "_atomic_json", "_run_provenance"],
+    "acquisition": ["halo_acquisition_vector", "halo_acquisition_rows"],
 }
 MOVED_CONSTANTS = {"features": ["FEATURE_CACHE_SCHEMA", "UNCHANGED_BASELINE_FEATURE_CACHE_SCHEMA"],
                    "manifests": ["SEED"], "zero_shot": ["TRAINING_BANK_ZERO_SHOT"]}

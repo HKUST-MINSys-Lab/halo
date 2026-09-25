@@ -12,6 +12,7 @@ import numpy as np
 import os
 import platform
 import subprocess
+import time
 import torch
 from pathlib import Path
 from typing import Sequence
@@ -64,6 +65,9 @@ def validate_result_rows(
         )
 
 
+_PROCESS_START = time.time()     # module import ~ run start for every evaluator entry point
+
+
 def _atomic_json(path: Path, value: object) -> None:
     """Write evaluator state without exposing a partial JSON document to monitors."""
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -100,6 +104,16 @@ def _run_provenance(argv: list[str], *, device: torch.device, halo_checkpoint: P
         },
         "feature_cache_schema": FEATURE_CACHE_SCHEMA,
     }
+
+
+def _resource_usage(device: torch.device) -> dict:
+    """Wall time since interpreter start and peak GPU memory, for budgeting co-scheduled jobs
+    (a run's cap must exceed its peak; the 2026-09-26 OOMs came from guessing it)."""
+    usage = {"process_wall_seconds": round(time.time() - _PROCESS_START, 1)}
+    if device.type == "cuda" and torch.cuda.is_available():
+        usage["cuda_peak_allocated_gib"] = round(torch.cuda.max_memory_allocated(device) / 1024 ** 3, 3)
+        usage["cuda_peak_reserved_gib"] = round(torch.cuda.max_memory_reserved(device) / 1024 ** 3, 3)
+    return usage
 
 
 # ---------------------------------------------------------------------------------------------
@@ -242,5 +256,6 @@ def write_artifact(out_dir: Path, rows: Sequence[dict], provenance: ArtifactProv
         "encoders_present": sorted({r["encoder"] for r in stamped if "encoder" in r}),
         "rows": len(stamped),
     }
+    record["resources"] = _resource_usage(device)
     _atomic_json(out_dir / "run_provenance.json", record)
     return out_dir / f"{name}.json"
