@@ -25,12 +25,17 @@ from model.support.evidence_gated_classifier import (
     ARCHITECTURE_VERSION as EVIDENCE_GATED_ARCHITECTURE,
     EvidenceGatedClassifierConfig, EvidenceGatedSupportClassifier,
 )
+from model.support.memory_classifier import (
+    ARCHITECTURE_VERSION as MEMORY_READER_ARCHITECTURE,
+    MemoryReaderClassifier, MemoryReaderConfig,
+)
 from model.support.residual_classifier import ResidualClassifierConfig, build_support_classifier
 
 RESIDUAL_ARCHITECTURES = frozenset({"support_classifier_v2", "support_classifier_v3"})
 LEARNED_CLASSIFIER_ARCHITECTURES = RESIDUAL_ARCHITECTURES | {
     LEGACY_CONTEXTUAL_ARCHITECTURE, CONTEXTUAL_RESIDUAL_ARCHITECTURE,
     EVIDENCE_AWARE_ARCHITECTURE, EVIDENCE_GATED_ARCHITECTURE,
+    MEMORY_READER_ARCHITECTURE,
 }
 # ``contextual`` is the CLI mode, not a checkpoint family.  New runs use v2 while v1 remains
 # explicitly addressable for checkpoint loading and historical evaluation.
@@ -56,6 +61,7 @@ CLASSIFIER_ARCHITECTURE_STATUS = {
     # Promoted 2026-09-21 as "v4", in its T6 recipe (see PROMOTED_RECIPE). The T7 and T8 recipes
     # share this architecture string and are recorded negative results.
     EVIDENCE_GATED_ARCHITECTURE: "promoted-control",
+    MEMORY_READER_ARCHITECTURE: "active-online-memory-experiment",
 }
 # Human-facing names, adopted 2026-09-20. `v4` (the T6 recipe) is the promoted classifier since
 # 2026-09-21 and `v3` is superseded; every experimental
@@ -70,6 +76,7 @@ CLASSIFIER_TRY_NAME = {
     "support_contextual_residual_v1": "T2",
     "support_evidence_aware_v2": "T3",
     "support_classifier_v4": "T4",
+    MEMORY_READER_ARCHITECTURE: "v5-online-memory",
 }
 
 
@@ -229,6 +236,10 @@ def build_classifier_from_blob(blob: dict, *, device=None, overrides: dict | Non
         head = EvidenceGatedSupportClassifier(
             spec, EvidenceGatedClassifierConfig(**config), primitive_values=primitive_values,
         )
+    elif version == MEMORY_READER_ARCHITECTURE:
+        if overrides:
+            raise ValueError("v5 memory-reader checkpoint does not support classifier overrides")
+        head = MemoryReaderClassifier(spec, MemoryReaderConfig(**config))
     else:
         raise ValueError(f"unsupported support-classifier architecture {version!r}")
     head.load_state_dict(blob["classifier"], strict=True)

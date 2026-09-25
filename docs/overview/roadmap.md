@@ -293,6 +293,16 @@ contract and gets the cached-feature treatments only.
 
 ## Code organisation
 
+The separate **v5 online-memory experiment** is implemented in
+[`model/support/memory_classifier.py`](../../model/support/memory_classifier.py),
+[`training/support_classifier/memory_bank.py`](../../training/support_classifier/memory_bank.py),
+[`training/support_classifier/memory_episodes.py`](../../training/support_classifier/memory_episodes.py),
+and [`train_memory.py`](../../training/support_classifier/train_memory.py). It predicts a stream
+causally and may retain earlier unlabelled predictions or verified enrollments. It is not a
+registered rung-1 readout: rung 1 remains the common fixed-pool transductive comparison. The
+[implementation record](../journal/2026-09-25-v5-online-memory-implementation.md) states what is
+built, smoke-tested, and still awaiting a dedicated online evaluation protocol.
+
 *Built 2026-09-23; rung 2's runners moved in on 2026-09-24.* Rung 2 is the working pipeline that
 produced every published number, so the rule was **extract, don't rewrite**, verified byte-exact
 against the anchor tag at the source level (the functional golden is still to be produced).
