@@ -278,10 +278,18 @@ contract and gets the cached-feature treatments only.
 2. **Build rung 1 and rung 3** — **done 2026-09-23**, with the pool training arm, per the
    [implementation plan](../journal/2026-09-22-rung1-rung2-implementation-plan.md) (old numbering);
    the embedding-affinity term added 2026-09-24. Level B is not built.
-3. **Debug sweep** by a second agent; produce the extraction golden; smoke on one cached cell.
+3. **Debug sweep** — done 2026-09-25, all findings fixed
+   ([record](../journal/2026-09-25-debug-sweep-and-fixes.md)). Still open: the extraction golden,
+   and a smoke on one cached cell.
 4. **Run rung 1, tier 1** on go. CPU, ~hours. Tier 2 after the matched arms are trained (separate go).
 5. **Gate:** run the HALO unrolled arm only if prediction 1's curve rises for at least one encoder.
 6. **Rung 3** fine-tuning. The expensive part; last in sequence, not least in weight.
+7. **v5, after rung 1** (decided 2026-09-25). v5 is a separate HALO-only experiment, not part of
+   the rung-1 comparison. It is trained and evaluated only once rung 1's EM-Dirichlet + affinity
+   curve exists, and is then compared against that method, its own fixed-vote floor and
+   no-memory control, and v4 under matched verified enrollments, on the same streams and with the
+   same information at each step. That needs an online predict-then-update evaluator, not yet
+   built.
 
 ## Open decisions
 
@@ -301,7 +309,8 @@ and [`train_memory.py`](../../training/support_classifier/train_memory.py). It p
 causally and may retain earlier unlabelled predictions or verified enrollments. It is not a
 registered rung-1 readout: rung 1 remains the common fixed-pool transductive comparison. The
 [implementation record](../journal/2026-09-25-v5-online-memory-implementation.md) states what is
-built, smoke-tested, and still awaiting a dedicated online evaluation protocol.
+built, smoke-tested, and still awaiting a dedicated online evaluation protocol. It comes after
+rung 1 (step 7 of the sequencing below).
 
 *Built 2026-09-23; rung 2's runners moved in on 2026-09-24.* Rung 2 is the working pipeline that
 produced every published number, so the rule was **extract, don't rewrite**, verified byte-exact
