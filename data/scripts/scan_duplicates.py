@@ -179,10 +179,12 @@ def load(alignment: str = "native", *, require: bool = False,
     from data.scripts.eda.grid_io import discover_grids, grid_corpus_fingerprint
     stream_fingerprints = blob.get("stream_fingerprints")
     if stream_fingerprints:
+        refs = _discover(discover_grids, alignment, window_seconds)
         stale = [
-            ref.key for ref in _discover(discover_grids, alignment, window_seconds)
+            ref.key for ref in refs
             if stream_fingerprints.get(ref.key) != grid_corpus_fingerprint(alignment, [ref])
         ]
+        stale.extend(sorted(set(stream_fingerprints) - {ref.key for ref in refs}))
         current_matches = not stale
     else:  # backwards-compatible validation for pre-per-stream cache fixtures/artifacts
         current_matches = blob.get("grid_fingerprint") == grid_corpus_fingerprint(alignment)

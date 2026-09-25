@@ -103,10 +103,13 @@ FILTERBANK_LONG_PATCH_ANALYSIS_HZ = 40.0
 STREAM_SOURCE_RATE_HZ = {
     "xrf_v2/airpods_ear": 25.0,      # AirPods Pro ear IMU @25 Hz, upsampled 25->50 in convert.py
     "extrasensory/watch_wrist": 25.0, # Pebble acquisition clock; converter stores at 50 Hz
+    "extrasensory_pretrain/watch_wrist": 25.0,
     # Phone clocks vary (~30-200 Hz). Thirty Hz is the conservative observed
     # floor, so bands above 15 Hz are never claimed as physically observable.
     "extrasensory/phone_pocket": 30.0,
     "extrasensory/phone_hand": 30.0,
+    "extrasensory_pretrain/phone_pocket": 30.0,
+    "extrasensory_pretrain/phone_hand": 30.0,
     # MM-Fit's packet-aware converter stores every device on a shared 100 Hz grid. The earbud is
     # acquired at ~85 Hz, so interpolation cannot make bands above its native Nyquist observable.
     "mmfit/left_ear": 85.0,

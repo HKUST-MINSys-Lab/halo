@@ -31,7 +31,7 @@ def test_implausible_cache_paths_do_not_overwrite_alignments(tmp_path, monkeypat
     assert si.cache_path("non_harmonised").name == "implausible_windows_non_harmonised.json"
 
 
-def test_implausible_cache_allows_absent_optional_cached_streams(tmp_path, monkeypatch):
+def test_implausible_cache_refuses_removed_streams(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from data.scripts import scan_implausible as si
     from data.scripts.eda import grid_io
@@ -46,7 +46,8 @@ def test_implausible_cache_allows_absent_optional_cached_streams(tmp_path, monke
                         lambda alignment: [SimpleNamespace(key="required/stream")])
     monkeypatch.setattr(grid_io, "grid_corpus_fingerprint",
                         lambda alignment, refs=None: "ok")
-    assert si.load("native", require=True) == {}
+    with pytest.raises(ValueError, match="does not match"):
+        si.load("native", require=True)
 
 
 def test_implausible_scan_excludes_nonfinite_windows(tmp_path, monkeypatch):

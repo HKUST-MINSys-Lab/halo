@@ -90,3 +90,4 @@ entries preserve what was believed at the time; current behavior is defined only
 | 2026-09-25 | [2026-09-25-memory-reader-literature-audit.md](2026-09-25-memory-reader-literature-audit.md) | Memory-reader literature audit: storage and token contract |
 | 2026-09-25 | [2026-09-25-memory-reader-online-episode-addendum.md](2026-09-25-memory-reader-online-episode-addendum.md) | Memory reader: online episodes and age decision |
 | 2026-09-25 | [2026-09-25-v5-online-memory-implementation.md](2026-09-25-v5-online-memory-implementation.md) | V5 online memory reader: implementation record |
+| 2026-09-25 | [2026-09-25-v5-verified-feedback.md](2026-09-25-v5-verified-feedback.md) | V5 verified-label feedback |

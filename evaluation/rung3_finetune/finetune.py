@@ -124,12 +124,8 @@ def build_encoder_for(name: str, treatment: str, *, halo_checkpoint, device: tor
         if halo_checkpoint is None:
             raise ValueError("halo fine-tuning needs --halo-checkpoint")
         blob = torch.load(halo_checkpoint, map_location="cpu", weights_only=False)
-        encoder = build_encoder(blob, device, training=True)
-        if treatment == "scratch_specialist":
-            from model.tokenizer.matched_encoder import _reinitialise
-
-            encoder.apply(_reinitialise)
-        return encoder
+        return build_encoder(blob, device, training=True,
+                             load_weights=treatment != "scratch_specialist")
     if name in MATCHED_BACKBONE:
         from model.tokenizer.matched_encoder import build_matched_encoder
 
@@ -143,12 +139,20 @@ def build_encoder_for(name: str, treatment: str, *, halo_checkpoint, device: tor
 def set_treatment(encoder: nn.Module, treatment: str, cfg: FineTuneConfig) -> tuple[list[nn.Parameter], dict]:
     if treatment == "lora":
         wrapped = apply_lora(encoder, rank=cfg.lora_rank, alpha=cfg.lora_alpha)
+        freeze_batchnorm_stats(encoder)
         return lora_parameters(encoder), {"lora_layers": len(wrapped)}
     if treatment in {"full_finetune", "scratch_specialist"}:
         for parameter in encoder.parameters():
             parameter.requires_grad_(True)
         return [p for p in encoder.parameters()], {}
     raise ValueError(f"{treatment} is not a raw-window treatment")
+
+
+def freeze_batchnorm_stats(encoder: nn.Module) -> None:
+    """LoRA freezes base weights, so the base's running statistics must remain frozen too."""
+    for module in encoder.modules():
+        if isinstance(module, nn.modules.batchnorm._BatchNorm):
+            module.eval()
 
 
 def encode_rows(encoder: nn.Module, stream, rows: np.ndarray, device: torch.device, *,
@@ -219,6 +223,8 @@ def raw_window_predictions(name: str, treatment: str, stream, support_rows: np.n
     encoder = build_encoder_for(name, treatment, halo_checkpoint=halo_checkpoint, device=device)
     trainable, info = set_treatment(encoder, treatment, cfg)
     encoder.train() if trainable else encoder.eval()
+    if treatment == "lora":
+        freeze_batchnorm_stats(encoder)
     with torch.no_grad():
         width = int(encode_rows(encoder, stream, support_rows[:1], device, requires_grad=False).shape[-1])
     head = nn.Linear(width, n_classes).to(device)

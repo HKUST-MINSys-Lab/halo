@@ -190,6 +190,7 @@ def test_run_cell_emits_the_grid_and_the_reproduction_row_with_the_sealed_metric
                     seed_parts=("c",))
     repro = [r for r in rows if r["scope"] == "all_windows"]
     assert len(repro) == 1 and repro[0]["method"] == "inductive" and repro[0]["k"] == 0
+    assert repro[0]["inductive_readout"] == "text_score_argmax"
     assert {"f1_macro", "balanced_accuracy", "accuracy"} <= set(repro[0])
     grid = [r for r in rows if r["scope"] == "scored" and r.get("status", "ok") == "ok"]
     assert {(r["method"], r["k"], r.get("N_label", "0")) for r in grid} >= {

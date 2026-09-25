@@ -43,6 +43,11 @@ supervised vocabulary, support bank, validation selection, or sealed evaluation.
 | `nymeria_xsens` | Nymeria Xsens MVN Link suit, 11 simultaneous placements selected from 17 trackers, accel + gyro at 240 Hz | 39 people, 440 streams, 113.5 h; median 932.0 s | Sensor-frame acceleration reconstructed/reoriented as documented by the converter, gravity restored, g conversion; gyro retained in rad/s; gaps split; full real windows only, float16 grid | Diverse limb/body dynamics and sensor placements |
 | `extrasensory_pretrain` | ExtraSensory raw phone/watch accelerometer captures; only deployment-valid phone hand/pocket and watch streams, labels unread | 60 people, 139 streams, 1,274.4 h; median 14,360.0 s | Android m/s2, iPhone g, Pebble milli-g converted to g; each capture independently resampled to 50 Hz; capture/gap ID preserved; full real windows only, float16 grid | Consumer-device and free-living motion without supervised-label leakage |
 
+Historical JEPA runs used the 50 Hz stored rate as the acquisition-rate bound for this
+ExtraSensory source. The loader now caps that bound at approximately 25 Hz for the watch and
+30 Hz for the phone; those retired checkpoints should not be presented as having learned
+physical bands above the source Nyquist frequency.
+
 ## Supervised Support-Classifier Training
 
 The active eight-source corpus totals **290.5 processed stream-hours** and **51,160 sessions**.

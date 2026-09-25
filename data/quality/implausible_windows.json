@@ -1,7 +1,7 @@
 {
   "alignment": "native",
   "window_seconds": 6.0,
-  "grid_fingerprint": "4c2e4be2dde1f00f37a7b11c75402833f2f8a99850863bee8fac7c70615b17f9",
+  "grid_fingerprint": "5fa332585a549f6617874ddd884ad81419103f2dfac0c6841ec9938d04824639",
   "stream_fingerprints": {
     "capture24/watch_wrist": "e035c8696d0246a5162d3358ffe4febd77855ec1f10501611a92ba557ba22f78",
     "capture24_pretrain/watch_wrist": "2433c4182d3ad06808138fa17482bc613d73ac4dea7f83f40677fe18e43223bb",
@@ -81,9 +81,6 @@
     "realdisp/rla": "156860674b305a13379fad1b07167d589d3c0718f59c892e6fd9d1f8c42cab1e",
     "realdisp/rt": "37d49a38b95aaf424202cb520af71af7630e5f52f71efdf774c5c4b7b3f6c812",
     "realdisp/rua": "cf31f496ecea90c0d383688c53ebfae978693877779f18a9a2531da4256b6984",
-    "realworld/phone_forearm": "db3ec1c040b5262a31016ffa3aad835cb86c0a03c3610684d79be8904625bd5f",
-    "realworld/phone_thigh": "e9ecf03e6e6b0337a0a7f2011c8db0a9d6d49743045e6c1b7e5cd7c3596cc8ba",
-    "realworld/phone_waist": "76da9f369b64aff08efbdad601e9264389ebb4c27f7dabe38b6d29b2b64ba50b",
     "shoaib/phone_belt": "adb3c65cf3a1f1eb8f3289a73cc3d3b76bb3590920b7a17d38f97f2c644a0ad1",
     "shoaib/phone_left_pocket": "295d01ec9eff536b84862d5483775f288a5590cc27c9b158cef1f12783bc859c",
     "shoaib/phone_right_pocket": "28e777ae434c8d580cf3c73101aed0600d09badace1d6c38ebbc11411f6804b2",

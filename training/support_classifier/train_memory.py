@@ -30,13 +30,26 @@ from training.support_classifier.memory_episodes import (
     MemoryEpisode, draw_memory_episode, eligible_memory_datasets,
 )
 from training.support_classifier.train import (
-    PROVENANCE_ROOTS, LabelTextTable, encode_recording_rows,
+    PROVENANCE_ROOTS, LabelTextTable, _atomic_torch_save, encode_recording_rows,
 )
 from training.tokenizer.eval_transfer import build_encoder
-from training.tokenizer.pretrain import capture_source_provenance, write_source_provenance
+from training.tokenizer.pretrain import corpus_fingerprint, capture_source_provenance, write_source_provenance
 from training.tokenizer.pretrain_data import CorpusIndex, MultiResolutionCollate, PretrainDataset
+from evaluation.provenance import _atomic_json
 
 MEMORY_SIZE_BINS = ("0", "1", "2_3", "4_7", "8_15", "16_31", "32_plus")
+EVALUATION_PROTOCOL_KEYS = (
+    "seed", "val_episodes", "max_history", "max_per_stream", "reader_holdout_fraction",
+    "fine_tune_encoder", "train_text_projection",
+)
+
+
+def validate_evaluation_protocol(current: dict, saved: dict) -> None:
+    mismatches = [key for key in EVALUATION_PROTOCOL_KEYS if key not in saved or
+                  current.get(key) != saved[key]]
+    if mismatches:
+        raise ValueError(f"evaluation protocol differs from checkpoint: {mismatches}; "
+                         "pass its training settings explicitly")
 
 
 def memory_size_bin(size: int) -> str:
@@ -51,6 +64,20 @@ def checkpoint_sha256(path: Path) -> str:
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(1 << 20), b""):
             digest.update(block)
+    return digest.hexdigest()
+
+
+def indexed_corpus_fingerprint(index: CorpusIndex) -> str:
+    """Bind v5 to both grid content and the exact quality-screened train/validation rows."""
+    digest = hashlib.sha256(corpus_fingerprint(index).encode())
+    for split in (index.train, index.val):
+        for key in split:
+            digest.update(f"{key.stream_i}:{key.window_i}:{key.label_id};".encode())
+        digest.update(b"|")
+    for stream in sorted(index.excluded):
+        digest.update(stream.encode())
+        for row in sorted(index.excluded[stream]):
+            digest.update(f"{row},".encode())
     return digest.hexdigest()
 
 
@@ -90,8 +117,7 @@ def episode_loss(
                 keep = (mask if i % 2 else ~mask) if bool(mask.any()) and bool((~mask).any()) \
                     else torch.zeros_like(mask)
                 view = classifier(motion[i], acquisition[i], candidate_text,
-                                  tensors[0][keep], tensors[1][keep],
-                                  tensors[2][keep], tensors[3][keep])
+                                  *(tensor[keep] for tensor in tensors))
                 losses.append(-view.probabilities[target].clamp_min(1e-8).log())
                 counts["counterfactual_views"] += 1
             pred = int(readout.probabilities.argmax())
@@ -162,8 +188,8 @@ def main() -> None:
     parser.add_argument("--encoder-lr-scale", type=float, default=0.1)
     parser.add_argument("--fine-tune-encoder", action="store_true")
     parser.add_argument("--train-text-projection", action="store_true",
-                        help="also train v4's p_text; off by default so the no-memory semantic "
-                             "control is exactly v4's zero-shot path")
+                        help="also train v4's p_text; off by default to preserve its text projection "
+                             "(fine-tuning the encoder still changes the no-memory control)")
     parser.add_argument("--seed", type=int, default=47)
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args()
@@ -224,6 +250,7 @@ def main() -> None:
     index = CorpusIndex(max_per_stream=args.max_per_stream, seed=split_seed,
                         datasets=deployment_policy.SUPERVISED_HEAD_TRAIN_DATASETS,
                         alignment="native", window_seconds=float(source["args"]["window_seconds"]))
+    corpus_fp = indexed_corpus_fingerprint(index)
     holdout = open_vocabulary_holdout_labels(index, fraction=args.reader_holdout_fraction,
                                              seed=args.seed)
     train_corpus = support_corpus_from_index(index, exclude_labels=holdout)
@@ -249,11 +276,14 @@ def main() -> None:
               "training_source": list(deployment_policy.SUPERVISED_HEAD_TRAIN_DATASETS),
               "reader_heldout_labels": list(holdout),
               "subject_split_seed": split_seed,
+              "corpus_fingerprint": corpus_fp,
+              "semantic_control": ("source_v4_text_with_finetuned_encoder" if args.fine_tune_encoder
+                                   else "source_v4_text_with_frozen_encoder"),
               "source_provenance": source_record,
               "args": {key: str(value) if isinstance(value, Path) else value
                        for key, value in vars(args).items()}}
     if args.resume is None:
-        (args.out / "run_config.json").write_text(json.dumps(config, indent=2) + "\n")
+        _atomic_json(args.out / "run_config.json", config)
         write_source_provenance(args.out, source_provenance)
 
     def validate(step: int) -> dict:
@@ -325,18 +355,20 @@ def main() -> None:
                 np.mean(acquisition[dataset]),
             )
         return {"step": step, "datasets": totals,
+                "semantic_control": config["semantic_control"],
                 "reader_heldout_labels": list(holdout),
                 "macro_accuracy": float(np.mean([v["correct_rate"] for v in totals.values()])),
                 "macro_f1": float(np.mean([v["reader_macro_f1"] for v in totals.values()
                                             if "reader_macro_f1" in v]))}
 
     def save(name: str, step: int, result: dict) -> None:
-        torch.save({"architecture_version": ARCHITECTURE_VERSION,
+        _atomic_torch_save({"architecture_version": ARCHITECTURE_VERSION,
                     "attention_spec": asdict(spec), "classifier_config": asdict(head.cfg),
                     "classifier": head.state_dict(), "encoder": encoder.state_dict(),
                     "config": source["config"], "source_checkpoint_sha256": source_hash,
                     "source_step": source.get("step"), "step": step, "validation": result,
                     "optimizer": optimizer.state_dict(), "training_args": config["args"],
+                    "corpus_fingerprint": corpus_fp,
                     "source_provenance": source_record,
                     "torch_rng": torch.get_rng_state(),
                     "cuda_rng": torch.cuda.get_rng_state_all() if device.type == "cuda" else None},
@@ -350,6 +382,12 @@ def main() -> None:
             parser.error("evaluation checkpoint is not v5 or does not match the source encoder")
         if snapshot.get("source_provenance") != source_record:
             parser.error("evaluation code differs from the checkpoint's source provenance")
+        if snapshot.get("corpus_fingerprint") != corpus_fp:
+            parser.error("evaluation corpus differs from the checkpoint's indexed grids or quality screens")
+        try:
+            validate_evaluation_protocol(config["args"], snapshot.get("training_args") or {})
+        except ValueError as exc:
+            parser.error(str(exc))
         head.load_state_dict(snapshot["classifier"], strict=True)
         encoder.load_state_dict(snapshot["encoder"], strict=True)
         result = validate(int(snapshot["step"]))
@@ -364,6 +402,8 @@ def main() -> None:
             parser.error("resume checkpoint is not v5 or has a different source encoder")
         if snapshot.get("source_provenance") != source_record:
             parser.error("resume code differs from the checkpoint's source provenance")
+        if snapshot.get("corpus_fingerprint") != corpus_fp:
+            parser.error("resume corpus differs from the checkpoint's indexed grids or quality screens")
         old = snapshot.get("training_args") or {}
         allowed = {"steps", "out", "device", "resume", "evaluate_checkpoint"}
         mismatch = [key for key, value in old.items()
@@ -390,6 +430,14 @@ def main() -> None:
             best = max(best, float(previous_best["validation"].get("macro_f1", -1.0)))
         if args.steps < start_step:
             parser.error("--steps must exceed the checkpoint's completed step")
+        previous_config = json.loads((args.out / "run_config.json").read_text())
+        config["resume_history"] = [*previous_config.get("resume_history", []), {
+            "checkpoint": str(args.resume), "completed_step": start_step - 1,
+            "previous_steps": previous_config["args"]["steps"], "requested_steps": args.steps,
+        }]
+        config["initial_training_args"] = previous_config.get("initial_training_args",
+                                                            previous_config["args"])
+        _atomic_json(args.out / "run_config.json", config)
     log = (args.out / "log.jsonl").open("a" if args.resume else "w")
     try:
         for step in range(start_step, args.steps + 1):
@@ -415,9 +463,11 @@ def main() -> None:
             batch_loss.backward()
             grad = torch.nn.utils.clip_grad_norm_(
                 list(head.parameters()) + [p for p in encoder.parameters() if p.requires_grad], 1.0,
+                error_if_nonfinite=True,
             )
             optimizer.step()
             record = {"step": step, "loss": float(batch_loss.detach()), "grad_norm": float(grad),
+                      "semantic_control": config["semantic_control"],
                       "mean_retained": float(np.mean([v["retained"] for v in counts])),
                       "mean_seen": float(np.mean([v["seen"] for v in counts])),
                       "mean_verified": float(np.mean([v["verified"] for v in counts])),

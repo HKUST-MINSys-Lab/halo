@@ -31,11 +31,32 @@ from evaluation.manifests import SEED, _aligned_labels, evaluation_cells
 from evaluation.provenance import ArtifactProvenance, Rung, _atomic_json, write_artifact
 from evaluation.rung1_unlabeled.ncurve import split_scored_pool
 from evaluation.rung3_finetune.finetune import (
-    CACHED_FEATURE_TREATMENTS, TREATMENTS, FineTuneConfig, run_cell,
+    CACHED_FEATURE_TREATMENTS, MATCHED_BACKBONE, TREATMENTS, FineTuneConfig, run_cell,
 )
 from evaluation.zero_shot import ProviderScorer
 
 RUNG_MODELS = ("halo", "harnet5", "harnet10", "limubert_x", "unimts", "normwear")
+
+
+def released_weight_fingerprints(names: Sequence[str], halo_checkpoint: Path | None) -> dict[str, str]:
+    """Identify raw-window providers even when no feature cache is requested."""
+    from evaluation.features import _file_hash
+
+    out = {}
+    for name in names:
+        if name == "halo":
+            if halo_checkpoint is None:
+                raise ValueError("HALO raw evaluation requires --halo-checkpoint")
+            path = halo_checkpoint
+        else:
+            adapter = baselines.REGISTRY[name]
+            artifacts = adapter.feature_artifacts({})
+            path = artifacts["released_checkpoint"]
+        path = Path(path)
+        if not path.is_file():
+            raise FileNotFoundError(f"released weights missing for {name}: {path}")
+        out[name] = _file_hash(path)
+    return out
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -74,6 +95,10 @@ def main() -> None:
                          batch_size=args.batch_size, lora_rank=args.lora_rank, lora_alpha=args.lora_alpha,
                          seed=args.seed)
     needs_cached = bool(set(args.treatments) & CACHED_FEATURE_TREATMENTS)
+    raw_models = [name for name in args.models if any(t not in CACHED_FEATURE_TREATMENTS
+                                                  for t in args.treatments)
+                  and (name == "halo" or name in MATCHED_BACKBONE)]
+    raw_fingerprints = released_weight_fingerprints(raw_models, args.halo_checkpoint)
     scorer = ProviderScorer(
         models=args.models, device=device, cache_dir=cache_dir, halo_checkpoint=args.halo_checkpoint,
         cache_read_dirs=args.cache_read_dirs,
@@ -128,7 +153,9 @@ def main() -> None:
             )
             for row in cell_rows:
                 row.update({**base, "model": name, "encoder": label_of[name],
-                            "artifact_fingerprint": fingerprint,
+                            "artifact_fingerprint": (fingerprint if row.get("method") in
+                                                     CACHED_FEATURE_TREATMENTS else
+                                                     raw_fingerprints.get(name)),
                             "n_executions_scored": split.n_executions_scored,
                             "n_executions_pool": split.n_executions_pool})
             rows.extend(cell_rows)
@@ -139,12 +166,14 @@ def main() -> None:
         _atomic_json(args.out / "progress.json", {"completed_cells": cell_index, "total_cells": len(cells)})
     provenance = ArtifactProvenance(
         rung=Rung.FINETUNE,
-        checkpoint_fingerprint=hashlib.sha256(json.dumps(sorted(fingerprints.items())).encode()).hexdigest()
-        if fingerprints else hashlib.sha256(str(args.halo_checkpoint).encode()).hexdigest(),
+        checkpoint_fingerprint=hashlib.sha256(json.dumps({
+            "cached": sorted(fingerprints.items()), "raw_weights": sorted(raw_fingerprints.items()),
+        }, sort_keys=True).encode()).hexdigest(),
         manifest_fingerprint=hashlib.sha256(json.dumps({
             "cells": [list(c[:3]) for c in cells], "seed": args.seed, "scored_fraction": args.scored_fraction,
             "k": args.k, "treatments": args.treatments}, sort_keys=True).encode()).hexdigest(),
-        extra={"per_model_fingerprints": fingerprints, "config": cfg.as_dict(),
+        extra={"per_model_fingerprints": fingerprints, "raw_weight_fingerprints": raw_fingerprints,
+               "config": cfg.as_dict(),
                # Same split as rung 1: execution-disjoint, not subject-disjoint.
                "subject_independent": False, "execution_disjoint_scored_pool": True},
     )

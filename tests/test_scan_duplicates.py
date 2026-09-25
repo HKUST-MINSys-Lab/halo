@@ -107,7 +107,7 @@ def test_duplicate_cache_paths_do_not_overwrite_alignments(tmp_path, monkeypatch
     assert sd.cache_path("non_harmonised").name == "duplicate_windows_non_harmonised.json"
 
 
-def test_duplicate_cache_allows_absent_optional_cached_streams(tmp_path, monkeypatch):
+def test_duplicate_cache_refuses_removed_streams(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from data.scripts import scan_duplicates as sd
     from data.scripts.eda import grid_io
@@ -122,7 +122,8 @@ def test_duplicate_cache_allows_absent_optional_cached_streams(tmp_path, monkeyp
                         lambda alignment: [SimpleNamespace(key="required/stream")])
     monkeypatch.setattr(grid_io, "grid_corpus_fingerprint",
                         lambda alignment, refs=None: "ok")
-    assert sd.load("native", require=True) == {}
+    with pytest.raises(ValueError, match="does not match"):
+        sd.load("native", require=True)
 
 
 def test_incremental_duplicate_refresh_preserves_only_fingerprinted_streams(tmp_path, monkeypatch):

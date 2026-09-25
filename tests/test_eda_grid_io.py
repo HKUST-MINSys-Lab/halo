@@ -53,7 +53,14 @@ def test_watch_stream_is_not_mistaken_for_duration_directory(tmp_path: Path) -> 
 
     refs = discover_grids(datasets_dir=tmp_path)
 
-    assert [ref.key for ref in refs] == ["alpha/watch_wrist", "beta/phone"]
+    assert [ref.key for ref in refs] == ["alpha/watch_wrist"]
+    assert [ref.key for ref in discover_grids(datasets_dir=tmp_path, window_seconds=4)] == ["beta/phone"]
+
+
+def test_default_never_promotes_a_longer_window_to_six_seconds(tmp_path: Path) -> None:
+    _write_grid(tmp_path, "alpha", "phone", [1, 1, 1, 0, 0, 0], duration_dir="w16")
+    _write_grid(tmp_path, "beta", "watch", [1, 1, 1, 0, 0, 0], duration_dir="w6")
+    assert [ref.key for ref in discover_grids(datasets_dir=tmp_path)] == ["beta/watch"]
 
 
 def test_explicit_six_second_discovery_prefers_w6_and_falls_back_per_stream(tmp_path: Path) -> None:
@@ -64,6 +71,10 @@ def test_explicit_six_second_discovery_prefers_w6_and_falls_back_per_stream(tmp_
     refs = discover_grids(datasets_dir=tmp_path, window_seconds=6.0)
 
     assert [(ref.key, ref.grid_dir.name) for ref in refs] == [
+        ("alpha/watch_wrist", "w6"), ("beta/phone", "phone"),
+    ]
+    implicit = discover_grids(datasets_dir=tmp_path)
+    assert [(ref.key, ref.grid_dir.name) for ref in implicit] == [
         ("alpha/watch_wrist", "w6"), ("beta/phone", "phone"),
     ]
 

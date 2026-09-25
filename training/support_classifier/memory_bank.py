@@ -8,7 +8,9 @@ from typing import Mapping
 import torch
 from torch.nn import functional as F
 
-from model.support.memory_classifier import MemoryReadout, MemoryReaderClassifier
+from model.support.memory_classifier import (
+    PRIOR_FEEDBACK_STATS, MemoryReadout, MemoryReaderClassifier,
+)
 
 
 @dataclass(frozen=True)
@@ -18,7 +20,7 @@ class MemoryEntry:
     observation_index: int
     motion: torch.Tensor
     acquisition: torch.Tensor
-    original_probabilities: torch.Tensor
+    original_probabilities: torch.Tensor  # immutable pre-feedback zero-shot snapshot
     original_roster: tuple[str, ...]
     model_version: str
     verified_label: str | None = None
@@ -80,7 +82,7 @@ class DeploymentMemory:
             raise ValueError("duplicate recording in one deployment bank")
         entry = MemoryEntry(
             recording_id, execution_id, self.seen, motion, acquisition,
-            original_probabilities.detach(), tuple(roster), self.model_version,
+            original_probabilities.detach().clone(), tuple(roster), self.model_version,
             verified_label, dict(acquisition_metadata or {}),
         )
         self.seen += 1
@@ -111,7 +113,7 @@ class DeploymentMemory:
                 "observation_index": entry.observation_index,
                 "motion": entry.motion.detach().cpu(),
                 "acquisition": entry.acquisition.detach().cpu(),
-                "original_probabilities": entry.original_probabilities.detach().cpu(),
+                "original_probabilities": entry.original_probabilities.detach().cpu().clone(),
                 "original_roster": entry.original_roster,
                 "model_version": entry.model_version,
                 "verified_label": entry.verified_label,
@@ -151,7 +153,7 @@ class DeploymentMemory:
                 observation_index=index,
                 motion=raw["motion"].to(device),
                 acquisition=raw["acquisition"].to(device),
-                original_probabilities=raw["original_probabilities"].to(device),
+                original_probabilities=raw["original_probabilities"].to(device).clone(),
                 original_roster=tuple(raw["original_roster"]),
                 model_version=model_version,
                 verified_label=raw.get("verified_label"),
@@ -162,7 +164,7 @@ class DeploymentMemory:
     def tensors(
         self, classifier: MemoryReaderClassifier, labels: tuple[str, ...],
         candidate_text: torch.Tensor, *, empty_device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if len(labels) != candidate_text.shape[0] or len(set(labels)) != len(labels):
             raise ValueError("candidate text and distinct roster labels must match")
         if not self.entries:
@@ -170,11 +172,13 @@ class DeploymentMemory:
             return (torch.empty((0, d), device=empty_device),
                     torch.empty((0, d), device=empty_device),
                     torch.empty((0, len(labels)), device=empty_device),
-                    torch.empty(0, dtype=torch.long, device=empty_device))
+                    torch.empty(0, dtype=torch.long, device=empty_device),
+                    torch.empty((0, PRIOR_FEEDBACK_STATS), device=empty_device))
         motion = torch.stack([e.motion for e in self.entries])
         acquisition = torch.stack([e.acquisition for e in self.entries])
         evidence = []
         verified = []
+        feedback = []
         for entry in self.entries:
             if entry.model_version != self.model_version:
                 raise ValueError("stale memory entry belongs to a different model version")
@@ -186,10 +190,23 @@ class DeploymentMemory:
                 prob = (entry.original_probabilities if entry.original_roster == labels else
                         classifier.semantic(entry.motion, candidate_text).detach())
             evidence.append(prob)
-            verified.append(labels.index(entry.verified_label)
-                            if entry.verified_label in labels else -1)
+            active_label = labels.index(entry.verified_label) if entry.verified_label in labels else -1
+            verified.append(active_label)
+            prior = entry.original_probabilities.float()
+            if active_label >= 0 and entry.verified_label in entry.original_roster:
+                original_label = entry.original_roster.index(entry.verified_label)
+                p_true = prior[original_label]
+                entropy = -(prior * prior.clamp_min(1e-8).log()).sum() / prior.new_tensor(
+                    len(entry.original_roster), dtype=torch.float32,
+                ).log()
+                feedback.append(torch.stack((prior.new_tensor(1.0), p_true,
+                                             prior.max() - p_true, entropy,
+                                             prior.new_tensor(1.0 / len(entry.original_roster)))))
+            else:
+                feedback.append(prior.new_zeros(PRIOR_FEEDBACK_STATS))
         return (motion, acquisition, torch.stack(evidence),
-                torch.tensor(verified, dtype=torch.long, device=motion.device))
+                torch.tensor(verified, dtype=torch.long, device=motion.device),
+                torch.stack(feedback))
 
     def predict_then_insert(
         self, classifier: MemoryReaderClassifier, *, recording_id: str,

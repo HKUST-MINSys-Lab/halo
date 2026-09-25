@@ -177,7 +177,8 @@ predictions are in the [roadmap](../overview/roadmap.md); the invariants a reade
   neighbours in the encoder's own feature space). HALO's zero-shot scores come from its checkpoint's
   `p_text`; HARNet and LiMU-BERT-X use the training-bank ConSE bridge; UniMTS and NormWear their native
   text heads. The curve's null is N = 0 under the same procedure; the per-window inductive anchor
-  must reproduce the sealed k = 0 row. Rows report `neighbour_purity`. Readout version `ncurve-v2`.
+  is the text-score arg-max, not HALO's full sealed classifier; it must not be labelled an exact
+  sealed k = 0 reproduction. Rows report `neighbour_purity`. Readout version `ncurve-v2`.
 - **Rung 3.** Every treatment — linear probe, small classifier, LoRA, full fine-tune, and a
   from-scratch specialist — is fitted on the same k windows per class and scored on rung 1's scored
   set, beside the rung-2 parameter-free readout re-run on the same draw (`enrollment_frozen`).

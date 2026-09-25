@@ -127,9 +127,13 @@ def build_encoder(
     *,
     training: bool = False,
     learnable_recording_pool: bool | None = None,
+    load_weights: bool = True,
 ) -> torch.nn.Module:
     c = ckpt["config"]
     arch = c.get("encoder_arch", "halo")
+    if not load_weights and (arch != "halo" or c.get("encoder_backbone") in {"harnet", "unimts"}):
+        raise ValueError("fresh construction here supports HALO only; use build_matched_encoder "
+                         "for random baseline trunks")
     if arch != "halo":
         # Matched-corpus M2 arm (docs/design/MATCHED_CORPUS_PLAN_20260915.md). The trunk's weights
         # live in the checkpoint like any other encoder, so evaluation needs no special casing
@@ -279,12 +283,13 @@ def build_encoder(
                 stem="none",
             )
     enc = SetTokenizerEncoder(**kw)
-    loaded = enc.load_state_dict(
-        ckpt["encoder"],
-        strict=not (bool(kw["learnable_recording_pool"])
-                    and not bool(c.get("learnable_recording_pool", False))),
-    )
-    if bool(kw["learnable_recording_pool"]) and not bool(c.get("learnable_recording_pool", False)):
+    if load_weights:
+        loaded = enc.load_state_dict(
+            ckpt["encoder"],
+            strict=not (bool(kw["learnable_recording_pool"])
+                        and not bool(c.get("learnable_recording_pool", False))),
+        )
+    if load_weights and bool(kw["learnable_recording_pool"]) and not bool(c.get("learnable_recording_pool", False)):
         unexpected = [key for key in loaded.unexpected_keys]
         missing = [key for key in loaded.missing_keys if not key.startswith("recording_pool.")]
         if unexpected or missing:
@@ -413,7 +418,7 @@ def encode_dataset_detailed(enc, data, texts, device, rate: float, gravity_state
             "duplicate the recording. Use --patching checkpoint."
         )
     use_multiresolution = (
-        getattr(enc, "multiresolution", enc.use_duration_embedding)
+        getattr(enc, "multiresolution", getattr(enc, "use_duration_embedding", False))
         if eval_patching == "checkpoint" else eval_patching == "multiresolution"
     )
     if owns_grid:
@@ -548,7 +553,7 @@ def encode_dataset_detailed(enc, data, texts, device, rate: float, gravity_state
                                  and batch.get("sensor_bias") is not None else None),
                 )
             embs.append(out["pooled"] if requires_grad else out["pooled"].cpu())
-            if "per_patch" not in out:
+            if out.get("per_patch") is None:
                 if _require_patches:
                     raise KeyError("encoder detailed export requires an out['per_patch'] tensor")
                 continue

@@ -25,7 +25,8 @@ from model.blocks import AttentionSpec
 
 ARCHITECTURE_VERSION = "support_memory_reader_v5"
 TRUST_LIMIT = 2.0          # bound on the per-entry log-weight adjustment, as v4's |t| <= 2
-EVIDENCE_STATS = 5         # entropy, max probability, top-2 margin, verified flag, has evidence
+PRIOR_FEEDBACK_STATS = 5   # available, p(true), error margin, entropy, chance level
+EVIDENCE_STATS = 5 + PRIOR_FEEDBACK_STATS
 
 
 @dataclass(frozen=True)
@@ -99,7 +100,7 @@ class MemoryReaderClassifier(nn.Module):
         self, query: torch.Tensor, query_acquisition: torch.Tensor,
         candidates: torch.Tensor, memory_motion: torch.Tensor,
         memory_acquisition: torch.Tensor, evidence: torch.Tensor,
-        verified: torch.Tensor,
+        verified: torch.Tensor, prior_feedback: torch.Tensor | None = None,
     ) -> MemoryReadout:
         if query.ndim != 1 or query_acquisition.shape != query.shape:
             raise ValueError("one query motion/acquisition vector is required")
@@ -112,6 +113,12 @@ class MemoryReaderClassifier(nn.Module):
                 or memory_acquisition.shape != memory_motion.shape
                 or verified.shape != (n,)):
             raise ValueError("memory tensor shapes do not agree")
+        if prior_feedback is None:
+            prior_feedback = evidence.new_zeros((n, PRIOR_FEEDBACK_STATS))
+        if prior_feedback.shape != (n, PRIOR_FEEDBACK_STATS) or not bool(torch.isfinite(prior_feedback).all()):
+            raise ValueError("original zero-shot feedback must be finite and match memory rows")
+        if bool((prior_feedback[(verified < 0)] != 0).any()):
+            raise ValueError("unverified memory cannot carry label feedback")
         if n and bool(((verified < -1) | (verified >= c)).any()):
             raise ValueError("verified label index is outside the roster")
         semantic = self.semantic(query, candidates)
@@ -145,6 +152,7 @@ class MemoryReaderClassifier(nn.Module):
         evidence_stats = torch.stack((
             entropy, top2[:, 0], top2[:, 0] - top2[:, -1],
             (verified >= 0).float(), has_evidence.float(),
+            *prior_feedback.float().unbind(dim=-1),
         ), dim=-1)
         tokens = torch.stack((
             self.motion_proj(memory_motion.float()) + self.role.weight[1],

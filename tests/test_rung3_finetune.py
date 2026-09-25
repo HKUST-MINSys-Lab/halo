@@ -11,7 +11,8 @@ from sklearn.datasets import make_blobs
 
 from evaluation.rung1_unlabeled.ncurve import CellSplit
 from evaluation.rung3_finetune.finetune import (
-    FineTuneConfig, enrollment_frozen_predictions, fit_head, linear_probe_predictions, run_cell,
+    FineTuneConfig, enrollment_frozen_predictions, fit_head, freeze_batchnorm_stats,
+    linear_probe_predictions, run_cell,
     small_classifier_predictions,
 )
 from evaluation.rung3_finetune.lora import LoRALinear, apply_lora, lora_parameters, trainable_parameter_count
@@ -149,6 +150,64 @@ def test_reinitialise_resets_batchnorm_running_statistics():
     bn.apply(_reinitialise)
     torch.testing.assert_close(bn.running_mean, torch.zeros(4))
     torch.testing.assert_close(bn.running_var, torch.ones(4))
+
+
+def test_lora_freezes_batchnorm_running_statistics():
+    net = nn.Sequential(nn.Conv1d(3, 4, 3), nn.BatchNorm1d(4), nn.AdaptiveAvgPool1d(1),
+                        nn.Flatten(), nn.Linear(4, 2))
+    apply_lora(net, rank=2)
+    net.train()
+    freeze_batchnorm_stats(net)
+    before = net[1].running_mean.clone()
+    net(torch.randn(8, 3, 20))
+    torch.testing.assert_close(net[1].running_mean, before)
+
+
+def test_raw_baseline_encoder_exports_pooled_rows_without_patch_tokens():
+    from model.tokenizer.matched_encoder import build_matched_encoder
+    from training.tokenizer.eval_transfer import encode_dataset_detailed
+    from training.tokenizer.pretrain_data import stream_channel_descriptions
+
+    encoder = build_matched_encoder("harnet", pretrained=False, device=torch.device("cpu"))
+    windows = np.zeros((1, 300, 6), dtype=np.float32)
+    out = encode_dataset_detailed(
+        encoder, windows, stream_channel_descriptions("wisdm", "phone_pocket"),
+        torch.device("cpu"), 50.0, None, dataset="wisdm", stream="phone_pocket",
+        _require_patches=False,
+    )
+    assert out["pooled"].shape == (1, 128) and out["patch_Z"].shape == (0, 128)
+
+
+def test_scratch_halo_does_not_reload_trained_direct_pool_parameter(tmp_path):
+    from evaluation.rung3_finetune.finetune import build_encoder_for
+    from model.tokenizer.encoder import SetTokenizerEncoder
+
+    source = SetTokenizerEncoder(d_model=32, num_layers=1, num_heads=4, dim_feedforward=64,
+                                 learnable_recording_pool=True)
+    with torch.no_grad():
+        source.recording_pool.query.fill_(42.0)
+    config = dict(d_model=32, num_layers=1, num_heads=4, dim_feedforward=64,
+                  learnable_recording_pool=True, frontend="fixed")
+    path = tmp_path / "source.pt"
+    torch.save({"config": config, "encoder": source.state_dict()}, path)
+    scratch = build_encoder_for("halo", "scratch_specialist", halo_checkpoint=path,
+                                device=torch.device("cpu"))
+    assert not torch.allclose(scratch.recording_pool.query, source.recording_pool.query)
+
+
+def test_raw_only_provenance_uses_released_weight_bytes(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import baselines
+    from evaluation.rung3_finetune.run import released_weight_fingerprints
+
+    path = tmp_path / "weights.pt"
+    path.write_bytes(b"first")
+    monkeypatch.setitem(baselines.REGISTRY, "toy", SimpleNamespace(
+        feature_artifacts=lambda state: {"released_checkpoint": path},
+    ))
+    first = released_weight_fingerprints(["toy"], None)["toy"]
+    path.write_bytes(b"second")
+    assert released_weight_fingerprints(["toy"], None)["toy"] != first
 
 
 def test_matched_resampling_is_the_released_adapters_method():

@@ -120,10 +120,9 @@ def discover_grids(
     """
     refs: list[GridRef] = []
     if window_seconds is None:
-        # Keep existing corpus discovery stable: legacy direct-stream grids remain its default.
-        # A duration-qualified grid must be requested explicitly so 4/8/16 s evaluation assets
-        # cannot silently multiply the label-free/pretraining corpus.
-        patterns = (f"*/grids/{alignment}/*/meta.json", f"*/grids/{alignment}/*/w*/meta.json")
+        # The implicit duration is six seconds, exactly as in the quality-cache loader. Never
+        # discover 4/8/16 s grids here or screen one six-second grid while loading another.
+        patterns = (f"*/grids/{alignment}/*/meta.json", f"*/grids/{alignment}/*/w6/meta.json")
     else:
         token = f"w{float(window_seconds):g}".replace(".", "p")
         # During migration, requested 6 s grids may still live directly under the stream. The
@@ -139,19 +138,18 @@ def discover_grids(
 
     candidates = [path for root in roots for pattern in patterns for path in root.glob(pattern)]
     if window_seconds is None or np.isclose(float(window_seconds), 6.0):
-        # Default corpus discovery keeps a direct legacy grid authoritative. An explicit 6 s
-        # request mirrors ``baselines.data._grid_dir`` and prefers w6, with legacy fallback.
+        # Both implicit and explicit six-second requests mirror ``baselines.data._grid_dir``:
+        # prefer w6 and fall back to the legacy unqualified grid.
         selected: dict[tuple[str, str], Path] = {}
         for path in candidates:
             key = _grid_key(path)
             old = selected.get(key)
             def rank(value: Path) -> int:
-                # A no-duration call is the historical six-second corpus.  New streams
-                # have no direct legacy directory, so choose explicit w6 deterministically.
+                # The cache and the selected grid must refer to the same windows.
                 if not _is_window_dir(value.parent):
-                    return 1 if window_seconds is not None else 0
+                    return 1
                 if value.parent.name == "w6":
-                    return 0 if window_seconds is not None else 1
+                    return 0
                 return 2
             if old is None or rank(path) < rank(old) or (rank(path) == rank(old) and str(path) < str(old)):
                 selected[key] = path

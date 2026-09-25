@@ -6,11 +6,10 @@ drawn. So per cell the queries are split **by physical execution** into a scored
 a pool P (80 %); nested subsets P_50 ⊂ P_100 ⊂ … ⊂ P are drawn once from a seeded permutation;
 transduction runs over S ∪ P_N; every metric is computed on S only.
 
-* The **inductive anchor** (``method="inductive"``, recorded with N = 0) involves no transduction at
-  all, and at k = 0 must reproduce the published
-  sealed zero-shot rule on the same windows (the arg-max of the zero-shot scores). That is the
-  self-consistency check, also emitted over *all* windows so it can be compared row for row with
-  the sealed results file.
+* The **inductive anchor** (``method="inductive"``, recorded with N = 0) involves no transduction.
+  At k = 0 it is the text-score arg-max on the same windows. For HALO this is the semantic
+  branch, not the full sealed zero-support classifier, so it must not be presented as a
+  reproduction of the published sealed result.
 * k > 0 supports are a **cell-level shared set** of k windows per class drawn from P (execution-
   disjoint from S by construction), because transduction is joint over the pool and cannot take
   the sealed manifest's per-query support sets. The inductive k > 0 readout at N = 0 is the
@@ -120,7 +119,7 @@ def shared_support_set(pool: np.ndarray, truth_ids: np.ndarray, k: int, n_classe
 
 def inductive_predictions(*, scores: np.ndarray, features: np.ndarray | None, support_rows: np.ndarray,
                           support_labels: np.ndarray, n_classes: int, rows: np.ndarray) -> np.ndarray:
-    """N = 0 readout. k = 0: arg-max of the zero-shot scores (the sealed rule). k > 0: normalised
+    """N = 0 readout. k = 0: arg-max of the text scores. k > 0: normalised
     class prototypes of the shared supports on the enrollment features (sealed ``prototype``)."""
     if len(support_rows) == 0:
         return np.asarray(scores[rows].argmax(axis=1), dtype=np.int64)
@@ -175,7 +174,7 @@ def run_cell(
     scored_classes: Sequence[int] | None = None,
 ) -> list[dict]:
     """Every rung-1 row for one (encoder, cell): the N × k grid on S, plus the all-windows
-    reproduction row at N = 0, k = 0. ``pool_filter`` (a control) may resample each P_N."""
+    all-window text-score anchor at N = 0, k = 0. ``pool_filter`` may resample each P_N."""
     classes = list(classes)
     C = len(classes)
     kwargs = {**INFERENCE_DEFAULTS, **(transduce_kwargs or {})}
@@ -198,11 +197,11 @@ def run_cell(
         pred = truth_names[pred_ids]
         return classification(truth, pred, f1_classes=f1_roster if fixed_roster else None)
 
-    # The reproduction row: the sealed k=0 rule over every in-roster window, no transduction.
+    # Text-score anchor over every in-roster window; HALO's full sealed classifier differs.
     all_rows = np.flatnonzero(truth_ids >= 0)
     rows.append({"method": "inductive", "k": 0, "N": 0, "scope": "all_windows", "control": control,
                  **metrics_on(all_rows, scores_all[all_rows].argmax(axis=1)),
-                 "score_kind": score_kind, **feature_info})
+                 "inductive_readout": "text_score_argmax", "score_kind": score_kind, **feature_info})
 
     for k in ks:
         support = shared_support_set(split.pool, truth_ids, k, C, seed_parts=(*seed_parts, "k", k))
