@@ -174,7 +174,16 @@ the representation itself got slightly worse. The T = 30 diagnostic (48.1 at N=a
 negative T1-D result does not hinge on the temperature. Artifact:
 `results/artifacts/rung1_halo_trained_20260926/`.
 
-## 12. Pending at time of writing
+## 12. T1-F: HARNet trained on our corpus closes about half the gap
+
+`results/artifacts/rung1_matched_harnet_20260926` — HARNet trunk trained on our 8 sources with our
+pipeline (neighbour head, 40k steps, 03:56–04:43; peaks ~22 GB GPU, so it ran alone), scored under
+tier 1 via a ridge text bridge (T = 7.4): 33.7 / 39.3 / 40.8 (anchor / N=0 / N=all), pool effect
++1.5. Strongest non-HALO row; released HARNet-5 is 31.2 / 30.5 / 31.1 and HALO 47.4 / 50.6 / 51.9.
+About 10 of HALO's ~21-point lead over released HARNet-5 is reproduced by our corpus and recipe on
+a HARNet trunk; ~11 stays with HALO. The pool effect is not unique to HALO's space.
+
+## 13. Pending at time of writing
 
 Controls (μ = 0, balanced pool, disjoint classes); HALO trained through EM-Dirichlet (40k steps,
 `last.pt` primary — declared before results); its tier-1 score and inductive-floor check; the

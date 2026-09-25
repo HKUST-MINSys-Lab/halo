@@ -26,6 +26,11 @@ supports come from the pool (same draw as rung 1 for draw 0). Dataset-balanced m
 | LiMU-BERT-X | 21.9 | 23.0 | 22.6 | −3.1 |
 | NormWear | 10.4 | 16.3 | 18.4 | +2.0 |
 
+A HARNet trunk trained on *our* corpus with our pipeline ([`rung1_matched_harnet_20260926`](../../results/artifacts/rung1_matched_harnet_20260926/README.md))
+scores 33.7 / 39.3 / 40.8 — the strongest non-HALO row, reproducing about half of HALO's lead.
+HALO trained *through* EM-Dirichlet ([`rung1_halo_trained_20260926`](../../results/artifacts/rung1_halo_trained_20260926/README.md))
+is worse than v4 at every N (42.9 / 48.3 / 47.9): level A is negative on this run.
+
 Most of the effect is anchor → N=0 (transduction over the scored set); the pool adds ≤ 2 points,
 and for HALO only with the affinity term. A pool with *none* of the scored classes still helps
 (explaining away, not learning target classes) — read the artifact README before citing.
