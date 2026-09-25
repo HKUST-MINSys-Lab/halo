@@ -1,0 +1,143 @@
+{
+  "argv": [
+    ".venv/bin/halo-rung1",
+    "--out",
+    "runs/evaluations/rung1_halo_trained_last_20260925",
+    "--models",
+    "halo",
+    "--encoder-label",
+    "halo:rung1-trained-last",
+    "--halo-checkpoint",
+    "runs/support-classifier/halo_rung1_40k_20260925/last.pt",
+    "--cache-read-dirs",
+    "cache/evaluations/feature_cache_halo_t6_40k_20260920_final40k",
+    "--feature-cache",
+    "runs/evaluations/rung1_cache_trained",
+    "--feature-memory-cache-gib",
+    "6",
+    "--resume"
+  ],
+  "artifact": {
+    "assignments": [
+      "identity",
+      "graph"
+    ],
+    "checkpoint_fingerprint": "633cc2960a1d698824997e81cd71383fd718a699b9a4b2bbbaf167e9658733fb",
+    "control": "none",
+    "encoder": null,
+    "encoders_present": [
+      "halo:rung1-trained-last"
+    ],
+    "execution_disjoint_scored_pool": true,
+    "manifest_fingerprint": "2e1cfd31c4740ad81a739712c77923092fdf91a8176ddb80b521095dc2ec3a28",
+    "method": null,
+    "methods_present": [
+      "inductive",
+      "transductive_clip_v1"
+    ],
+    "per_model_fingerprints": {
+      "halo:rung1-trained-last": "0d913376740e49798dcf71fc6a8e41f9f5917f82951e09e43992208d9e991a18"
+    },
+    "readout_version": "ncurve-v2",
+    "reference_implementation": "github.com/SegoleneMartin/transductive-CLIP@master (fetched 2026-09-23)",
+    "rows": 154,
+    "rung": 1,
+    "subject_independent": false,
+    "temperature": "calibrated",
+    "temperature_calibration": {
+      "halo@8s": {
+        "accuracy": 0.6154066985645933,
+        "at_search_bound": false,
+        "data_seed": 20260901,
+        "ece": 0.0502047283104995,
+        "ece_at_30": 0.05387118268244471,
+        "held_out_subjects": 23,
+        "kind": "cosine",
+        "model": "halo",
+        "n_datasets": 8,
+        "n_windows": 10450,
+        "nll": 1.2068073865439637,
+        "nll_at_30": 1.2077888508062262,
+        "per_dataset": {
+          "dsads": {
+            "accuracy": 0.7786666666666666,
+            "n": 1500,
+            "roster_size": 19
+          },
+          "forth_trace": {
+            "accuracy": 0.6111888111888112,
+            "n": 715,
+            "roster_size": 16
+          },
+          "harmes": {
+            "accuracy": 0.286,
+            "n": 1500,
+            "roster_size": 52
+          },
+          "hhar": {
+            "accuracy": 0.9409395973154362,
+            "n": 1490,
+            "roster_size": 6
+          },
+          "kuhar": {
+            "accuracy": 0.8268456375838926,
+            "n": 745,
+            "roster_size": 18
+          },
+          "realdisp": {
+            "accuracy": 0.7186666666666667,
+            "n": 1500,
+            "roster_size": 33
+          },
+          "wisdm": {
+            "accuracy": 0.5346666666666666,
+            "n": 1500,
+            "roster_size": 18
+          },
+          "xrf_v2": {
+            "accuracy": 0.33266666666666667,
+            "n": 1500,
+            "roster_size": 30
+          }
+        },
+        "route": "halo_p_text",
+        "temperature": 31.76649077052987,
+        "version": "temperature-calibration-v1",
+        "window_seconds": 8.0
+      }
+    },
+    "temperatures": {
+      "halo@8s": 31.76649077052987
+    },
+    "transduce": {
+      "early_stop": true,
+      "knn": 10,
+      "lam": null,
+      "mu": 1.0,
+      "n_iter": 20,
+      "n_iter_mm": 1000
+    }
+  },
+  "baseline_adapters": {
+    "harnet10": "Harnet10Adapter",
+    "harnet5": "HarnetAdapter",
+    "limubert_x": "LiMUBERTXAdapter",
+    "normwear": "NormWearAdapter",
+    "unimts": "UniMTSAdapter"
+  },
+  "device": "cuda",
+  "dirty_worktree": false,
+  "feature_cache_schema": "sealed-feature-v6-20260918",
+  "git_revision": "c606d4bd59cd327479956312449fd7711a3ab4ab",
+  "halo_checkpoint": "/home/alex/code/HALO/halo/runs/support-classifier/halo_rung1_40k_20260925/last.pt",
+  "halo_checkpoint_sha256": "0d913376740e49798dcf71fc6a8e41f9f5917f82951e09e43992208d9e991a18",
+  "numpy": "2.5.3",
+  "protocol": "sealed-support-conditioned-v3-20260920",
+  "python": "3.13.9",
+  "resources": {
+    "cuda_peak_allocated_gib": 1.425,
+    "cuda_peak_reserved_gib": 2.221,
+    "process_wall_seconds": 307.0
+  },
+  "torch": "2.14.0+cu130"
+}

@@ -1,0 +1,67 @@
+{
+  "version": "temperature-calibration-v1",
+  "window_seconds": 8.0,
+  "fingerprint": "db33577eb9caf9582c4b990de862305321215b7cf601d1350c11b7663334f4c0",
+  "models": {
+    "halo": {
+      "temperature": 31.76649077052987,
+      "nll": 1.2068073865439637,
+      "nll_at_30": 1.2077888508062262,
+      "ece": 0.0502047283104995,
+      "ece_at_30": 0.05387118268244471,
+      "at_search_bound": false,
+      "accuracy": 0.6154066985645933,
+      "n_windows": 10450,
+      "n_datasets": 8,
+      "model": "halo",
+      "kind": "cosine",
+      "window_seconds": 8.0,
+      "version": "temperature-calibration-v1",
+      "data_seed": 20260901,
+      "per_dataset": {
+        "dsads": {
+          "n": 1500,
+          "roster_size": 19,
+          "accuracy": 0.7786666666666666
+        },
+        "forth_trace": {
+          "n": 715,
+          "roster_size": 16,
+          "accuracy": 0.6111888111888112
+        },
+        "harmes": {
+          "n": 1500,
+          "roster_size": 52,
+          "accuracy": 0.286
+        },
+        "hhar": {
+          "n": 1490,
+          "roster_size": 6,
+          "accuracy": 0.9409395973154362
+        },
+        "kuhar": {
+          "n": 745,
+          "roster_size": 18,
+          "accuracy": 0.8268456375838926
+        },
+        "realdisp": {
+          "n": 1500,
+          "roster_size": 33,
+          "accuracy": 0.7186666666666667
+        },
+        "wisdm": {
+          "n": 1500,
+          "roster_size": 18,
+          "accuracy": 0.5346666666666666
+        },
+        "xrf_v2": {
+          "n": 1500,
+          "roster_size": 30,
+          "accuracy": 0.33266666666666667
+        }
+      },
+      "route": "halo_p_text",
+      "held_out_subjects": 23
+    }
+  }
+}
