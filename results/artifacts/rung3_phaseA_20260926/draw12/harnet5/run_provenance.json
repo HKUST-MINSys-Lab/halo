@@ -1,0 +1,81 @@
+{
+  "argv": [
+    "halo-rung3",
+    "--out",
+    "runs/evaluations/rung3_phaseA_d12_20260926/harnet5",
+    "--models",
+    "harnet5",
+    "--halo-checkpoint",
+    "runs/support-classifier/halo_t6_40k_20260920/last.pt",
+    "--k",
+    "1",
+    "4",
+    "16",
+    "--first-draw",
+    "1",
+    "--support-draws",
+    "3",
+    "--treatments",
+    "full_finetune",
+    "scratch_specialist",
+    "--resume"
+  ],
+  "artifact": {
+    "checkpoint_fingerprint": "7dfa37c3c8b5b8c33f12494248cdaf1a748eec44443cf7271dc8af727a70a5f0",
+    "config": {
+      "batch_size": 32,
+      "encoder_lr_scale": 0.1,
+      "first_draw": 1,
+      "lora_alpha": 16.0,
+      "lora_rank": 8,
+      "lr": 0.001,
+      "probe_c": 1.0,
+      "projection_dim": 128,
+      "seed": 20260912,
+      "steps": 300,
+      "support_draws": 3,
+      "weight_decay": 0.05
+    },
+    "encoder": null,
+    "encoders_present": [
+      "harnet5"
+    ],
+    "execution_disjoint_scored_pool": true,
+    "manifest_fingerprint": "fa757b29ad48242810bf4c8bcfc65001b31e6082bee357f861e98c96f0d684db",
+    "method": null,
+    "methods_present": [
+      "full_finetune",
+      "scratch_specialist"
+    ],
+    "per_model_fingerprints": {},
+    "raw_weight_fingerprints": {
+      "harnet5": "74ffaefbafb467b7253d121ef71fe734ee03bc802ba33c33a6aa1aef7f91de5e"
+    },
+    "readout_version": "finetune-v1",
+    "rows": 132,
+    "rung": 3,
+    "subject_independent": false
+  },
+  "baseline_adapters": {
+    "harnet10": "Harnet10Adapter",
+    "harnet5": "HarnetAdapter",
+    "limubert_x": "LiMUBERTXAdapter",
+    "normwear": "NormWearAdapter",
+    "unimts": "UniMTSAdapter"
+  },
+  "device": "cuda",
+  "dirty_worktree": false,
+  "feature_cache_schema": "sealed-feature-v6-20260918",
+  "git_revision": "19db51d10774f0cae7397b4b7b90c852746abdff",
+  "halo_checkpoint": "/home/alex/code/HALO/halo/runs/support-classifier/halo_t6_40k_20260920/last.pt",
+  "halo_checkpoint_sha256": "858cebbded5b747cee7b1e43e7e8049ac676cc847d7b9f7856b4ee8020e42562",
+  "numpy": "2.5.3",
+  "protocol": "sealed-support-conditioned-v3-20260920",
+  "python": "3.13.9",
+  "resources": {
+    "cuda_peak_allocated_gib": 0.247,
+    "cuda_peak_reserved_gib": 0.314,
+    "process_wall_seconds": 1559.5
+  },
+  "torch": "2.14.0+cu130"
+}

@@ -148,6 +148,12 @@ from k = 4 and costs 3 points at k = 1. At k = 16 even a from-scratch HALO archi
 every fine-tuned baseline. One draw only: k = 1 differences under ~5 are unresolved until draws
 1–2 land.
 
+**Update 04:10 — draws 1–2 for HARNet-5 and LiMU-BERT-X weaken the k = 16 claim.** HARNet-5 full
+fine-tune at k = 16 is 68.1 / 71.6 / 72.2 across draws (mean 70.7) vs HALO frozen's 3-draw 71.3: a
+near-tie, not a win. Draw 0 happened to be HARNet-5's worst k = 16 draw. The claim to carry is "HALO
+frozen matches the best fine-tuned baseline at k = 16 and leads at k ≤ 4", pending HALO's and
+UniMTS's draws 1–2.
+
 ## 11. Speed: sealed evaluation was 59 % one unvectorised line
 
 The T1-E sealed run projected 45 min for 13 cells. A 3-minute py-spy copy showed 59 % of wall time

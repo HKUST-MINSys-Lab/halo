@@ -30,8 +30,8 @@ Dataset-balanced macro-F1 on the fixed scored set (mean over support draws; ± =
 |---|---:|---:|---:|---:|
 | halo | 50.1 ± 0.0 | 69.7 ± 0.0 | 76.2 ± 0.0 | 840993 |
 | harnet10 | - | - | - | - |
-| harnet5 | 42.6 ± 0.0 | 54.9 ± 0.0 | 68.1 ± 0.0 | 4231488 |
-| limubert_x | 45.1 ± 0.0 | 58.3 ± 0.0 | 60.8 ± 0.0 | 55950 |
+| harnet5 | 41.1 ± 5.0 | 56.0 ± 4.2 | 70.7 ± 3.1 | 4231488 |
+| limubert_x | 41.7 ± 7.3 | 58.1 ± 5.2 | 63.0 ± 4.1 | 55950 |
 | normwear | - | - | - | - |
 | unimts | 50.2 ± 0.0 | 64.4 ± 0.0 | 67.4 ± 0.0 | 5183484 |
 
@@ -41,8 +41,8 @@ Dataset-balanced macro-F1 on the fixed scored set (mean over support draws; ± =
 |---|---:|---:|---:|---:|
 | halo | 42.2 ± 0.0 | 59.6 ± 0.0 | 73.2 ± 0.0 | 840993 |
 | harnet10 | - | - | - | - |
-| harnet5 | 36.3 ± 0.0 | 47.9 ± 0.0 | 63.3 ± 0.0 | 4231488 |
-| limubert_x | 41.6 ± 0.0 | 52.2 ± 0.0 | 61.7 ± 0.0 | 55950 |
+| harnet5 | 31.4 ± 5.4 | 49.9 ± 7.6 | 62.6 ± 3.9 | 4231488 |
+| limubert_x | 35.3 ± 7.0 | 52.2 ± 4.5 | 60.8 ± 2.8 | 55950 |
 | normwear | - | - | - | - |
 | unimts | 34.7 ± 0.0 | 44.0 ± 0.0 | 59.9 ± 0.0 | 5183484 |
 
@@ -101,12 +101,12 @@ Dataset-balanced macro-F1 on the fixed scored set (mean over support draws; ± =
 | halo | 1 | 34.8 | 57.6 | 49.1 | 62.3 | 43.0 | 54.0 |
 | halo | 4 | 40.5 | 87.7 | 66.7 | 85.8 | 67.7 | 69.8 |
 | halo | 16 | 48.1 | 92.2 | 76.2 | 88.8 | 76.7 | 75.5 |
-| harnet5 | 1 | 20.1 | 58.7 | 43.1 | 55.3 | 36.8 | 41.3 |
-| harnet5 | 4 | 13.6 | 70.7 | 52.1 | 75.7 | 61.3 | 56.1 |
-| harnet5 | 16 | 30.7 | 88.1 | 63.2 | 86.2 | 70.3 | 70.2 |
-| limubert_x | 1 | 23.1 | 54.9 | 45.3 | 55.5 | 46.2 | 45.4 |
-| limubert_x | 4 | 30.4 | 65.0 | 55.6 | 84.2 | 59.6 | 55.0 |
-| limubert_x | 16 | 35.2 | 80.7 | 55.5 | 84.1 | 59.0 | 50.5 |
+| harnet5 | 1 | 26.6 | 51.2 | 41.2 | 49.7 | 37.3 | 41.0 |
+| harnet5 | 4 | 25.6 | 73.9 | 50.1 | 76.1 | 57.7 | 52.6 |
+| harnet5 | 16 | 40.5 | 88.9 | 65.2 | 86.7 | 70.7 | 71.9 |
+| limubert_x | 1 | 19.4 | 47.9 | 40.6 | 62.2 | 36.4 | 43.7 |
+| limubert_x | 4 | 28.8 | 69.1 | 52.3 | 82.2 | 63.4 | 52.8 |
+| limubert_x | 16 | 37.3 | 82.1 | 58.7 | 83.6 | 60.3 | 56.1 |
 | unimts | 1 | 29.9 | 61.0 | 45.4 | 60.6 | 52.0 | 52.4 |
 | unimts | 4 | 46.2 | 79.0 | 68.1 | 79.7 | 51.9 | 61.7 |
 | unimts | 16 | 29.7 | 87.7 | 70.7 | 91.0 | 59.3 | 66.3 |
@@ -118,12 +118,12 @@ Dataset-balanced macro-F1 on the fixed scored set (mean over support draws; ± =
 | halo | 1 | 29.3 | 50.3 | 42.6 | 59.1 | 35.9 | 36.1 |
 | halo | 4 | 38.0 | 72.8 | 54.7 | 82.6 | 56.9 | 52.7 |
 | halo | 16 | 52.6 | 88.1 | 68.9 | 86.8 | 72.9 | 70.0 |
-| harnet5 | 1 | 27.7 | 31.9 | 29.9 | 45.0 | 36.4 | 46.9 |
-| harnet5 | 4 | 9.0 | 62.4 | 39.7 | 65.2 | 59.0 | 52.3 |
-| harnet5 | 16 | 25.2 | 79.7 | 60.9 | 80.5 | 70.7 | 63.1 |
-| limubert_x | 1 | 24.7 | 54.6 | 35.2 | 45.9 | 45.1 | 43.9 |
-| limubert_x | 4 | 14.3 | 61.1 | 42.3 | 73.7 | 64.1 | 57.6 |
-| limubert_x | 16 | 29.5 | 85.3 | 51.2 | 79.8 | 67.0 | 57.2 |
+| harnet5 | 1 | 22.3 | 31.8 | 24.4 | 41.2 | 34.2 | 34.8 |
+| harnet5 | 4 | 24.8 | 60.0 | 42.5 | 66.4 | 56.1 | 50.0 |
+| harnet5 | 16 | 29.2 | 77.9 | 56.8 | 77.9 | 71.4 | 62.3 |
+| limubert_x | 1 | 14.6 | 42.4 | 33.2 | 48.7 | 34.9 | 38.0 |
+| limubert_x | 4 | 19.3 | 64.2 | 44.0 | 73.9 | 60.8 | 51.2 |
+| limubert_x | 16 | 31.2 | 82.1 | 54.7 | 78.6 | 65.0 | 53.4 |
 | unimts | 1 | 19.2 | 44.1 | 27.4 | 44.7 | 33.9 | 38.6 |
 | unimts | 4 | 29.8 | 30.7 | 49.1 | 62.0 | 38.8 | 53.7 |
 | unimts | 16 | 30.4 | 78.0 | 62.5 | 80.1 | 53.2 | 55.4 |
@@ -142,12 +142,12 @@ Coverage and cost per (encoder, method). A final loss far above 0 means the head
 | harnet10 | linear_probe | 11 | 3 | 99 | - | - |
 | harnet5 | enrollment_frozen | 11 | 3 | 99 | - | - |
 | harnet5 | linear_probe | 11 | 3 | 99 | - | - |
-| harnet5 | full_finetune | 11 | 1 | 33 | 13.54 | 0.012 |
-| harnet5 | scratch_specialist | 11 | 1 | 33 | 12.65 | 0.054 |
+| harnet5 | full_finetune | 11 | 3 | 99 | 12.50 | 0.012 |
+| harnet5 | scratch_specialist | 11 | 3 | 99 | 11.74 | 0.045 |
 | limubert_x | enrollment_frozen | 11 | 3 | 99 | - | - |
 | limubert_x | linear_probe | 11 | 3 | 99 | - | - |
-| limubert_x | full_finetune | 11 | 1 | 33 | 15.18 | 0.495 |
-| limubert_x | scratch_specialist | 11 | 1 | 33 | 15.71 | 0.238 |
+| limubert_x | full_finetune | 11 | 3 | 99 | 14.05 | 0.444 |
+| limubert_x | scratch_specialist | 11 | 3 | 99 | 14.14 | 0.223 |
 | normwear | enrollment_frozen | 11 | 3 | 99 | - | - |
 | normwear | linear_probe | 11 | 3 | 99 | - | - |
 | unimts | enrollment_frozen | 11 | 3 | 99 | - | - |
