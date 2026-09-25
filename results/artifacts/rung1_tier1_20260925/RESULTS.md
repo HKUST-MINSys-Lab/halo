@@ -35,6 +35,17 @@ Macro-F1 on the fixed scored set (20 % of executions, execution-disjoint from th
 | normwear | 10.4 | 16.8 | 16.7 | 16.9 | 18.7 | 17.9 | 18.6 | 1.8 |
 | unimts | 31.9 | 36.5 | 36.9 | 35.0 | 36.6 | 36.6 | 36.9 | 0.5 |
 
+### Cells helped / hurt by more than 5 points at N=all
+
+| encoder | cells | vs anchor: helped | hurt | vs N=0: helped | hurt |
+|---|---:|---:|---:|---:|---:|
+| halo | 11 | 3 | 0 | 3 | 1 |
+| harnet10 | 11 | 1 | 3 | 0 | 0 |
+| harnet5 | 11 | 2 | 3 | 0 | 0 |
+| limubert_x | 11 | 4 | 1 | 2 | 1 |
+| normwear | 11 | 8 | 0 | 2 | 0 |
+| unimts | 11 | 5 | 2 | 2 | 3 |
+
 ### Per dataset (anchor → N=0 → N=all)
 
 | encoder | inclusivehar | motionsense | realworld | shoaib | usc_had | ut_complex |

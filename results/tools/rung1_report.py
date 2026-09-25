@@ -114,6 +114,30 @@ def diagnostics_section(rows: list[dict]) -> list[str]:
     return lines + [""]
 
 
+def harm_section(rows: list[dict], threshold: float = 5.0) -> list[str]:
+    """How often transduction helps or hurts a cell by more than ``threshold`` points."""
+    anchor = {(r["encoder"], r["dataset"], r["stream"]): r["f1_macro"] for r in rows
+              if r.get("method") == "inductive" and r.get("scope") == "scored" and r.get("k") == 0}
+    zero = {(r["encoder"], r["dataset"], r["stream"]): r["f1_macro"] for r in rows
+            if r.get("method") == "transductive_clip_v1" and r.get("assignment") == "identity" and r.get("N_label") == "0"}
+    counts = defaultdict(lambda: [0, 0, 0, 0, 0])
+    for r in rows:
+        if r.get("method") != "transductive_clip_v1" or r.get("assignment") != "identity" or r.get("N_label") != "all":
+            continue
+        key = (r["encoder"], r["dataset"], r["stream"])
+        c = counts[r["encoder"]]
+        c[0] += 1
+        c[1] += r["f1_macro"] - anchor[key] > threshold
+        c[2] += r["f1_macro"] - anchor[key] < -threshold
+        if key in zero:
+            c[3] += r["f1_macro"] - zero[key] > threshold
+            c[4] += r["f1_macro"] - zero[key] < -threshold
+    lines = [f"### Cells helped / hurt by more than {threshold:g} points at N=all", "",
+             "| encoder | cells | vs anchor: helped | hurt | vs N=0: helped | hurt |", "|---|---:|---:|---:|---:|---:|"]
+    lines += [f"| {e} | {c[0]} | {c[1]} | {c[2]} | {c[3]} | {c[4]} |" for e, c in sorted(counts.items())]
+    return lines + [""]
+
+
 def calibration_section(main: Path) -> list[str]:
     files = sorted(Path(main).glob("temperature_calibration_w*.json"))
     if not files:
@@ -148,6 +172,7 @@ def main() -> None:
     for spec in args.control:
         name, _, path = spec.partition("=")
         lines += aggregate_section(f"Control: {name}", load(Path(path)))
+    lines += harm_section(rows)
     lines += per_dataset_section(rows)
     lines += per_cell_section(rows)
     lines += diagnostics_section(rows)
