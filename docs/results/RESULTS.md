@@ -5,8 +5,35 @@ Promoted results for the support-conditioned HAR design, newest first.
 **Where these sit in the paper (2026-09-22 onward):** every table below is **rung 2** of the
 three-rung plan — k labelled examples, parameters frozen — and is presented as a case study written
 as an *encoder* result, not as the headline. Rungs 1 (unlabelled adaptation) and 3 (fine-tuning for
-every model) are built and pre-registered but have no results yet; see
-[the roadmap](../overview/roadmap.md).
+every model) got their first results on 2026-09-26 (next section); the operational plan is
+[the experiment runbook](../overview/experiments.md), the design [the roadmap](../overview/roadmap.md).
+
+## Rung 1 (tier 1) and rung 3 (tier 3) — first results, 2026-09-26
+
+Protocol for both: the 11 sealed single-device 8 s cells; per cell a fixed scored set (20 % of
+executions) and an execution-disjoint pool. Rung 1 = EM-Dirichlet + embedding affinity (μ = 1,
+10 neighbours), per-encoder temperatures fitted on held-out *training-source* windows, k = 0. Rung 3
+supports come from the pool (same draw as rung 1 for draw 0). Dataset-balanced macro-F1.
+
+**Rung 1** — [`results/artifacts/rung1_tier1_20260925`](../../results/artifacts/rung1_tier1_20260925/README.md):
+
+| encoder | anchor (no unlabelled data) | N=0 (scored set only) | N=all | pool effect, μ = 0 (published) |
+|---|---:|---:|---:|---:|
+| HALO v4 | 47.4 | 50.6 | 51.9 | −2.0 |
+| UniMTS | 31.9 | 35.1 | 34.7 | +1.8 |
+| HARNet-10 | 32.0 | 31.6 | 31.4 | −1.0 |
+| HARNet-5 | 31.2 | 30.5 | 31.1 | −0.4 |
+| LiMU-BERT-X | 21.9 | 23.0 | 22.6 | −3.1 |
+| NormWear | 10.4 | 16.3 | 18.4 | +2.0 |
+
+Most of the effect is anchor → N=0 (transduction over the scored set); the pool adds ≤ 2 points,
+and for HALO only with the affinity term. A pool with *none* of the scored classes still helps
+(explaining away, not learning target classes) — read the artifact README before citing.
+
+**Rung 3, frozen features** — [`results/artifacts/rung3_probe_20260925`](../../results/artifacts/rung3_probe_20260925/README.md)
+(3 support draws; ± ≈ 5 points at k = 1 for every model): linear probe k = 1 / 4 / 16 — HALO
+53.5 / 66.8 / 73.3, UniMTS 45.4 / 51.6 / 60.8, LiMU-BERT-X 34.7 / 41.9 / 50.6, HARNet-5
+34.7 / 41.2 / 51.3. Fine-tuning rows (full, from-scratch) are running; see the runbook.
 
 **The one rule: never mix protocols.** A number is only comparable to another number produced by
 the same protocol on the same manifests. Every table below states its protocol, and superseded
