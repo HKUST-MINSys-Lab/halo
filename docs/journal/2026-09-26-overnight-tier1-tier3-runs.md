@@ -50,7 +50,51 @@ Frozen enrollment and linear probe for all six, k ∈ {1, 4, 16}, 3 support draw
 k under both (probe 53.5 / 66.8 / 73.3 vs UniMTS 45.4 / 51.6 / 60.8). Support-draw spread at k = 1
 ≈ 5 points for every model.
 
-## 5. Pending at time of writing
+## 5. Control: the published method (μ = 0) — the affinity term is what lets HALO use the pool
+
+Same protocol, same temperatures, affinity term off (`runs/evaluations/rung1_tier1_mu0_20260925`):
+
+| encoder | N=0 μ=0 → μ=1 | N=all μ=0 → μ=1 | pool effect (all − 0) μ=0 → μ=1 |
+|---|---|---|---:|
+| HALO v4 | 51.1 → 50.6 | 49.1 → 51.9 | −2.0 → **+1.3** |
+| UniMTS | 34.8 → 35.1 | 36.5 → 34.7 | +1.8 → −0.4 |
+| NormWear | 15.1 → 16.3 | 17.1 → 18.4 | +2.0 → +2.1 |
+| LiMU-BERT-X | 23.3 → 23.0 | 20.2 → 22.6 | −3.1 → −0.4 |
+| HARNet-10 | 32.8 → 31.6 | 31.8 → 31.4 | −1.0 → −0.3 |
+| HARNet-5 | 30.5 → 30.5 | 30.1 → 31.1 | −0.4 → +0.6 |
+
+Under the published EM-Dirichlet, a bigger unlabelled pool *hurts* HALO (−2.0). With the affinity
+term (neighbours in the encoder's own space vote with their text probabilities) the pool helps it
+(+1.3; +2.8 over μ = 0 at N = all). The term is not uniformly good: it costs UniMTS 1.8 at N = all.
+μ = 1 was fixed before any result, so this is a finding about the method, not a tuned choice.
+
+## 6. Tier-3 timing (T3-0) found two defects before any fine-tune result
+
+- **Raw-window treatments could not run on CUDA.** `encode_dataset_detailed` returns host tensors on
+  its no-grad path; prediction fed them to a CUDA head. The earlier smokes ran on CPU. Fixed
+  (`encode_rows` moves features to the head's device).
+- **The head measured feature scale.** Per-dimension feature spread differs by >1000× across trunks
+  (from-scratch UniMTS 0.0005, released LiMU-BERT-X 0.03, HALO 0.7, from-scratch HARNet 1.4). With
+  one plain linear head at lr 1e-3 for 300 steps, released LiMU-BERT-X ended at loss 1.45 and
+  scored *below* its own linear probe (55.9 vs 57.9). Raw-window heads are now cosine classifiers
+  (scale 10, Baseline++), matching the L2-normalised probe; LiMU-BERT-X full fine-tune on the timing
+  cell becomes 65.0 and every model's full fine-tune is ≥ its probe there. Decided from training
+  losses on one cell, applied uniformly, before any Phase-A row.
+- Cost per fit (one small cell, shared GPU): HALO 19 s, HARNet-5 8 s, LiMU-BERT-X 9 s, UniMTS 46 s
+  (full) / 34 s (scratch). Serial Phase A with 3 draws ≈ 4.3 h, so draw 0 runs first as four
+  memory-capped per-model processes in parallel; draws 1–2 follow (`--first-draw 1`).
+- Profile (py-spy, `runs/evaluations/rung3_timing_20260926/profile.speedscope.json`): 88 % of wall
+  in the fit loop; ~26 % of it is CPU collation/preprocessing per step, the rest GPU-bound forward/
+  backward. Worth caching the collated support batch if fine-tuning becomes the bottleneck.
+
+## 7. T1-C is not a single-factor change from v4
+
+Rung-1 training refuses text corruption, so the rung-1-trained HALO lacks v4's auxiliary
+corrupted-text view as well as gaining the EM-Dirichlet objective. T1-D vs v4 therefore measures
+both changes together. (The contextual/evidence switches recorded True in v4's config are forced off
+for the evidence-gated head by current code; they were inert for v4 too.)
+
+## 8. Pending at time of writing
 
 Controls (μ = 0, balanced pool, disjoint classes); HALO trained through EM-Dirichlet (40k steps,
 `last.pt` primary — declared before results); its tier-1 score and inductive-floor check; the
