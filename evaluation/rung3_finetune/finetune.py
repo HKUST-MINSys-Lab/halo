@@ -21,6 +21,7 @@ declared unsupported rather than approximated):
 
 from __future__ import annotations
 
+import time
 from dataclasses import asdict, dataclass, replace
 from typing import Callable, Sequence
 
@@ -28,6 +29,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.metrics import f1_score
 
 import baselines
 from evaluation.metrics import classification
@@ -282,6 +284,7 @@ def _run_draw(*, name, stream, features, truth_ids, names, C, split, k, draw, dr
     for treatment in treatments:
         base = {"method": treatment, "k": k, "support_draw": draw, "n_support": int(len(support_rows)),
                 "n_scored": int(len(split.scored)), "config": cfg.as_dict()}
+        started = time.perf_counter()
         try:
             if treatment == "enrollment_frozen":
                 if features is None:
@@ -303,6 +306,12 @@ def _run_draw(*, name, stream, features, truth_ids, names, C, split, k, draw, dr
         except baselines.UnsupportedEvaluationCell as exc:
             rows.append({**base, "status": "n/a", "reason": str(exc)})
             continue
-        rows.append({**base, "status": "ok",
-                     **classification(names[truth_ids[split.scored]], names[preds]), **info})
+        truth_names, pred_names = names[truth_ids[split.scored]], names[preds]
+        rows.append({**base, "status": "ok", "fit_seconds": round(time.perf_counter() - started, 3),
+                     **classification(truth_names, pred_names), **info,
+                     # Per-class diagnostics, so a dataset's number can be traced without a re-run.
+                     "per_label_f1": {str(label): float(v) for label, v in zip(names, 100 * f1_score(
+                         truth_names, pred_names, labels=list(names), average=None, zero_division=0))},
+                     "predicted_class_counts": {str(v): int(c) for v, c in zip(*np.unique(pred_names,
+                                                                                    return_counts=True))}})
     return rows
