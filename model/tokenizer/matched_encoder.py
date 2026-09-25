@@ -262,7 +262,7 @@ class MatchedCorpusEncoder(nn.Module):
     requires_stream_metadata = False
 
     def __init__(self, backbone: str, *, d_model: int = 128, pretrained: bool = False,
-                 dropout: float = 0.1, compile_trunk: bool = False):
+                 dropout: float = 0.1, compile_trunk: bool = False, projection: bool = True):
         super().__init__()
         if backbone not in BACKBONE_CONTRACTS:
             raise ValueError(f"backbone must be one of {sorted(BACKBONE_CONTRACTS)}")
@@ -273,6 +273,12 @@ class MatchedCorpusEncoder(nn.Module):
         self.n_channels = int(contract["channels"])
         self.crop_rule = contract["crop"]
         self.min_clip = int(contract.get("min_clip", contract["clip"]))
+        # ``projection=False`` exposes the trunk's own feature (width ``out_dim``) with no added
+        # layers. Rung 3 needs it: its heads sit directly on each model's features, as they do on
+        # HALO's pooled vector and on the released adapters' frozen features. The projection
+        # below is freshly initialised, so under LoRA it would be a frozen random bottleneck and
+        # under full fine-tuning an extra layer trained from k windows that no other model has.
+        self.projection = bool(projection)
         self.d_model = int(d_model)
         self.pretrained = bool(pretrained)
 
@@ -288,11 +294,16 @@ class MatchedCorpusEncoder(nn.Module):
                     else _HarnetTrunk(pretrained))
         # A trainable projection to the classifier's width. Without it the comparison would be
         # decided by whichever trunk happens to emit the classifier's dimension.
-        self.proj = nn.Sequential(
-            nn.Linear(self.net.out_dim, 2 * self.d_model), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(2 * self.d_model, self.d_model),
-        )
-        self.row_norm = nn.LayerNorm(self.d_model)
+        if self.projection:
+            self.proj = nn.Sequential(
+                nn.Linear(self.net.out_dim, 2 * self.d_model), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(2 * self.d_model, self.d_model),
+            )
+            self.row_norm = nn.LayerNorm(self.d_model)
+        else:
+            self.d_model = int(self.net.out_dim)
+            self.proj = nn.Identity()
+            self.row_norm = nn.Identity()
         # Compilation is opt-in: measured 1.28x on the UniMTS graph, but it costs a warm-up and it
         # recompiles per input shape. Chunking already fixes the shape except for the final partial
         # chunk, which ``_run_trunk`` pads so only one graph is ever built.
@@ -639,7 +650,7 @@ class MatchedCorpusEncoder(nn.Module):
 
 def build_matched_encoder(backbone: str, *, d_model: int = 128, pretrained: bool = False,
                           device: torch.device | None = None,
-                          compile_trunk: bool = False) -> MatchedCorpusEncoder:
+                          compile_trunk: bool = False, projection: bool = True) -> MatchedCorpusEncoder:
     encoder = MatchedCorpusEncoder(backbone, d_model=d_model, pretrained=pretrained,
-                                   compile_trunk=compile_trunk)
+                                   compile_trunk=compile_trunk, projection=projection)
     return encoder.to(device) if device is not None else encoder

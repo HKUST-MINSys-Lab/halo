@@ -80,6 +80,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=FineTuneConfig.batch_size)
     parser.add_argument("--lora-rank", type=int, default=FineTuneConfig.lora_rank)
     parser.add_argument("--lora-alpha", type=float, default=FineTuneConfig.lora_alpha)
+    parser.add_argument("--support-draws", type=int, default=FineTuneConfig.support_draws,
+                        help="independent k-shot support sets per (cell, k); report mean and spread")
     parser.add_argument("--cells", type=int, default=None, help="evaluate only the first N cells (smoke)")
     return parser
 
@@ -93,7 +95,7 @@ def main() -> None:
     cache_dir = args.feature_cache or args.out / "feature_cache"
     cfg = FineTuneConfig(steps=args.steps, lr=args.lr, encoder_lr_scale=args.encoder_lr_scale,
                          batch_size=args.batch_size, lora_rank=args.lora_rank, lora_alpha=args.lora_alpha,
-                         seed=args.seed)
+                         seed=args.seed, support_draws=args.support_draws)
     needs_cached = bool(set(args.treatments) & CACHED_FEATURE_TREATMENTS)
     raw_models = [name for name in args.models if any(t not in CACHED_FEATURE_TREATMENTS
                                                   for t in args.treatments)
@@ -171,7 +173,8 @@ def main() -> None:
         }, sort_keys=True).encode()).hexdigest(),
         manifest_fingerprint=hashlib.sha256(json.dumps({
             "cells": [list(c[:3]) for c in cells], "seed": args.seed, "scored_fraction": args.scored_fraction,
-            "k": args.k, "treatments": args.treatments}, sort_keys=True).encode()).hexdigest(),
+            "k": args.k, "treatments": args.treatments, "support_draws": args.support_draws},
+            sort_keys=True).encode()).hexdigest(),
         extra={"per_model_fingerprints": fingerprints, "raw_weight_fingerprints": raw_fingerprints,
                "config": cfg.as_dict(),
                # Same split as rung 1: execution-disjoint, not subject-disjoint.

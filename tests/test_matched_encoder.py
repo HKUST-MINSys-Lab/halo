@@ -384,3 +384,16 @@ def test_unimts_uses_the_real_window_rather_than_fabricating_padding():
     pretrained_rule = build_matched_encoder("unimts", pretrained=False)
     assert pretrained_rule._clip_length([torch.zeros(2, 160, 3)]) == 160
     assert pretrained_rule._clip_length([torch.zeros(2, 400, 3)]) == 200, "still capped at the contract"
+
+
+@pytest.mark.parametrize("arch", ARCHS)
+def test_projection_free_trunk_exposes_its_own_feature(arch):
+    """Rung 3 heads sit on the trunk feature: no freshly initialised layer between them."""
+    encoder = build_matched_encoder(arch, projection=False).eval()
+    assert isinstance(encoder.proj, torch.nn.Identity) and isinstance(encoder.row_norm, torch.nn.Identity)
+    assert encoder.d_model == encoder.net.out_dim
+    out = _forward(encoder, _batch())
+    assert out["pooled"].shape == (4, encoder.net.out_dim)
+    assert torch.isfinite(out["pooled"]).all()
+    assert not any(isinstance(m, torch.nn.Linear) for m in encoder.modules() if m is not encoder.net
+                   and not any(m is n for n in encoder.net.modules()))

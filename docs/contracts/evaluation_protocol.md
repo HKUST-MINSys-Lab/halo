@@ -182,7 +182,11 @@ predictions are in the [roadmap](../overview/roadmap.md); the invariants a reade
 - **Rung 3.** Every treatment — linear probe, small classifier, LoRA, full fine-tune, and a
   from-scratch specialist — is fitted on the same k windows per class and scored on rung 1's scored
   set, beside the rung-2 parameter-free readout re-run on the same draw (`enrollment_frozen`).
-  Budgets are fixed a priori; nothing selects on the scored set. NormWear has no fine-tuning path
+  Budgets are fixed a priori; nothing selects on the scored set. Every head sits directly on the
+  model's own features — HALO's pooled vector, the released adapters' frozen features, or the
+  released trunk's own output for LoRA / full fine-tuning / the specialist (no added projection).
+  Each (cell, k) is repeated over `--support-draws` independent support sets (default 3; draw 0 is
+  rung 1's draw) and reported as mean and spread. NormWear has no fine-tuning path
   and is reported unsupported; HARNet-10 gets the cached-feature treatments only. Readout version
   `finetune-v1`.
 

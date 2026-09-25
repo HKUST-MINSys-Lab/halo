@@ -21,7 +21,7 @@ declared unsupported rather than approximated):
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Callable, Sequence
 
 import numpy as np
@@ -55,6 +55,7 @@ class FineTuneConfig:
     projection_dim: int = 128
     probe_c: float = 1.0               # inverse L2 strength of the logistic-regression probe
     seed: int = 0
+    support_draws: int = 3             # independent k-shot support sets per (cell, k); k=1-2 vary a lot
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -129,7 +130,8 @@ def build_encoder_for(name: str, treatment: str, *, halo_checkpoint, device: tor
     if name in MATCHED_BACKBONE:
         from model.tokenizer.matched_encoder import build_matched_encoder
 
-        return build_matched_encoder(MATCHED_BACKBONE[name], device=device,
+        # No projection layer: the head sits on the trunk's own feature, like every other model.
+        return build_matched_encoder(MATCHED_BACKBONE[name], device=device, projection=False,
                                      pretrained=(treatment != "scratch_specialist")).train()
     raise baselines.UnsupportedEvaluationCell(
         f"{name} has no fine-tuning path: no trunk under the encoder contract"
@@ -256,36 +258,51 @@ def run_cell(*, name: str, stream, features: np.ndarray | None, truth_ids: np.nd
     for k in ks:
         if k < 1:
             continue
-        support = shared_support_set(split.pool, truth_ids, k, C, seed_parts=(*seed_parts, "k", k))
-        if support is None:
-            rows.append({"method": None, "k": k, "status": "n/a",
-                         "reason": f"pool lacks {k} execution-disjoint windows for every class"})
+        for draw in range(max(1, int(cfg.support_draws))):
+            # Draw 0 keeps the original seed parts, so it is the same support set as before
+            # multiple draws existed (and as rung 1's k>0 draw).
+            draw_parts = (*seed_parts, "k", k) if draw == 0 else (*seed_parts, "k", k, "draw", draw)
+            rows.extend(_run_draw(name=name, stream=stream, features=features, truth_ids=truth_ids,
+                                  names=names, C=C, split=split, k=k, draw=draw, draw_parts=draw_parts,
+                                  treatments=treatments, cfg=cfg, device=device,
+                                  halo_checkpoint=halo_checkpoint))
+    return rows
+
+
+def _run_draw(*, name, stream, features, truth_ids, names, C, split, k, draw, draw_parts, treatments,
+              cfg, device, halo_checkpoint) -> list[dict]:
+    rows: list[dict] = []
+    support = shared_support_set(split.pool, truth_ids, k, C, seed_parts=draw_parts)
+    if support is None:
+        return [{"method": None, "k": k, "support_draw": draw, "status": "n/a",
+                 "reason": f"pool lacks {k} execution-disjoint windows for every class"}]
+    support_rows, support_labels = support
+    # Each draw is its own fit; vary the fit seed with the draw so draws are independent.
+    cfg = replace(cfg, seed=cfg.seed + draw)
+    for treatment in treatments:
+        base = {"method": treatment, "k": k, "support_draw": draw, "n_support": int(len(support_rows)),
+                "n_scored": int(len(split.scored)), "config": cfg.as_dict()}
+        try:
+            if treatment == "enrollment_frozen":
+                if features is None:
+                    raise ValueError("cached features required")
+                preds, info = enrollment_frozen_predictions(features, support_rows, support_labels,
+                                                            split.scored, C), {"trainable_params": 0}
+            elif treatment == "linear_probe":
+                preds, info = linear_probe_predictions(features, support_rows, support_labels, split.scored, C, cfg)
+            elif treatment == "small_classifier":
+                preds, info = small_classifier_predictions(features, support_rows, support_labels,
+                                                           split.scored, C, cfg, device)
+            elif treatment in RAW_WINDOW_TREATMENTS:
+                if stream is None:
+                    raise ValueError("raw-window treatments need the stream")
+                preds, info = raw_window_predictions(name, treatment, stream, support_rows, support_labels,
+                                                     split.scored, C, cfg, device, halo_checkpoint=halo_checkpoint)
+            else:
+                raise ValueError(f"unknown treatment {treatment!r}")
+        except baselines.UnsupportedEvaluationCell as exc:
+            rows.append({**base, "status": "n/a", "reason": str(exc)})
             continue
-        support_rows, support_labels = support
-        for treatment in treatments:
-            base = {"method": treatment, "k": k, "n_support": int(len(support_rows)),
-                    "n_scored": int(len(split.scored)), "config": cfg.as_dict()}
-            try:
-                if treatment == "enrollment_frozen":
-                    if features is None:
-                        raise ValueError("cached features required")
-                    preds, info = enrollment_frozen_predictions(features, support_rows, support_labels,
-                                                                split.scored, C), {"trainable_params": 0}
-                elif treatment == "linear_probe":
-                    preds, info = linear_probe_predictions(features, support_rows, support_labels, split.scored, C, cfg)
-                elif treatment == "small_classifier":
-                    preds, info = small_classifier_predictions(features, support_rows, support_labels,
-                                                               split.scored, C, cfg, device)
-                elif treatment in RAW_WINDOW_TREATMENTS:
-                    if stream is None:
-                        raise ValueError("raw-window treatments need the stream")
-                    preds, info = raw_window_predictions(name, treatment, stream, support_rows, support_labels,
-                                                         split.scored, C, cfg, device, halo_checkpoint=halo_checkpoint)
-                else:
-                    raise ValueError(f"unknown treatment {treatment!r}")
-            except baselines.UnsupportedEvaluationCell as exc:
-                rows.append({**base, "status": "n/a", "reason": str(exc)})
-                continue
-            rows.append({**base, "status": "ok",
-                         **classification(names[truth_ids[split.scored]], names[preds]), **info})
+        rows.append({**base, "status": "ok",
+                     **classification(names[truth_ids[split.scored]], names[preds]), **info})
     return rows

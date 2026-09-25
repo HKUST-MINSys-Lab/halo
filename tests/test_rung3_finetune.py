@@ -234,3 +234,26 @@ def test_matched_resampling_is_the_released_adapters_method():
         ratio = Fraction(hz / 50.0).limit_denominator(1000)
         theirs = resample_poly(signal.astype(np.float64), ratio.numerator, ratio.denominator, axis=1)
         np.testing.assert_allclose(ours, theirs[:, :ours.shape[1]], atol=1e-5)
+
+
+def test_support_draws_are_independent_and_draw_zero_is_the_original_set(monkeypatch):
+    from evaluation.rung1_unlabeled.ncurve import shared_support_set
+    from evaluation.rung3_finetune import finetune
+
+    x, y = _blob_features(n=120)
+    split = CellSplit(scored=np.arange(0, 30), pool=np.arange(30, 120), n_executions_scored=1, n_executions_pool=3)
+    seen = []
+    original = finetune.shared_support_set
+
+    def spy(pool, truth, k, n_classes, *, seed_parts=()):
+        out = original(pool, truth, k, n_classes, seed_parts=seed_parts)
+        seen.append(tuple(out[0].tolist()))
+        return out
+
+    monkeypatch.setattr(finetune, "shared_support_set", spy)
+    rows = run_cell(name="toy", stream=None, features=x, truth_ids=y, classes=["a", "b", "c"], split=split,
+                    ks=(2,), treatments=("linear_probe",), cfg=FineTuneConfig(support_draws=3),
+                    device=torch.device("cpu"), seed_parts=("t",))
+    assert sorted(r["support_draw"] for r in rows) == [0, 1, 2]
+    assert len(set(seen)) == 3                                   # three different support sets
+    assert seen[0] == tuple(shared_support_set(split.pool, y, 2, 3, seed_parts=("t", "k", 2))[0].tolist())
