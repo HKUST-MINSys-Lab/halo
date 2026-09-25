@@ -105,7 +105,15 @@ corrupted-text view as well as gaining the EM-Dirichlet objective. T1-D vs v4 th
 both changes together. (The contextual/evidence switches recorded True in v4's config are forced off
 for the evidence-gated head by current code; they were inert for v4 too.)
 
-## 8. Pending at time of writing
+## 8. Scoring policy for the rung-1-trained HALO (declared 03:15 HKT, before any T1-D result)
+
+T1-C ran EM-Dirichlet inside training at a fixed T = 30; the tier-1 protocol scores every encoder at
+its own calibrated temperature. **Primary:** calibrated T (the same procedure as every other
+encoder; fitted on held-out training-source windows). **Secondary diagnostic:** T = 30, the
+temperature it was trained through. `last.pt` primary, `best_internal.pt` secondary (declared
+earlier). Training ended 03:13 HKT; internal validation dataset-macro F1 0.14 (2.5k) → 0.367 (40k).
+
+## 9. Pending at time of writing
 
 Controls (μ = 0, balanced pool, disjoint classes); HALO trained through EM-Dirichlet (40k steps,
 `last.pt` primary — declared before results); its tier-1 score and inductive-floor check; the
