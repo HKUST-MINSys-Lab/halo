@@ -73,3 +73,20 @@ assignment, macro-F1 / accuracy / balanced accuracy (+ per-label F1 where availa
 transduced, λ, μ, knn, neighbour purity, same-execution share, other-execution purity, collapsed
 components, pool class marginal. Per artifact: provenance (rung, method, readout version,
 checkpoint + manifest fingerprints, argv, git state), calibration file, run log.
+
+**Added 2026-09-26:** tier-3 rows carry `fit_seconds`, first/final loss, per-label F1 and
+predicted-class counts; `rung3_report.py` prints a fit-diagnostics table (coverage, draws, median
+fit time, mean final loss — a high final loss means the head did not fit its supports).
+`write_artifact` records `resources` (process wall time, peak CUDA allocated/reserved) in every
+rung-1/rung-3 `run_provenance.json`. The trainer logs `timing/steps_per_s`,
+`timing/data_wait_fraction` and `cuda/peak_{allocated,reserved}_gib` every log interval.
+
+**Recommended next (not built):**
+- Rung 1: EM convergence per cell (MM iterations used, final Δα), the estimated class marginal π
+  vs the pool's true marginal (L1), and per-cluster purity — to see *why* a curve bends.
+- Rung 1: a per-window "flip" record (anchor right → transduction wrong and vice versa) keyed by
+  window id, so helped/hurt cells can be traced to specific executions.
+- Rung 3: accuracy on the supports at the end of the fit, and the encoder's parameter drift
+  (‖θ − θ₀‖ / ‖θ₀‖), to separate under-fitting from forgetting.
+- Everywhere: GPU SM utilisation sampled during the run (`nvidia-smi dmon`), since `utilization.gpu`
+  reads 99 % while time-sliced processes leave SMs idle.
