@@ -602,6 +602,9 @@ def pooled_episode_logits(
         # E-step: soft label of every pool row from the supports (the neighbour vote, per row).
         sim_ps = torch.einsum("bpd,bkd->bpk", p, s) / TAU_SUPPORT
         sim_ps = sim_ps.masked_fill(~support_mask[:, None, :], float("-inf"))
+        # Mixed k=0/enrolled batches otherwise softmax an all-inf row. Even when the caller
+        # masks that row's output, its backward pass can still inject NaNs into the encoder.
+        sim_ps = torch.where(support_mask.any(dim=1)[:, None, None], sim_ps, torch.zeros_like(sim_ps))
         pool_prob = torch.einsum("bpk,bkc->bpc", torch.softmax(sim_ps, dim=-1), onehot_s)   # (B, P, C)
         # M-step + query vote: supports and soft-labelled pool rows share one softmax over similarity.
         sim_qs = torch.einsum("bd,bkd->bk", q, s) / TAU_SUPPORT
@@ -613,6 +616,71 @@ def pooled_episode_logits(
         vote = torch.einsum("bk,bkc->bc", weight[:, :K], onehot_s) + torch.einsum("bp,bpc->bc", weight[:, K:], pool_prob)
         return vote.clamp_min(1e-12).log().masked_fill(~candidate_mask, -1e30)
     raise ValueError(f"unknown pool mode {mode!r}")
+
+
+def grouped_zero_shot_transduction(
+    query: torch.Tensor,
+    pool_feature: torch.Tensor,
+    pool_mask: torch.Tensor,
+    candidate_text: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    episodes: list[Episode],
+    p_text: torch.nn.Module,
+    temperature: float,
+    unroll: dict,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score every query of a k=0 roster jointly with its shared unlabeled pool."""
+    from evaluation.rung1_unlabeled.transductive import transduce
+
+    if any(episode.support or not episode.is_zero_shot for episode in episodes):
+        raise ValueError("rung-1 groups must have no labeled supports")
+    by_set: dict[int, list[int]] = {}
+    for index, episode in enumerate(episodes):
+        by_set.setdefault(episode.support_set_id if episode.support_set_id >= 0 else -(index + 1), []).append(index)
+    groups = list(by_set.values())
+    rows, texts, masks, lengths = [], [], [], []
+    for indices in groups:
+        first = indices[0]
+        if any(episodes[index].candidates != episodes[first].candidates
+               or episodes[index].pool != episodes[first].pool for index in indices):
+            raise ValueError("rung-1 query group must share its roster and pool")
+        count = int(pool_mask[first].sum())
+        features = torch.cat((query[indices], pool_feature[first, :count]), dim=0)
+        rows.append(features)
+        texts.append(candidate_text[first])
+        masks.append(candidate_mask[first])
+        lengths.append(len(features))
+    features = torch.nn.utils.rnn.pad_sequence(rows, batch_first=True)
+    row_mask = torch.arange(features.shape[1], device=query.device)[None, :] < torch.tensor(
+        lengths, device=query.device,
+    )[:, None]
+    text = torch.stack(texts)
+    mask = torch.stack(masks)
+    z = probability_features_torch(features, p_text, text, mask, temperature)
+    transduced = transduce(z, candidate_mask=mask, row_mask=row_mask,
+                           embeddings=features, **unroll).logits
+    logits: list[torch.Tensor | None] = [None] * len(episodes)
+    for group_index, indices in enumerate(groups):
+        for position, episode_index in enumerate(indices):
+            logits[episode_index] = transduced[group_index, position]
+    if any(value is None for value in logits):
+        raise RuntimeError("a rung-1 query was not scored")
+    projected = F.normalize(p_text(query.float()), dim=-1)
+    text_unit = F.normalize(candidate_text.float(), dim=-1)
+    inductive = temperature * torch.einsum("bd,bcd->bc", projected, text_unit)
+    inductive = inductive.masked_fill(~candidate_mask, torch.finfo(inductive.dtype).min)
+    return torch.stack(logits), inductive
+
+
+def scale_invariant_roster_logits(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Unit-RMS centered logits for a scale-stable CE; ordering and inference stay unchanged."""
+    valid = mask.to(logits.dtype)
+    count = valid.sum(-1, keepdim=True).clamp_min(1)
+    centered = (logits.masked_fill(~mask, 0) * valid)
+    centered = centered - (centered.sum(-1, keepdim=True) / count)
+    rms = ((centered.square() * valid).sum(-1, keepdim=True) / count).sqrt().detach()
+    scaled = centered / rms.clamp_min(1.0)
+    return scaled.masked_fill(~mask, torch.finfo(scaled.dtype).min)
 
 
 def episode_text(
@@ -870,10 +938,11 @@ def effective_rank(features: torch.Tensor) -> float:
     return float(entropy.exp())
 
 
-def _macro_f1_names(truth: list[str], prediction: list[str]) -> float:
+def _macro_f1_names(truth: list[str], prediction: list[str],
+                    classes: set[str] | None = None) -> float:
     """Unweighted class F1 without adding sklearn to the training hot path."""
     scores = []
-    for label in sorted(set(truth)):
+    for label in sorted(set(truth) if classes is None else classes):
         tp = sum(t == label and p == label for t, p in zip(truth, prediction))
         fp = sum(t != label and p == label for t, p in zip(truth, prediction))
         fn = sum(t == label and p != label for t, p in zip(truth, prediction))
@@ -955,6 +1024,23 @@ def draw_kwargs_from_args(args) -> dict:
     counterfactual_probability = float(args.counterfactual_enrollment_probability)
     if args.classifier != "contextual" and counterfactual_probability:
         raise ValueError("counterfactual enrollment groups require the contextual classifier")
+    if getattr(args, "rung1_training", False):
+        return {
+            "deployment_matched": True, "semantic_zero_shot": True,
+            "enrollment_k": tuple(args.enrollment_k),
+            "enrollment_mix": (0.0, 0.0, 1.0),
+            "acquisition_mix": (1.0, 0.0, 0.0),
+            "label_subset": tuple(args.label_subset),
+            "queries_per_support_set": args.queries_per_support_set,
+            "query_group_sizes": tuple(args.rung1_query_group_sizes),
+            "windows_per_execution": args.windows_per_execution,
+            "pool_size": int(args.pool_size),
+            "pool_sizes": tuple(args.rung1_pool_sizes), "joint_pool": True,
+            "pool_regime_mix": (1.0, 0.0, 0.0),
+            "pool_concentration": float(args.pool_concentration),
+            "pool_distractor_fraction": 0.0, "pool_coverage": (1.0, 1.0),
+            "p_mask_candidate": 0.0, "p_mask_gt": 0.0,
+        }
     return {
         "p_gt_present": args.p_gt_present,
         "same_subject_probability": args.same_subject_probability,
@@ -1075,6 +1161,7 @@ def run_step(
     pool_mode: str = "none",
     pool_temperature: float = 30.0,
     pool_unroll: dict | None = None,
+    rung1_training: bool = False,
 ) -> dict:
     """``batch`` lets a prefetching loader hand over an already-collated batch for these episodes;
     otherwise the windows are loaded and collated here, on the calling thread."""
@@ -1124,7 +1211,21 @@ def run_step(
             device=device,
         )
     query = rows["query_feature"].squeeze(1)
-    if classifier_mode == "neighbors":
+    if rung1_training:
+        if pool_mode != "transductive" or classifier is None or not hasattr(classifier, "p_text"):
+            raise ValueError("rung-1 training needs transduction and a trainable text projection")
+        from evaluation.rung1_unlabeled.transductive import UNROLL_DEFAULTS
+
+        pool_feature, pool_mask = split_pool(pooled, episodes)
+        logits, inductive = grouped_zero_shot_transduction(
+            query, pool_feature, pool_mask, text["candidate_text"], text["candidate_mask"],
+            episodes, classifier.p_text, pool_temperature,
+            {**UNROLL_DEFAULTS, **(pool_unroll or {})},
+        )
+        output = {"logits": logits, "inductive_logits": inductive,
+                  "pool_rows": int(pool_mask.sum()),
+                  "pooled_episodes": sum(bool(episode.pool) for episode in episodes)}
+    elif classifier_mode == "neighbors":
         if any(episode.is_zero_shot for episode in episodes):
             raise ValueError("differentiable neighbors only supports enrolled episodes")
         logits, weight = differentiable_neighbor_logits(
@@ -1193,7 +1294,7 @@ def run_step(
         )
     else:
         raise ValueError(f"unknown classifier mode {classifier_mode!r}")
-    if pool_mode != "none" and any(episode.pool for episode in episodes):
+    if not rung1_training and pool_mode != "none" and any(episode.pool for episode in episodes):
         # Rung-1 training arm: pooled episodes are scored by the transductive readout instead of
         # the head; every other episode keeps the head's logits, so a batch without pools is
         # bit-identical to the existing recipe.
@@ -1219,10 +1320,21 @@ def run_step(
             )
         output["pool_rows"] = int(pool_mask.sum())
         output["pooled_episodes"] = int(has_pool.sum())
+    loss_logits = (scale_invariant_roster_logits(output["logits"], text["candidate_mask"])
+                   if rung1_training else output["logits"])
     loss = episode_loss(
-        output["logits"], episodes, text,
+        loss_logits, episodes, text,
         counterfactual_grouping=isinstance(classifier, EvidenceAwareSupportClassifier),
     )
+    if rung1_training:
+        target = torch.tensor([episode.gt_slot for episode in episodes], device=device)
+        inductive_ce = F.cross_entropy(
+            scale_invariant_roster_logits(
+                output["inductive_logits"].float(), text["candidate_mask"],
+            ), target,
+        )
+        loss["inductive_ce"] = inductive_ce.detach()
+        loss["loss"] = 0.5 * (loss["loss"] + inductive_ce)
     if text_corruption_mode == "auxiliary" and "aux/corrupted_view_loss" in output \
             and output["aux/corrupted_view_loss"].requires_grad:
         # The corrupted view's loss can reach only the blend gate (see ``gate_only``), so this
@@ -1273,7 +1385,7 @@ def run_step(
         loss.update(auxiliary_metrics)
     return {**loss, **output, "pooled": pooled, "text": text, "rows": rows,
             "text_corrupted": text_corrupted,
-            "device_count": device_count, "readout": classifier_mode,
+            "device_count": device_count, "readout": "rung1_transductive" if rung1_training else classifier_mode,
             "augmentation_rows": augmentation_rows,
             "episode_perturbations": episode_perturbations,
             "episode_support_perturbation_fractions": episode_support_perturbation_fractions,
@@ -1309,6 +1421,18 @@ def prediction_telemetry(result: dict, episodes: list[Episode]) -> dict[str, flo
         "batch/mean_device_count": float(result["device_count"].mean()),
         "batch/multi_device_fraction": float(result["device_count"].gt(1).float().mean()),
     }
+    if "inductive_logits" in result:
+        inductive = result["inductive_logits"].detach().masked_fill(~mask, float("-inf"))
+        final = result["logits"].detach().masked_fill(~mask, float("-inf"))
+        metrics.update({
+            "rung1/inductive_accuracy": float(inductive.argmax(-1).eq(target).float().mean()),
+            "rung1/transductive_accuracy": float(learned.eq(target).float().mean()),
+            "rung1/inductive_ce": float(F.cross_entropy(inductive.float(), target)),
+            "rung1/transductive_ce": float(F.cross_entropy(final.float(), target)),
+            "rung1/logit_spread": float((final.max(-1).values
+                                         - final.masked_fill(~mask, float("inf")).min(-1).values).mean()),
+            "rung1/pool_rows_per_query": float(result["pool_rows"] / len(episodes)),
+        })
     per_row_loss = F.cross_entropy(result["logits"].float(), target, reduction="none").detach()
     correct = learned.eq(target).float()
 
@@ -1871,6 +1995,7 @@ def validate(
     pool_mode: str = "none",
     pool_temperature: float = 30.0,
     pool_unroll: dict | None = None,
+    rung1_training: bool = False,
 ) -> dict[str, float]:
     """Evaluate a fixed subject-held-out episode draw without consuming test datasets."""
     was_encoder_training = encoder.training
@@ -1895,6 +2020,7 @@ def validate(
     learned_by_regime: dict[bool, dict[str, tuple[list[str], list[str]]]] = {
         False: {}, True: {},
     }
+    rung1_rosters: dict[str, set[str]] = {}
     learned_by_panel: dict[str, dict[str, tuple[list[str], list[str]]]] = {}
     panel_payload = json.dumps(
         [dataclasses.asdict(episode) for episode in episodes],
@@ -1930,6 +2056,7 @@ def validate(
                 episodes=group, corpus=corpus, dataset=dataset, collate=collate,
                 encoder=encoder, classifier=classifier, classifier_mode=classifier_mode,
                 pool_mode=pool_mode, pool_temperature=pool_temperature, pool_unroll=pool_unroll,
+                rung1_training=rung1_training,
                 text_of=text_of, device=device, executor=executor,
                 # The collapse detector, reported beside every validation score.
                 corrupted_view_probe=isinstance(classifier, EvidenceGatedSupportClassifier),
@@ -1943,6 +2070,8 @@ def validate(
         ).argmax(dim=-1).tolist()
         for index, episode in enumerate(group):
             recording = corpus.recordings[episode.query]
+            if rung1_training:
+                rung1_rosters.setdefault(recording.dataset, set()).update(episode.candidates)
             learned = learned_by_regime[episode.is_zero_shot].setdefault(
                 recording.dataset, ([], []),
             )
@@ -1972,7 +2101,9 @@ def validate(
     aggregate_telemetry = weighted_present_metrics(rows, group_sizes)
     learned_dataset_f1 = {
         regime: {
-            dataset: _macro_f1_names(truth, prediction)
+            dataset: _macro_f1_names(
+                truth, prediction, rung1_rosters.get(dataset) if rung1_training else None,
+            )
             for dataset, (truth, prediction) in rows.items()
         }
         for regime, rows in learned_by_regime.items()
@@ -2007,6 +2138,8 @@ def validate(
     scenario_balanced_f1 = float(np.mean(family_scores)) if family_scores else float("-inf")
     if selection_policy == "legacy_enrolled":
         selection_f1 = float(np.mean(list(enrolled_f1.values()))) if enrolled_f1 else float("-inf")
+    elif selection_policy == "rung1_zero_shot":
+        selection_f1 = float(np.mean(list(zero_f1.values()))) if zero_f1 else float("-inf")
     elif selection_policy == "scenario_balanced":
         selection_f1 = scenario_balanced_f1
     else:
@@ -2114,6 +2247,14 @@ def main() -> None:
     # --pool-size 0 nothing in the recipe changes.
     parser.add_argument("--pool-size", type=int, default=0,
                         help="unlabelled deployment-pool windows drawn per episode; 0 = off")
+    parser.add_argument("--rung1-training", action="store_true",
+                        help="zero-support joint query/pool transduction; bypasses the classifier head")
+    parser.add_argument("--rung1-pool-sizes", type=int, nargs="+", default=[0, 50, 100, 500],
+                        help="training unlabeled-pool sizes, including N=0")
+    parser.add_argument("--rung1-val-pool-sizes", type=int, nargs="+", default=None,
+                        help="requested internal-validation N values; defaults to feasible small-N probes")
+    parser.add_argument("--rung1-query-group-sizes", type=int, nargs="+", default=[4, 8, 16],
+                        help="number of jointly transduced scored queries per zero-shot roster")
     parser.add_argument("--pool-mode", choices=("none", "soft_kmeans", "transductive"), default="none",
                         help="how pooled episodes are scored: transductive = EM-Dirichlet unrolled "
                              "(evaluation.rung1_unlabeled.transductive, the evaluator's method); "
@@ -2340,6 +2481,10 @@ def main() -> None:
     parser.add_argument("--smoke", action="store_true",
                         help="three steps on capped real data with telemetry; launches nothing long")
     args = parser.parse_args()
+    if args.rung1_val_pool_sizes is None:
+        args.rung1_val_pool_sizes = list(dict.fromkeys(
+            [0, min(10, args.pool_size), min(20, args.pool_size), min(50, args.pool_size)]
+        )) if args.rung1_training else []
     automatic_val_episodes = args.val_episodes is None
     if args.resolutions is None and args.frontend in {"fixed", "learnable"} \
             and args.phase_a is None and args.resume is None:
@@ -2399,7 +2544,7 @@ def main() -> None:
     if args.unenrolled_calibration is None:
         args.unenrolled_calibration = args.classifier == "evidence_gated"
     if args.text_corruption_probability is None:
-        if args.classifier != "evidence_gated":
+        if args.rung1_training or args.classifier != "evidence_gated":
             args.text_corruption_probability = 0.0
         else:
             # replace mode displaces episodes, so it is rationed; auxiliary mode displaces
@@ -2504,6 +2649,19 @@ def main() -> None:
         parser.error("--pool-mode needs --pool-size > 0")
     if args.pool_mode != "none" and args.classifier in ("neighbors", "token_mixer"):
         parser.error("--pool-mode needs a classifier with a text projection (residual or evidence_gated)")
+    if args.rung1_training:
+        if args.pool_mode != "transductive" or args.pool_size < 1:
+            parser.error("--rung1-training requires --pool-mode transductive and --pool-size > 0")
+        if not args.rung1_pool_sizes or 0 not in args.rung1_pool_sizes \
+                or any(size < 0 or size > args.pool_size for size in args.rung1_pool_sizes):
+            parser.error("rung1-pool-sizes must include 0 and be within [0, pool-size]")
+        if not args.rung1_val_pool_sizes or 0 not in args.rung1_val_pool_sizes \
+                or any(size < 0 or size > args.pool_size for size in args.rung1_val_pool_sizes):
+            parser.error("rung1-val-pool-sizes must include 0 and be within [0, pool-size]")
+        if not args.rung1_query_group_sizes or any(size < 1 for size in args.rung1_query_group_sizes):
+            parser.error("rung1-query-group-sizes must contain positive sizes")
+        if args.text_corruption_probability or args.counterfactual_enrollment_probability:
+            parser.error("rung-1 transduction is incompatible with text corruption/counterfactuals")
     if not 0.0 <= args.pool_distractor_fraction < 1.0 or args.pool_concentration <= 0 \
             or not (0.0 < args.pool_coverage[0] <= args.pool_coverage[1] <= 1.0) \
             or args.pool_unroll_iters < 1 or args.pool_unroll_mm_iters < 1 or args.pool_temperature <= 0 \
@@ -2612,6 +2770,10 @@ def main() -> None:
                                          ("pool_unroll_mm_iters", 20), ("pool_affinity_mu", 0.0),
                                          ("pool_affinity_knn", 10)):
             saved.setdefault(pool_field, pool_default)
+        saved.setdefault("rung1_training", False)
+        saved.setdefault("rung1_pool_sizes", [])
+        saved.setdefault("rung1_val_pool_sizes", [])
+        saved.setdefault("rung1_query_group_sizes", [])
         saved.setdefault("variable_support_probability", 0.0)
         saved.setdefault("counterfactual_enrollment_probability", 0.0)
         saved.setdefault("open_vocabulary_holdout_fraction", 0.0)
@@ -2677,6 +2839,9 @@ def main() -> None:
             "acquisition_mix": "--acquisition-mix", "enrollment_mix": "--enrollment-mix",
             "partial_coverage": "--partial-coverage",
             "pool_size": "--pool-size", "pool_mode": "--pool-mode",
+            "rung1_training": "--rung1-training", "rung1_pool_sizes": "--rung1-pool-sizes",
+            "rung1_val_pool_sizes": "--rung1-val-pool-sizes",
+            "rung1_query_group_sizes": "--rung1-query-group-sizes",
             "pool_regime_mix": "--pool-regime-mix", "pool_concentration": "--pool-concentration",
             "pool_distractor_fraction": "--pool-distractor-fraction", "pool_coverage": "--pool-coverage",
             "pool_temperature": "--pool-temperature", "pool_unroll_iters": "--pool-unroll-iters",
@@ -3164,6 +3329,10 @@ def main() -> None:
             "curriculum_sampler_schema": DEPLOYMENT_SAMPLER_SCHEMA,
             "partial_coverage": list(args.partial_coverage),
             "pool_size": int(args.pool_size), "pool_mode": args.pool_mode,
+            "rung1_training": args.rung1_training,
+            "rung1_pool_sizes": list(args.rung1_pool_sizes) if args.rung1_training else [],
+            "rung1_val_pool_sizes": list(args.rung1_val_pool_sizes) if args.rung1_training else [],
+            "rung1_query_group_sizes": list(args.rung1_query_group_sizes) if args.rung1_training else [],
             "pool_regime_mix": list(args.pool_regime_mix), "pool_concentration": float(args.pool_concentration),
             "pool_distractor_fraction": float(args.pool_distractor_fraction),
             "pool_coverage": list(args.pool_coverage), "pool_temperature": float(args.pool_temperature),
@@ -3252,6 +3421,10 @@ def main() -> None:
         saved_trajectory["steps"] = args.steps
         saved_trajectory.setdefault("classifier", "token_mixer")
         saved_trajectory.setdefault("freeze_encoder", False)
+        saved_trajectory.setdefault("rung1_training", False)
+        saved_trajectory.setdefault("rung1_pool_sizes", [])
+        saved_trajectory.setdefault("rung1_val_pool_sizes", [])
+        saved_trajectory.setdefault("rung1_query_group_sizes", [])
         saved_trajectory.setdefault("enrollment_k", list(DEFAULT_ENROLLMENT_K))
         saved_trajectory.setdefault("queries_per_support_set", DEFAULT_QUERIES_PER_SUPPORT_SET)
         saved_trajectory.setdefault("windows_per_execution", DEFAULT_WINDOWS_PER_EXECUTION)
@@ -3492,21 +3665,48 @@ def main() -> None:
     def run_validation(step: int) -> dict[str, float]:
         nonlocal latest_validation, best_accuracy, best_loss, best_dataset_f1
         nonlocal best_zero_f1, best_enrolled_f1, best_positive_regret
-        latest_validation = validate(
-            encoder=encoder, classifier=classifier, classifier_mode=args.classifier,
-            pool_mode=args.pool_mode, pool_temperature=args.pool_temperature, pool_unroll=_pool_unroll(args),
-            corpus=val_corpus, dataset=val_dataset,
-            collate=collate, text_of=text_of, device=device,
-            episodes_count=args.val_episodes, episodes_per_step=args.episodes_per_step,
-            seed=args.data_seed + 91_003, draw_kwargs=draw_kwargs,
-            executor=executor,
-            deployment_matched=True,
-            selection_policy=(
-                "scenario_balanced"
-                if isinstance(classifier, EvidenceAwareSupportClassifier)
-                else "legacy_enrolled"
-            ),
-        )
+        validation_sizes = args.rung1_val_pool_sizes if args.rung1_training else [None]
+        validation_unroll = _pool_unroll(args)
+        if args.rung1_training:
+            from evaluation.rung1_unlabeled.transductive import INFERENCE_DEFAULTS
+            validation_unroll = {
+                **INFERENCE_DEFAULTS,
+                "mu": float(args.pool_affinity_mu), "knn": int(args.pool_affinity_knn),
+            }
+        panels = {}
+        for pool_size in validation_sizes:
+            panel_draw = (dict(draw_kwargs, pool_sizes=(pool_size,))
+                          if pool_size is not None else draw_kwargs)
+            panel = validate(
+                encoder=encoder, classifier=classifier, classifier_mode=args.classifier,
+                pool_mode=args.pool_mode, pool_temperature=args.pool_temperature,
+                pool_unroll=validation_unroll, rung1_training=args.rung1_training,
+                corpus=val_corpus, dataset=val_dataset,
+                collate=collate, text_of=text_of, device=device,
+                episodes_count=args.val_episodes, episodes_per_step=args.episodes_per_step,
+                seed=args.data_seed + 91_003, draw_kwargs=panel_draw,
+                executor=executor, deployment_matched=True,
+                selection_policy=("rung1_zero_shot" if args.rung1_training else
+                                  "scenario_balanced" if isinstance(classifier, EvidenceAwareSupportClassifier)
+                                  else "legacy_enrolled"),
+            )
+            panels[pool_size] = panel
+        latest_validation = dict(panels[validation_sizes[0]])
+        if args.rung1_training:
+            scores = [panels[size]["validation/selection_dataset_macro_f1"]
+                      for size in validation_sizes]
+            latest_validation.update({
+                f"validation/rung1/n_{size}/dataset_macro_f1": score
+                for size, score in zip(validation_sizes, scores)
+            })
+            latest_validation.update({
+                f"validation/rung1/n_{size}/realized_pool_mean_size": panels[size].get(
+                    "validation/sampler/pool_mean_size", 0.0,
+                )
+                for size in validation_sizes
+            })
+            latest_validation["validation/selection_dataset_macro_f1"] = float(np.mean(scores))
+            latest_validation["validation/zero_shot_dataset_macro_f1"] = float(np.mean(scores))
         if (isinstance(classifier, EvidenceAwareSupportClassifier)
                 and open_vocab_val_corpus is not None):
             heldout = validate(
@@ -3586,6 +3786,7 @@ def main() -> None:
                 episodes=episodes, corpus=corpus, dataset=dataset, collate=collate,
                 encoder=encoder, classifier=classifier, classifier_mode=args.classifier,
                 pool_mode=args.pool_mode, pool_temperature=args.pool_temperature, pool_unroll=_pool_unroll(args),
+                rung1_training=args.rung1_training,
                 improvement_objective=improvement_objective,
                 evidence_objective=evidence_objective,
                 text_corruption_probability=args.text_corruption_probability,

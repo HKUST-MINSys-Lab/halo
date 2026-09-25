@@ -1,7 +1,8 @@
-"""Disjoint-class control (threat: the model exploits the pool's acquisition fingerprint, not its
-class structure). A seeded subset of the roster is held out; the scored set contains only kept-class
-windows, the pool contains only held-out-class windows from the same stream. If the N-curve still
-rises, the gain is domain adaptation to the acquisition; if it vanishes, it was class structure."""
+"""Disjoint-class diagnostic: scored and pool sets have no shared labels.
+
+A change in the N-curve shows that pool-label overlap is not required. It does not by itself
+identify domain adaptation; the pool may change the decision boundary for other reasons.
+"""
 
 from __future__ import annotations
 

@@ -444,7 +444,7 @@ def _available_units(
     corpus: SupportCorpus,
     keys: Sequence[AcquisitionKey],
     query: Recording,
-    relation: SubjectRelation,
+    relation: SubjectRelation | Literal["any_subject"],
     *,
     different_dataset: bool = False,
     same_dataset: bool = False,
@@ -772,6 +772,9 @@ def attach_pool(
     concentration: float = 1.0,
     distractor_fraction: float = 0.0,
     coverage: tuple[float, float] = (0.5, 1.0),
+    query_indices: Sequence[int] = (),
+    allow_same_subject: bool = False,
+    fill_requested: bool = False,
 ) -> Episode:
     """Attach an unlabelled pool that looks like a deployment pool (rung 1, roadmap):
 
@@ -802,12 +805,19 @@ def attach_pool(
     if not keys:
         return replace(episode, pool_regime="unavailable")
     units = _available_units(
-        corpus, keys, query, "cross_subject", different_dataset=(pool_regime == "cross_dataset"),
+        corpus, keys, query, "any_subject" if allow_same_subject else "cross_subject",
+        different_dataset=(pool_regime == "cross_dataset"),
     )
+    query_units = {
+        (corpus.recordings[index].dataset, corpus.recordings[index].subject,
+         corpus.recordings[index].execution)
+        for index in (episode.query, *query_indices)
+    }
     excluded = {episode.query, *episode.support,
-                *(index for group in episode.support_window_groups for index in group)}
+                *query_indices, *(index for group in episode.support_window_groups for index in group)}
     rows_by_label = {
-        label: [row for unit_rows in by_unit.values() for row in unit_rows if row not in excluded]
+        label: [row for unit, unit_rows in by_unit.items() if unit not in query_units
+                for row in unit_rows if row not in excluded]
         for label, by_unit in units.items()
     }
     rows_by_label = {label: rows for label, rows in rows_by_label.items() if rows}
@@ -836,6 +846,21 @@ def attach_pool(
     if n_distractor_actual > 0:
         picked = rng.choice(len(distractor_rows), size=n_distractor_actual, replace=False)
         pool.extend(int(distractor_rows[i]) for i in picked)
+    if fill_requested and len(pool) < pool_size:
+        used = set(pool)
+        spare_by_slot = {
+            slot: [row for row in rows_by_label.get(label, ()) if row not in used]
+            for slot, label in enumerate(candidates)
+        }
+        while len(pool) < pool_size:
+            available_slots = [slot for slot, spare in spare_by_slot.items() if spare]
+            if not available_slots:
+                break
+            slot = int(rng.choice(available_slots))
+            spare = spare_by_slot[slot]
+            row = spare.pop(int(rng.integers(len(spare))))
+            pool.append(row)
+            realised[slot] += 1
     if not pool:
         return replace(episode, pool_regime="unavailable")
     total_in_roster = max(1, sum(realised))
@@ -1321,6 +1346,9 @@ def draw_batch(
     pool_concentration: float = 1.0,
     pool_distractor_fraction: float = 0.0,
     pool_coverage: tuple[float, float] = (0.5, 1.0),
+    pool_sizes: Sequence[int] | None = None,
+    joint_pool: bool = False,
+    query_group_sizes: Sequence[int] | None = None,
     **kwargs,
 ) -> tuple[list[Episode], dict[str, float]]:
     """Draw ``batch_size`` episodes plus auditable curriculum telemetry.
@@ -1333,6 +1361,10 @@ def draw_batch(
         raise ValueError("counterfactual_enrollment_probability must be in [0, 1]")
     if pool_size < 0:
         raise ValueError("pool_size must be non-negative")
+    if pool_sizes is not None and (not pool_sizes or any(size < 0 or size > pool_size for size in pool_sizes)):
+        raise ValueError("pool_sizes must be nonempty and within [0, pool_size]")
+    if query_group_sizes is not None and (not query_group_sizes or any(size < 1 for size in query_group_sizes)):
+        raise ValueError("query_group_sizes must contain positive sizes")
     pool_regimes: tuple[SamplingMode, ...] = ("compatible", "cross_placement", "cross_dataset")
     pool_probability = (np.ones(3, dtype=np.float64) / 3 if pool_regime_mix is None
                         else np.asarray(pool_regime_mix, dtype=np.float64))
@@ -1514,7 +1546,9 @@ def draw_batch(
                     group = _draw_deployment_support_set(
                         corpus, rng, support_set_id=support_set_id,
                         enrollment_k=enrollment_k,
-                        queries_per_support_set=queries_per_support_set,
+                        queries_per_support_set=(int(rng.choice(query_group_sizes))
+                                                 if query_group_sizes is not None
+                                                 else queries_per_support_set),
                         windows_per_execution=windows_per_execution,
                         query_dataset=query_dataset,
                         query_label=query_label,
@@ -1567,18 +1601,41 @@ def draw_batch(
         regime_episodes = episodes
         support_set_episodes = episodes
     if pool_size > 0:
-        # One independent pool per query: each pooled episode is its own transductive task. Drawn
-        # after the support sets so pools can never claim an enrolled row, and before the
-        # counterfactual expansion so every view of an episode shares its pool.
-        episodes = [
-            attach_pool(
-                corpus, rng, episode, pool_size=pool_size,
-                pool_regime=pool_regimes[int(rng.choice(3, p=pool_probability))],
-                concentration=pool_concentration, distractor_fraction=pool_distractor_fraction,
-                coverage=pool_coverage,
-            )
-            for episode in episodes
-        ]
+        # Rung 1 transduces a query group jointly over one shared pool. Other recipes retain
+        # their historical independent-per-query pool draws.
+        if joint_pool:
+            by_set: dict[int, list[int]] = defaultdict(list)
+            for index, episode in enumerate(episodes):
+                by_set[episode.support_set_id if episode.support_set_id >= 0 else -(index + 1)].append(index)
+            updated = list(episodes)
+            for indices in by_set.values():
+                base = episodes[indices[0]]
+                if any(episodes[index].candidates != base.candidates for index in indices):
+                    raise ValueError("joint pool needs one candidate roster per query group")
+                size = int(rng.choice(pool_sizes)) if pool_sizes is not None else pool_size
+                attached = attach_pool(
+                    corpus, rng, base, pool_size=size,
+                    pool_regime=pool_regimes[int(rng.choice(3, p=pool_probability))],
+                    concentration=pool_concentration, distractor_fraction=pool_distractor_fraction,
+                    coverage=pool_coverage, query_indices=[episodes[index].query for index in indices],
+                    allow_same_subject=True, fill_requested=True,
+                )
+                for index in indices:
+                    updated[index] = replace(episodes[index], pool=attached.pool,
+                                             pool_regime=attached.pool_regime,
+                                             pool_marginal=attached.pool_marginal,
+                                             pool_distractors=attached.pool_distractors)
+            episodes = updated
+        else:
+            episodes = [
+                attach_pool(
+                    corpus, rng, episode, pool_size=pool_size,
+                    pool_regime=pool_regimes[int(rng.choice(3, p=pool_probability))],
+                    concentration=pool_concentration, distractor_fraction=pool_distractor_fraction,
+                    coverage=pool_coverage,
+                )
+                for episode in episodes
+            ]
     counterfactual_groups = 0
     if counterfactual_enrollment_probability and rng.random() < counterfactual_enrollment_probability:
         eligible_complete = [index for index, episode in enumerate(episodes)

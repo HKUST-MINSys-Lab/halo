@@ -338,7 +338,7 @@ def zero_shot_scores(*, name: str, features: np.ndarray, candidates: Sequence[st
 
 
 def probability_features(scores: np.ndarray, kind: str, *, temperature: float = 30.0,
-                         eps: float = 1e-15) -> tuple[np.ndarray, dict]:
+                         eps: float = 1e-15, distance_scale: float | None = None) -> tuple[np.ndarray, dict]:
     """Rows on the unit simplex, as transductive-CLIP consumes them.
 
     ``cosine``: softmax(T * s) with T = 30, verbatim from the released config (``T: 30``).
@@ -353,7 +353,9 @@ def probability_features(scores: np.ndarray, kind: str, *, temperature: float = 
         p = np.clip(s, eps, None)
         return (p / p.sum(axis=1, keepdims=True)).astype(np.float32), info
     if kind == "distance":
-        scale = float(s.std()) or 1.0
+        scale = (float(s.std()) or 1.0) if distance_scale is None else float(distance_scale)
+        if not np.isfinite(scale) or scale <= 0:
+            raise ValueError("distance_scale must be finite and positive")
         s = s / scale
         info["distance_scale"] = scale
     elif kind != "cosine":

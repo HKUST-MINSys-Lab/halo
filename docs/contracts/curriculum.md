@@ -33,8 +33,18 @@ step, seed 20260901, bf16.
 
 ## The unlabelled-pool arm (rung 1's training arm; built, not run)
 
-`--pool-size N --pool-mode {transductive, soft_kmeans}` attaches an unlabelled pool to each
-episode, structured the way deployment pools are ([roadmap](../overview/roadmap.md)):
+`--rung1-training --pool-mode transductive --pool-size MAX_N` selects the zero-support rung-1
+objective. Queries sharing one roster are transduced jointly with one execution-disjoint pool.
+`--rung1-pool-sizes` (including 0) and `--rung1-query-group-sizes` vary N and the scored-set
+size in training. Internal validation uses `--rung1-val-pool-sizes` (default 0, 10, 20, 50,
+bounded by `--pool-size`) with the deployment solver and selects by the mean of its
+dataset-balanced zero-shot macro-F1 values. It logs the realized mean pool size for every
+requested N; the sealed N-curve, not internal validation, measures large-N behavior. No labeled
+supports or v4 head outputs enter this loss.
+Requested pool sizes are filled from other eligible roster classes if an imbalanced draw exhausts
+one class; if the entire eligible source is too small, telemetry reports the realized smaller N.
+The older `--pool-size N --pool-mode {transductive, soft_kmeans}` path remains an opt-in
+few-shot diagnostic, not the rung-1 training recipe ([roadmap](../overview/roadmap.md)).
 
 | option | meaning | default |
 |---|---|---|
@@ -46,9 +56,11 @@ episode, structured the way deployment pools are ([roadmap](../overview/roadmap.
 | `--pool-unroll-iters`, `--pool-unroll-mm-iters` | unrolled EM and MM iterations | `5`, `20` |
 | `--pool-affinity-mu`, `--pool-affinity-knn` | embedding-affinity term of the transductive readout | `1.0`, `10` |
 
-`transductive` scores pooled episodes through the rung-1 evaluator's own EM-Dirichlet
-(`evaluation/rung1_unlabeled/transductive.py`), unrolled, so what HALO is trained through is
-exactly what every encoder is scored with. It trains the encoder, the recording pool and `p_text`;
-the v4 head's gates are not used on pooled episodes. `soft_kmeans` is the Ren-2018 control (one
-E-step under the support vote, no unrolling). With `--pool-size 0` the recipe is bit-identical to v4.
-All pool options are persisted in the checkpoint and checked on resume.
+The rung-1 mode trains the encoder, recording pool, and `p_text` through short, fixed-step
+EM-Dirichlet unrolling plus an inductive text cross-entropy guard. It uses the evaluator's
+transduction implementation, but its training unroll (5 x 20 by default) is shorter than
+deployment inference (20 x up to 1000 MM steps); validation uses the inference budget.
+Both cross-entropies standardize their valid candidate logits to unit RMS per query for loss
+stability; this preserves the predicted class and leaves inference logits untouched.
+The v4 gates are bypassed. The opt-in `soft_kmeans` control requires labeled supports and is not
+a rung-1 k=0 baseline. All rung-1 options are checkpointed and checked on resume.

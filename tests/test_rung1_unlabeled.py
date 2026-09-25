@@ -203,6 +203,25 @@ def test_run_cell_emits_the_grid_and_the_reproduction_row_with_the_sealed_metric
     assert all(r["assignment"] == "identity" for r in grid if r["method"] != "inductive" and r["k"] == 1)
 
 
+def test_distance_calibration_uses_only_scored_rows_and_pool_metrics_exclude_them():
+    scores = np.array([[0.0, -1.0], [-1.0, 0.0], [-100.0, 0.0], [0.0, -100.0]])
+    split = CellSplit(scored=np.array([0, 1]), pool=np.array([2, 3]),
+                      n_executions_scored=2, n_executions_pool=2)
+    kwargs = dict(score_kind="distance", features_all=None, truth_ids=np.array([0, 1, 0, 1]),
+                  classes=["a", "b"], split=split, pool_draws={"0": np.array([], dtype=int)},
+                  ks=(0,), assignments=("identity",),
+                  transduce_kwargs={"n_iter": 2, "n_iter_mm": 5, "early_stop": False})
+    first = run_cell(scores_all=scores, **kwargs)
+    changed = scores.copy()
+    changed[2:] *= 100
+    second = run_cell(scores_all=changed, **kwargs)
+    transduced = lambda rows: next(row for row in rows if row["method"] == "transductive_clip_v1")
+    assert transduced(first)["distance_scale"] == transduced(second)["distance_scale"]
+    assert transduced(first)["pool_class_counts"] == [0, 0]
+    assert transduced(first)["pool_classes_present"] == 0
+    assert transduced(first)["f1_macro"] == transduced(second)["f1_macro"]
+
+
 def test_balanced_pool_filter_yields_a_uniform_marginal_from_labels():
     truth_ids = np.array([0] * 30 + [1] * 6 + [2] * 12)
     pool = np.arange(len(truth_ids))
@@ -210,6 +229,19 @@ def test_balanced_pool_filter_yields_a_uniform_marginal_from_labels():
     counts = np.bincount(truth_ids[balanced], minlength=3)
     assert counts.max() - counts.min() <= 0 or counts[1] == 6      # limited by the rarest class
     assert len(set(balanced)) == len(balanced) and set(balanced) <= set(pool)
+
+
+def test_balanced_pool_control_keeps_n_and_excludes_support_rows():
+    truth_ids = np.array([0] * 20 + [1] * 12 + [2] * 10)
+    requested = np.arange(8)
+    available = np.arange(4, len(truth_ids))
+    balanced = balanced_pool_filter(truth_ids, 3, seed_parts=("size",))(
+        requested, available_rows=available,
+    )
+    counts = np.bincount(truth_ids[balanced], minlength=3)
+    assert len(balanced) == len(requested)
+    assert set(balanced) <= set(available)
+    assert counts.max() - counts.min() <= 1
 
 
 def test_disjoint_class_split_separates_scored_and_pool_classes():

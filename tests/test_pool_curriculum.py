@@ -13,7 +13,8 @@ import torch.nn as nn
 
 from training.support_classifier.sampling import Episode, attach_pool, draw_batch, draw_episode
 from training.support_classifier.train import (
-    episode_recording_indices, pooled_episode_logits, probability_features_torch, split_pool,
+    _macro_f1_names, episode_recording_indices, grouped_zero_shot_transduction, pooled_episode_logits,
+    probability_features_torch, scale_invariant_roster_logits, split_pool,
 )
 
 # The sampler tests' synthetic corpus builder, loaded by path so this file makes no assumption
@@ -102,6 +103,63 @@ def test_draw_batch_attaches_pools_and_reports_them_only_when_asked():
         draw_batch(corpus, np.random.default_rng(0), batch_size=2, pool_size=-1)
 
 
+def test_joint_zero_shot_pool_is_shared_and_execution_disjoint():
+    corpus = _corpus(sites=("left_wrist",), subjects_per_label=6, windows_per_subject=4)
+    episodes, _ = draw_batch(
+        corpus, np.random.default_rng(19), batch_size=2, deployment_matched=True,
+        enrollment_mix=(0, 0, 1), acquisition_mix=(1, 0, 0),
+        label_subset=(3, 4), enrollment_k=(1,), query_group_sizes=(2, 4),
+        pool_size=6, pool_sizes=(6,), joint_pool=True,
+        pool_regime_mix=(1, 0, 0), pool_coverage=(1, 1),
+    )
+    for set_id in {episode.support_set_id for episode in episodes}:
+        group = [episode for episode in episodes if episode.support_set_id == set_id]
+        assert len(group) in (2, 4)
+        assert all(episode.is_zero_shot and episode.pool == group[0].pool for episode in group)
+        assert len(group[0].pool) == 6
+        query_units = _units(corpus, [episode.query for episode in group])
+        assert not query_units & _units(corpus, group[0].pool)
+
+
+def test_joint_transduction_backpropagates_for_shared_pool_and_n0():
+    class E:
+        def __init__(self, set_id, pool):
+            self.support_set_id, self.pool = set_id, pool
+            self.support, self.is_zero_shot = (), True
+            self.candidates = ("a", "b", "c")
+
+    episodes = [E(0, (3, 4, 5)), E(0, (3, 4, 5)), E(1, ())]
+    query = torch.randn(3, 8, requires_grad=True)
+    pool = torch.randn(3, 3, 8, requires_grad=True)
+    mask = torch.tensor([[True] * 3, [True] * 3, [False] * 3])
+    labels = torch.randn(3, 3, 6)
+    candidate_mask = torch.ones(3, 3, dtype=torch.bool)
+    projection = nn.Linear(8, 6)
+    logits, inductive = grouped_zero_shot_transduction(
+        query, pool, mask, labels, candidate_mask, episodes, projection, 30.0,
+        {"n_iter": 2, "n_iter_mm": 5, "early_stop": False, "mu": 1.0, "knn": 2},
+    )
+    assert logits.shape == (3, 3) and torch.isfinite(logits).all()
+    (logits[:, 0].sum() + inductive[:, 0].sum()).backward()
+    assert torch.isfinite(query.grad).all() and torch.isfinite(pool.grad).all()
+    assert torch.isfinite(projection.weight.grad).all()
+
+
+def test_rung1_validation_macro_f1_includes_absent_roster_classes():
+    assert _macro_f1_names(["a"], ["a"], {"a", "b"}) == 0.5
+
+
+def test_rung1_loss_logits_ignore_raw_dirichlet_scale():
+    raw = torch.tensor([[2000.0, -1000.0, -500.0, -1e30]], requires_grad=True)
+    mask = torch.tensor([[True, True, True, False]])
+    normal = scale_invariant_roster_logits(raw, mask)
+    magnified = scale_invariant_roster_logits(raw * 50, mask)
+    assert normal.argmax(-1).item() == raw.argmax(-1).item()
+    assert torch.allclose(normal[:, :3], magnified[:, :3], atol=1e-5)
+    torch.nn.functional.cross_entropy(normal, torch.tensor([1])).backward()
+    assert torch.isfinite(raw.grad).all()
+
+
 def _tensors(B=3, K=4, P=5, C=3, D=8, T=6, seed=0):
     g = torch.Generator().manual_seed(seed)
     query = torch.randn(B, D, generator=g, requires_grad=True)
@@ -152,6 +210,19 @@ def test_transductive_readout_ignores_padded_pool_rows():
     padded["pool_mask"] = torch.tensor([[True] * 4 + [False] * 3])
     out = pooled_episode_logits(mode="transductive", unroll={"n_iter": 3, "n_iter_mm": 10, "early_stop": False}, **padded).detach()
     assert torch.allclose(full, out, atol=1e-4)
+
+
+def test_soft_kmeans_mixed_zero_support_rows_do_not_poison_gradients():
+    t = _tensors(B=2, K=4, P=3)
+    t["support_mask"][1] = False
+    t["support_bound"][1] = -1
+    logits = pooled_episode_logits(mode="soft_kmeans", unroll={}, **t)
+    active = torch.tensor([True, False])
+    loss = torch.where(active[:, None], logits, torch.zeros_like(logits)).sum()
+    loss.backward()
+    assert torch.isfinite(logits).all()
+    assert torch.isfinite(t["query"].grad).all()
+    assert torch.isfinite(t["pool_feature"].grad).all()
 
 
 def test_probability_features_torch_masks_invalid_candidates():

@@ -109,6 +109,12 @@ functions of the pool; once they depend on the pool it is C. **Fallback: PADDLE*
 arXiv:2210.14545) — hyperparameter-free, built for query classes drawn from a larger set than the
 support set. Same first author; the swap costs nothing narratively.
 
+A [deployment memory-reader proposal](../journal/2026-09-25-deployment-memory-reader-proposal.md)
+with a [storage/token literature audit](../journal/2026-09-25-memory-reader-literature-audit.md)
+and an [online-episode addendum](../journal/2026-09-25-memory-reader-online-episode-addendum.md)
+record a separate HALO-specific classifier experiment for future implementation. It does not
+replace this rung's registered shared inference procedure or change the current paper protocol.
+
 Cited for properties, **not** run as arms: OSLO (open-set), α-TIM (imbalance), Burzer et al. 2026
 MAP-EM (the HAR-native competitor; its stated limitation — assumes known active classes — is our
 regime).
@@ -132,9 +138,12 @@ text prototypes; the analogue of CLIP's image–text alignment). **The v4 learne
 attention stack, gated text blend, corruption auxiliary, unenrolled calibration — is not used on
 rung 1**, at training or at inference; it remains the rung-2 case-study vehicle. (An earlier draft
 proposed a `ROLE_UNLABELED` token acting through v4's residual; withdrawn — it would give HALO a
-private inference path.) Built as `halo-train --pool-size N --pool-mode transductive` (affinity on by default:
+private inference path.) Built as `halo-train --rung1-training --pool-size MAX_N --pool-mode transductive`
+(zero-support query groups with a shared pool; affinity on by default:
 `--pool-affinity-mu 1 --pool-affinity-knn 10`, so gradients also reach the encoder through its
-neighbourhood geometry); `--pool-mode soft_kmeans` is ladder step 3.
+neighbourhood geometry). `--pool-mode soft_kmeans` is an enrolled-only diagnostic, not a k=0
+rung-1 arm. The rung-1 objective mixes transductive and inductive text cross-entropy; validation
+selects checkpoints across N with the full inference solver.
 
 Two N=0 checks, not one: (i) **architectural** — the same checkpoint with the pool removed must give
 a bit-identical forward pass; (ii) **inductive floor** — the retrained encoder's own N=0 k-curve must
@@ -160,12 +169,12 @@ needs no training; tier 2 needs the matched arms trained (≈ 15.5 GPU-h, a sepa
 | B | every encoder of tiers 1–2 with the level-B constants fitted on our training corpus (encoder frozen) | whether learning the method's constants helps any encoder, separately from training through it | a few constants per encoder; not built |
 
 HALO ladder, all from random initialisation on our corpus: (1) plain cross-entropy → (2) +
-heterogeneity curriculum, **which is today's v4 encoder** → (3) + unlabelled-pool episodes with the
-differentiable-neighbour objective, no unrolling (Ren 2018 style; objective-matched to tier 2) →
-(4) + unrolled transductive loss → (5) + the level-B constants learned jointly. Step 3→4 is "trained
-through the procedure"; 4→5 is "and the procedure's constants", matched by tier B; 2→3 is exposure alone;
-1→2 is the existing curriculum. Step 3 exists so that "our encoder is better" and "our loss is
-better" can be told apart. Optional tier 4: the unrolled loss dropped into the cheapest matched arm
+heterogeneity curriculum, **which is today's v4 encoder** → (3) zero-support grouped-pool training
+with the shared unrolled transductive method → (4, proposed, not built) learned method constants.
+Step 2→3 asks whether optimizing through the deployment method helps; step 3→4 would ask whether
+learned constants help, matched by tier B. Exposure alone without an inference path is not a
+meaningful k=0 training arm: the unlabeled pool cannot change a support-only prediction when no
+supports exist. Optional tier 4: the unrolled loss dropped into the cheapest matched arm
 (HARNet, 32 min) as a transfer check — not required for the claim.
 
 **Invariant: inference is identical for everyone, HALO included.** Unrolling is training-time only.
@@ -175,9 +184,9 @@ better" can be told apart. Optional tier 4: the unrolled loss dropped into the c
 | threat | source | control |
 |---|---|---|
 | transductive gains are an artefact of balanced pools | Veilleux et al. 2022 (arXiv:2204.11181): drops "even below inductive" under Dirichlet marginals | balanced-pool arm; per-cell imbalance reported |
-| exposure to heterogeneous pools does not by itself confer robustness | Ochal et al. | ladder step 3 vs step 4 |
+| exposure to heterogeneous pools does not by itself confer robustness | Ochal et al. | compare the inductive N=0 anchor with training through the transductive method |
 | episodic training is unnecessary; plain CE suffices | Laenen & Bertinetto NeurIPS 2021; Burzer et al. validate for HAR; Zhang 2024 (arXiv:2402.00092). Counter: LibFewShot (TPAMI) | ladder step 1 |
-| the model exploits the pool's acquisition fingerprint, not its class structure | — | same-config **disjoint-class** pool: gain survives ⇒ domain adaptation; vanishes ⇒ class structure |
+| the model exploits the pool's acquisition fingerprint, not its class structure | — | same-config **disjoint-class** pool tests whether label overlap is required; it cannot alone establish domain adaptation |
 | pseudo-label confirmation bias and cluster collapse | Wang et al. CVPR 2022 (10.1109/cvpr52688.2022.01424) | confidence threshold, per-class cap, **collapse rate reported** |
 | encoder overfits the unrolled method and regresses inductively | — | N=0 check (ii): the retrained encoder's k-curve must not fall below v4's |
 | the affinity vote spreads errors for an encoder that groups windows by subject or device rather than activity | synthetic check, 2026-09-24 | `neighbour_purity` reported per encoder and cell; the μ = 0 ablation (the published method) reported for every encoder |

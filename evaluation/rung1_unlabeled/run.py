@@ -97,6 +97,8 @@ def main() -> None:
     for cell_index, (window_seconds, dataset, stream_id, _) in enumerate(cells, start=1):
         stream = load_eval_stream(dataset, stream_id, alignment="native", window_seconds=window_seconds,
                                   apply_quality_screen=True)
+        if stream.quality_screen != "applied":
+            raise RuntimeError(f"quality screen unavailable for {dataset}/{stream_id}: {stream.quality_screen}")
         base = {"dataset": dataset, "stream": stream_id, "window_seconds": float(window_seconds),
                 "source_slice_fingerprint": source_slice_fingerprint(stream)}
         classes = list(stream.eval_labels)
@@ -112,6 +114,7 @@ def main() -> None:
         seed_parts = (args.seed, dataset, stream_id, float(window_seconds), args.scored_fraction)
         split = split_scored_pool(stream.execution_ids, valid_rows, fraction=args.scored_fraction,
                                   seed_parts=seed_parts)
+        shared_subjects = len(set(stream.subjects[split.scored]) & set(stream.subjects[split.pool]))
         kept = held = None
         if args.control == "disjoint_classes":
             split, kept, held = disjoint_class_split(split, truth_ids, len(classes),
@@ -142,6 +145,7 @@ def main() -> None:
                             "zero_shot_route": info["route"],
                             "n_executions_scored": split.n_executions_scored,
                             "n_executions_pool": split.n_executions_pool,
+                            "n_subjects_shared_scored_pool": shared_subjects,
                             **({"roster_kept": [classes[i] for i in kept],
                                 "roster_held_out": [classes[i] for i in held]} if kept is not None else {})})
             rows.extend(cell_rows)
@@ -159,7 +163,7 @@ def main() -> None:
         extra={"per_model_fingerprints": fingerprints, "temperature": args.temperature,
                "transduce": transduce_kwargs, "assignments": args.assignments, "control": args.control,
                "reference_implementation": "github.com/SegoleneMartin/transductive-CLIP@master (fetched 2026-09-23)",
-               "subject_independent": True},
+               "execution_disjoint_scored_pool": True, "subject_independent": False},
     )
     path = write_artifact(args.out, rows, provenance, argv=sys.argv, device=device,
                           halo_checkpoint=args.halo_checkpoint)

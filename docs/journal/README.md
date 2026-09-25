@@ -85,3 +85,6 @@ entries preserve what was believed at the time; current behavior is defined only
 | 2026-09-23 | [2026-09-23-rungs-implementation-record.md](2026-09-23-rungs-implementation-record.md) | Rungs 1, 2 and 4 built; the unlabelled-pool training arm built — implementation record |
 | 2026-09-23 | [2026-09-23-three-rungs-discovery-dropped.md](2026-09-23-three-rungs-discovery-dropped.md) | Addendum: the discovery rung is dropped; three rungs, renumbered |
 | 2026-09-24 | [2026-09-24-rung1-affinity-and-repository-reorganisation.md](2026-09-24-rung1-affinity-and-repository-reorganisation.md) | Rung 1 gets an embedding-affinity term and is k = 0 only; the repository moves to main-only and is reorganised |
+| 2026-09-25 | [2026-09-25-deployment-memory-reader-proposal.md](2026-09-25-deployment-memory-reader-proposal.md) | Deployment memory reader: proposed design for a later classifier experiment |
+| 2026-09-25 | [2026-09-25-memory-reader-literature-audit.md](2026-09-25-memory-reader-literature-audit.md) | Memory-reader literature audit: storage and token contract |
+| 2026-09-25 | [2026-09-25-memory-reader-online-episode-addendum.md](2026-09-25-memory-reader-online-episode-addendum.md) | Memory reader: online episodes and age decision |

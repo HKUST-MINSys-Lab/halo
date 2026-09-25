@@ -19,6 +19,12 @@
 > fingerprint, and writes machine-readable and Markdown per-stream tables. Internal validation from
 > `training.support_classifier.train` is not a sealed result.
 
+Rung 1 splits scored windows and unlabeled-pool windows by physical execution within each sealed
+cell. It does **not** split these two sets by subject; the runner reports their subject overlap.
+Its scored-set macro-F1 uses the complete declared candidate roster as the class set at every N,
+and the balanced-pool control keeps N fixed while excluding labeled supports. Historical rung-1
+artifacts made before this contract should not be pooled with new N-curves.
+
 ## Data separation
 
 1. Split subjects before constructing recordings or episodes.

@@ -178,14 +178,19 @@ def run_cell(
     classes = list(classes)
     C = len(classes)
     kwargs = {**INFERENCE_DEFAULTS, **(transduce_kwargs or {})}
-    z_all, feature_info = probability_features(scores_all, score_kind, temperature=temperature)
+    # A distance-score provider must not calibrate N=0 using withheld pool windows. The fixed
+    # scored set is available at every N and supplies one unchanged, label-free scale.
+    distance_scale = (float(np.std(scores_all[split.scored])) or 1.0) if score_kind == "distance" else None
+    z_all, feature_info = probability_features(
+        scores_all, score_kind, temperature=temperature, distance_scale=distance_scale,
+    )
     truth_names = np.asarray(classes, dtype=object)
     rows: list[dict] = []
 
-    def metrics_on(rows_idx: np.ndarray, pred_ids: np.ndarray) -> dict:
+    def metrics_on(rows_idx: np.ndarray, pred_ids: np.ndarray, *, fixed_roster: bool = False) -> dict:
         truth = truth_names[truth_ids[rows_idx]]
         pred = truth_names[pred_ids]
-        return classification(truth, pred)
+        return classification(truth, pred, f1_classes=classes if fixed_roster else None)
 
     # The reproduction row: the sealed k=0 rule over every in-roster window, no transduction.
     all_rows = np.flatnonzero(truth_ids >= 0)
@@ -207,12 +212,13 @@ def run_cell(
                                           n_classes=C, rows=split.scored)
         rows.append({"method": "inductive", "k": k, "N": 0, "scope": "scored", "control": control,
                      "inductive_readout": "zero_shot_argmax" if k == 0 else "prototype",
-                     **metrics_on(split.scored, inductive), "n_scored": int(len(split.scored)),
+                     "macro_f1_class_policy": "declared_roster",
+                     **metrics_on(split.scored, inductive, fixed_roster=True), "n_scored": int(len(split.scored)),
                      "n_support": int(len(support_rows)), "score_kind": score_kind, **feature_info})
         for label, drawn in pool_draws.items():
             pool_n = drawn[np.isin(drawn, pool_available)] if len(support_rows) else drawn
             if pool_filter is not None:
-                pool_n = pool_filter(pool_n)
+                pool_n = pool_filter(pool_n, available_rows=pool_available)
             task_rows = np.concatenate([split.scored, pool_n])
             z = z_all[task_rows]
             support_z = z_all[support_rows] if k else None
@@ -229,8 +235,9 @@ def run_cell(
                 rows.append({
                     "method": "transductive_clip_v1", "k": k, "N": int(len(pool_n)), "N_label": label,
                     "scope": "scored", "control": control, "assignment": assignment,
-                    **metrics_on(split.scored, scored_preds),
-                    **pool_marginal(truth_ids, task_rows, C),
+                    "macro_f1_class_policy": "declared_roster",
+                    **metrics_on(split.scored, scored_preds, fixed_roster=True),
+                    **pool_marginal(truth_ids, pool_n, C),
                     "n_scored": int(len(split.scored)), "n_support": int(len(support_rows)),
                     "n_transduced": int(len(task_rows)),
                     "lam": info["lam"], "n_iter": info["n_iter"], "n_iter_mm": info["n_iter_mm"],
