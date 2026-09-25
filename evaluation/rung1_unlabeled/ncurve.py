@@ -33,6 +33,8 @@ from typing import Callable, Sequence
 
 import numpy as np
 
+from sklearn.metrics import f1_score
+
 from evaluation.metrics import classification
 from evaluation.rung1_unlabeled.transductive import INFERENCE_DEFAULTS, transduce_numpy
 from evaluation.zero_shot import _normalise, probability_features
@@ -219,7 +221,15 @@ def run_cell(
     def metrics_on(rows_idx: np.ndarray, pred_ids: np.ndarray, *, fixed_roster: bool = False) -> dict:
         truth = truth_names[truth_ids[rows_idx]]
         pred = truth_names[pred_ids]
-        return classification(truth, pred, f1_classes=f1_roster if fixed_roster else None)
+        out = classification(truth, pred, f1_classes=f1_roster if fixed_roster else None)
+        # Diagnostics telemetry: per-label F1 and the predicted-class distribution, so a dataset's
+        # number can be traced to the classes that moved (or collapsed) without re-running.
+        labels = list(f1_roster) if fixed_roster else sorted(set(truth.tolist()) | set(pred.tolist()))
+        out["per_label_f1"] = {str(label): float(v) for label, v in zip(labels, 100 * f1_score(
+            truth, pred, labels=labels, average=None, zero_division=0))}
+        values, counts = np.unique(pred, return_counts=True)
+        out["predicted_class_counts"] = {str(v): int(c) for v, c in zip(values, counts)}
+        return out
 
     # Text-score anchor over every in-roster window; HALO's full sealed classifier differs.
     all_rows = np.flatnonzero(truth_ids >= 0)
