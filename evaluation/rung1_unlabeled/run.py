@@ -72,6 +72,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--control", choices=CONTROLS, default="none")
     parser.add_argument("--holdout-fraction", type=float, default=0.5, help="disjoint_classes control")
     parser.add_argument("--cells", type=int, default=None, help="evaluate only the first N cells (smoke)")
+    parser.add_argument("--resume", action="store_true",
+                        help="reuse completed cells from <out>/cells_partial.json (written after every cell)")
     return parser
 
 
@@ -118,7 +120,19 @@ def main() -> None:
     fingerprints: dict[str, str] = {}
     rows: list[dict] = []
     started = time.perf_counter()
+    partial_path = args.out / "cells_partial.json"
+    done_cells: dict[str, list] = {}
+    if args.resume and partial_path.is_file():
+        done_cells = json.loads(partial_path.read_text()).get("cells", {})
     for cell_index, (window_seconds, dataset, stream_id, _) in enumerate(cells, start=1):
+        cell_key = f"{float(window_seconds):g}|{dataset}|{stream_id}"
+        if cell_key in done_cells:
+            rows.extend(done_cells[cell_key]["rows"])
+            fingerprints.update(done_cells[cell_key]["fingerprints"])
+            print(f"[rung1] cells={cell_index}/{len(cells)} reused from {partial_path.name}", flush=True)
+            continue
+        rows_before = len(rows)
+        fingerprints_before = dict(fingerprints)
         stream = load_eval_stream(dataset, stream_id, alignment="native", window_seconds=window_seconds,
                                   apply_quality_screen=True)
         if stream.quality_screen != "applied":
@@ -178,6 +192,11 @@ def main() -> None:
         elapsed = time.perf_counter() - started
         print(f"[rung1] cells={cell_index}/{len(cells)} elapsed={elapsed / 60:.1f}m", flush=True)
         _atomic_json(args.out / "progress.json", {"completed_cells": cell_index, "total_cells": len(cells)})
+        # Checkpoint every completed cell so a crash (e.g. GPU OOM from a co-scheduled job) loses at
+        # most one cell; --resume reuses them. The final artifact is still written once at the end.
+        done_cells[cell_key] = {"rows": rows[rows_before:], "fingerprints": {
+            k: v for k, v in fingerprints.items() if fingerprints_before.get(k) != v}}
+        _atomic_json(partial_path, {"cells": done_cells})
     provenance = ArtifactProvenance(
         rung=Rung.UNLABELED,
         checkpoint_fingerprint=hashlib.sha256(json.dumps(sorted(fingerprints.items())).encode()).hexdigest(),
