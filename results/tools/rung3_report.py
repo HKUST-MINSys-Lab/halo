@@ -82,6 +82,25 @@ def main() -> None:
                     lines.append(f"| {enc} | {k} | " + " | ".join(
                         f"{np.mean(d[x]):.1f}" if x in d else "-" for x in datasets) + " |")
         lines.append("")
+    fits = defaultdict(lambda: defaultdict(list))
+    for r in ok:
+        fit = fits[(r["encoder"], r["method"])]
+        fit["cells"].append((r["dataset"], r["stream"]))
+        fit["draws"].append(r.get("support_draw", 0))
+        for key in ("fit_seconds", "final_loss"):
+            if r.get(key) is not None:
+                fit[key].append(float(r[key]))
+    lines += ["## Fit diagnostics", "",
+              "Coverage and cost per (encoder, method). A final loss far above 0 means the head did not "
+              "fit its supports within the fixed budget.", "",
+              "| encoder | method | cells | draws | rows | median fit s | mean final loss |",
+              "|---|---|---:|---:|---:|---:|---:|"]
+    for (enc, method), fit in sorted(fits.items(), key=lambda kv: (kv[0][0], ORDER.index(kv[0][1]))):
+        med = f"{np.median(fit['fit_seconds']):.2f}" if fit["fit_seconds"] else "-"
+        loss = f"{np.mean(fit['final_loss']):.3f}" if fit["final_loss"] else "-"
+        lines.append(f"| {enc} | {method} | {len(set(fit['cells']))} | {len(set(fit['draws']))} | "
+                     f"{len(fit['cells'])} | {med} | {loss} |")
+    lines.append("")
     if na:
         reasons = defaultdict(int)
         for r in na:
