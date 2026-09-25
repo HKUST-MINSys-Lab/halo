@@ -93,3 +93,4 @@ entries preserve what was believed at the time; current behavior is defined only
 | 2026-09-25 | [2026-09-25-rung3-fairness-fixes.md](2026-09-25-rung3-fairness-fixes.md) | Rung 3: heads on each model's own features, and three support draws |
 | 2026-09-25 | [2026-09-25-v5-online-memory-implementation.md](2026-09-25-v5-online-memory-implementation.md) | V5 online memory reader: implementation record |
 | 2026-09-25 | [2026-09-25-v5-verified-feedback.md](2026-09-25-v5-verified-feedback.md) | V5 verified-label feedback |
+| 2026-09-26 | [2026-09-26-overnight-tier1-tier3-runs.md](2026-09-26-overnight-tier1-tier3-runs.md) | Overnight 2026-09-25/26: tier-1 results, temperature calibration, speed fixes, tier-3 probe |
