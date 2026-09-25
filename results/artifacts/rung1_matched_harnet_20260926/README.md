@@ -1,7 +1,7 @@
 # Tier 1 (rung 1): corpus-matched HARNet arm — 2026-09-26
 
-**What:** the HARNet trunk trained from its released weights' architecture on **our** 8 training
-sources with our pipeline (`halo-train --encoder-arch harnet --classifier neighbors --steps 40000`,
+**What:** the HARNet architecture trained **from scratch** (`matched_pretrained: False`; no released
+weights) on **our** 8 training sources with our pipeline (`halo-train --encoder-arch harnet --classifier neighbors --steps 40000`,
 differentiable-neighbour head), then scored under exactly the tier-1 protocol of
 `results/artifacts/rung1_tier1_20260925`. It separates "our corpus and training recipe" from "the
 HALO architecture/text" in the tier-1 gap. Checkpoint
