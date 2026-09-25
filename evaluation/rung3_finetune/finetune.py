@@ -175,7 +175,8 @@ def encode_rows(encoder: nn.Module, stream, rows: np.ndarray, device: torch.devi
         source_rate=(stream.effective_source_rate_hz if stream.effective_source_rate_hz is not None else None),
         lengths=lengths, requires_grad=requires_grad, batch_size=max(1, len(rows)), _require_patches=False,
     )
-    pooled = out["pooled"]
+    # The no-grad path returns host tensors; the head lives on ``device``.
+    pooled = out["pooled"].to(device)
     return pooled if requires_grad else pooled.detach()
 
 
