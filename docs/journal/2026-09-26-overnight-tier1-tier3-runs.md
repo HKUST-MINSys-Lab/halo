@@ -113,7 +113,25 @@ encoder; fitted on held-out training-source windows). **Secondary diagnostic:** 
 temperature it was trained through. `last.pt` primary, `best_internal.pt` secondary (declared
 earlier). Training ended 03:13 HKT; internal validation dataset-macro F1 0.14 (2.5k) → 0.367 (40k).
 
-## 9. Pending at time of writing
+## 9. T1-D: HALO trained through EM-Dirichlet is worse than v4 (primary, `last.pt`)
+
+`runs/evaluations/rung1_halo_trained_last_20260925`; calibrated T = 31.8 (≈ its training T = 30,
+so the declared T = 30 diagnostic cannot differ much). Dataset-balanced macro-F1:
+
+| encoder | anchor | N=0 | N=100 | N=500 | N=all | pool effect |
+|---|---:|---:|---:|---:|---:|---:|
+| HALO v4 | 47.4 | 50.6 | 52.1 | 52.6 | 51.9 | +1.3 |
+| HALO trained through EM (40k, from scratch) | 42.9 | 48.3 | 49.3 | 48.9 | 47.9 | −0.4 |
+
+Lower at every N. Training did make transduction worth more *relative to its own anchor* (+5.4 to
+N=0 vs v4's +3.2), but from a base 4.5 points lower, and the pool no longer helps (ut_complex N=0
+39.3 → N=all 30.7). Per dataset it wins only shoaib at N=all (67.2 vs 65.5) and usc_had (38.6 vs
+38.0). Confounds (§7): the arm also lacks v4's auxiliary corrupted-text view. Reading: as with the
+2026-08/09 Phase-B findings, training through the adaptation procedure did not beat the untrained
+procedure on a good encoder; level A is **negative** on this run. Not re-tuned: that would select
+on sealed data.
+
+## 10. Pending at time of writing
 
 Controls (μ = 0, balanced pool, disjoint classes); HALO trained through EM-Dirichlet (40k steps,
 `last.pt` primary — declared before results); its tier-1 score and inductive-floor check; the
