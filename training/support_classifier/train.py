@@ -3696,7 +3696,10 @@ def main() -> None:
                 pool_unroll=validation_unroll, rung1_training=args.rung1_training,
                 corpus=val_corpus, dataset=val_dataset,
                 collate=collate, text_of=text_of, device=device,
-                episodes_count=args.val_episodes, episodes_per_step=args.episodes_per_step,
+                episodes_count=args.val_episodes,
+                # Rung-1 validation is gradient-free and its solver cost is flat in batch size
+                # (kernel-launch-bound), so it batches 8x more support sets per call.
+                episodes_per_step=args.episodes_per_step * (8 if args.rung1_training else 1),
                 seed=args.data_seed + 91_003, draw_kwargs=panel_draw,
                 executor=executor, deployment_matched=True,
                 selection_policy=("rung1_zero_shot" if args.rung1_training else

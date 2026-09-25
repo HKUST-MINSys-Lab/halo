@@ -95,18 +95,40 @@ def _curvature(alpha: torch.Tensor, log_gamma_1: torch.Tensor, zero_value: torch
     return curv, digam
 
 
+def _mm_step(alpha: torch.Tensor, y_cst: torch.Tensor, dim_mask: torch.Tensor,
+             log_gamma_1: torch.Tensor, zero_value: torch.Tensor) -> torch.Tensor:
+    """One MM-quadratic update. Pure elementwise math plus one masked sum."""
+    curv, digam = _curvature(alpha, log_gamma_1, zero_value)
+    alpha_sum = (alpha * dim_mask).sum(-1, keepdim=True)
+    b = digam - torch.polygamma(0, alpha_sum) - curv * alpha - y_cst
+    return (-b + torch.sqrt(b * b + 4 * curv)) / (2 * curv)
+
+
+_COMPILED_MM_STEP = None
+
+
+def _mm_step_fn(device: torch.device):
+    """On CUDA the ~12 tiny kernels of one MM step are fused by ``torch.compile``: the loop is
+    kernel-launch-bound (tensors are (B, C, C) with C <= ~20), and fusion cut a step from 0.094 to
+    0.034 ms with outputs equal to 5e-7 (2026-09-25 profile: this loop was 88 % of rung-1 training
+    wall time). CPU stays eager, so tests and CPU runs need no compiler toolchain."""
+    global _COMPILED_MM_STEP
+    if device.type != "cuda":
+        return _mm_step
+    if _COMPILED_MM_STEP is None:
+        _COMPILED_MM_STEP = torch.compile(_mm_step, dynamic=True)
+    return _COMPILED_MM_STEP
+
+
 def update_alpha(alpha: torch.Tensor, y_cst: torch.Tensor, dim_mask: torch.Tensor, *,
                  n_iter_mm: int, early_stop: bool, tol: float = 1e-11) -> torch.Tensor:
     """MM-quadratic (Algorithm 1). ``alpha, y_cst: (B, K, C)``; ``dim_mask: (B, 1, C)``."""
     one = torch.ones((), dtype=alpha.dtype, device=alpha.device)
     log_gamma_1 = torch.lgamma(one)
     zero_value = torch.polygamma(1, one)
+    step_fn = _mm_step_fn(alpha.device)
     for step in range(int(n_iter_mm)):
-        curv, digam = _curvature(alpha, log_gamma_1, zero_value)
-        alpha_sum = (alpha * dim_mask).sum(-1, keepdim=True)
-        b = digam - torch.polygamma(0, alpha_sum) - curv * alpha - y_cst
-        a = curv
-        alpha_new = (-b + torch.sqrt(b * b + 4 * a)) / (2 * a)
+        alpha_new = step_fn(alpha, y_cst, dim_mask, log_gamma_1, zero_value)
         if early_stop and step > 0 and step % 50 == 0:
             criterion = (alpha_new - alpha).norm() ** 2 / alpha.norm().clamp_min(EPS) ** 2
             alpha = alpha_new
