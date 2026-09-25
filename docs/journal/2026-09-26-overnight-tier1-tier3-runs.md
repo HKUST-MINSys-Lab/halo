@@ -162,6 +162,12 @@ Also noted, not changed tonight: the tier-3 shards and evals run as separate pro
 `nvidia-smi` reports 99 %. Enabling MPS, or fitting several (k, draw) jobs in one process, would
 raise real utilisation.
 
+**T1-E (inductive floor), 03:56:** the rung-1-trained encoder's sealed cosine 1-NN k-curve is below
+v4's by 1.9 / 2.2 / 2.5 at k = 1 / 8 / 32 (13 shared cells). The pre-registered floor check fails:
+the representation itself got slightly worse. The T = 30 diagnostic (48.1 at N=all) confirms the
+negative T1-D result does not hinge on the temperature. Artifact:
+`results/artifacts/rung1_halo_trained_20260926/`.
+
 ## 12. Pending at time of writing
 
 Controls (μ = 0, balanced pool, disjoint classes); HALO trained through EM-Dirichlet (40k steps,

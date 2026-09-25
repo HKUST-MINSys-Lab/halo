@@ -33,4 +33,10 @@ gain. It is below v4 at every N and on 4 of 6 datasets at N=all.
 - Not a single-factor ablation: rung-1 training refuses text corruption, so this arm also lacks v4's
   auxiliary corrupted-text view (journal §7).
 - One seed, one run. Not re-tuned: doing so would select on sealed data.
-- The inductive-floor check (T1-E: 1-NN k-curve vs v4) is in `INDUCTIVE_FLOOR.md` once it lands.
+
+## Inductive floor (T1-E): fails by ~2 points
+
+`INDUCTIVE_FLOOR.md`, `sealed_1nn/` — the trained encoder under the sealed tier-2 cosine 1-NN
+readout, vs v4's published k-curve on the 13 shared 8 s cells: k = 1 60.3 → 58.5 (−1.9), k = 8
+70.9 → 68.7 (−2.2), k = 32 74.6 → 72.1 (−2.5). Training through EM-Dirichlet slightly degraded the
+representation itself, not only the transductive score.
