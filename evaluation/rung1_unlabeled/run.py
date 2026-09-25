@@ -55,7 +55,12 @@ def _parser() -> argparse.ArgumentParser:
                         help="pool sizes N (integers and/or 'all'); N=0 is transduction over the "
                              "scored set alone, the null of the curve (the inductive anchor is always emitted)")
     parser.add_argument("--scored-fraction", type=float, default=0.2)
-    parser.add_argument("--temperature", type=float, default=30.0, help="released config: T 30")
+    parser.add_argument("--temperature", default="calibrated",
+                        help="'calibrated' (default): each encoder's maximum-likelihood temperature on "
+                             "held-out training-source windows (evaluation.rung1_unlabeled.calibration); "
+                             "or a number applied to every encoder (the reference used 30)")
+    parser.add_argument("--temperature-file", type=Path, default=None,
+                        help="reuse a temperature_calibration.json from an earlier run with the same checkpoints")
     parser.add_argument("--n-iter", type=int, default=INFERENCE_DEFAULTS["n_iter"])
     parser.add_argument("--n-iter-mm", type=int, default=INFERENCE_DEFAULTS["n_iter_mm"])
     parser.add_argument("--lam", type=float, default=None, help="override lambda (default: N)")
@@ -87,6 +92,25 @@ def main() -> None:
                         "early_stop": args.n_iter_mm >= 100, "lam": args.lam,
                         "mu": args.affinity_mu, "knn": args.affinity_knn}
     cells = [cell for cell in evaluation_cells(args.window_seconds, scope="sealed") if not cell[3]]
+    temperatures: dict[tuple[str, float], float] = {}
+    calibration: dict[str, dict] = {}
+    for window_seconds in args.window_seconds:
+        if str(args.temperature) == "calibrated":
+            from evaluation.rung1_unlabeled.calibration import calibrate_all
+
+            token = f"{float(window_seconds):g}".replace(".", "p")
+            fitted = calibrate_all(scorer, args.models, float(window_seconds), device=device,
+                                   out_path=args.out / f"temperature_calibration_w{token}.json",
+                                   cached=args.temperature_file)
+            for name, info in fitted.items():
+                temperatures[(name, float(window_seconds))] = float(info["temperature"])
+                calibration[f"{name}@{float(window_seconds):g}s"] = info
+                print(f"[rung1] temperature {name} @{window_seconds:g}s = {info['temperature']:.3f} "
+                      f"(held-out NLL {info['nll']:.3f} vs {info['nll_at_30']:.3f} at T=30; "
+                      f"ECE {info['ece']:.3f} vs {info['ece_at_30']:.3f})", flush=True)
+        else:
+            for name in args.models:
+                temperatures[(name, float(window_seconds))] = float(args.temperature)
     if args.cells is not None:
         cells = cells[:args.cells]
     label_of = {name: (args.encoder_label if name == "halo" and args.encoder_label else name)
@@ -135,7 +159,7 @@ def main() -> None:
             cell_rows = run_cell(
                 scores_all=scores, score_kind=info["kind"], features_all=enrollment, truth_ids=truth_ids,
                 classes=classes, split=split, pool_draws=pool_draws, ks=args.k,
-                temperature=args.temperature, transduce_kwargs=transduce_kwargs,
+                temperature=temperatures[(name, float(window_seconds))], transduce_kwargs=transduce_kwargs,
                 assignments=args.assignments, seed_parts=(*seed_parts, name),
                 pool_filter=pool_filter, control=args.control, device=device,
                 scored_classes=kept, execution_ids=stream.execution_ids,
@@ -161,7 +185,9 @@ def main() -> None:
             "cells": [list(c[:3]) for c in cells], "seed": args.seed, "scored_fraction": args.scored_fraction,
             "pool_sizes": [str(s) for s in pool_sizes], "k": args.k, "control": args.control},
             sort_keys=True).encode()).hexdigest(),
-        extra={"per_model_fingerprints": fingerprints, "temperature": args.temperature,
+        extra={"per_model_fingerprints": fingerprints, "temperature": str(args.temperature),
+               "temperatures": {f"{n}@{w:g}s": t for (n, w), t in temperatures.items()},
+               "temperature_calibration": calibration,
                "transduce": transduce_kwargs, "assignments": args.assignments, "control": args.control,
                "reference_implementation": "github.com/SegoleneMartin/transductive-CLIP@master (fetched 2026-09-23)",
                "execution_disjoint_scored_pool": True, "subject_independent": False},

@@ -379,3 +379,19 @@ def test_neighbour_execution_diagnostics_separate_within_recording_similarity():
     # other-execution pairs: (0,2) diff, (1,3) diff, (2,3) same, (2,0) diff, (3,2) same, (3,1) diff
     assert out["neighbour_purity_other_execution"] == pytest.approx(2 / 6)
     assert neighbour_execution_diagnostics(truth, None, neighbours)["neighbour_same_execution"] is None
+
+
+def test_temperature_fit_recovers_the_generating_temperature():
+    from evaluation.rung1_unlabeled.calibration import fit_temperature
+    rng = np.random.default_rng(0)
+    sets = []
+    for n_classes in (4, 6, 9):
+        scores = rng.normal(size=(3000, n_classes)) * 0.1
+        logits = 25.0 * scores
+        p = np.exp(logits - logits.max(1, keepdims=True))
+        p /= p.sum(1, keepdims=True)
+        truth = np.array([rng.choice(n_classes, p=row) for row in p])
+        sets.append((scores, truth))
+    out = fit_temperature(sets, "cosine")
+    assert abs(out["temperature"] - 25.0) / 25.0 < 0.1
+    assert out["nll"] <= out["nll_at_30"] and not out["at_search_bound"]
