@@ -33,7 +33,12 @@ and for HALO only with the affinity term. A pool with *none* of the scored class
 **Rung 3, frozen features** — [`results/artifacts/rung3_probe_20260925`](../../results/artifacts/rung3_probe_20260925/README.md)
 (3 support draws; ± ≈ 5 points at k = 1 for every model): linear probe k = 1 / 4 / 16 — HALO
 53.5 / 66.8 / 73.3, UniMTS 45.4 / 51.6 / 60.8, LiMU-BERT-X 34.7 / 41.9 / 50.6, HARNet-5
-34.7 / 41.2 / 51.3. Fine-tuning rows (full, from-scratch) are running; see the runbook.
+34.7 / 41.2 / 51.3.
+
+**Rung 3, fine-tuning** — [`results/artifacts/rung3_phaseA_20260926`](../../results/artifacts/rung3_phaseA_20260926/README.md)
+(draw 0 only so far): full fine-tune k = 1 / 4 / 16 — HALO 50.1 / 69.7 / 76.2, UniMTS 50.2 / 64.4 /
+67.4, HARNet-5 42.6 / 54.9 / 68.1, LiMU-BERT-X 45.1 / 58.3 / 60.8. HALO *frozen* (53.1 / 66.0 / 71.8,
+draw 0) is ≥ every baseline's full fine-tune at every k.
 
 **The one rule: never mix protocols.** A number is only comparable to another number produced by
 the same protocol on the same manifests. Every table below states its protocol, and superseded

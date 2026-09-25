@@ -131,7 +131,38 @@ N=0 vs v4's +3.2), but from a base 4.5 points lower, and the pool no longer help
 procedure on a good encoder; level A is **negative** on this run. Not re-tuned: that would select
 on sealed data.
 
-## 10. Pending at time of writing
+## 10. Tier 3 Phase A, draw 0: HALO frozen already beats every fine-tuned baseline
+
+`results/artifacts/rung3_phaseA_20260926` (draw 0; like-for-like against the probe run's draw 0).
+Dataset-balanced macro-F1, k = 1 / 4 / 16:
+
+| encoder | frozen enrollment | full fine-tune | from scratch |
+|---|---|---|---|
+| HALO v4 | 53.1 / 66.0 / 71.8 | 50.1 / 69.7 / 76.2 | 42.2 / 59.6 / 73.2 |
+| UniMTS | 47.7 / 60.6 / 60.1 | 50.2 / 64.4 / 67.4 | 34.7 / 44.0 / 59.9 |
+| HARNet-5 | 34.7 / 42.1 / 48.2 | 42.6 / 54.9 / 68.1 | 36.3 / 47.9 / 63.3 |
+| LiMU-BERT-X | 45.1 / 51.6 / 55.3 | 45.1 / 58.3 / 60.8 | 41.6 / 52.2 / 61.7 |
+
+HALO with no parameter update is ≥ every baseline's full fine-tune at every k; fine-tuning HALO pays
+from k = 4 and costs 3 points at k = 1. At k = 16 even a from-scratch HALO architecture (73.2) beats
+every fine-tuned baseline. One draw only: k = 1 differences under ~5 are unresolved until draws
+1–2 land.
+
+## 11. Speed: sealed evaluation was 59 % one unvectorised line
+
+The T1-E sealed run projected 45 min for 13 cells. A 3-minute py-spy copy showed 59 % of wall time
+on one line of `_halo_evidence_gated_predictions` — a per-episode `torch.as_tensor(..., device=cuda)`
+plus an indexed device write inside the batch loop (the classifier forward was 23 %). Five sites in
+`sealed_eval.py` had the pattern; all now fill host arrays and transfer once per batch. Predictions
+bit-identical (checked on 150 plans incl. zero-support); throughput ≈ 2× on the first cells. The
+running T1-E was left on the old code (a restart would not have finished sooner).
+
+Also noted, not changed tonight: the tier-3 shards and evals run as separate processes, which
+**time-slice** the GPU (no MPS), and batch-32 fine-tuning of small trunks leaves SMs idle while
+`nvidia-smi` reports 99 %. Enabling MPS, or fitting several (k, draw) jobs in one process, would
+raise real utilisation.
+
+## 12. Pending at time of writing
 
 Controls (μ = 0, balanced pool, disjoint classes); HALO trained through EM-Dirichlet (40k steps,
 `last.pt` primary — declared before results); its tier-1 score and inductive-floor check; the
