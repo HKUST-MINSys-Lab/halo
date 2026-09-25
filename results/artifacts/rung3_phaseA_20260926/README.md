@@ -37,8 +37,8 @@ HARNet-5 and LiMU-BERT-X so far).
 - Fine-tuning HALO pays from k = 4 (+3.7 over frozen) and k = 16 (+4.4); at k = 1 it is below
   frozen enrollment (50.1 vs 53.1).
 - Pretraining is worth most at small k: HALO pretrained − scratch = +7.9 / +10.1 / +3.0; UniMTS
-  +15.5 / +20.4 / +7.5. At k = 16 a from-scratch HALO architecture (73.2) already beats every
-  fine-tuned baseline.
+  +15.5 / +20.4 / +7.5. On draw 0 at k = 16 a from-scratch HALO architecture (73.2) is above
+  every fine-tuned baseline (HARNet-5's 3-draw mean is 70.7; confirm with HALO's draws 1–2).
 - Fine-tuning helps HARNet-5 most (+9 to +19 over its probe).
 
 ## Caveats
