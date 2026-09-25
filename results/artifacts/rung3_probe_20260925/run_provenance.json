@@ -1,0 +1,88 @@
+{
+  "argv": [
+    ".venv/bin/halo-rung3",
+    "--out",
+    "runs/evaluations/rung3_probe_20260925",
+    "--device",
+    "cpu",
+    "--halo-checkpoint",
+    "runs/support-classifier/halo_t6_40k_20260920/last.pt",
+    "--cache-read-dirs",
+    "cache/evaluations/feature_cache_halo_t6_40k_20260920_final40k",
+    "cache/evaluations/feature_cache_baselines_v2_20260917_final",
+    "cache/evaluations/feature_cache_baselines_v2_20260917",
+    "--feature-cache",
+    "runs/evaluations/rung1_cache",
+    "--k",
+    "1",
+    "4",
+    "16",
+    "--support-draws",
+    "3",
+    "--treatments",
+    "enrollment_frozen",
+    "linear_probe"
+  ],
+  "artifact": {
+    "checkpoint_fingerprint": "94f7d8e974e9e22479c264c23302057bec4c958d1a4846c2b15e4d19b66f8ea0",
+    "config": {
+      "batch_size": 32,
+      "encoder_lr_scale": 0.1,
+      "lora_alpha": 16.0,
+      "lora_rank": 8,
+      "lr": 0.001,
+      "probe_c": 1.0,
+      "projection_dim": 128,
+      "seed": 20260912,
+      "steps": 300,
+      "support_draws": 3,
+      "weight_decay": 0.05
+    },
+    "encoder": null,
+    "encoders_present": [
+      "halo",
+      "harnet10",
+      "harnet5",
+      "limubert_x",
+      "normwear",
+      "unimts"
+    ],
+    "execution_disjoint_scored_pool": true,
+    "manifest_fingerprint": "ff2f481251551517fcead3048ae11d61999d7458dae2d331e5cb0965067ab4f3",
+    "method": null,
+    "methods_present": [
+      "enrollment_frozen",
+      "linear_probe"
+    ],
+    "per_model_fingerprints": {
+      "halo": "858cebbded5b747cee7b1e43e7e8049ac676cc847d7b9f7856b4ee8020e42562",
+      "harnet10": "f1a1ee2e639f40ac510c7323e5a68debe6f6e3fdde080886a6c753dc802db95f",
+      "harnet5": "68e9e8c84401e7d57c703a896491ee6ccd3b26e0908be488fcbbb0ac1de7b236",
+      "limubert_x": "0299734e3a6718f0958f3b160f0dadc177205e34aefa96ec5ab95d1f453ba60b",
+      "normwear": "67e17d6ad610db78b0d66ebd68820829d571c705d4a42a7deb884a2940cc79fc",
+      "unimts": "d16f739eeebfbf523ad6e17e49826a92df0f1f229d1b6aae0efd46a8fd6f8de9"
+    },
+    "raw_weight_fingerprints": {},
+    "readout_version": "finetune-v1",
+    "rows": 1188,
+    "rung": 3,
+    "subject_independent": false
+  },
+  "baseline_adapters": {
+    "harnet10": "Harnet10Adapter",
+    "harnet5": "HarnetAdapter",
+    "limubert_x": "LiMUBERTXAdapter",
+    "normwear": "NormWearAdapter",
+    "unimts": "UniMTSAdapter"
+  },
+  "device": "cpu",
+  "dirty_worktree": false,
+  "feature_cache_schema": "sealed-feature-v6-20260918",
+  "git_revision": "8fec89b51b55cda100f650ed0ec209d13c124aa1",
+  "halo_checkpoint": "/home/alex/code/HALO/halo/runs/support-classifier/halo_t6_40k_20260920/last.pt",
+  "halo_checkpoint_sha256": "858cebbded5b747cee7b1e43e7e8049ac676cc847d7b9f7856b4ee8020e42562",
+  "numpy": "2.5.3",
+  "protocol": "sealed-support-conditioned-v3-20260920",
+  "python": "3.13.9",
+  "torch": "2.14.0+cu130"
+}

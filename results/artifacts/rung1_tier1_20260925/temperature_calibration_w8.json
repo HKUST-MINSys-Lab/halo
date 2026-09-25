@@ -1,0 +1,352 @@
+{
+  "version": "temperature-calibration-v1",
+  "window_seconds": 8.0,
+  "fingerprint": "5435a0adbc41149bf017008808f4f5e50f864d8e1b5c9a98df5bc27f0e7fe3fb",
+  "models": {
+    "halo": {
+      "temperature": 13.913304541677057,
+      "nll": 1.0026059370234686,
+      "nll_at_30": 1.3357752902185196,
+      "ece": 0.00891639437095514,
+      "ece_at_30": 0.1495230329702405,
+      "at_search_bound": false,
+      "accuracy": 0.6832535885167464,
+      "n_windows": 10450,
+      "n_datasets": 8,
+      "model": "halo",
+      "kind": "cosine",
+      "window_seconds": 8.0,
+      "version": "temperature-calibration-v1",
+      "data_seed": 20260901,
+      "per_dataset": {
+        "dsads": {
+          "n": 1500,
+          "roster_size": 19,
+          "accuracy": 0.7826666666666666
+        },
+        "forth_trace": {
+          "n": 715,
+          "roster_size": 16,
+          "accuracy": 0.6321678321678321
+        },
+        "harmes": {
+          "n": 1500,
+          "roster_size": 52,
+          "accuracy": 0.5193333333333333
+        },
+        "hhar": {
+          "n": 1490,
+          "roster_size": 6,
+          "accuracy": 0.9550335570469799
+        },
+        "kuhar": {
+          "n": 745,
+          "roster_size": 18,
+          "accuracy": 0.8402684563758389
+        },
+        "realdisp": {
+          "n": 1500,
+          "roster_size": 33,
+          "accuracy": 0.7213333333333334
+        },
+        "wisdm": {
+          "n": 1500,
+          "roster_size": 18,
+          "accuracy": 0.6173333333333333
+        },
+        "xrf_v2": {
+          "n": 1500,
+          "roster_size": 30,
+          "accuracy": 0.452
+        }
+      },
+      "route": "halo_p_text",
+      "held_out_subjects": 23
+    },
+    "harnet5": {
+      "temperature": 4.273214863136446,
+      "nll": 2.3956241453825866,
+      "nll_at_30": 8.631566513104884,
+      "ece": 0.04489001483977587,
+      "ece_at_30": 0.5228506018001409,
+      "at_search_bound": false,
+      "accuracy": 0.3895929933024214,
+      "n_windows": 9705,
+      "n_datasets": 7,
+      "model": "harnet5",
+      "kind": "cosine",
+      "window_seconds": 8.0,
+      "version": "temperature-calibration-v1",
+      "data_seed": 20260901,
+      "per_dataset": {
+        "dsads": {
+          "n": 1500,
+          "roster_size": 19,
+          "accuracy": 0.47933333333333333
+        },
+        "forth_trace": {
+          "n": 715,
+          "roster_size": 16,
+          "accuracy": 0.3958041958041958
+        },
+        "harmes": {
+          "n": 1500,
+          "roster_size": 52,
+          "accuracy": 0.18333333333333332
+        },
+        "hhar": {
+          "n": 1490,
+          "roster_size": 6,
+          "accuracy": 0.636241610738255
+        },
+        "realdisp": {
+          "n": 1500,
+          "roster_size": 33,
+          "accuracy": 0.464
+        },
+        "wisdm": {
+          "n": 1500,
+          "roster_size": 18,
+          "accuracy": 0.3466666666666667
+        },
+        "xrf_v2": {
+          "n": 1500,
+          "roster_size": 30,
+          "accuracy": 0.22666666666666666
+        }
+      },
+      "route": "training_bank_conse_heldout_subjects",
+      "held_out_subjects": 23
+    },
+    "harnet10": {
+      "temperature": 4.532052478399844,
+      "nll": 2.26818227437546,
+      "nll_at_30": 8.191612708068416,
+      "ece": 0.07359372046040268,
+      "ece_at_30": 0.48913789778051914,
+      "at_search_bound": false,
+      "accuracy": 0.439258114374034,
+      "n_windows": 9705,
+      "n_datasets": 7,
+      "model": "harnet10",
+      "kind": "cosine",
+      "window_seconds": 8.0,
+      "version": "temperature-calibration-v1",
+      "data_seed": 20260901,
+      "per_dataset": {
+        "dsads": {
+          "n": 1500,
+          "roster_size": 19,
+          "accuracy": 0.5586666666666666
+        },
+        "forth_trace": {
+          "n": 715,
+          "roster_size": 16,
+          "accuracy": 0.42937062937062936
+        },
+        "harmes": {
+          "n": 1500,
+          "roster_size": 52,
+          "accuracy": 0.27466666666666667
+        },
+        "hhar": {
+          "n": 1490,
+          "roster_size": 6,
+          "accuracy": 0.6315436241610738
+        },
+        "realdisp": {
+          "n": 1500,
+          "roster_size": 33,
+          "accuracy": 0.5053333333333333
+        },
+        "wisdm": {
+          "n": 1500,
+          "roster_size": 18,
+          "accuracy": 0.422
+        },
+        "xrf_v2": {
+          "n": 1500,
+          "roster_size": 30,
+          "accuracy": 0.24933333333333332
+        }
+      },
+      "route": "training_bank_conse_heldout_subjects",
+      "held_out_subjects": 23
+    },
+    "limubert_x": {
+      "temperature": 4.22768208085989,
+      "nll": 2.405095637743694,
+      "nll_at_30": 8.653289061705005,
+      "ece": 0.07675686694770825,
+      "ece_at_30": 0.5111814065825285,
+      "at_search_bound": false,
+      "accuracy": 0.3878307939053729,
+      "n_windows": 9976,
+      "n_datasets": 8,
+      "model": "limubert_x",
+      "kind": "cosine",
+      "window_seconds": 8.0,
+      "version": "temperature-calibration-v1",
+      "data_seed": 20260901,
+      "per_dataset": {
+        "dsads": {
+          "n": 1500,
+          "roster_size": 19,
+          "accuracy": 0.39466666666666667
+        },
+        "forth_trace": {
+          "n": 715,
+          "roster_size": 16,
+          "accuracy": 0.4
+        },
+        "harmes": {
+          "n": 1500,
+          "roster_size": 52,
+          "accuracy": 0.236
+        },
+        "hhar": {
+          "n": 1016,
+          "roster_size": 6,
+          "accuracy": 0.6712598425196851
+        },
+        "kuhar": {
+          "n": 745,
+          "roster_size": 18,
+          "accuracy": 0.5543624161073826
+        },
+        "realdisp": {
+          "n": 1500,
+          "roster_size": 33,
+          "accuracy": 0.516
+        },
+        "wisdm": {
+          "n": 1500,
+          "roster_size": 18,
+          "accuracy": 0.2673333333333333
+        },
+        "xrf_v2": {
+          "n": 1500,
+          "roster_size": 30,
+          "accuracy": 0.24466666666666667
+        }
+      },
+      "route": "training_bank_conse_heldout_subjects",
+      "held_out_subjects": 23
+    },
+    "unimts": {
+      "temperature": 372.41709244892024,
+      "nll": 2.7440836241301176,
+      "nll_at_30": 2.9876842675452457,
+      "ece": 0.051415118709893126,
+      "ece_at_30": 0.13524940794700835,
+      "at_search_bound": false,
+      "accuracy": 0.2016486347243689,
+      "n_windows": 9705,
+      "n_datasets": 7,
+      "model": "unimts",
+      "kind": "cosine",
+      "window_seconds": 8.0,
+      "version": "temperature-calibration-v1",
+      "data_seed": 20260901,
+      "per_dataset": {
+        "dsads": {
+          "n": 1500,
+          "roster_size": 19,
+          "accuracy": 0.19466666666666665
+        },
+        "forth_trace": {
+          "n": 715,
+          "roster_size": 16,
+          "accuracy": 0.2517482517482518
+        },
+        "harmes": {
+          "n": 1500,
+          "roster_size": 52,
+          "accuracy": 0.02266666666666667
+        },
+        "hhar": {
+          "n": 1490,
+          "roster_size": 6,
+          "accuracy": 0.5409395973154363
+        },
+        "realdisp": {
+          "n": 1500,
+          "roster_size": 33,
+          "accuracy": 0.126
+        },
+        "wisdm": {
+          "n": 1500,
+          "roster_size": 18,
+          "accuracy": 0.24
+        },
+        "xrf_v2": {
+          "n": 1500,
+          "roster_size": 30,
+          "accuracy": 0.064
+        }
+      },
+      "route": "native",
+      "held_out_subjects": 23
+    },
+    "normwear": {
+      "temperature": 0.3285785810579776,
+      "nll": 2.9899333170445996,
+      "nll_at_30": 31.386748947006367,
+      "ece": 0.031812526569351976,
+      "ece_at_30": 0.8048348082664185,
+      "at_search_bound": false,
+      "accuracy": 0.10344497607655502,
+      "n_windows": 10450,
+      "n_datasets": 8,
+      "model": "normwear",
+      "kind": "distance",
+      "window_seconds": 8.0,
+      "version": "temperature-calibration-v1",
+      "data_seed": 20260901,
+      "per_dataset": {
+        "dsads": {
+          "n": 1500,
+          "roster_size": 19,
+          "accuracy": 0.05
+        },
+        "forth_trace": {
+          "n": 715,
+          "roster_size": 16,
+          "accuracy": 0.18181818181818182
+        },
+        "harmes": {
+          "n": 1500,
+          "roster_size": 52,
+          "accuracy": 0.04666666666666667
+        },
+        "hhar": {
+          "n": 1490,
+          "roster_size": 6,
+          "accuracy": 0.24697986577181208
+        },
+        "kuhar": {
+          "n": 745,
+          "roster_size": 18,
+          "accuracy": 0.07114093959731543
+        },
+        "realdisp": {
+          "n": 1500,
+          "roster_size": 33,
+          "accuracy": 0.09533333333333334
+        },
+        "wisdm": {
+          "n": 1500,
+          "roster_size": 18,
+          "accuracy": 0.09
+        },
+        "xrf_v2": {
+          "n": 1500,
+          "roster_size": 30,
+          "accuracy": 0.07133333333333333
+        }
+      },
+      "route": "native",
+      "held_out_subjects": 23
+    }
+  }
+}
