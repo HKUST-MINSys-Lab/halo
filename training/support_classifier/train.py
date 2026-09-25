@@ -197,6 +197,18 @@ def _prefetch_worker(corpus, dataset, collate, data_seed, batch_size, draw_kwarg
             results.put((step, None, None, None, None, repr(error)))
 
 
+def _interval_timing(started: float, data_wait: float, steps: int, device: torch.device) -> dict:
+    """Steps/s and the fraction of wall time the host spent waiting for batches since the last log,
+    plus peak CUDA memory (what a co-scheduled job must leave free)."""
+    elapsed = max(time.perf_counter() - started, 1e-9)
+    out = {"timing/steps_per_s": round(steps / elapsed, 3),
+           "timing/data_wait_fraction": round(data_wait / elapsed, 4)}
+    if device.type == "cuda" and torch.cuda.is_available():
+        out["cuda/peak_allocated_gib"] = round(torch.cuda.max_memory_allocated(device) / 1024 ** 3, 3)
+        out["cuda/peak_reserved_gib"] = round(torch.cuda.max_memory_reserved(device) / 1024 ** 3, 3)
+    return out
+
+
 class PrefetchLoader:
     """Draw, load and collate the NEXT training steps in worker processes while the GPU trains.
 
@@ -3781,11 +3793,15 @@ def main() -> None:
         run_validation(0)
         _atomic_torch_save(payload(0), args.out / "initial.pt")
 
+    # Throughput telemetry per logging interval: host time blocked on the batch source vs total,
+    # so a loader-bound run (GPU idle) is visible in the log without a profiler.
+    interval_started, interval_data_wait, interval_steps = time.perf_counter(), 0.0, 0
     for step in range(start_step + 1, args.steps + 1):
         scale = _learning_rate_scale(step, warmup=args.warmup_steps, total=args.steps)
         for group in optimizer.param_groups:
             group["lr"] = base_lrs[group["name"]] * scale
 
+        data_started = time.perf_counter()
         if loader is not None:
             episodes, telemetry, batch, device_set_plans = loader.get(step)
         else:
@@ -3793,6 +3809,8 @@ def main() -> None:
                 corpus, dataset, collate.bucketed, args.data_seed, step,
                 args.episodes_per_step, draw_kwargs, args.device_set_challenge_probability,
             )
+        interval_data_wait += time.perf_counter() - data_started
+        interval_steps += 1
         log_step = step % args.log_every == 0 or step == 1
         if frontend is not None and hasattr(frontend, "request_runtime_telemetry"):
             frontend.request_runtime_telemetry(log_step)
@@ -3894,6 +3912,7 @@ def main() -> None:
                     if structured_conditioner is not None else 0.0
                 ),
                 "elapsed_s": round(time.perf_counter() - started, 1),
+                **_interval_timing(interval_started, interval_data_wait, interval_steps, device),
                 **telemetry,
                 **behavior,
                 **({} if classifier is None else classifier.telemetry()),
@@ -3901,6 +3920,7 @@ def main() -> None:
             }
             with log_path.open("a") as handle:
                 handle.write(json.dumps(row) + "\n")
+            interval_started, interval_data_wait, interval_steps = time.perf_counter(), 0.0, 0
             accuracy_text = f"{row['accuracy/learned']:.2f}"
             if "accuracy/base" in row:
                 accuracy_text += f"/{row['accuracy/base']:.2f}"
