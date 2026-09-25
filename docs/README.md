@@ -7,6 +7,7 @@ HALO documentation has three kinds of source, and each fact should have exactly 
 - [Thesis and scope](overview/thesis.md)
 - [Current architecture](overview/architecture.md)
 - [Experiment roadmap](overview/roadmap.md)
+- [Experiment runbook](overview/experiments.md) — what we run, in order, with commands and status
 - [Project eras and historical Git references](overview/history.md)
 
 ## Living contracts
