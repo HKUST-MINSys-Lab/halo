@@ -26,7 +26,15 @@ class MemoryEntry:
 
 
 class DeploymentMemory:
-    """One deployment only; no hidden truth is ever inferred from an unlabelled insert."""
+    """One deployment only; no hidden truth is ever inferred from an unlabelled insert.
+
+    ``capacity`` bounds the *unlabelled* entries. Verified enrollments are never evicted and do not
+    count against it, so a deployment can enrol k >= 16 examples per class (v4 is evaluated to
+    k = 128). One entry is kept per physical execution: a later window of an execution already in
+    memory replaces an unlabelled entry of that execution, and is observed but not retained when
+    the execution's entry is verified (a live stream delivers many windows per execution; the first
+    version raised instead).
+    """
 
     def __init__(self, model_version: str, *, capacity: int = 64):
         if not model_version or capacity < 1:
@@ -37,11 +45,9 @@ class DeploymentMemory:
         self.entries: list[MemoryEntry] = []
 
     def _evict(self) -> None:
-        if len(self.entries) <= self.capacity:
-            return
         unlabelled = [e for e in self.entries if e.verified_label is None]
-        if not unlabelled:
-            raise ValueError("verified enrollments exceed memory capacity")
+        if len(unlabelled) <= self.capacity:
+            return
         # Keep recent samples, but preferentially evict a redundant nearby motion/acquisition
         # sample. No pseudo-class quotas: an incorrect prediction must not control retention.
         removable = sorted(unlabelled, key=lambda e: e.observation_index)[:max(1, len(unlabelled) // 2)]
@@ -70,21 +76,19 @@ class DeploymentMemory:
             original_probabilities.sum(), original_probabilities.new_tensor(1.0), atol=1e-4
         ):
             raise ValueError("original probabilities must be a normalized roster distribution")
-        if any(e.recording_id == recording_id or e.execution_id == execution_id
-               for e in self.entries):
-            raise ValueError("duplicate recording or execution in one deployment bank")
-        full_of_verified = (len(self.entries) >= self.capacity
-                            and all(e.verified_label is not None for e in self.entries))
-        if full_of_verified and verified_label is not None:
-            raise ValueError("verified enrollments already fill memory capacity")
+        if any(e.recording_id == recording_id for e in self.entries):
+            raise ValueError("duplicate recording in one deployment bank")
         entry = MemoryEntry(
             recording_id, execution_id, self.seen, motion, acquisition,
             original_probabilities.detach(), tuple(roster), self.model_version,
             verified_label, dict(acquisition_metadata or {}),
         )
         self.seen += 1
-        if full_of_verified:
-            return entry  # Observed, but not retained; verified evidence stays protected.
+        same = [e for e in self.entries if e.execution_id == execution_id]
+        if same:
+            if any(e.verified_label is not None for e in same) and verified_label is None:
+                return entry  # Observed, not retained: the execution is already enrolled.
+            self.entries = [e for e in self.entries if e.execution_id != execution_id]
         self.entries.append(entry)
         self._evict()
         return entry
@@ -124,7 +128,8 @@ class DeploymentMemory:
             raise ValueError("memory schema or model version does not match the reader")
         bank = cls(model_version, capacity=int(state["capacity"]))
         bank.seen = int(state["seen"])
-        if bank.seen < 0 or len(state["entries"]) > bank.capacity:
+        n_unlabelled = sum(raw.get("verified_label") is None for raw in state["entries"])
+        if bank.seen < 0 or n_unlabelled > bank.capacity:
             raise ValueError("invalid memory snapshot count or capacity")
         recording_ids: set[str] = set()
         execution_ids: set[str] = set()

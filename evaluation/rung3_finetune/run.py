@@ -108,15 +108,22 @@ def main() -> None:
                                   seed_parts=seed_parts)
         for name in args.models:
             features = fingerprint = None
+            treatments = list(args.treatments)
             if needs_cached:
                 try:
                     features, fingerprint = scorer.features(name, stream)
                 except baselines.UnsupportedEvaluationCell as exc:
-                    rows.append({**base, "model": name, "encoder": label_of[name], "status": "n/a", "reason": str(exc)})
-                    continue
+                    # Only the cached-feature treatments depend on these features; the raw-window
+                    # treatments build their own trunk and are still attempted.
+                    for treatment in (t for t in treatments if t in CACHED_FEATURE_TREATMENTS):
+                        rows.append({**base, "model": name, "encoder": label_of[name], "method": treatment,
+                                     "status": "n/a", "reason": f"cached features unavailable: {exc}"})
+                    treatments = [t for t in treatments if t not in CACHED_FEATURE_TREATMENTS]
+                    if not treatments:
+                        continue
             cell_rows = run_cell(
                 name=name, stream=stream, features=features, truth_ids=truth_ids, classes=classes,
-                split=split, ks=args.k, treatments=args.treatments, cfg=cfg, device=device,
+                split=split, ks=args.k, treatments=treatments, cfg=cfg, device=device,
                 halo_checkpoint=args.halo_checkpoint, seed_parts=(*seed_parts, name),
             )
             for row in cell_rows:
@@ -137,7 +144,9 @@ def main() -> None:
         manifest_fingerprint=hashlib.sha256(json.dumps({
             "cells": [list(c[:3]) for c in cells], "seed": args.seed, "scored_fraction": args.scored_fraction,
             "k": args.k, "treatments": args.treatments}, sort_keys=True).encode()).hexdigest(),
-        extra={"per_model_fingerprints": fingerprints, "config": cfg.as_dict(), "subject_independent": True},
+        extra={"per_model_fingerprints": fingerprints, "config": cfg.as_dict(),
+               # Same split as rung 1: execution-disjoint, not subject-disjoint.
+               "subject_independent": False, "execution_disjoint_scored_pool": True},
     )
     path = write_artifact(args.out, rows, provenance, argv=sys.argv, device=device,
                           halo_checkpoint=args.halo_checkpoint)

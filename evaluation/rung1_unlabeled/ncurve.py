@@ -172,6 +172,7 @@ def run_cell(
     pool_filter: Callable[[np.ndarray], np.ndarray] | None = None,
     control: str = "none",
     device=None,
+    scored_classes: Sequence[int] | None = None,
 ) -> list[dict]:
     """Every rung-1 row for one (encoder, cell): the N × k grid on S, plus the all-windows
     reproduction row at N = 0, k = 0. ``pool_filter`` (a control) may resample each P_N."""
@@ -186,11 +187,16 @@ def run_cell(
     )
     truth_names = np.asarray(classes, dtype=object)
     rows: list[dict] = []
+    # Macro-F1 averages over the classes the scored set can contain: the declared roster, or, when
+    # a control restricts the scored set (disjoint classes), only the kept classes. Averaging over
+    # classes with no scored window would score each as 0 and cap the control near the kept share.
+    f1_roster = classes if scored_classes is None else [classes[int(i)] for i in scored_classes]
+    f1_policy = "declared_roster" if scored_classes is None else "scored_classes_only"
 
     def metrics_on(rows_idx: np.ndarray, pred_ids: np.ndarray, *, fixed_roster: bool = False) -> dict:
         truth = truth_names[truth_ids[rows_idx]]
         pred = truth_names[pred_ids]
-        return classification(truth, pred, f1_classes=classes if fixed_roster else None)
+        return classification(truth, pred, f1_classes=f1_roster if fixed_roster else None)
 
     # The reproduction row: the sealed k=0 rule over every in-roster window, no transduction.
     all_rows = np.flatnonzero(truth_ids >= 0)
@@ -212,7 +218,7 @@ def run_cell(
                                           n_classes=C, rows=split.scored)
         rows.append({"method": "inductive", "k": k, "N": 0, "scope": "scored", "control": control,
                      "inductive_readout": "zero_shot_argmax" if k == 0 else "prototype",
-                     "macro_f1_class_policy": "declared_roster",
+                     "macro_f1_class_policy": f1_policy,
                      **metrics_on(split.scored, inductive, fixed_roster=True), "n_scored": int(len(split.scored)),
                      "n_support": int(len(support_rows)), "score_kind": score_kind, **feature_info})
         for label, drawn in pool_draws.items():
@@ -235,7 +241,7 @@ def run_cell(
                 rows.append({
                     "method": "transductive_clip_v1", "k": k, "N": int(len(pool_n)), "N_label": label,
                     "scope": "scored", "control": control, "assignment": assignment,
-                    "macro_f1_class_policy": "declared_roster",
+                    "macro_f1_class_policy": f1_policy,
                     **metrics_on(split.scored, scored_preds, fixed_roster=True),
                     **pool_marginal(truth_ids, pool_n, C),
                     "n_scored": int(len(split.scored)), "n_support": int(len(support_rows)),

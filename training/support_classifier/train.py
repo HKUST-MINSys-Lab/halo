@@ -672,14 +672,27 @@ def grouped_zero_shot_transduction(
     return torch.stack(logits), inductive
 
 
+# Cap on the RMS of the centered roster logits the rung-1 cross-entropies see. EM-Dirichlet log
+# densities run to thousands, so the raw logits would saturate the softmax; dividing by their
+# (detached) RMS keeps the loss scale-stable. The cap must still let the loss sharpen: at RMS r
+# the best reachable softmax for the correct class among C is 1 / (1 + (C-1) exp(-r (sqrt(C-1)
+# + 1/sqrt(C-1)))). A cap of 1 (the original rule) bounds that near 0.75 for C = 5-10 and puts a
+# floor under the loss — the no-scale failure of normalised softmax (NormFace, Wang et al. 2017).
+# At 4 it is >= 0.9996 for every roster size from 2 to 20.
+ROSTER_LOGIT_RMS = 4.0
+
+
 def scale_invariant_roster_logits(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Unit-RMS centered logits for a scale-stable CE; ordering and inference stay unchanged."""
+    """Centered logits with RMS capped at ``ROSTER_LOGIT_RMS`` for a scale-stable CE.
+
+    Ordering (and so every prediction) is unchanged, and inference never uses this transform.
+    """
     valid = mask.to(logits.dtype)
     count = valid.sum(-1, keepdim=True).clamp_min(1)
     centered = (logits.masked_fill(~mask, 0) * valid)
     centered = centered - (centered.sum(-1, keepdim=True) / count)
     rms = ((centered.square() * valid).sum(-1, keepdim=True) / count).sqrt().detach()
-    scaled = centered / rms.clamp_min(1.0)
+    scaled = centered / (rms / ROSTER_LOGIT_RMS).clamp_min(1.0)
     return scaled.masked_fill(~mask, torch.finfo(scaled.dtype).min)
 
 

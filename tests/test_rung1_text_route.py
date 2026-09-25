@@ -71,3 +71,10 @@ def test_without_p_text_the_bridge_route_is_used_and_labelled():
     _, info = zero_shot_scores(name="halo", features=features, candidates=LABELS,
                                device=torch.device("cpu"), halo_bridge=bridge, sbert=_sbert)
     assert info["route"] == "halo_text_bridge"
+
+
+def test_only_text_space_projections_are_used():
+    # T1's contextual head also has an attribute called p_text, but it is a d x d encoder-space
+    # alignment; it must fall back to the bridge rather than crash scoring.
+    assert checkpoint_text_projection({"architecture_version": "support_contextual_mixture_v1",
+                                       "classifier": {"p_text.weight": torch.zeros(4, 4)}}) is None

@@ -100,3 +100,78 @@ def test_run_cell_reports_unsupported_raw_treatments_instead_of_approximating():
     rows = run_cell(name="normwear", stream=object(), features=x, truth_ids=y, classes=["a", "b", "c"], split=split,
                     ks=(1,), treatments=("lora",), cfg=FineTuneConfig(steps=1), device=torch.device("cpu"))
     assert rows and rows[0]["status"] == "n/a" and "no fine-tuning path" in rows[0]["reason"]
+
+
+# ---------------------------------------------------------------- 2026-09-25 sweep fixes
+def test_lora_wraps_convolutions_so_conv_trunks_adapt():
+    from evaluation.rung3_finetune.lora import LoRAConv
+
+    torch.manual_seed(0)
+    trunk = nn.Sequential(nn.Conv1d(3, 8, 5, padding=2, padding_mode="circular"), nn.ReLU(),
+                          nn.Conv1d(8, 8, 3, padding=1), nn.Conv1d(8, 8, 3, padding=1, groups=2))
+    x = torch.randn(2, 3, 16)
+    before = trunk(x)
+    wrapped = apply_lora(trunk, rank=2)
+    assert wrapped == ["0", "2"]                         # the grouped conv is left alone
+    assert all(isinstance(trunk[i], LoRAConv) for i in (0, 2))
+    torch.testing.assert_close(trunk(x), before)         # identity at init
+    trainable = {id(p) for p in lora_parameters(trunk)}
+    assert trainable and all((id(p) in trainable) == p.requires_grad for p in trunk.parameters())
+    conv2d = nn.Sequential(nn.Conv2d(3, 4, (9, 1), padding=(4, 0)))
+    assert apply_lora(conv2d, rank=2) == ["0"]
+    assert conv2d(torch.randn(1, 3, 20, 5)).shape == (1, 4, 20, 5)
+
+
+def test_small_classifier_scores_in_eval_mode(monkeypatch):
+    from evaluation.rung3_finetune import finetune
+
+    modes = []
+    original = finetune._ProjectionClassifier.forward
+
+    def spy(self, x):
+        modes.append(self.training)
+        return original(self, x)
+
+    monkeypatch.setattr(finetune._ProjectionClassifier, "forward", spy)
+    x, y = make_blobs(n_samples=60, centers=3, n_features=8, random_state=0)
+    support = np.concatenate([np.flatnonzero(y == c)[:4] for c in range(3)])
+    finetune.small_classifier_predictions(x.astype(np.float32), support, y[support], np.arange(60), 3,
+                                          finetune.FineTuneConfig(steps=5), torch.device("cpu"))
+    assert modes and modes[-1] is False
+
+
+def test_reinitialise_resets_batchnorm_running_statistics():
+    from model.tokenizer.matched_encoder import _reinitialise
+
+    bn = nn.BatchNorm1d(4)
+    bn.running_mean.fill_(3.0)
+    bn.running_var.fill_(7.0)
+    bn.apply(_reinitialise)
+    torch.testing.assert_close(bn.running_mean, torch.zeros(4))
+    torch.testing.assert_close(bn.running_var, torch.ones(4))
+
+
+def test_matched_resampling_is_the_released_adapters_method():
+    from fractions import Fraction
+
+    from scipy.signal import resample_poly
+
+    from baselines.harnet.adapter import _to_30hz_fixed
+    from model.tokenizer.matched_encoder import MatchedCorpusEncoder
+
+    rng = np.random.default_rng(0)
+    signal = rng.standard_normal((2, 400, 3)).astype(np.float32)          # 8 s at 50 Hz
+    harnet = MatchedCorpusEncoder.__new__(MatchedCorpusEncoder)
+    object.__setattr__(harnet, "backbone_name", "harnet")
+    object.__setattr__(harnet, "in_hz", 30.0)
+    ours = harnet._resample(torch.as_tensor(signal), 50.0).numpy()
+    theirs = _to_30hz_fixed(signal, 50.0, target_len=ours.shape[1]).transpose(0, 2, 1)  # adapter is (N, C, T)
+    np.testing.assert_allclose(ours, theirs, atol=1e-5)
+    for backbone, hz in (("limubert", 10.0), ("unimts", 20.0)):
+        encoder = MatchedCorpusEncoder.__new__(MatchedCorpusEncoder)
+        object.__setattr__(encoder, "backbone_name", backbone)
+        object.__setattr__(encoder, "in_hz", hz)
+        ours = encoder._resample(torch.as_tensor(signal), 50.0).numpy()
+        ratio = Fraction(hz / 50.0).limit_denominator(1000)
+        theirs = resample_poly(signal.astype(np.float64), ratio.numerator, ratio.denominator, axis=1)
+        np.testing.assert_allclose(ours, theirs[:, :ours.shape[1]], atol=1e-5)

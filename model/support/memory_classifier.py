@@ -2,6 +2,14 @@
 
 The reader may reweight evidence but cannot create an independent candidate-logit path.
 It is deliberately separate from the registered transductive rung-1 readout.
+
+Label-blind, bounded gates (2026-09-25). Neither learned gate sees label identity: an entry's
+evidence token carries only the *shape* of its label evidence (entropy, confidence, margin,
+provenance), never the label text, and the blend gate sees per-candidate evidence values, never
+candidate text. The per-entry trust adjustment is bounded by ``TRUST_LIMIT`` like v4's trust. The
+first version fed label-text embeddings to both gates with an unbounded trust; with verified
+entries of every class in memory, trust could then route to any label on label identity alone,
+i.e. act as a private closed-vocabulary classifier — the shortcut T1/T3 collapsed into.
 """
 
 from __future__ import annotations
@@ -16,6 +24,8 @@ from model.blocks import AttentionSpec
 
 
 ARCHITECTURE_VERSION = "support_memory_reader_v5"
+TRUST_LIMIT = 2.0          # bound on the per-entry log-weight adjustment, as v4's |t| <= 2
+EVIDENCE_STATS = 5         # entropy, max probability, top-2 margin, verified flag, has evidence
 
 
 @dataclass(frozen=True)
@@ -62,7 +72,7 @@ class MemoryReaderClassifier(nn.Module):
         self.p_text = nn.Linear(d, self.cfg.text_dim)
         self.motion_proj = nn.Linear(d, h)
         self.acquisition_proj = nn.Linear(d, h)
-        self.evidence_proj = nn.Linear(self.cfg.text_dim, h)
+        self.evidence_proj = nn.Linear(EVIDENCE_STATS, h)
         self.query_proj = nn.Linear(d, h)
         self.role = nn.Embedding(4, h)  # query, motion, acquisition, label evidence
         self.entry_attention = nn.MultiheadAttention(h, self.cfg.num_heads, batch_first=True)
@@ -70,7 +80,7 @@ class MemoryReaderClassifier(nn.Module):
         self.entry_norm = nn.LayerNorm(h)
         self.bank_norm = nn.LayerNorm(h)
         self.trust = nn.Sequential(nn.Linear(2 * h + 6, h), nn.GELU(), nn.Linear(h, 1))
-        self.gate = nn.Sequential(nn.Linear(2 * h + 4, h), nn.GELU(), nn.Linear(h, 1))
+        self.gate = nn.Sequential(nn.Linear(h + 6, h), nn.GELU(), nn.Linear(h, 1))
         # Initial state is close to the fixed equal blend, without freezing inner gradients.
         nn.init.normal_(self.trust[-1].weight, std=1e-3)
         nn.init.zeros_(self.trust[-1].bias)
@@ -96,8 +106,8 @@ class MemoryReaderClassifier(nn.Module):
         if candidates.ndim != 2 or candidates.shape[0] < 2:
             raise ValueError("at least two candidate labels are required")
         n, c = evidence.shape
-        if n > self.cfg.max_entries or c != candidates.shape[0]:
-            raise ValueError("memory capacity or evidence roster mismatch")
+        if c != candidates.shape[0]:
+            raise ValueError("evidence roster mismatch")
         if (memory_motion.shape != (n, self.spec.d_model)
                 or memory_acquisition.shape != memory_motion.shape
                 or verified.shape != (n,)):
@@ -128,11 +138,18 @@ class MemoryReaderClassifier(nn.Module):
             empty = query.new_empty(0)
             return MemoryReadout(semantic, semantic, semantic, semantic, empty,
                                  semantic.new_ones(c))
-        label_vector = label_probs @ F.normalize(candidates.float(), dim=-1)
+        entropy = -(label_probs * label_probs.clamp_min(1e-8).log()).sum(-1) / torch.log(
+            label_probs.new_tensor(float(c)),
+        )
+        top2 = label_probs.topk(min(2, c), dim=-1).values
+        evidence_stats = torch.stack((
+            entropy, top2[:, 0], top2[:, 0] - top2[:, -1],
+            (verified >= 0).float(), has_evidence.float(),
+        ), dim=-1)
         tokens = torch.stack((
             self.motion_proj(memory_motion.float()) + self.role.weight[1],
             self.acquisition_proj(memory_acquisition.float()) + self.role.weight[2],
-            self.evidence_proj(label_vector) + self.role.weight[3],
+            self.evidence_proj(evidence_stats) + self.role.weight[3],
         ), dim=1)
         # Attention within each entry supplies a shared group identity without a positional code.
         local, _ = self.entry_attention(tokens, tokens, tokens, need_weights=False)
@@ -154,9 +171,6 @@ class MemoryReaderClassifier(nn.Module):
         )
         fixed_vote = base_weights @ label_probs
         fixed = 0.5 * (semantic + fixed_vote)
-        entropy = -(label_probs * label_probs.clamp_min(1e-8).log()).sum(-1) / torch.log(
-            similarity.new_tensor(float(c)),
-        )
         if n > 1:
             pairwise = F.normalize(memory_motion.float(), dim=-1) @ F.normalize(
                 memory_motion.float(), dim=-1,
@@ -179,18 +193,24 @@ class MemoryReaderClassifier(nn.Module):
             entropy[:, None], (verified >= 0).float()[:, None],
             neighbor_density[:, None], neighbor_consensus[:, None],
         ), dim=-1)
-        adjustment = self.trust(trust_features).squeeze(-1)
+        adjustment = TRUST_LIMIT * torch.tanh(self.trust(trust_features).squeeze(-1))
         weights = F.softmax(
             (similarity / self.cfg.neighbor_temperature + adjustment).masked_fill(
                 ~has_evidence, float("-inf"),
             ), dim=0,
         )
         vote = weights @ label_probs
-        semantic_candidate = F.normalize(candidates.float(), dim=-1)
+
+        def normalised_entropy(p: torch.Tensor) -> torch.Tensor:
+            return -(p * p.clamp_min(1e-8).log()).sum() / torch.log(p.new_tensor(float(c)))
+
+        # Memory size enters as a bounded feature; banks larger than ``max_entries`` (e.g. many
+        # verified enrollments) read as full rather than out of range.
+        size = min(n / self.cfg.max_entries, 1.0)
         gate_features = torch.cat((
-            q.expand(c, -1), self.evidence_proj(semantic_candidate),
-            semantic[:, None], vote[:, None], fixed_vote[:, None],
-            torch.full((c, 1), n / self.cfg.max_entries, device=q.device),
+            q.expand(c, -1), semantic[:, None], vote[:, None], fixed_vote[:, None],
+            torch.full((c, 1), size, device=q.device),
+            normalised_entropy(semantic).expand(c, 1), normalised_entropy(vote).expand(c, 1),
         ), dim=-1)
         semantic_weight = torch.sigmoid(self.gate(gate_features).squeeze(-1))
         combined = semantic_weight * semantic + (1 - semantic_weight) * vote

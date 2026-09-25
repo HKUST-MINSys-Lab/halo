@@ -138,6 +138,7 @@ def main() -> None:
                 temperature=args.temperature, transduce_kwargs=transduce_kwargs,
                 assignments=args.assignments, seed_parts=(*seed_parts, name),
                 pool_filter=pool_filter, control=args.control, device=device,
+                scored_classes=kept,
             )
             for row in cell_rows:
                 row.update({**base, "model": name, "encoder": label_of[name],

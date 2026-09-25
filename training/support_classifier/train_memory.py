@@ -36,14 +36,14 @@ from training.tokenizer.eval_transfer import build_encoder
 from training.tokenizer.pretrain import capture_source_provenance, write_source_provenance
 from training.tokenizer.pretrain_data import CorpusIndex, MultiResolutionCollate, PretrainDataset
 
-MEMORY_SIZE_BINS = ("0", "1", "2_3", "4_7", "8_plus")
+MEMORY_SIZE_BINS = ("0", "1", "2_3", "4_7", "8_15", "16_31", "32_plus")
 
 
 def memory_size_bin(size: int) -> str:
     if size < 0:
         raise ValueError("memory size cannot be negative")
     return "0" if size == 0 else "1" if size == 1 else "2_3" if size < 4 else \
-        "4_7" if size < 8 else "8_plus"
+        "4_7" if size < 8 else "8_15" if size < 16 else "16_31" if size < 32 else "32_plus"
 
 
 def checkpoint_sha256(path: Path) -> str:
@@ -152,13 +152,18 @@ def main() -> None:
     parser.add_argument("--episodes-per-step", type=int, default=4)
     parser.add_argument("--val-episodes", type=int, default=64)
     parser.add_argument("--val-every", type=int, default=250)
-    parser.add_argument("--max-history", type=int, default=12)
+    parser.add_argument("--max-history", type=int, default=63,
+                        help="longest simulated history; the default fills the reader's 64-entry "
+                             "size scale so deployment memories are not longer than any trained on")
     parser.add_argument("--max-per-stream", type=int, default=None)
     parser.add_argument("--reader-holdout-fraction", type=float, default=0.2,
                         help="globally held-out labels for reader optimization; source v4 encoder saw them")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--encoder-lr-scale", type=float, default=0.1)
     parser.add_argument("--fine-tune-encoder", action="store_true")
+    parser.add_argument("--train-text-projection", action="store_true",
+                        help="also train v4's p_text; off by default so the no-memory semantic "
+                             "control is exactly v4's zero-shot path")
     parser.add_argument("--seed", type=int, default=47)
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args()
@@ -201,12 +206,22 @@ def main() -> None:
         "weight": source["classifier"]["p_text.weight"],
         "bias": source["classifier"]["p_text.bias"],
     })
+    if not args.train_text_projection:
+        # Cross-entropy on the training vocabulary would otherwise retune v4's zero-shot text
+        # path, so v5's "no memory" control would no longer be v4 and unseen-label transfer could
+        # regress (as T7's did).
+        head.p_text.requires_grad_(False)
     encoder = build_encoder(source, device, training=args.fine_tune_encoder)
     if not args.fine_tune_encoder:
         encoder.requires_grad_(False)
         encoder.eval()
     deployment_policy.assert_no_retired_sources(deployment_policy.SUPERVISED_HEAD_TRAIN_DATASETS)
-    index = CorpusIndex(max_per_stream=args.max_per_stream, seed=args.seed,
+    # The subject split must be the source encoder's: CorpusIndex's validation subjects depend on
+    # its seed, and with v5's own seed 12 of 23 "held-out" subjects were v4 training subjects
+    # (2026-09-25 sweep). ``--seed`` still drives episodes and the reader label holdout.
+    source_args = source["args"]
+    split_seed = int(source_args.get("data_seed", source_args["seed"]))
+    index = CorpusIndex(max_per_stream=args.max_per_stream, seed=split_seed,
                         datasets=deployment_policy.SUPERVISED_HEAD_TRAIN_DATASETS,
                         alignment="native", window_seconds=float(source["args"]["window_seconds"]))
     holdout = open_vocabulary_holdout_labels(index, fraction=args.reader_holdout_fraction,
@@ -225,7 +240,7 @@ def main() -> None:
     labels = sorted(set(train_corpus.all_labels) | set(val_corpus.all_labels))
     text = LabelTextTable(labels, device)
     optimizer = torch.optim.AdamW([
-        {"params": head.parameters(), "lr": args.lr},
+        {"params": [p for p in head.parameters() if p.requires_grad], "lr": args.lr},
         {"params": [p for p in encoder.parameters() if p.requires_grad],
          "lr": args.lr * args.encoder_lr_scale},
     ], weight_decay=0.01)
@@ -233,6 +248,7 @@ def main() -> None:
               "source_checkpoint_sha256": source_hash, "source_step": source.get("step"),
               "training_source": list(deployment_policy.SUPERVISED_HEAD_TRAIN_DATASETS),
               "reader_heldout_labels": list(holdout),
+              "subject_split_seed": split_seed,
               "source_provenance": source_record,
               "args": {key: str(value) if isinstance(value, Path) else value
                        for key, value in vars(args).items()}}

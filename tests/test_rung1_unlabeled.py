@@ -334,3 +334,35 @@ def test_neighbour_purity_ignores_out_of_roster_rows():
     neighbours = np.array([[1, 3], [0, 2], [0, 1], [0, 1]])
     # counted pairs: (0,1)=same, (1,0)=same, (1,2)=diff, (2,0)=diff, (2,1)=diff -> 2/5
     assert neighbour_purity(truth, neighbours) == pytest.approx(0.4)
+
+
+def test_balanced_pool_control_is_nested_in_n_and_order_independent():
+    truth_ids = np.array([0] * 40 + [1] * 15 + [2] * 25)
+    pool = np.arange(len(truth_ids))
+    draws = nested_pool_draws(pool, (10, 20, 50), seed_parts=("cell",))
+    first = balanced_pool_filter(truth_ids, 3, seed_parts=("cell",))
+    b10, b20, b50 = (first(draws[n], available_rows=pool) for n in ("10", "20", "50"))
+    assert set(b10) <= set(b20) <= set(b50)
+    assert [len(b10), len(b20), len(b50)] == [10, 20, 50]
+    assert np.bincount(truth_ids[b20], minlength=3).tolist() in ([7, 7, 6], [7, 6, 7], [6, 7, 7])
+    second = balanced_pool_filter(truth_ids, 3, seed_parts=("cell",))    # a fresh filter, other order
+    np.testing.assert_array_equal(second(draws["50"], available_rows=pool), b50)
+    np.testing.assert_array_equal(second(draws["10"], available_rows=pool), b10)
+
+
+def test_disjoint_control_scores_macro_f1_over_the_kept_classes_only():
+    # Two kept classes, perfectly separable text scores: the control must be able to reach 100,
+    # not ~50 from averaging in held-out classes that never occur in the scored set.
+    rng = np.random.default_rng(0)
+    truth_ids = np.repeat(np.arange(4), 30)
+    scores = np.eye(4)[truth_ids] + 0.01 * rng.standard_normal((120, 4))
+    split = CellSplit(scored=np.arange(0, 120, 2), pool=np.arange(1, 120, 2),
+                      n_executions_scored=60, n_executions_pool=60)
+    new, kept, held = disjoint_class_split(split, truth_ids, 4, holdout_fraction=0.5, seed_parts=("d",))
+    rows = run_cell(scores_all=scores.astype(np.float32), score_kind="cosine", features_all=None,
+                    truth_ids=truth_ids, classes=["a", "b", "c", "d"], split=new,
+                    pool_draws={"0": np.zeros(0, np.int64)}, ks=(0,), control="disjoint_classes",
+                    scored_classes=kept, transduce_kwargs={"n_iter": 2, "n_iter_mm": 10, "early_stop": False})
+    anchor = next(r for r in rows if r["method"] == "inductive" and r["scope"] == "scored")
+    assert anchor["macro_f1_class_policy"] == "scored_classes_only"
+    assert anchor["f1_macro"] > 99.0

@@ -60,7 +60,10 @@ The rung-1 mode trains the encoder, recording pool, and `p_text` through short, 
 EM-Dirichlet unrolling plus an inductive text cross-entropy guard. It uses the evaluator's
 transduction implementation, but its training unroll (5 x 20 by default) is shorter than
 deployment inference (20 x up to 1000 MM steps); validation uses the inference budget.
-Both cross-entropies standardize their valid candidate logits to unit RMS per query for loss
-stability; this preserves the predicted class and leaves inference logits untouched.
+Both cross-entropies center their valid candidate logits and cap their RMS at 4 per query for
+loss stability (`ROSTER_LOGIT_RMS`); this preserves the predicted class and leaves inference logits
+untouched. The cap was 1 until 2026-09-25, which bounded the reachable correct-class probability
+near 0.75 for 5–10 candidates and put a floor under the loss; at 4 a perfectly separated roster of
+2–20 candidates can reach > 0.999.
 The v4 gates are bypassed. The opt-in `soft_kmeans` control requires labeled supports and is not
 a rung-1 k=0 baseline. All rung-1 options are checkpointed and checked on resume.

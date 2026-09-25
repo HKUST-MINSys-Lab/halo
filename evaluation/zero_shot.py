@@ -279,6 +279,13 @@ def halo_text_scores(features: np.ndarray, bridge: np.ndarray, candidates: Seque
     return _normalise(projected) @ text.T
 
 
+# Heads whose ``p_text`` maps the pooled motion vector into the frozen SBERT label space
+# (``nn.Linear(d_model, text_dim)``): residual v2/v3, v4 (evidence-gated) and the v5 memory reader.
+TEXT_PROJECTION_ARCHITECTURES = frozenset({
+    "support_classifier_v2", "support_classifier_v3", "support_classifier_v4", "support_memory_reader_v5",
+})
+
+
 def checkpoint_text_projection(blob: dict) -> tuple[np.ndarray, np.ndarray] | None:
     """``(W^T, b)`` of the checkpoint's learned ``p_text``, or ``None`` if it has no learned head.
 
@@ -289,11 +296,15 @@ def checkpoint_text_projection(blob: dict) -> tuple[np.ndarray, np.ndarray] | No
     """
     from model.support.factory import build_classifier_from_blob
 
-    if blob.get("classifier") is None:
+    if blob.get("classifier") is None or blob.get("architecture_version") not in TEXT_PROJECTION_ARCHITECTURES:
+        # The legacy contextual head (T1) also has an attribute called ``p_text``, but it is an
+        # encoder-space d x d alignment applied after a separate text adapter, not a projection
+        # into the frozen label-text space; heads without one fall back to the ridge bridge.
         return None
     head, _ = build_classifier_from_blob(blob, device=torch.device("cpu"))
     p_text = getattr(head, "p_text", None)
-    if p_text is None:
+    text_dim = int(dict(blob.get("classifier_config") or {}).get("text_dim", 0))
+    if p_text is None or not isinstance(p_text, torch.nn.Linear) or p_text.out_features != text_dim:
         return None
     weight = p_text.weight.detach().float().numpy().T.copy()
     bias = None if p_text.bias is None else p_text.bias.detach().float().numpy().copy()

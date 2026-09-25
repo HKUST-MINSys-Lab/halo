@@ -106,6 +106,7 @@ def small_classifier_predictions(features: np.ndarray, support_rows: np.ndarray,
     model = _ProjectionClassifier(table.shape[1], n_classes, cfg.projection_dim).to(device)
     history = fit_head(lambda idx: model.projection(table[torch.as_tensor(idx, device=device)]),
                        list(model.projection.parameters()), model.head, support_rows, support_labels, cfg, device)
+    model.eval()                      # the projection has dropout; score deterministically
     with torch.no_grad():
         preds = model(table[torch.as_tensor(rows, device=device)]).argmax(-1).cpu().numpy()
     return preds.astype(np.int64), {**history, "trainable_params": trainable_parameter_count(model)}

@@ -230,3 +230,14 @@ def test_probability_features_torch_masks_invalid_candidates():
     t["candidate_mask"][:, 2] = False
     z = probability_features_torch(t["pool_feature"], t["p_text"], t["candidate_text"], t["candidate_mask"], 30.0)
     assert torch.all(z[:, :, 2] == 0) and torch.allclose(z.sum(-1), torch.ones(3, 5), atol=1e-5)
+
+
+def test_rung1_loss_logits_can_still_become_confident():
+    # The RMS cap must not put a floor under the cross-entropy: a perfectly separated roster must
+    # reach near-certainty for every roster size in use (2-20 candidates).
+    from training.support_classifier.train import ROSTER_LOGIT_RMS
+    for c in (2, 5, 8, 12, 20):
+        raw = torch.full((1, c), -1000.0)
+        raw[0, 0] = 5000.0
+        scaled = scale_invariant_roster_logits(raw, torch.ones(1, c, dtype=torch.bool))
+        assert float(torch.softmax(scaled, -1)[0, 0]) > 0.999, (c, ROSTER_LOGIT_RMS)

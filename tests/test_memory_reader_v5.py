@@ -83,33 +83,75 @@ def test_predict_before_insert_and_roster_recompute():
     bank.verify("r1", "b")
     assert bank.entries[0].verified_label == "b"
     with pytest.raises(ValueError, match="duplicate"):
-        bank.insert(recording_id="r2", execution_id="e1", motion=q, acquisition=acq,
+        bank.insert(recording_id="r1", execution_id="e9", motion=q, acquisition=acq,
                     original_probabilities=first.semantic, roster=("a", "b", "c"))
+    # A later unlabelled window of an enrolled execution is observed, not retained.
+    bank.insert(recording_id="r2", execution_id="e1", motion=q, acquisition=acq,
+                original_probabilities=first.semantic, roster=("a", "b", "c"))
+    assert [e.recording_id for e in bank.entries] == ["r1"] and bank.seen == 2
+
+
+def test_later_window_of_an_unlabelled_execution_replaces_it():
+    model = _model()
+    q, acq, labels = _inputs()
+    bank = DeploymentMemory("x", capacity=4)
+    for i in range(3):
+        bank.insert(recording_id=f"w{i}", execution_id="walk-bout", motion=q + i, acquisition=acq,
+                    original_probabilities=model.semantic(q + i, labels), roster=("a", "b", "c"))
+    assert [e.recording_id for e in bank.entries] == ["w2"] and bank.seen == 3
 
 
 def test_eviction_protects_verified_and_ignores_pseudo_class():
     model = _model()
     q, acq, labels = _inputs()
-    bank = DeploymentMemory("x", capacity=2)
+    bank = DeploymentMemory("x", capacity=1)
     for i in range(3):
         bank.insert(recording_id=f"r{i}", execution_id=f"e{i}", motion=q + i,
                     acquisition=acq, original_probabilities=model.semantic(q + i, labels),
                     roster=("a", "b", "c"), verified_label="a" if i == 0 else None)
     assert len(bank.entries) == 2 and bank.seen == 3
     assert any(e.recording_id == "r0" for e in bank.entries)
+    assert sum(e.verified_label is None for e in bank.entries) == 1
 
 
-def test_full_verified_bank_counts_unretained_observation():
-    model = _model()
+def test_verified_enrollments_are_never_capped_by_unlabelled_capacity():
+    model = _model()                              # max_entries = 4
     q, acq, labels = _inputs()
     bank = DeploymentMemory("x", capacity=1)
-    bank.insert(recording_id="r0", execution_id="e0", motion=q, acquisition=acq,
-                original_probabilities=model.semantic(q, labels), roster=("a", "b", "c"),
-                verified_label="a")
-    bank.insert(recording_id="r1", execution_id="e1", motion=q, acquisition=acq,
-                original_probabilities=model.semantic(q, labels), roster=("a", "b", "c"))
-    assert bank.seen == 2 and len(bank.entries) == 1
-    assert bank.entries[0].recording_id == "r0"
+    for i in range(6):                            # more enrollments than the reader's size scale
+        bank.insert(recording_id=f"v{i}", execution_id=f"v{i}", motion=q + i, acquisition=acq,
+                    original_probabilities=model.semantic(q + i, labels), roster=("a", "b", "c"),
+                    verified_label="abc"[i % 3])
+    for i in range(2):
+        bank.insert(recording_id=f"u{i}", execution_id=f"u{i}", motion=q - i, acquisition=acq,
+                    original_probabilities=model.semantic(q - i, labels), roster=("a", "b", "c"))
+    assert sum(e.verified_label is not None for e in bank.entries) == 6
+    assert sum(e.verified_label is None for e in bank.entries) == 1
+    out = model(q, acq, labels, *bank.tensors(model, ("a", "b", "c"), labels, empty_device=q.device))
+    assert torch.isfinite(out.probabilities).all()
+
+
+def test_gates_never_see_label_identity_and_trust_is_bounded():
+    # Relabelling the roster (same evidence values, different label texts) must not change the
+    # reader's reliability weights or its semantic/memory blend weights: neither gate may see
+    # label identity. Trust stays within its bound however large the MLP output.
+    from model.support.memory_classifier import TRUST_LIMIT
+
+    model = _model()
+    q, acq, labels = _inputs()
+    motion, acquisition = torch.randn(3, 8), torch.randn(3, 8)
+    evidence = torch.softmax(torch.randn(3, 3), -1)
+    verified = torch.tensor([-1, 1, -1])
+    base = model(q, acq, labels, motion, acquisition, evidence, verified)
+    other = model(q, acq, torch.randn(3, 6), motion, acquisition, evidence, verified)
+    torch.testing.assert_close(base.reliability, other.reliability, rtol=0, atol=0)
+    with torch.no_grad():
+        model.trust[-1].bias.fill_(1e6)
+        model.trust[-1].weight.normal_(std=1e3)
+    extreme = model(q, acq, labels, motion, acquisition, evidence, verified)
+    similarity = torch.nn.functional.normalize(q, dim=-1) @ torch.nn.functional.normalize(motion, dim=-1).T
+    logits = (extreme.reliability.log() - similarity / model.cfg.neighbor_temperature)
+    assert float(logits.max() - logits.min()) <= 2 * TRUST_LIMIT + 1e-4
 
 
 def test_verified_label_outside_new_roster_has_no_false_vote():
@@ -159,6 +201,6 @@ def test_sampler_does_not_duplicate_execution_or_verify_final_query():
 
 
 def test_memory_size_telemetry_bins_are_stable():
-    assert [memory_size_bin(i) for i in (0, 1, 2, 3, 4, 7, 8, 64)] == [
-        "0", "1", "2_3", "2_3", "4_7", "4_7", "8_plus", "8_plus",
+    assert [memory_size_bin(i) for i in (0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 64)] == [
+        "0", "1", "2_3", "2_3", "4_7", "4_7", "8_15", "8_15", "16_31", "16_31", "32_plus", "32_plus",
     ]

@@ -27,9 +27,9 @@ Capacity is reported, never matched (plan §5.6).
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn as nn
-import torchaudio.transforms as audio_transforms
 
 from training.tokenizer.pretrain_data import CHANNELS
 
@@ -133,6 +133,10 @@ def _reinitialise(module: nn.Module) -> None:
             nn.init.ones_(module.weight)
         if getattr(module, "bias", None) is not None:
             nn.init.zeros_(module.bias)
+        if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d)) and module.track_running_stats:
+            # The trunk is built from the released model first; its running mean/variance would
+            # otherwise survive into the "random-init" control.
+            module.reset_running_stats()
 
 
 class _LiMUBertTrunk(nn.Module):
@@ -150,7 +154,7 @@ class _LiMUBertTrunk(nn.Module):
         self.net = _Backbone()
         if pretrained:
             state = torch.load(CHECKPOINT, map_location="cpu", weights_only=False)
-            self.net.load_state_dict(state, strict=False)
+            self.net.load_state_dict(state, strict=True)
         self.out_dim = BACKBONE_CONTRACTS["limubert"]["dim"]
 
     def forward(self, clips: torch.Tensor) -> torch.Tensor:
@@ -289,7 +293,6 @@ class MatchedCorpusEncoder(nn.Module):
             nn.Linear(2 * self.d_model, self.d_model),
         )
         self.row_norm = nn.LayerNorm(self.d_model)
-        object.__setattr__(self, "_resamplers", {})
         # Compilation is opt-in: measured 1.28x on the UniMTS graph, but it costs a warm-up and it
         # recompiles per input shape. Chunking already fixes the shape except for the final partial
         # chunk, which ``_run_trunk`` pads so only one graph is ever built.
@@ -310,17 +313,37 @@ class MatchedCorpusEncoder(nn.Module):
 
     # ------------------------------------------------------------------ helpers
     def _resample(self, x: torch.Tensor, source_hz: float) -> torch.Tensor:
-        """Anti-aliased resample of ``(n, T, C)`` to the trunk's rate, caching the sinc kernel."""
-        source = int(round(float(source_hz)))
-        target = int(round(self.in_hz))
-        if source == target:
+        """Resample ``(n, T, C)`` to the trunk's rate with **the released adapter's own method**.
+
+        HARNet's adapter interpolates linearly (``np.interp`` on sample clocks); LiMU-BERT-X's and
+        UniMTS's use ``scipy.signal.resample_poly``. Until 2026-09-25 this used a torchaudio sinc
+        resampler for every backbone, so rung 3's cached-feature treatments (released adapters)
+        and raw-window treatments (this trunk) read differently resampled signals of the same
+        model. Resampling acts on data, not parameters, so no gradient is needed through it.
+        """
+        source = float(source_hz)
+        target = float(self.in_hz)
+        if int(round(source)) == int(round(target)):
             return x
-        key = (source, target, x.device, x.dtype)
-        resampler = self._resamplers.get(key)
-        if resampler is None:
-            resampler = audio_transforms.Resample(source, target, dtype=x.dtype).to(x.device)
-            self._resamplers[key] = resampler
-        return resampler(x.transpose(1, 2).contiguous()).transpose(1, 2)
+        n, length, channels = x.shape
+        expected = max(1, int(round(length * target / source)))
+        if self.backbone_name == "harnet":
+            position = (torch.arange(expected, device=x.device, dtype=torch.float64) * (source / target))
+            position = position.clamp(0, length - 1)
+            low = position.floor().long()
+            high = (low + 1).clamp_max(length - 1)
+            weight = (position - low.to(position.dtype)).to(x.dtype).view(1, -1, 1)
+            return x[:, low] * (1 - weight) + x[:, high] * weight
+        from fractions import Fraction
+
+        from scipy.signal import resample_poly
+
+        ratio = Fraction(target / source).limit_denominator(1000)
+        out = resample_poly(x.detach().double().cpu().numpy(), ratio.numerator, ratio.denominator, axis=1)
+        out = out[:, :expected]
+        if out.shape[1] < expected:
+            out = np.pad(out, ((0, 0), (0, expected - out.shape[1]), (0, 0)), mode="edge")
+        return torch.as_tensor(out, dtype=x.dtype, device=x.device)
 
     def _clip_length(self, groups) -> int:
         """One clip length for the whole call, so groups concatenate into a single trunk batch.
