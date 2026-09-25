@@ -82,6 +82,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--lora-alpha", type=float, default=FineTuneConfig.lora_alpha)
     parser.add_argument("--support-draws", type=int, default=FineTuneConfig.support_draws,
                         help="independent k-shot support sets per (cell, k); report mean and spread")
+    parser.add_argument("--first-draw", type=int, default=0,
+                        help="skip draws below this index (add draws to an earlier run in a new --out)")
     parser.add_argument("--cells", type=int, default=None, help="evaluate only the first N cells (smoke)")
     parser.add_argument("--resume", action="store_true",
                         help="reuse completed cells from <out>/cells_partial.json (written after every cell)")
@@ -97,7 +99,7 @@ def main() -> None:
     cache_dir = args.feature_cache or args.out / "feature_cache"
     cfg = FineTuneConfig(steps=args.steps, lr=args.lr, encoder_lr_scale=args.encoder_lr_scale,
                          batch_size=args.batch_size, lora_rank=args.lora_rank, lora_alpha=args.lora_alpha,
-                         seed=args.seed, support_draws=args.support_draws)
+                         seed=args.seed, support_draws=args.support_draws, first_draw=args.first_draw)
     needs_cached = bool(set(args.treatments) & CACHED_FEATURE_TREATMENTS)
     raw_models = [name for name in args.models if any(t not in CACHED_FEATURE_TREATMENTS
                                                   for t in args.treatments)
@@ -191,7 +193,8 @@ def main() -> None:
         }, sort_keys=True).encode()).hexdigest(),
         manifest_fingerprint=hashlib.sha256(json.dumps({
             "cells": [list(c[:3]) for c in cells], "seed": args.seed, "scored_fraction": args.scored_fraction,
-            "k": args.k, "treatments": args.treatments, "support_draws": args.support_draws},
+            "k": args.k, "treatments": args.treatments, "support_draws": args.support_draws,
+            "first_draw": args.first_draw},
             sort_keys=True).encode()).hexdigest(),
         extra={"per_model_fingerprints": fingerprints, "raw_weight_fingerprints": raw_fingerprints,
                "config": cfg.as_dict(),

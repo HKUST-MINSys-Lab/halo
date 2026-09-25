@@ -58,6 +58,7 @@ class FineTuneConfig:
     probe_c: float = 1.0               # inverse L2 strength of the logistic-regression probe
     seed: int = 0
     support_draws: int = 3             # independent k-shot support sets per (cell, k); k=1-2 vary a lot
+    first_draw: int = 0                # run draws [first_draw, support_draws); lets draws be added later
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -221,6 +222,25 @@ def predict_rows(encode_fn: Callable[[np.ndarray], torch.Tensor], head: nn.Modul
     return np.concatenate(out).astype(np.int64) if out else np.zeros(0, np.int64)
 
 
+class CosineHead(nn.Module):
+    """Scale-invariant linear head: ``scale * cos(z, w_c)`` (Baseline++, Chen et al. 2019).
+
+    The trunks hand the head features whose per-dimension spread differs by >1000x (0.0005 for a
+    from-scratch UniMTS, 0.03 for the released LiMU-BERT-X, 0.7 for HALO); a plain linear head at
+    one learning rate and step budget then measures feature scale, not the representation (the
+    released LiMU-BERT-X did not fit its supports in 300 steps). Normalising both sides removes the
+    scale, like the L2-normalised linear probe."""
+
+    def __init__(self, in_dim: int, n_classes: int, scale: float = 10.0):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(n_classes, in_dim))
+        nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
+        self.scale = float(scale)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.scale * F.normalize(x, dim=-1) @ F.normalize(self.weight, dim=-1).T
+
+
 def raw_window_predictions(name: str, treatment: str, stream, support_rows: np.ndarray,
                            support_labels: np.ndarray, rows: np.ndarray, n_classes: int,
                            cfg: FineTuneConfig, device: torch.device, *, halo_checkpoint) -> tuple[np.ndarray, dict]:
@@ -232,7 +252,7 @@ def raw_window_predictions(name: str, treatment: str, stream, support_rows: np.n
         freeze_batchnorm_stats(encoder)
     with torch.no_grad():
         width = int(encode_rows(encoder, stream, support_rows[:1], device, requires_grad=False).shape[-1])
-    head = nn.Linear(width, n_classes).to(device)
+    head = CosineHead(width, n_classes).to(device)
     history = fit_head(lambda r: encode_rows(encoder, stream, r, device, requires_grad=bool(trainable)),
                        trainable, head, support_rows, support_labels, cfg, device)
     encoder.eval()
@@ -261,7 +281,7 @@ def run_cell(*, name: str, stream, features: np.ndarray | None, truth_ids: np.nd
     for k in ks:
         if k < 1:
             continue
-        for draw in range(max(1, int(cfg.support_draws))):
+        for draw in range(int(cfg.first_draw), max(1, int(cfg.support_draws))):
             # Draw 0 keeps the original seed parts, so it is the same support set as before
             # multiple draws existed (and as rung 1's k>0 draw).
             draw_parts = (*seed_parts, "k", k) if draw == 0 else (*seed_parts, "k", k, "draw", draw)
