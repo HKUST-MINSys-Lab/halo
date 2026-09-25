@@ -89,6 +89,7 @@ entries preserve what was believed at the time; current behavior is defined only
 | 2026-09-25 | [2026-09-25-deployment-memory-reader-proposal.md](2026-09-25-deployment-memory-reader-proposal.md) | Deployment memory reader: proposed design for a later classifier experiment |
 | 2026-09-25 | [2026-09-25-memory-reader-literature-audit.md](2026-09-25-memory-reader-literature-audit.md) | Memory-reader literature audit: storage and token contract |
 | 2026-09-25 | [2026-09-25-memory-reader-online-episode-addendum.md](2026-09-25-memory-reader-online-episode-addendum.md) | Memory reader: online episodes and age decision |
+| 2026-09-25 | [2026-09-25-rung1-smoke-tests.md](2026-09-25-rung1-smoke-tests.md) | Rung 1 smoke tests: everything runs; one comparability problem found |
 | 2026-09-25 | [2026-09-25-rung3-fairness-fixes.md](2026-09-25-rung3-fairness-fixes.md) | Rung 3: heads on each model's own features, and three support draws |
 | 2026-09-25 | [2026-09-25-v5-online-memory-implementation.md](2026-09-25-v5-online-memory-implementation.md) | V5 online memory reader: implementation record |
 | 2026-09-25 | [2026-09-25-v5-verified-feedback.md](2026-09-25-v5-verified-feedback.md) | V5 verified-label feedback |

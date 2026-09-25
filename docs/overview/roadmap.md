@@ -55,8 +55,9 @@ example at any point (k = 0)**:
 > N ∈ {0, 50, 100, 500, 2000, all}, log-spaced. The scored set is a fixed 20 % of executions, so
 > every N is measured on the same windows. **The curve's null is N = 0 under the same method**
 > (transduction over the scored set alone). A separate *inductive* anchor — the per-window zero-shot
-> arg-max — is a text-only anchor. For HALO it excludes the sealed classifier's zero-support
-> correction, so it is not an exact sealed k=0 reproduction; it is never the baseline for a gain.
+> arg-max — reproduces the published sealed k=0 row: exactly for every baseline, and for HALO v4
+> too, whose k=0 classifier reduces to its `p_text` arg-max (verified equal on all 11 sealed 8 s
+> cells, 2026-09-25). It reads a different space and is never the baseline for a gain.
 
 Pools exist: the sealed single-device cells hold 552–16,828 windows each, median ~450 per class.
 (k > 0 plus a pool — labels *and* unlabelled data — is computable with the same code, but it is a

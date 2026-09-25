@@ -367,3 +367,15 @@ def test_disjoint_control_scores_macro_f1_over_the_kept_classes_only():
     anchor = next(r for r in rows if r["method"] == "inductive" and r["scope"] == "scored")
     assert anchor["macro_f1_class_policy"] == "scored_classes_only"
     assert anchor["f1_macro"] > 99.0
+
+
+def test_neighbour_execution_diagnostics_separate_within_recording_similarity():
+    from evaluation.rung1_unlabeled.ncurve import neighbour_execution_diagnostics
+    truth = np.array([0, 0, 1, 1])
+    executions = np.array(["a", "a", "b", "c"], dtype=object)
+    neighbours = np.array([[1, 2], [0, 3], [3, 0], [2, 1]])
+    out = neighbour_execution_diagnostics(truth, executions, neighbours)
+    assert out["neighbour_same_execution"] == pytest.approx(2 / 8)
+    # other-execution pairs: (0,2) diff, (1,3) diff, (2,3) same, (2,0) diff, (3,2) same, (3,1) diff
+    assert out["neighbour_purity_other_execution"] == pytest.approx(2 / 6)
+    assert neighbour_execution_diagnostics(truth, None, neighbours)["neighbour_same_execution"] is None

@@ -7,9 +7,11 @@ a pool P (80 %); nested subsets P_50 ⊂ P_100 ⊂ … ⊂ P are drawn once from
 transduction runs over S ∪ P_N; every metric is computed on S only.
 
 * The **inductive anchor** (``method="inductive"``, recorded with N = 0) involves no transduction.
-  At k = 0 it is the text-score arg-max on the same windows. For HALO this is the semantic
-  branch, not the full sealed zero-support classifier, so it must not be presented as a
-  reproduction of the published sealed result.
+  At k = 0 it is the text-score arg-max on the same windows. For the baselines this is their
+  published sealed k = 0 rule. For HALO v4 it also equals the published sealed k = 0 classifier:
+  with no supports every candidate is unenrolled, v4's calibration term shifts them all equally,
+  and the prediction reduces to the ``p_text`` arg-max (all 11 sealed 8 s cells verified equal,
+  2026-09-25). For another HALO head that need not hold; rows name their route.
 * k > 0 supports are a **cell-level shared set** of k windows per class drawn from P (execution-
   disjoint from S by construction), because transduction is joint over the pool and cannot take
   the sealed manifest's per-query support sets. The inductive k > 0 readout at N = 0 is the
@@ -130,6 +132,27 @@ def inductive_predictions(*, scores: np.ndarray, features: np.ndarray | None, su
     return np.asarray((z[rows] @ _normalise(prototypes).T).argmax(axis=1), dtype=np.int64)
 
 
+def neighbour_execution_diagnostics(truth: np.ndarray, executions: np.ndarray | None,
+                                    neighbours: np.ndarray | None) -> dict:
+    """Share of neighbours from the same physical execution, and purity among the others.
+
+    Adjacent windows of one continuous recording are legitimately available to a deployment, but
+    they make ``neighbour_purity`` partly a measure of within-recording similarity. The purity over
+    neighbours from *other* executions is the part that reflects class structure (2026-09-25:
+    14-56 % of neighbours shared the query's execution on two smoke cells)."""
+    if neighbours is None or neighbours.size == 0 or executions is None:
+        return {"neighbour_same_execution": None, "neighbour_purity_other_execution": None}
+    executions = np.asarray(executions, dtype=object)
+    truth = np.asarray(truth)
+    same = executions[neighbours] == executions[:, None]
+    counted = (truth[:, None] >= 0) & (truth[neighbours] >= 0)
+    other = counted & ~same
+    agree = truth[neighbours] == truth[:, None]
+    return {"neighbour_same_execution": float(same.mean()),
+            "neighbour_purity_other_execution": (float((agree & other).sum() / other.sum())
+                                                 if other.any() else None)}
+
+
 def neighbour_purity(truth: np.ndarray, neighbours: np.ndarray | None) -> float | None:
     """Share of embedding-space neighbours with the same true class (in-roster rows only).
 
@@ -172,6 +195,7 @@ def run_cell(
     control: str = "none",
     device=None,
     scored_classes: Sequence[int] | None = None,
+    execution_ids: np.ndarray | None = None,
 ) -> list[dict]:
     """Every rung-1 row for one (encoder, cell): the N × k grid on S, plus the all-windows
     all-window text-score anchor at N = 0, k = 0. ``pool_filter`` may resample each P_N."""
@@ -248,6 +272,10 @@ def run_cell(
                     "lam": info["lam"], "n_iter": info["n_iter"], "n_iter_mm": info["n_iter_mm"],
                     "affinity_mu": info["mu"], "affinity_knn": info["knn"],
                     "neighbour_purity": neighbour_purity(truth_ids[task_rows], neighbours),
+                    **neighbour_execution_diagnostics(
+                        truth_ids[task_rows],
+                        None if execution_ids is None else np.asarray(execution_ids, dtype=object)[task_rows],
+                        neighbours),
                     "cluster_sizes": info["cluster_sizes"],
                     "collapsed_components": int(sum(1 for s in info["cluster_sizes"] if s < 0.5)),
                     "score_kind": score_kind, **feature_info,
