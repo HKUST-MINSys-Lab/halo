@@ -68,6 +68,17 @@ term (neighbours in the encoder's own space vote with their text probabilities) 
 (+1.3; +2.8 over μ = 0 at N = all). The term is not uniformly good: it costs UniMTS 1.8 at N = all.
 μ = 1 was fixed before any result, so this is a finding about the method, not a tuned choice.
 
+**Balanced pool** (`..._balanced_...`): HALO 50.6 → 51.9, the same pool effect with a smoother
+curve (52.1 at N = 2000) — not an artefact of the natural class imbalance.
+
+**Disjoint classes** (pool holds none of the scored classes; F1 over the scored half of the roster,
+hence higher anchors): the pool still helps HALO (+3.6), UniMTS (+4.8), NormWear (+3.0); LiMU-BERT-X
+drops (−6.1). So the pool effect is not "learning the target classes from unlabelled data". Likely
+mechanism — explaining away: without a pool, scored windows the text wrongly assigns to other classes
+become those classes' clusters and reinforce the error; pool windows of the real other classes anchor
+those clusters elsewhere and release the scored windows. The paper must describe the gain this way.
+All three controls are in `results/artifacts/rung1_tier1_20260925/controls/`.
+
 ## 6. Tier-3 timing (T3-0) found two defects before any fine-tune result
 
 - **Raw-window treatments could not run on CUDA.** `encode_dataset_detailed` returns host tensors on
